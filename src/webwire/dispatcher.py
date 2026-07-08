@@ -63,7 +63,7 @@ class Dispatcher:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> ActionResult:
-        """Start the session and register default Phase 0a capabilities."""
+        """Start the session, restore persisted cookies, register capabilities."""
         r = await self._session.start()
         if not r.ok:
             return r
@@ -75,9 +75,23 @@ class Dispatcher:
                 "Session reported started but sb is None",
                 failure_category=FailureCategory.BROWSER_CRASH,
             )
+        # Restore persisted cookies BEFORE first navigation (review Q3).
+        # Non-fatal: whoami is the real auth gate.
+        if self._session.session_loaded_state == "pending":
+            try:
+                await self._session.restore_session_async()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("session restore failed: %r", exc)
         self._broker = ReadOnlyBroker(sb, self._kill, self._config)
         # Defaults already registered in __init__; ensure idempotent.
         self._register_defaults()
+        # Enrich the start result with session/ownership state for callers.
+        try:
+            data = r.data or {}
+            data["ownership"] = self._session.ownership
+            data["session"] = self._session.session_loaded_state
+        except Exception:  # noqa: BLE001
+            pass
         return r
 
     async def stop(self) -> ActionResult:
@@ -152,6 +166,18 @@ class Dispatcher:
                 failure_category=FailureCategory.UNKNOWN,
             )
 
+        # Session checkpoint policy (review Q3): on a successful whoami, mark
+        # authenticated and eagerly checkpoint the cookie jar. whoami is the
+        # only capability that establishes identity; other capabilities benefit
+        # from the checkpoint but don't trigger it. This keeps capabilities pure
+        # (no persistence coupling) — policy lives in the dispatcher.
+        if name == "whoami" and result.ok:
+            self._session.mark_authenticated()
+            try:
+                await self._session.checkpoint_session()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("post-whoami checkpoint failed: %r", exc)
+
         self._journal_write(
             trace_id=trace_id, capability=name, input=input,
             result=result, policy_decision="allowed",
@@ -180,8 +206,8 @@ class Dispatcher:
             return
         # whoami — pure read, no extra deps.
         self._registry.register(WhoamiCapability())
-        # health — needs kill switch + config for diagnostics.
-        self._registry.register(HealthCapability(self._kill, self._config))
+        # health — needs kill switch + session manager + config for diagnostics.
+        self._registry.register(HealthCapability(self._kill, self._session, self._config))
         self._registered_default = True
 
     def _journal_write(

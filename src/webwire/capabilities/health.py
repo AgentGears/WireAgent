@@ -23,6 +23,7 @@ from webwire.capabilities.base import CapabilityTier
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, hard_failure, ok_result, soft_failure
 from webwire.safety import KillSwitch
+from webwire.session import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +39,11 @@ class HealthCapability:
     def __init__(
         self,
         kill_switch: KillSwitch,
+        session_manager: SessionManager,
         config: Optional[WebWireConfig] = None,
     ) -> None:
         self._kill = kill_switch
+        self._session = session_manager
         self._config = config or WebWireConfig()
 
     async def run(self, broker: ReadOnlyBroker, input: dict[str, Any]) -> ActionResult:
@@ -52,7 +55,14 @@ class HealthCapability:
         # 1. Kill switch state (always available).
         diag["checks"]["kill_switch"] = self._kill.state()
 
-        # 2. Read-only broker policy active (structural — always true by construction).
+        # 2. Browser ownership + session-restore state (review Q4 invariant).
+        diag["checks"]["browser"] = {
+            "ownership": self._session.ownership,  # owned | attached
+            "session": self._session.session_loaded_state,  # no_file|loaded|load_failed|pending
+            "authenticated": self._session.authenticated,
+        }
+
+        # 3. Read-only broker policy active (structural — always true by construction).
         diag["checks"]["broker_policy"] = {
             "active": True,
             "allowed_methods": sorted(broker.allowed_methods),

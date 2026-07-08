@@ -53,10 +53,27 @@ class WebWireConfig:
     max_runtime_seconds_per_capability: float = 60.0
 
     # -- Super-Browser session ------------------------------------------------
-    # How to obtain the browser. PATCHRIGHT_ATTACH uses the user's already-
-    # logged-in Chrome — the whole point of this tool.
-    # If None, defaults to PATCHRIGHT_ATTACH.
-    session_mode_override: Optional[str] = None
+    # How to obtain the browser. Default is LAUNCH — Super-Browser starts its
+    # OWN Patchright Chromium. This is the golden path: a stealth browser
+    # Agent-WebWire owns, isolated from other automation clients.
+    #
+    # Browser ownership is foundational (review Q4 invariant): attach mode is a
+    # non-production diagnostic path and must be explicitly opted into.
+    session_mode_override: Optional[str] = None  # None => LAUNCH (default)
+    # Attach mode requires explicit opt-in. Refused by default to prevent the
+    # "ambient CDP attachment" mistake (attaching to a foreign browser like the
+    # ChatGPT-Web2API bridge's Chrome). Set True only for diagnostics/dev.
+    allow_attach: bool = False
+    # Dedicated Chrome profile directory for launch mode (currently a stub on
+    # the Super-Browser side — launch uses an ephemeral profile). Retained for
+    # the future persistent-context feature; ignored by the current launch path.
+    chrome_profile_dir: str = "chrome-profile"
+    # CDP WebSocket URL — only used when session_mode_override="patchright_attach".
+    cdp_ws_url: str = "ws://127.0.0.1:9222"
+    # Session-persistence file (cookie serialization via Super-Browser's public
+    # save_session/load_session). Loaded on start if present; checkpointed after
+    # verified whoami. Treated as a secret: gitignored, restrictive perms.
+    session_file: str = "session.json"
 
     def kill_path(self) -> Path:
         """Absolute path to the kill hot file."""
@@ -69,3 +86,11 @@ class WebWireConfig:
     def screenshot_dir(self) -> Path:
         """Directory for screenshot artifacts."""
         return self.state_dir / "screenshots"
+
+    def chrome_profile_path(self) -> Path:
+        """Absolute path to the dedicated Chrome profile (launch mode)."""
+        return self.state_dir / self.chrome_profile_dir
+
+    def session_path(self) -> Path:
+        """Absolute path to the session-persistence file (cookie jar)."""
+        return self.state_dir / self.session_file

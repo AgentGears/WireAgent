@@ -38,7 +38,7 @@
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **0a** | session + whoami + health + envelope + journal + kill switch + read-only broker | **IMPLEMENTED** (60 tests pass); live-smoke Gate 3 blocked on session-login |
+| **0a** | session + whoami + health + envelope + journal + kill switch + read-only broker | **IMPLEMENTED + LIVE-VERIFIED** (60 tests pass; live smoke all 6 gates PASS, identity @infaag resolved) |
 | **0b** | write-safety kernel (token bucket, dedupe, risk registry, dry-run, compose→…→verify) | not started; before Phase 3 |
 | **1** | golden read (`read <post_url>`) | blocked on 0a-live |
 | **2** | read fan-out | blocked on Phase 1 |
@@ -46,18 +46,19 @@
 | **4** | public writes | blocked on Phase 3 |
 | **5** | analytics (separate adapter family) | blocked on Phase 4 |
 
-## Current blocker
+## Current status
 
-**Phase 0a live-smoke Gate 3 (whoami) blocked.** Root cause is operational, not
-code: Super-Browser's `PATCHRIGHT_LAUNCH` uses an ephemeral profile (the
-`user_data_dir` config field is an unimplemented stub on the SDK side — see
-"Session persistence" below). So every launch starts logged-out, and the
-authenticated cookie jar must be established via a one-time login + checkpoint.
-The login helper has been unreliable (window visibility / possible X bot-
-detection on the fresh Patchright profile). User is attempting a manual login
-via `scripts/login.py` to produce `.webwire/session.json`.
+**Phase 0a-live PASSED — all 6 gates satisfied** (live, against real X, identity
+`@infaag` resolved via Profile-link href). The control loop is proven end-to-end:
+owned browser → session restore → whoami gate → kill invariant → journal proof.
 
-Smoke gate status: Gates 1,2,4,5,6 PASS; Gate 3 BLOCKED on session.
+Resolved along the way:
+- Session persistence via cookie serialization (save_session/load_session).
+- whoami primary path = `broker.query_attr` reading the Profile nav link href
+  (`data-testid=AppTabBar_Profile_Link` → `/<handle>`). AX-parse is fallback.
+- Hydration wait (4s) in whoami — X is a React SPA; observe() before hydration
+  returns an empty snapshot.
+- Strategy B tightened: rejects single-char names and brand names ("X", "Grok").
 
 ## Session persistence (key architectural finding)
 
@@ -111,18 +112,20 @@ Per-action token bucket + per-target dedupe key. Kill switch before every write.
 
 ## Verification snapshot
 
-- 60 unit tests pass (0.63s). Coverage ~71%.
-- Live smoke: Gates 1,2,4,5,6 PASS; Gate 3 blocked on session (see Current blocker).
+- 60 unit tests pass (0.66s). Coverage ~71%.
+- **Live smoke: ALL 6 GATES PASS** (real X, identity @infaag).
 
 ## Open items / known gaps
 
-- [ ] Complete one-time X login → produce `.webwire/session.json` (user action)
-- [ ] Re-run live smoke; pass Gate 3; declare 0a-live done
+- [x] ~~Complete one-time X login → session.json~~ (done; 22 cookies incl. auth_token)
+- [x] ~~Re-run live smoke; pass Gate 3; declare 0a-live done~~ (done)
 - [ ] Screenshot capture plumbed but unimplemented (broker.diagnostic_screenshot())
 - [ ] No CLI yet; docs/ now has STATE.md only
 - [ ] `identity_resolved` as a health probe (ChatGPT Q4 note, optional)
 - [ ] Future: persistent-context feature in Super-Browser (launch_persistent_context behind a flag)
+- [ ] Cookie-only persistence is fragile — expect re-login on token expiry
 
 ## History
 
-- 2026-07-08: Phase 0a implemented + review-hardened + cookie-persistence wired. Live smoke 5/6 gates pass; Gate 3 blocked on session-login operational issue.
+- 2026-07-08 (late): Phase 0a-LIVE PASSED. All 6 gates, identity @infaag resolved via Profile-link href. Session persistence via cookie serialization working end-to-end.
+- 2026-07-08: Phase 0a implemented + review-hardened + cookie-persistence wired.

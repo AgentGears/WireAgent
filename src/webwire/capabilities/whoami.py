@@ -58,7 +58,12 @@ class WhoamiCapability:
         if not nav.ok:
             return nav  # propagate navigation failure (TIMEOUT/NAVIGATION/SECURITY)
 
-        # 2. Observe — deterministic AX snapshot.
+        # 1b. X is a React SPA — content isn't ready at domcontentloaded. Wait
+        # for hydration before observing, or the snapshot is empty/partial.
+        import asyncio as _asyncio
+        await _asyncio.sleep(4)
+
+        # 2. Observe — AX snapshot for login-wall detection + fast parse.
         obs = await broker.observe()
         if not obs.ok:
             return obs
@@ -73,56 +78,113 @@ class WhoamiCapability:
                 f"Login wall detected at {url!r}. Re-acquire an authenticated session."
             )
 
-        # 4. Deterministic parse off the AX snapshot targets.
+        # 4. PRIMARY path: read the Profile nav link's href via query_attr.
+        # X's home left-rail has a stable Profile link (data-testid=
+        # AppTabBar_Profile_Link) whose href is /<handle>. This is the most
+        # deterministic identity source — it comes straight from X's own nav,
+        # not from heuristics on element names. query_attr reads the href
+        # attribute via read-only CDP getAttribute.
+        logger.info("whoami: reading Profile link href from DOM (primary path)")
+        profile_href = await _read_profile_href(broker)
+        if profile_href:
+            handle = profile_href.strip("/").split("/")[-1]
+            if handle and "/" not in handle and len(handle) >= 2:
+                identity = {
+                    "handle": handle,
+                    "display_name": None,
+                    "profile_url": _absolutize_path(profile_href, url),
+                    "session_status": "authenticated",
+                    "source": "profile_link_href",
+                }
+                return ok_result(data=identity, success_category=SuccessCategory.INSPECTION)
+
+        # 5. Fallback: deterministic parse off the AX snapshot targets.
+        # (Weaker — relies on @-handle link names, which X often doesn't expose
+        #  on the home timeline. Kept as fallback for surfaces that do.)
         identity = _parse_identity_from_observation(obs_data)
         if identity is not None and identity.get("handle") and identity.get("profile_url"):
             identity["session_status"] = "authenticated"
             return ok_result(data=identity, success_category=SuccessCategory.INSPECTION)
 
-        # 5. Fallback: extract with a schema. Only if observe could not resolve it.
-        logger.info("whoami: deterministic parse incomplete; falling back to extract()")
-        ext = await broker.extract(
-            "my account handle, display name, profile URL",
-            schema={
-                "type": "object",
-                "properties": {
-                    "handle": {"type": "string"},
-                    "display_name": {"type": "string"},
-                    "profile_url": {"type": "string"},
-                },
-                "required": ["handle", "profile_url"],
-            },
-        )
-        if not ext.ok:
-            # Authenticated but identity unresolvable via both observe-parse and
-            # extract. Review-iteration adjustment: encode the operational
-            # condition as a distinct code so the journal distinguishes this
-            # from generic selector drift. This is a soft FAILURE at runtime
-            # (likely DOM churn, recoverable) but a HARD BLOCKER at the Phase
-            # 0a acceptance gate (identity is foundational).
-            return soft_failure(
-                "identity_unresolved_on_authenticated_surface: authenticated session "
-                "but could not resolve identity (observe-parse and extract both failed). "
-                "Likely X DOM churn — update _parse_identity_from_observation.",
-                failure_category=FailureCategory.SELECTOR_NOT_FOUND,
-                retry_hint="Update the identity parser in whoami.py and retry. "
-                "Blocks Phase 1 until whoami resolves on a live authenticated session.",
-            )
+        # 6. Last resort: scan the AX compact string for a handle-like path.
+        ext = await broker.extract("identity")
+        if ext.ok and ext.data:
+            extracted_str = (
+                ext.data.get("extracted") if isinstance(ext.data, dict) else str(ext.data)
+            ) or ""
+            handle = _scan_for_handle_in_ax(extracted_str, obs_data)
+            if handle:
+                identity = {
+                    "handle": handle,
+                    "display_name": None,
+                    "profile_url": _absolutize_path(f"/{handle}", url),
+                    "session_status": "authenticated",
+                    "source": "ax_scan",
+                }
+                return ok_result(data=identity, success_category=SuccessCategory.INSPECTION)
 
-        ext_data: dict[str, Any] = ext.data or {}
-        identity = {
-            "handle": ext_data.get("handle"),
-            "display_name": ext_data.get("display_name"),
-            "profile_url": ext_data.get("profile_url"),
-            "session_status": "authenticated",
-            "source": "extract_fallback",
-        }
-        return ok_result(data=identity)
+        return soft_failure(
+            "identity_unresolved_on_authenticated_surface: authenticated session "
+            "but could not resolve identity (AX-parse, profile-href, and AX-scan all failed). "
+            "Likely X DOM churn — update whoami.",
+            failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+            retry_hint="Update the identity parser in whoami.py and retry. "
+            "Blocks Phase 1 until whoami resolves on a live authenticated session.",
+        )
 
 
 # ---------------------------------------------------------------------------
 # Helpers — the maintenance-sensitive surface
 # ---------------------------------------------------------------------------
+
+async def _read_profile_href(broker: ReadOnlyBroker) -> Optional[str]:
+    """Read the logged-in user's profile path via the Profile nav link's href.
+
+    X's left rail has a stable Profile link whose href is /<handle>. We read the
+    href attribute via broker.query_attr (read-only CDP getAttribute), since
+    observe() (AX snapshot) and extract(selector) (textContent) can't read attrs.
+    Tries X's known testids/aria-labels, most-stable first.
+    """
+    # (selector, attr) pairs to try. X's Profile link: data-testid or aria-label.
+    probes = [
+        ("[data-testid='AppTabBar_Profile_Link']", "href"),
+        ("a[aria-label='Profile']", "href"),
+        ("[data-testid='SideNav_AccountSwitcher_Button']", "href"),
+        # Account menu button sometimes carries the handle in aria-label
+        ("[aria-label='Account menu']", "aria-label"),
+    ]
+    for selector, attr in probes:
+        r = await broker.query_attr(selector, attr)
+        if not r.ok or not r.data:
+            continue
+        value = r.data.get("value") if isinstance(r.data, dict) else None
+        if not value:
+            continue
+        # href is /<handle>; aria-label may be "Account menu" or contain @handle
+        if value.startswith("/") and len(value) > 1:
+            return value
+        if value.startswith("@"):
+            return "/" + value.lstrip("@")
+    return None
+
+
+def _scan_for_handle_in_ax(ax_str: str, obs_data: dict[str, Any]) -> Optional[str]:
+    """Last-resort: scan the AX compact string for a handle-like path near
+    account/profile affordances. Best-effort; returns None if uncertain."""
+    import re
+    # Look for /<handle> patterns (single path segment, alnum/underscore).
+    # Prefer ones appearing near "Account" or "Profile" context.
+    candidates = re.findall(r"/([A-Za-z0-9_]{1,15})\b", ax_str)
+    # Filter out obvious non-handles.
+    non_profile = {
+        "home", "explore", "notifications", "messages", "search", "compose",
+        "settings", "i", "login", "signup", "tos", "privacy", "search",
+    }
+    for c in candidates:
+        if c.lower() not in non_profile and len(c) >= 2:
+            return c
+    return None
+
 
 def _looks_like_login_wall(url: str, title: str) -> bool:
     url_l = url.lower()
@@ -165,11 +227,14 @@ def _parse_identity_from_observation(obs_data: dict[str, Any]) -> Optional[dict[
     # /<handle> path that looks like a profile. Restricting to role=link avoids
     # matching UI labels like "Post" / "Explore" that are buttons or menu items.
     # Heuristic: single-segment, alnum+underscore, not a known non-profile root.
+    # MUST reject single-char names and brand names — "X" (the logo link) is a
+    # classic false positive that previously produced a wrong identity.
     non_profile_roots = {
         "home", "explore", "notifications", "messages", "search", "compose",
         "settings", "i", "login", "signup", "tos", "privacy",
         "post", "tweet", "reply", "share", "more", "back", "next", "close",
         "follow", "following", "followers", "likes", "bookmarks", "profile",
+        "x", "grok", "chat", "subscribe", "premium",  # brand/nav false positives
     }
     for t in targets:
         if t.get("role") != "link":
@@ -177,10 +242,12 @@ def _parse_identity_from_observation(obs_data: dict[str, Any]) -> Optional[dict[
         name = (t.get("name") or "").strip()
         if not name or name.startswith("@"):
             continue
-        # Only accept if it really looks like a handle (alnum + underscore).
+        # Only accept if it really looks like a handle (alnum + underscore),
+        # length >= 2 (single-char like "X" is never a real handle), and not a
+        # known brand/nav label.
         tentative = name.lstrip("@")
         if (
-            tentative
+            len(tentative) >= 2
             and tentative.lower() not in non_profile_roots
             and all(c.isalnum() or c == "_" for c in tentative)
             and 1 <= len(tentative) <= 15

@@ -44,6 +44,7 @@ class ReadOnlyBroker:
         "navigate", "reload", "go_back", "go_forward",
         "observe", "extract",
         "list_tabs", "switch_tab",
+        "query_attr", "query_text",
     })
 
     def __init__(
@@ -117,50 +118,75 @@ class ReadOnlyBroker:
             return r
         return await self._sb.switch_tab(tab_id)
 
-    # -- attribute read (read-only DOM query, scoped) ------------------------
-    # Added to unblock identity resolution: X exposes the handle in the Profile
-    # link's href attribute, which observe() (AX snapshot) and extract(selector)
-    # (textContent) cannot read. This method reads ONE attribute of ONE element
-    # via CDP evaluate — it's read-only by construction (getAttribute cannot
-    # mutate) and stays within the broker's read-only contract.
+    # -- bounded DOM read primitives (read-only, scoped) ---------------------
+    # query_attr and query_text are bounded read primitives: the caller supplies
+    # a selector (and for query_attr, an attr name), NOT executable JS. The broker
+    # owns the fixed expression shape. These stay within the read-only contract
+    # (review invariant: "bounded, non-mutating read primitive with no caller-
+    # controlled executable code"). They unblock reads that observe() (AX
+    # snapshot) and extract() (textContent) cannot serve — hrefs and innerText.
 
-    async def query_attr(self, selector: str, attr: str) -> ActionResult:
-        """Read a single DOM attribute. Read-only and scoped — safe to expose.
-
-        Uses CDP evaluate under the hood: document.querySelector(sel).getAttribute(attr).
-        Returns ActionResult with data={'selector':..., 'attr':..., 'value': str|None}.
-        """
-        if (r := self._guard()) is not None:
-            return r
-        # Escape the selector/attr for safe embedding in a JS string literal.
-        safe_sel = selector.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
-        safe_attr = attr.replace("\\", "\\\\").replace("'", "\\'")
-        expr = (
-            f"(function(){{var el=document.querySelector('{safe_sel}');"
-            f"return el?el.getAttribute('{safe_attr}'):null;}})()"
-        )
+    async def _cdp_read(self, expr: str, label: str) -> ActionResult:
+        """Shared CDP-evaluate read helper. Returns ok+value or soft failure."""
         try:
-            # Access the controller's CDP evaluate, same path extract() uses.
             cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
             result = await cdp.evaluate(expr)
             if result.ok and "exceptionDetails" not in result.data:
                 value = result.data.get("result", {}).get("value")
                 from webwire.envelope import ok_result
                 from super_browser.results.types import SuccessCategory
-                return ok_result(
-                    data={"selector": selector, "attr": attr, "value": value},
-                    success_category=SuccessCategory.INSPECTION,
-                )
+                return ok_result(data=value, success_category=SuccessCategory.INSPECTION)
             from webwire.envelope import soft_failure
             from super_browser.results.types import FailureCategory
             return soft_failure(
-                f"query_attr CDP evaluate failed for {selector!r}[{attr}]",
+                f"{label}: CDP evaluate failed",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
         except Exception as exc:  # noqa: BLE001
             from webwire.envelope import hard_failure
             from super_browser.results.types import FailureCategory
-            return hard_failure(f"query_attr error: {exc!r}")
+            return hard_failure(f"{label} error: {exc!r}")
+
+    async def query_attr(self, selector: str, attr: str) -> ActionResult:
+        """Read ONE DOM attribute. Read-only and scoped.
+
+        document.querySelector(sel).getAttribute(attr). Returns value (str|None)
+        in data on success.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        safe_sel = selector.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        safe_attr = attr.replace("\\", "\\\\").replace("'", "\\'")
+        expr = (
+            f"(function(){{var el=document.querySelector('{safe_sel}');"
+            f"return el?el.getAttribute('{safe_attr}'):null;}})()"
+        )
+        r = await self._cdp_read(expr, f"query_attr({selector!r},{attr!r})")
+        if r.ok:
+            # Wrap into a descriptive data dict for callers that want context.
+            r.data = {"selector": selector, "attr": attr, "value": r.data}
+        return r
+
+    async def query_text(self, selector: str) -> ActionResult:
+        """Read the innerText of ONE element. Read-only and scoped.
+
+        document.querySelector(sel).innerText. Resolves text from nested spans
+        (X renders tweetText through nested span/emoji/bidi nodes where direct
+        textContent returns None). innerText is layout-aware; acceptable for
+        Phase 1 since the contract wants human-visible text, not byte-exact DOM.
+        Returns value (str|None) in data on success.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        safe_sel = selector.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        expr = (
+            f"(function(){{var el=document.querySelector('{safe_sel}');"
+            f"return el?el.innerText:null;}})()"
+        )
+        r = await self._cdp_read(expr, f"query_text({selector!r})")
+        if r.ok:
+            r.data = {"selector": selector, "value": r.data}
+        return r
 
     # -- diagnostics ---------------------------------------------------------
 

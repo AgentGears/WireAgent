@@ -26,6 +26,7 @@ from super_browser.results.types import SuccessCategory
 from webwire.broker import ReadOnlyBroker
 from webwire.capabilities.base import Capability, CapabilityTier
 from webwire.capabilities.health import HealthCapability
+from webwire.capabilities.read import ReadCapability
 from webwire.capabilities.whoami import WhoamiCapability
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, unsupported_capability
@@ -208,6 +209,8 @@ class Dispatcher:
         self._registry.register(WhoamiCapability())
         # health — needs kill switch + session manager + config for diagnostics.
         self._registry.register(HealthCapability(self._kill, self._session, self._config))
+        # read — the golden read (Phase 1).
+        self._registry.register(ReadCapability())
         self._registered_default = True
 
     def _journal_write(

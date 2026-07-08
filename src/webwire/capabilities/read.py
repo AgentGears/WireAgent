@@ -134,17 +134,27 @@ class ReadCapability:
         if lang_r.ok and lang_r.data:
             post.lang = lang_r.data.get("value") or None
 
-        # display_name — from the User-Name area; query_text the displayName span.
-        dn_r = await broker.query_text("a[href] span")
-        # Best-effort; often the first span under the author link is the name.
+        # display_name — best-effort, scoped to the post's User-Name area.
+        # X marks the author name region with data-testid='User-Name'; the
+        # display name is a span inside it. Kept optional (not required for
+        # success). The earlier unscoped 'a[href] span' grabbed nav text.
+        dn_r = await broker.query_text(
+            "[data-testid='User-Name'] span"
+        )
         if dn_r.ok and dn_r.data:
             dn = (dn_r.data.get("value") or "").strip()
-            # Avoid picking up the handle (which starts with @) as the name.
-            if dn and not dn.startswith("@"):
+            # Reject handles (@...) and known nav/non-name strings.
+            if dn and not dn.startswith("@") and len(dn) > 1:
                 post.author_display_name = dn
 
         # metrics — parsed from AX button names (engagement bar).
         post.metrics = await _read_metrics(broker, obs_data)
+
+        # quoted_post — shallow one-level resolution (review Q2).
+        # Opportunistic: a quote-tweet's value IS the quoted post, but failure
+        # to resolve it must NOT fail the parent read. Returns quoted_post=None
+        # if absent or unresolvable.
+        post.quoted_post = await _try_read_quoted_post(broker)
 
         # 5. SUCCESS/PARTIAL/FAILURE per review Q4.
         required_ok = all([post.post_id, post.author_handle, post.created_at])
@@ -181,6 +191,53 @@ def _parse_status_href(href: str) -> tuple[Optional[str], Optional[str]]:
     if not m:
         return None, None
     return m.group(2), m.group(1)
+
+
+async def _try_read_quoted_post(broker: ReadOnlyBroker) -> Optional[Post]:
+    """Resolve a shallow (one-level) quoted post if a quote-tweet card is present.
+
+    X nests the quoted post inside [data-testid='quoteTweet'] as its own
+    <article> with tweetText, a status href, and a time. Selectors are scoped
+    to the quote container so they don't match the parent post.
+
+    Opportunistic (review Q2): returns None if no quote card is present OR if
+    the quote can't be resolved. Never raises — quote failure must not fail the
+    parent read.
+    """
+    try:
+        # Detect the quote-tweet container.
+        qt = await broker.query_attr("[data-testid='quoteTweet']", "role")
+        if not qt.ok or not qt.data or qt.data.get("value") is None:
+            return None  # no quote card
+
+        # Scope reads to the quote container.
+        QT = "[data-testid='quoteTweet'] "
+        quoted = Post()
+
+        href_r = await broker.query_attr(f"{QT}a[href*='/status/']", "href")
+        if href_r.ok and href_r.data:
+            qid, qhandle = _parse_status_href(href_r.data.get("value") or "")
+            quoted.post_id = qid
+            quoted.author_handle = qhandle
+            quoted.url = href_r.data.get("value")
+
+        time_r = await broker.query_attr(f"{QT}time", "datetime")
+        if time_r.ok and time_r.data:
+            quoted.created_at = time_r.data.get("value")
+
+        text_r = await broker.query_text(f"{QT}[data-testid='tweetText']")
+        if text_r.ok and text_r.data:
+            quoted.text = text_r.data.get("value") or None
+
+        # A quote is only useful if it has at least an identity (post_id or
+        # author). If we got nothing meaningful, return None rather than an
+        # empty partial — the parent read shouldn't carry a hollow quote.
+        if not (quoted.post_id or quoted.author_handle or quoted.text):
+            return None
+        return quoted
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("quoted_post resolution failed: %r", exc)
+        return None
 
 
 def _text_from_title(title: str) -> Optional[str]:

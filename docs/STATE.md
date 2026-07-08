@@ -40,7 +40,7 @@
 |-------|-------|--------|
 | **0a** | session + whoami + health + envelope + journal + kill switch + read-only broker | **IMPLEMENTED + LIVE-VERIFIED** (60 tests pass; live smoke all 6 gates PASS, identity @infaag resolved) |
 | **0b** | write-safety kernel (token bucket, dedupe, risk registry, dry-run, compose→…→verify) | not started; before Phase 3 |
-| **1** | golden read (`read <post_url>`) | blocked on 0a-live |
+| **1** | golden read (`read <post_url>`) | **IMPLEMENTED + LIVE-VERIFIED** (read resolves real post: id/handle/created_at/text/metrics) |
 | **2** | read fan-out | blocked on Phase 1 |
 | **3** | reversible writes (bookmark/like) | blocked on 0b |
 | **4** | public writes | blocked on Phase 3 |

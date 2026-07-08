@@ -127,7 +127,54 @@ class ReadOnlyBroker:
     # -- internals -----------------------------------------------------------
 
     def _url_allowed(self, url: str) -> bool:
-        return any(url.startswith(p) for p in self._config.allowed_url_prefixes)
+        """Origin-based enforcement, NOT prefix string matching.
+
+        Review-iteration adjustment: the prior ``url.startswith(prefix)`` check
+        was defeated by look-alike hosts (``https://x.com.evil.example/``).
+        Parse the URL and require scheme=https + host in the exact allowlist.
+        Reject deceptive forms: userinfo, non-https schemes, look-alike hosts.
+        """
+        from urllib.parse import urlsplit
+
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return False
+        # Scheme must be exactly https.
+        if parts.scheme.lower() != "https":
+            return False
+        # Reject userinfo (``https://user:pass@x.com/``) — deceptive form.
+        if parts.username or parts.password:
+            return False
+        # Host must exactly match an allowed host (no suffix matching).
+        host = (parts.hostname or "").lower()
+        if host not in self._allowed_hosts:
+            return False
+        return True
+
+    @property
+    def _allowed_hosts(self) -> frozenset[str]:
+        """Allowed hosts derived from config at construction, lowercased.
+
+        Computed once from ``allowed_url_prefixes`` so we don't re-parse the
+        config on every navigate(). Stored on first access.
+        """
+        cached = getattr(self, "_allowed_hosts_cached", None)
+        if cached is not None:
+            return cached
+        from urllib.parse import urlsplit
+
+        hosts: set[str] = set()
+        for prefix in self._config.allowed_url_prefixes:
+            try:
+                p = urlsplit(prefix)
+                if p.hostname:
+                    hosts.add(p.hostname.lower())
+            except ValueError:
+                continue
+        frozen = frozenset(hosts)
+        self._allowed_hosts_cached = frozen  # type: ignore[attr-defined]
+        return frozen
 
     @staticmethod
     def _redact_url(url: str) -> str:

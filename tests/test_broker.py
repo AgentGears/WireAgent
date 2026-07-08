@@ -84,6 +84,32 @@ async def test_broker_navigate_blocks_non_http(broker) -> None:
     assert r.ok is False
 
 
+async def test_broker_navigate_blocks_lookalike_host(broker) -> None:
+    """Origin-based guard defeats prefix-spoofing hosts like x.com.evil.example."""
+    b, sb, _ = broker
+    # Naïve startswith('https://x.com/') would WRONGLY allow this.
+    r = await b.navigate("https://x.com.evil.example/")
+    assert r.ok is False
+    assert r.failure_category.value == "security"
+    assert all(c[0] != "navigate" for c in sb.calls)
+
+
+async def test_broker_navigate_blocks_userinfo_form(broker) -> None:
+    """Reject deceptive userinfo form https://user:pass@x.com/."""
+    b, sb, _ = broker
+    r = await b.navigate("https://evil:x@x.com/home")
+    assert r.ok is False
+    assert all(c[0] != "navigate" for c in sb.calls)
+
+
+async def test_broker_navigate_blocks_http_scheme(broker) -> None:
+    """Only https is allowed, even on a valid host."""
+    b, sb, _ = broker
+    r = await b.navigate("http://x.com/home")
+    assert r.ok is False
+    assert all(c[0] != "navigate" for c in sb.calls)
+
+
 async def test_broker_kill_switch_guard(broker) -> None:
     b, sb, ks = broker
     ks.trip()

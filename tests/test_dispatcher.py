@@ -74,6 +74,32 @@ async def test_dispatch_kill_switch_blocks_at_top(tmp_path, dispatcher) -> None:
     assert rec["kill_switch_tripped"] is True
 
 
+async def test_dispatch_kill_dominates_unsupported(tmp_path, dispatcher) -> None:
+    """Review-iteration change: kill switch now checked BEFORE unsupported.
+    A tripped kill must return 'killed' even for an unsupported capability
+    name, so the operator invariant ('killed => every invoke returns killed')
+    is absolute."""
+    dispatcher.kill_switch.trip()
+    r = await dispatcher.invoke("like")  # unsupported cap, but kill dominates
+    assert r.ok is False
+    assert r.failure_category.value == "security"  # NOT validation
+    line = (tmp_path / "journal.ndjson").read_text(encoding="utf-8").strip()
+    rec = json.loads(line)
+    assert rec["policy_decision"] == "killed"  # NOT unsupported
+    assert rec["kill_switch_tripped"] is True
+
+
+async def test_dispatch_unsupported_journaled_when_not_killed(tmp_path, dispatcher) -> None:
+    """When kill is clear, unsupported still returns validation as before."""
+    assert not dispatcher.kill_switch.tripped()
+    r = await dispatcher.invoke("like")
+    assert r.ok is False
+    assert r.failure_category.value == "validation"
+    line = (tmp_path / "journal.ndjson").read_text(encoding="utf-8").strip()
+    rec = json.loads(line)
+    assert rec["policy_decision"] == "unsupported"
+
+
 async def test_dispatch_lists_registered_capabilities(dispatcher) -> None:
     caps = dispatcher.capabilities
     assert "whoami" in caps

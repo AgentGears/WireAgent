@@ -100,23 +100,27 @@ class Dispatcher:
         trace_id = _new_trace_id()
         capability = self._registry.get(name)
 
-        # Pre-flight: unsupported capability — before touching the browser.
-        if capability is None:
-            result = unsupported_capability(name)
-            self._journal_write(
-                trace_id=trace_id, capability=name, input=input,
-                result=result, policy_decision="unsupported",
-                actions=[], started_monotonic=started_monotonic,
-            )
-            return result
-
-        # Kill switch (Point 3 first site).
+        # Kill switch FIRST (Point 3 first site). Review-iteration adjustment:
+        # kill must dominate every other resolution so the operator invariant
+        # is absolute — "when killed, every invocation returns killed." This
+        # includes unsupported capability names (safe: they never reach the
+        # browser, but the cleaner mental model is global-shut-on-trip).
         if self._kill.tripped():
             from webwire.envelope import kill_switched
             result = kill_switched()
             self._journal_write(
                 trace_id=trace_id, capability=name, input=input,
                 result=result, policy_decision="killed",
+                actions=[], started_monotonic=started_monotonic,
+            )
+            return result
+
+        # Unsupported capability — before touching the browser.
+        if capability is None:
+            result = unsupported_capability(name)
+            self._journal_write(
+                trace_id=trace_id, capability=name, input=input,
+                result=result, policy_decision="unsupported",
                 actions=[], started_monotonic=started_monotonic,
             )
             return result

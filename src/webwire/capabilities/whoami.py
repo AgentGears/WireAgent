@@ -94,13 +94,19 @@ class WhoamiCapability:
             },
         )
         if not ext.ok:
-            # If extract also failed, report soft failure — we're logged in but
-            # couldn't resolve identity (likely DOM churn). Recoverable.
+            # Authenticated but identity unresolvable via both observe-parse and
+            # extract. Review-iteration adjustment: encode the operational
+            # condition as a distinct code so the journal distinguishes this
+            # from generic selector drift. This is a soft FAILURE at runtime
+            # (likely DOM churn, recoverable) but a HARD BLOCKER at the Phase
+            # 0a acceptance gate (identity is foundational).
             return soft_failure(
-                "Authenticated, but could not resolve identity (observe + extract both failed). "
+                "identity_unresolved_on_authenticated_surface: authenticated session "
+                "but could not resolve identity (observe-parse and extract both failed). "
                 "Likely X DOM churn — update _parse_identity_from_observation.",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
-                retry_hint="Update the identity parser in whoami.py and retry.",
+                retry_hint="Update the identity parser in whoami.py and retry. "
+                "Blocks Phase 1 until whoami resolves on a live authenticated session.",
             )
 
         ext_data: dict[str, Any] = ext.data or {}

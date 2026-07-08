@@ -1,0 +1,139 @@
+"""Read-only browser-action broker.
+
+Per the Phase 0a design (Point 2 decision B):
+- Capability code NEVER receives the raw Super-Browser facade.
+- The dispatcher owns the real ``sb`` instance (via SessionManager).
+- Capabilities receive only this broker interface.
+- The broker exposes only explicitly-allowed read/navigation methods.
+- The broker does NOT expose: click, fill, act, delegate, upload_file,
+  download, check, uncheck, type_text, or any controller-level mutating
+  primitive.
+- Every method checks the kill switch at entry (Point 3 — second check site).
+
+Same-surface navigation rule: ``navigate`` only accepts URLs matching the
+configured ``allowed_url_prefixes`` (default https://x.com/ , https://twitter.com/).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+from super_browser import SuperBrowser
+
+from webwire.config import WebWireConfig
+from webwire.envelope import ActionResult, policy_blocked
+from webwire.safety import KillSwitch
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["ReadOnlyBroker"]
+
+
+class ReadOnlyBroker:
+    """The only browser surface capabilities are allowed to touch.
+
+    Constructed by the dispatcher after session start, handed to capabilities.
+    Holds a reference to the live ``SuperBrowser`` but exposes only safe
+    methods. The raw facade is never leaked.
+    """
+
+    # Allowlist of facade methods the broker may delegate to. Anything NOT in
+    # this set is unreachable through the broker by construction.
+    _ALLOWED = frozenset({
+        "navigate", "reload", "go_back", "go_forward",
+        "observe", "extract",
+        "list_tabs", "switch_tab",
+    })
+
+    def __init__(
+        self,
+        sb: SuperBrowser,
+        kill_switch: KillSwitch,
+        config: Optional[WebWireConfig] = None,
+    ) -> None:
+        self._sb = sb
+        self._kill = kill_switch
+        self._config = config or WebWireConfig()
+
+    # -- kill-switch guard (second check site, Point 3) ----------------------
+
+    def _guard(self) -> Optional[ActionResult]:
+        return self._kill.guard()
+
+    # -- navigation (same-surface constrained) -------------------------------
+
+    async def navigate(self, url: str, *, wait_until: str = "domcontentloaded") -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        if not self._url_allowed(url):
+            return policy_blocked(
+                f"navigate() target outside allowed surfaces: {self._redact_url(url)}"
+            )
+        return await self._sb.navigate(url, wait_until=wait_until)
+
+    async def reload(self, *, wait_until: str = "domcontentloaded") -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.reload(wait_until=wait_until)
+
+    async def go_back(self, *, wait_until: str = "domcontentloaded") -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.go_back(wait_until=wait_until)
+
+    async def go_forward(self, *, wait_until: str = "domcontentloaded") -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.go_forward(wait_until=wait_until)
+
+    # -- inspection (pure read) ----------------------------------------------
+
+    async def observe(self) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.observe()
+
+    async def extract(
+        self,
+        query: str,
+        *,
+        selector: Optional[str] = None,
+        schema: Optional[dict[str, Any]] = None,
+    ) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.extract(query, selector=selector, schema=schema)
+
+    # -- tabs (read + switch only; NO close_tab — that mutates state) --------
+
+    async def list_tabs(self) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.list_tabs()
+
+    async def switch_tab(self, tab_id: int) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        return await self._sb.switch_tab(tab_id)
+
+    # -- diagnostics ---------------------------------------------------------
+
+    @property
+    def allowed_methods(self) -> frozenset[str]:
+        """The fixed allowlist, for health/journal reporting."""
+        return self._ALLOWED
+
+    # -- internals -----------------------------------------------------------
+
+    def _url_allowed(self, url: str) -> bool:
+        return any(url.startswith(p) for p in self._config.allowed_url_prefixes)
+
+    @staticmethod
+    def _redact_url(url: str) -> str:
+        """Minimal URL redaction for logs — keep origin+path, drop query/fragment."""
+        if "://" not in url:
+            return "<invalid>"
+        scheme, rest = url.split("://", 1)
+        path = rest.split("?", 1)[0].split("#", 1)[0]
+        return f"{scheme}://{path}"

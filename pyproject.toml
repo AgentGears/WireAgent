@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "webwire"
+version = "0.0.1"
+description = "Browser-native X/Twitter capability layer for AI agents — built on Super-Browser"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Agent-WebWire Contributors" }]
+keywords = ["x", "twitter", "agent", "browser-automation", "super-browser"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
+dependencies = [
+    # Local path dependency — the user's own SDK. Editable install.
+    "superbrowser-sdk @ file:///C:/Next-Era/Super-Browser",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/webwire"]
+
+[tool.hatch.metadata]
+# Required because project.dependencies contains a direct file:/// reference
+# to the local Super-Browser SDK.
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["src/webwire"]
+branch = true

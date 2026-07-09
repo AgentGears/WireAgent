@@ -125,10 +125,11 @@ class WriteBroker:
     # ------------------------------------------------------------------
 
     async def click_like(self, post_url: str) -> ActionResult:
-        """Click the like button on the post at post_url.
+        """Click the like button (directional — only when not liked).
 
-        X's like button: data-testid='like' (when not liked). After clicking,
-        it becomes data-testid='unlike'.
+        X's like button: data-testid='like' (when not liked). If already liked,
+        the button is data-testid='unlike', and this method returns already_liked
+        WITHOUT toggling. Compensation must use click_unlike, not this method.
         """
         if (r := self._guard()) is not None:
             return r
@@ -143,11 +144,9 @@ class WriteBroker:
                 description="like button",
             )
             if not click_result.ok:
-                already = await self._sb.click(
-                    "[data-testid='unlike']",
-                    description="unlike button (already liked)",
-                )
-                if already.ok:
+                # Maybe already liked — check, but DON'T toggle.
+                state = await self.read_like_state(post_url)
+                if state.ok and state.data and state.data.get("like_state") == "liked":
                     return ok_result(data={"liked": True, "note": "already_liked"})
                 return soft_failure(
                     f"Could not find like button at {post_url!r}.",
@@ -156,6 +155,39 @@ class WriteBroker:
             return ok_result(data={"liked": True})
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"click_like error: {exc!r}")
+
+    async def click_unlike(self, post_url: str) -> ActionResult:
+        """Click the unlike button (directional — only when liked).
+
+        Compensation primitive: clicks data-testid='unlike'. If not liked,
+        returns already_not_liked WITHOUT toggling. This is the directional
+        inverse of click_like, per ChatGPT's rule: 'Write methods must be
+        semantic, not toggle-based.'
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        await asyncio.sleep(4)
+        try:
+            click_result = await self._sb.click(
+                "[data-testid='unlike']",
+                description="unlike button (compensation)",
+            )
+            if not click_result.ok:
+                # Maybe already not liked — check, DON'T toggle.
+                state = await self.read_like_state(post_url)
+                if state.ok and state.data and state.data.get("like_state") == "not_liked":
+                    return ok_result(data={"liked": False, "note": "already_not_liked"})
+                return soft_failure(
+                    f"Could not find unlike button at {post_url!r}.",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            return ok_result(data={"liked": False, "unliked": True})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"click_unlike error: {exc!r}")
 
     async def read_like_state(self, post_url: str) -> ActionResult:
         """Read-only check: is the post currently liked?"""

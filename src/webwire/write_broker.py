@@ -424,3 +424,92 @@ class WriteBroker:
             return ok_result(data={"filled": True, "text_length": len(text)})
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"fill_reply_composer error: {exc!r}")
+
+    # ------------------------------------------------------------------
+    # Quote port (Phase 4d) — target-scoped quote
+    # ------------------------------------------------------------------
+
+    async def open_quote_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
+        """Navigate to the target post, find the article matching target_post_id,
+        click the repost button inside THAT article, then click 'Quote' from
+        the popup menu. This opens the quote composer with the target embedded.
+
+        ChatGPT's invariant #4: quote action must be target-scoped.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        await asyncio.sleep(4)
+
+        try:
+            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            # Step 1: find the target article and click its repost button.
+            click_repost_expr = (
+                '(function(){'
+                'var links=document.querySelectorAll("a[href*=\'/status/\']");'
+                f'for(var i=0;i<links.length;i++){{'
+                f'var href=links[i].getAttribute("href");'
+                f'if(href&&href.indexOf("/status/{target_post_id}")>=0){{'
+                f'var art=links[i].closest("article");'
+                f'if(art){{var btn=art.querySelector("[data-testid=\'retweet\']");'
+                f'if(btn){{btn.click();return "clicked";}}'
+                f'return "no_repost_button";}}}}}}'
+                f'return "target_not_found";'
+                f'}})()'
+            )
+            result = await cdp.evaluate(click_repost_expr)
+            repost_result = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
+
+            if repost_result != "clicked":
+                return soft_failure(
+                    f"open_quote_on_target: could not click repost on {target_post_id}: {repost_result}",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            await asyncio.sleep(1.5)  # wait for the repost menu to appear
+
+            # Step 2: click "Quote" from the popup menu.
+            click_quote_expr = (
+                '(function(){'
+                'var items=document.querySelectorAll("[role=\'menuitem\']");'
+                'for(var i=0;i<items.length;i++){'
+                'var text=items[i].innerText||"";'
+                'if(text.trim()==="Quote"){items[i].click();return "clicked";}'
+                '}'
+                'return "no_quote_menuitem";'
+                '})()'
+            )
+            result2 = await cdp.evaluate(click_quote_expr)
+            quote_result = result2.data.get("result", {}).get("value") if (result2.ok and result2.data) else None
+
+            if quote_result != "clicked":
+                return soft_failure(
+                    f"open_quote_on_target: could not click Quote menu item: {quote_result}",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            await asyncio.sleep(2)  # wait for quote composer to open
+            return ok_result(data={"quote_opened": True, "target_post_id": target_post_id})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"open_quote_on_target error: {exc!r}")
+
+    async def fill_quote_composer(self, text: str) -> ActionResult:
+        """Type text into the quote composer (already opened by open_quote_on_target).
+        Uses keyboard.type for DraftJS compatibility."""
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        try:
+            await self._sb.click(
+                "[data-testid='tweetTextarea_0']",
+                description="quote composer textarea",
+            )
+            await asyncio.sleep(0.5)
+            page = self._sb._page  # type: ignore[attr-defined]
+            backend_page = page.engine_page.backend_page  # type: ignore[attr-defined]
+            await backend_page.keyboard.type(text, delay=10)
+            await asyncio.sleep(1)
+            return ok_result(data={"filled": True, "text_length": len(text)})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"fill_quote_composer error: {exc!r}")

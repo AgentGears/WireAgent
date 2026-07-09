@@ -286,6 +286,10 @@ class Dispatcher:
         # with target_post_id binding + target-scoped reply button click.
         from webwire.capabilities.reply_post import ReplyPostCapability
         self._registry.register(ReplyPostCapability())
+        # quote_post — Phase 4d target-bound quote (the final capability).
+        # Target-scoped repost→Quote flow + dual verification (text + quote attachment).
+        from webwire.capabilities.quote_post import QuotePostCapability
+        self._registry.register(QuotePostCapability())
         self._registered_default = True
 
     def _journal_write(

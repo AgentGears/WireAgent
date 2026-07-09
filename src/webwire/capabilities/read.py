@@ -65,6 +65,8 @@ class Post:
     appeared_on_profile: Optional[str] = None
     retweeted_by: Optional[str] = None
     retweeted_by_inferred: bool = False
+    # Phase 2b thread relationship: "target" | "ancestor" | "reply" | "quoted" | None.
+    relationship: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

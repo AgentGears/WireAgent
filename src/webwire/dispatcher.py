@@ -259,6 +259,9 @@ class Dispatcher:
         self._registry.register(ReadCapability())
         # read_profile — fan-out: enumerate a profile's posts (Phase 2).
         self._registry.register(ReadProfileCapability())
+        # read_thread — visible conversation-slice reader (Phase 2b).
+        from webwire.capabilities.read_thread import ReadThreadCapability
+        self._registry.register(ReadThreadCapability())
         # bookmark_post — first write capability (Phase 3 canary). Routes
         # through the WriteKernel pipeline.
         from webwire.capabilities.bookmark import BookmarkCapability

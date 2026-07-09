@@ -216,3 +216,138 @@ class WriteBroker:
             return ok_result(data={"like_state": "unknown"})
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"read_like_state error: {exc!r}")
+
+    # ------------------------------------------------------------------
+    # Post port (PostWritePort) — Phase 4b
+    # ------------------------------------------------------------------
+
+    async def fill_composer(self, text: str) -> ActionResult:
+        """Navigate to the compose page and fill the text composer with exactly
+        the provided text. Does NOT submit.
+
+        X's composer: navigate to x.com/compose/post, then fill the
+        data-testid='tweetTextarea_0' contenteditable div.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        nav = await self._sb.navigate("https://x.com/compose/post", wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        await asyncio.sleep(4)  # hydrate the compose page (DraftJS needs time)
+        try:
+            # Click the textarea to focus it, then type the text.
+            click_r = await self._sb.click(
+                "[data-testid='tweetTextarea_0']",
+                description="post composer textarea",
+            )
+            if not click_r.ok:
+                return soft_failure(
+                    "Could not focus composer textarea.",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            await asyncio.sleep(1)
+            # X's composer is a DraftJS contenteditable — fill() and
+            # type_text(selector, text) don't work because Draft manages its
+            # own state. Use backend_page.keyboard.type() which sends real
+            # keyboard events to the focused element — Draft picks these up.
+            page = self._sb._page  # type: ignore[attr-defined]
+            backend_page = page.engine_page.backend_page  # type: ignore[attr-defined]
+            await backend_page.keyboard.type(text, delay=10)
+            await asyncio.sleep(1)
+            return ok_result(data={"filled": True, "text_length": len(text)})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"fill_composer error: {exc!r}")
+
+    async def read_composer_text(self) -> ActionResult:
+        """Read the current text in the composer DOM. Used for the pre-submit
+        assertion (ChatGPT's step 10: composer_dom_text == normalized_text)."""
+        if (r := self._guard()) is not None:
+            return r
+        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        # NOTE: the selector contains single quotes (data-testid='tweetTextarea_0')
+        # which conflict with JS string delimiters. Use double quotes in the JS
+        # and escape properly. This was a real bug — the unescaped single quote
+        # in the selector silently broke querySelector, returning empty text.
+        expr = (
+            '(function(){var el=document.querySelector("[data-testid=\'tweetTextarea_0\']");'
+            'return el?el.innerText:"";})()'
+        )
+        try:
+            result = await cdp.evaluate(expr)
+            if result.ok and "exceptionDetails" not in result.data:
+                text = result.data.get("result", {}).get("value") or ""
+                return ok_result(data={"composer_text": text})
+            return ok_result(data={"composer_text": ""})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"read_composer_text error: {exc!r}")
+
+    async def click_submit(self) -> ActionResult:
+        """Click the post submit button. Semantic, not generic — targets
+        data-testid='tweetButton' specifically."""
+        if (r := self._guard()) is not None:
+            return r
+        try:
+            return await self._sb.click(
+                "[data-testid='tweetButton']",
+                description="post submit button",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"click_submit error: {exc!r}")
+
+    async def capture_posted_url(self) -> ActionResult:
+        """After clicking submit, capture the posted post's URL.
+
+        X navigates to the new post's page after posting (or shows it in the
+        timeline). We wait briefly, then check the URL + look for the most
+        recent article with a /status/ href.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        await asyncio.sleep(4)  # wait for navigation to the new post
+
+        # Check if the URL is now at a /status/ page.
+        obs = await self._sb.observe()
+        url = ""
+        if obs.ok and obs.data:
+            url = obs.data.get("url", "") or ""
+
+        # If we're on a /status/ page, that's the posted URL.
+        import re
+        m = re.search(r"/status/(\d+)", url)
+        if m:
+            return ok_result(data={
+                "posted_url": url,
+                "posted_post_id": m.group(1),
+            })
+
+        # Fallback: look for the first article with a /status/ href (the new post).
+        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        expr = (
+            "(function(){"
+            "var a=document.querySelector(\"a[href*='/status/']\");"
+            "return a?a.getAttribute('href'):null;"
+            "})()"
+        )
+        try:
+            result = await cdp.evaluate(expr)
+            if result.ok and "exceptionDetails" not in result.data:
+                href = result.data.get("result", {}).get("value")
+                if href:
+                    m2 = re.search(r"/status/(\d+)", href)
+                    if m2:
+                        full_url = f"https://x.com{href}" if href.startswith("/") else href
+                        return ok_result(data={
+                            "posted_url": full_url,
+                            "posted_post_id": m2.group(1),
+                        })
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Could not capture — this is a degraded result (submit may have worked).
+        return ok_result(data={
+            "posted_url": None,
+            "posted_post_id": None,
+            "note": "submit_clicked_verification_pending",
+        })

@@ -277,6 +277,11 @@ class Dispatcher:
         # irreversible-write safety contract before any public post is possible.
         from webwire.capabilities.compose_post import ComposePostCapability
         self._registry.register(ComposePostCapability())
+        # post_text — Phase 4b first live public content write. The actual
+        # submit path for posting text to X. Routes through the full safety
+        # pipeline with composer read-back assertion + final kill check.
+        from webwire.capabilities.post_text import PostTextCapability
+        self._registry.register(PostTextCapability())
         self._registered_default = True
 
     def _journal_write(

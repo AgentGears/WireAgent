@@ -17,3 +17,7 @@ venv/
 # Agent-WebWire runtime state (journal, kill file, screenshots) — local-only
 /.webwire/*
 !/.webwire/.gitkeep
+
+# Logs
+*.log
+debug.log

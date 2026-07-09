@@ -273,6 +273,10 @@ class Dispatcher:
         # aware: already-liked → already_satisfied no-op, no compensation.
         from webwire.capabilities.like import LikeCapability
         self._registry.register(LikeCapability())
+        # compose_post — Phase 4a dry-run compose (NO submit). Proves the
+        # irreversible-write safety contract before any public post is possible.
+        from webwire.capabilities.compose_post import ComposePostCapability
+        self._registry.register(ComposePostCapability())
         self._registered_default = True
 
     def _journal_write(

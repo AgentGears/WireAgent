@@ -66,16 +66,18 @@ class WriteCapability(Protocol):
         """Produce a declarative WriteIntent from input. NO browser interaction."""
         ...
 
-    async def preview(self, intent: WriteIntent, broker: ReadOnlyBroker) -> PreviewResult:
-        """Read-only check of the current state. NO mutation."""
+    async def preview(self, intent: WriteIntent, broker: "ReadOnlyBroker") -> PreviewResult:
+        """Read-only check of the current state. NO mutation. Receives the
+        ReadOnlyBroker — preview runs BEFORE confirmation."""
         ...
 
-    async def execute(self, intent: WriteIntent, broker: ReadOnlyBroker) -> ActionResult:
-        """Perform the actual mutation. Returns the execution result."""
+    async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
+        """Perform the actual mutation. Receives a WriteBroker (narrow write
+        surface) — only reachable after the kernel's confirmation gate."""
         ...
 
-    async def verify(self, intent: WriteIntent, broker: ReadOnlyBroker) -> ActionResult:
-        """Confirm the action took effect (read-only verification)."""
+    async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
+        """Confirm the action took effect. Receives a WriteBroker."""
         ...
 
 
@@ -90,13 +92,15 @@ class WriteKernel:
         dedupe: DedupeStore,
         journal: Journal,
         *,
-        auto_approve_private: bool = False,  # even private actions require confirm by default
+        write_broker_factory=None,  # callable(kill_switch) -> WriteBroker; set by dispatcher
+        auto_approve_private: bool = False,
     ) -> None:
         self._kill = kill_switch
         self._risk = risk_registry
         self._bucket = token_bucket
         self._dedupe = dedupe
         self._journal = journal
+        self._write_broker_factory = write_broker_factory
         self._auto_approve_private = auto_approve_private
         # Pending confirmation tokens: token_str -> ConfirmationToken
         self._pending_tokens: dict[str, ConfirmationToken] = {}
@@ -204,9 +208,12 @@ class WriteKernel:
         token.consumed = True
         trace["stages"].append("confirmed")
 
-        # 6. Execute.
+        # 6. Execute. Construct a WriteBroker (narrow write surface) for the
+        # execute + verify stages. Preview used the ReadOnlyBroker; execute
+        # uses the WriteBroker — only reachable after confirmation.
+        write_broker = self._write_broker_factory() if self._write_broker_factory else broker
         trace["stages"].append("execute_attempted")
-        exec_result = await write_cap.execute(intent, broker)
+        exec_result = await write_cap.execute(intent, write_broker)
         trace["execute_ok"] = exec_result.ok
 
         if exec_result.ok:
@@ -217,7 +224,7 @@ class WriteKernel:
         trace["stages"].append("journalled")
 
         # 8. Verify.
-        verify_result = await write_cap.verify(intent, broker)
+        verify_result = await write_cap.verify(intent, write_broker)
         trace["verify_ok"] = verify_result.ok
         trace["stages"].append("verified" if verify_result.ok else "verify_failed")
 

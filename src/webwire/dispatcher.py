@@ -65,12 +65,23 @@ class Dispatcher:
             WriteKernel,
         )
         self._dedupe = DedupeStore(ttl_seconds=3600)
+        # WriteBroker factory: constructs a narrow WriteBroker from the live
+        # SuperBrowser session. Called by the kernel during execute/verify.
+        # Defined as a closure so it captures self._session (which isn't
+        # populated until start()).
+        def _make_write_broker():
+            from webwire.write_broker import WriteBroker
+            sb = self._session.sb
+            if sb is None:
+                raise RuntimeError("Cannot create WriteBroker: session not started")
+            return WriteBroker(sb, self._kill)
         self._write_kernel = WriteKernel(
             kill_switch=self._kill,
             risk_registry=DEFAULT_REGISTRY,
             token_bucket=TokenBucket(),
             dedupe=self._dedupe,
             journal=self._journal,
+            write_broker_factory=_make_write_broker,
         )
         # Register default capabilities eagerly so the registry is introspectable
         # and the unsupported-capability path works even before session start.
@@ -99,6 +110,15 @@ class Dispatcher:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("session restore failed: %r", exc)
         self._broker = ReadOnlyBroker(sb, self._kill, self._config)
+        # Hydrate the dedupe store from recent journal entries (Phase 0b review
+        # requirement): closes the restart-during-loop hole. Safe no-op if the
+        # journal is empty or doesn't exist yet.
+        try:
+            hydrated = self._dedupe.hydrate_from_journal(self._config.journal_path())
+            if hydrated:
+                logger.info("DedupeStore hydrated %d entries from journal", hydrated)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dedupe hydration failed: %r", exc)
         # Defaults already registered in __init__; ensure idempotent.
         self._register_defaults()
         # Enrich the start result with session/ownership state for callers.
@@ -239,6 +259,10 @@ class Dispatcher:
         self._registry.register(ReadCapability())
         # read_profile — fan-out: enumerate a profile's posts (Phase 2).
         self._registry.register(ReadProfileCapability())
+        # bookmark_post — first write capability (Phase 3 canary). Routes
+        # through the WriteKernel pipeline.
+        from webwire.capabilities.bookmark import BookmarkCapability
+        self._registry.register(BookmarkCapability())
         self._registered_default = True
 
     def _journal_write(

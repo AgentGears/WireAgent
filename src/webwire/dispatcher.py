@@ -262,6 +262,9 @@ class Dispatcher:
         # read_thread — visible conversation-slice reader (Phase 2b).
         from webwire.capabilities.read_thread import ReadThreadCapability
         self._registry.register(ReadThreadCapability())
+        # read_search — search X for posts (Phase 2c).
+        from webwire.capabilities.read_search import ReadSearchCapability
+        self._registry.register(ReadSearchCapability())
         # bookmark_post — first write capability (Phase 3 canary). Routes
         # through the WriteKernel pipeline.
         from webwire.capabilities.bookmark import BookmarkCapability

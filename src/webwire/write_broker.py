@@ -119,3 +119,68 @@ class WriteBroker:
             return ok_result(data={"bookmark_state": "unknown"})
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"read_bookmark_state error: {exc!r}")
+
+    # ------------------------------------------------------------------
+    # Like port (LikeWritePort)
+    # ------------------------------------------------------------------
+
+    async def click_like(self, post_url: str) -> ActionResult:
+        """Click the like button on the post at post_url.
+
+        X's like button: data-testid='like' (when not liked). After clicking,
+        it becomes data-testid='unlike'.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        await asyncio.sleep(4)
+        try:
+            click_result = await self._sb.click(
+                "[data-testid='like']",
+                description="like button",
+            )
+            if not click_result.ok:
+                already = await self._sb.click(
+                    "[data-testid='unlike']",
+                    description="unlike button (already liked)",
+                )
+                if already.ok:
+                    return ok_result(data={"liked": True, "note": "already_liked"})
+                return soft_failure(
+                    f"Could not find like button at {post_url!r}.",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            return ok_result(data={"liked": True})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"click_like error: {exc!r}")
+
+    async def read_like_state(self, post_url: str) -> ActionResult:
+        """Read-only check: is the post currently liked?"""
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        await asyncio.sleep(4)
+        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        expr = (
+            "(function(){"
+            "var l=document.querySelector(\"[data-testid='like']\");"
+            "var ul=document.querySelector(\"[data-testid='unlike']\");"
+            "if(ul)return 'liked';"
+            "if(l)return 'not_liked';"
+            "return 'unknown';"
+            "})()"
+        )
+        try:
+            result = await cdp.evaluate(expr)
+            if result.ok and "exceptionDetails" not in result.data:
+                state = result.data.get("result", {}).get("value")
+                return ok_result(data={"like_state": state})
+            return ok_result(data={"like_state": "unknown"})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"read_like_state error: {exc!r}")

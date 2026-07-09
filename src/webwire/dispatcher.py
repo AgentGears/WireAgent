@@ -263,6 +263,10 @@ class Dispatcher:
         # through the WriteKernel pipeline.
         from webwire.capabilities.bookmark import BookmarkCapability
         self._registry.register(BookmarkCapability())
+        # like_post — public engagement canary (Phase 3b). Pre-existing-state
+        # aware: already-liked → already_satisfied no-op, no compensation.
+        from webwire.capabilities.like import LikeCapability
+        self._registry.register(LikeCapability())
         self._registered_default = True
 
     def _journal_write(

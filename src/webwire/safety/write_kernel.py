@@ -46,12 +46,27 @@ _CONFIRM_TTL_S = 300.0  # confirmation tokens expire after 5 min
 
 
 @dataclass
+class StateTransition:
+    """Formal state-transition record (ChatGPT's pre-Phase-4 ask). Records the
+    delta this invocation created, so compensation reverses THIS invocation's
+    delta, not merely the final state."""
+    pre_state: Optional[str] = None       # e.g. "not_liked", "not_bookmarked"
+    intended_state: Optional[str] = None  # e.g. "liked", "bookmarked"
+    post_state: Optional[str] = None      # verified actual state after execute
+    changed_by_this_invocation: bool = False  # did THIS call mutate state?
+    verification_result: Optional[str] = None  # "verified" | "verify_failed" | None
+    compensation_eligible: bool = False   # only True if THIS invocation created the delta
+    compensation_action: Optional[str] = None
+    residual_side_effects: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PreviewResult:
     """Read-only preview of what a write will do. Returned to the caller for
     human approval before execution."""
-    summary: str                       # human-readable description
+    summary: str
     target_url: Optional[str] = None
-    current_state: Optional[str] = None  # e.g. "not liked", "not bookmarked"
+    current_state: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
 
 

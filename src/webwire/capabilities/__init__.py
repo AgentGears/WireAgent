@@ -1,7 +1,9 @@
 """Capability implementations."""
 
 from webwire.capabilities.base import Capability, CapabilityTier
+from webwire.capabilities.bookmark import BookmarkCapability
 from webwire.capabilities.health import HealthCapability
+from webwire.capabilities.like import LikeCapability
 from webwire.capabilities.read import Post, ReadCapability
 from webwire.capabilities.read_profile import ReadProfileCapability
 from webwire.capabilities.whoami import WhoamiCapability
@@ -13,5 +15,7 @@ __all__ = [
     "HealthCapability",
     "ReadCapability",
     "ReadProfileCapability",
+    "BookmarkCapability",
+    "LikeCapability",
     "Post",
 ]

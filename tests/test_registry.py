@@ -31,11 +31,27 @@ def test_registry_accepts_read_capability() -> None:
     assert reg.names() == ["fake_read"]
 
 
-def test_registry_rejects_write_capability() -> None:
-    """Phase 0a physically prevents write capabilities from registering."""
+def test_registry_accepts_write_capability_phase0b() -> None:
+    """Phase 0b: WRITE capabilities may now register (routed through the
+    WriteKernel by the dispatcher). Previously (Phase 0a) they were rejected."""
     reg = CapabilityRegistry()
-    with pytest.raises(PermissionError, match="READ"):
-        reg.register(FakeWriteCap())
+    reg.register(FakeWriteCap())  # should NOT raise
+    assert "fake_write" in reg
+
+
+def test_registry_rejects_unknown_tier() -> None:
+    """Tiers not in the allowed set are still rejected."""
+
+    class FakeUnknownCap:
+        name = "fake_unknown"
+        tier = "bogus_tier"  # not a valid CapabilityTier
+
+        async def run(self, broker, input):  # type: ignore[no-untyped-def]
+            ...
+
+    reg = CapabilityRegistry()
+    with pytest.raises(PermissionError):
+        reg.register(FakeUnknownCap())  # type: ignore[arg-type]
 
 
 def test_registry_rejects_duplicate_name() -> None:

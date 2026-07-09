@@ -56,10 +56,24 @@ class Dispatcher:
         self._registry = CapabilityRegistry()
         self._broker: Optional[ReadOnlyBroker] = None
         self._registered_default = False
+        # Write-safety kernel (Phase 0b). WRITE-tier capabilities route through
+        # this instead of calling .run() directly.
+        from webwire.safety import (
+            DEFAULT_REGISTRY,
+            DedupeStore,
+            TokenBucket,
+            WriteKernel,
+        )
+        self._dedupe = DedupeStore(ttl_seconds=3600)
+        self._write_kernel = WriteKernel(
+            kill_switch=self._kill,
+            risk_registry=DEFAULT_REGISTRY,
+            token_bucket=TokenBucket(),
+            dedupe=self._dedupe,
+            journal=self._journal,
+        )
         # Register default capabilities eagerly so the registry is introspectable
         # and the unsupported-capability path works even before session start.
-        # (whoami needs no deps; health needs the kill switch + config, both
-        # already constructed above.)
         self._register_defaults()
 
     # -- lifecycle -----------------------------------------------------------
@@ -157,8 +171,19 @@ class Dispatcher:
 
         # Run the capability. The broker (with its own kill-switch guard) is
         # the only browser surface the capability sees.
+        # Phase 0b: WRITE-tier capabilities route through the WriteKernel pipeline
+        # (compose→preview→policy→confirm→execute→journal→verify). READ capabilities
+        # call .run() directly.
         try:
-            result = await capability.run(self._broker, input)
+            if capability.tier == CapabilityTier.WRITE:
+                # Actor identity: resolved per-invocation from the session's
+                # authenticated handle (set by whoami). None until whoami runs.
+                actor = getattr(self._session, '_resolved_handle', None)
+                result = await self._write_kernel.execute(
+                    capability, self._broker, input, actor_identity=actor,
+                )
+            else:
+                result = await capability.run(self._broker, input)
         except Exception as exc:  # noqa: BLE001 — envelope the error
             logger.exception("Capability %r raised", name)
             from webwire.envelope import hard_failure

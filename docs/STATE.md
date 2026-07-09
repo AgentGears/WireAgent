@@ -39,9 +39,9 @@
 | Phase | Scope | Status |
 |-------|-------|--------|
 | **0a** | session + whoami + health + envelope + journal + kill switch + read-only broker | **IMPLEMENTED + LIVE-VERIFIED** (60 tests pass; live smoke all 6 gates PASS, identity @infaag resolved) |
-| **0b** | write-safety kernel (token bucket, dedupe, risk registry, dry-run, compose→…→verify) | not started; before Phase 3 |
+| **0b** | write-safety kernel (token bucket, dedupe, risk registry, dry-run, compose→…→verify) | **IMPLEMENTED** (114 tests pass; write pipeline + token-bound confirmation + 4-tier risk + global circuit breaker) |
 | **1** | golden read (`read <post_url>`) | **IMPLEMENTED + LIVE-VERIFIED** (read resolves real post: id/handle/created_at/text/metrics) |
-| **2** | read fan-out | blocked on Phase 1 |
+| **2** | read fan-out (`read_profile`) | **IMPLEMENTED + LIVE-VERIFIED** (read_profile @jack: 10 posts, retweet provenance correct) |
 | **3** | reversible writes (bookmark/like) | blocked on 0b |
 | **4** | public writes | blocked on Phase 3 |
 | **5** | analytics (separate adapter family) | blocked on Phase 4 |

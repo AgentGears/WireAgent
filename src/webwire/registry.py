@@ -22,19 +22,20 @@ __all__ = ["CapabilityRegistry"]
 class CapabilityRegistry:
     """Name -> Capability map with tier gating."""
 
-    # Which tiers this build allows to register. Phase 0a = READ only.
-    _ALLOWED_TIERS = frozenset({CapabilityTier.READ})
+    # Phase 0b: WRITE capabilities may now register (routed through the
+    # WriteKernel by the dispatcher). READ + WRITE + ANALYTICS allowed.
+    _ALLOWED_TIERS = frozenset({CapabilityTier.READ, CapabilityTier.WRITE, CapabilityTier.ANALYTICS})
 
     def __init__(self) -> None:
         self._caps: dict[str, Capability] = {}
 
     def register(self, cap: Capability) -> None:
-        """Register a capability. Raises if tier not allowed in this phase."""
+        """Register a capability. Raises if tier not allowed."""
         if cap.tier not in self._ALLOWED_TIERS:
+            tier_name = cap.tier.value if hasattr(cap.tier, "value") else str(cap.tier)
             raise PermissionError(
-                f"Capability {cap.name!r} has tier {cap.tier.value!r}, but only "
-                f"READ capabilities may be registered in Phase 0a. "
-                f"Write-safety kernel lands in Phase 0b."
+                f"Capability {cap.name!r} has tier {tier_name!r}, which is "
+                f"not in the allowed tiers {sorted(t.value for t in self._ALLOWED_TIERS)}."
             )
         if cap.name in self._caps:
             raise ValueError(f"Capability {cap.name!r} already registered")

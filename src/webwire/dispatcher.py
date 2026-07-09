@@ -282,6 +282,10 @@ class Dispatcher:
         # pipeline with composer read-back assertion + final kill check.
         from webwire.capabilities.post_text import PostTextCapability
         self._registry.register(PostTextCapability())
+        # reply_post — Phase 4c target-bound reply. Reuses post_text machinery
+        # with target_post_id binding + target-scoped reply button click.
+        from webwire.capabilities.reply_post import ReplyPostCapability
+        self._registry.register(ReplyPostCapability())
         self._registered_default = True
 
     def _journal_write(

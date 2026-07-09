@@ -351,3 +351,76 @@ class WriteBroker:
             "posted_post_id": None,
             "note": "submit_clicked_verification_pending",
         })
+
+    # ------------------------------------------------------------------
+    # Reply port (Phase 4c) — target-scoped reply
+    # ------------------------------------------------------------------
+
+    async def open_reply_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
+        """Navigate to the target post, find the article matching target_post_id,
+        click the reply button inside THAT article (not the first visible one),
+        then type text via keyboard.
+
+        ChatGPT's invariant #4: click must be scoped to the target article.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        await asyncio.sleep(4)
+
+        try:
+            # Find the article with the matching post_id and click its reply button.
+            # X's reply button: data-testid='reply' inside the article.
+            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            # Use CDP to find + click the reply button on the target article.
+            # First, locate the article by its status href.
+            expr = (
+                '(function(){'
+                'var links=document.querySelectorAll("a[href*=\'/status/\']");'
+                f'for(var i=0;i<links.length;i++){{'
+                f'var href=links[i].getAttribute("href");'
+                f'if(href&&href.indexOf("/status/{target_post_id}")>=0){{'
+                f'var art=links[i].closest("article");'
+                f'if(art){{var btn=art.querySelector("[data-testid=\'reply\']");'
+                f'if(btn){{btn.click();return "clicked";}}'
+                f'return "no_reply_button";}}}}}}'
+                f'return "target_not_found";'
+                f'}})()'
+            )
+            result = await cdp.evaluate(expr)
+            click_result = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
+
+            if click_result != "clicked":
+                return soft_failure(
+                    f"open_reply_on_target: {click_result} for post {target_post_id}",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            await asyncio.sleep(2)  # wait for reply composer to open
+            return ok_result(data={"reply_opened": True, "target_post_id": target_post_id})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"open_reply_on_target error: {exc!r}")
+
+    async def fill_reply_composer(self, text: str) -> ActionResult:
+        """Type text into the reply composer (already opened by open_reply_on_target).
+        Uses keyboard.type for DraftJS compatibility."""
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        try:
+            # The reply composer is a DraftJS contenteditable, same as the post composer.
+            # Click it to ensure focus, then type via keyboard.
+            await self._sb.click(
+                "[data-testid='tweetTextarea_0']",
+                description="reply composer textarea",
+            )
+            await asyncio.sleep(0.5)
+            page = self._sb._page  # type: ignore[attr-defined]
+            backend_page = page.engine_page.backend_page  # type: ignore[attr-defined]
+            await backend_page.keyboard.type(text, delay=10)
+            await asyncio.sleep(1)
+            return ok_result(data={"filled": True, "text_length": len(text)})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"fill_reply_composer error: {exc!r}")

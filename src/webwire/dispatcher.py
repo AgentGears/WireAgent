@@ -27,6 +27,7 @@ from webwire.broker import ReadOnlyBroker
 from webwire.capabilities.base import Capability, CapabilityTier
 from webwire.capabilities.health import HealthCapability
 from webwire.capabilities.read import ReadCapability
+from webwire.capabilities.read_profile import ReadProfileCapability
 from webwire.capabilities.whoami import WhoamiCapability
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, unsupported_capability
@@ -211,6 +212,8 @@ class Dispatcher:
         self._registry.register(HealthCapability(self._kill, self._session, self._config))
         # read — the golden read (Phase 1).
         self._registry.register(ReadCapability())
+        # read_profile — fan-out: enumerate a profile's posts (Phase 2).
+        self._registry.register(ReadProfileCapability())
         self._registered_default = True
 
     def _journal_write(

@@ -58,6 +58,13 @@ class Post:
     metrics: Metrics = field(default_factory=Metrics)
     quoted_post: Optional["Post"] = None
     in_reply_to: Optional[str] = None  # deferred to Phase 1b/2
+    # Phase 2 fan-out provenance (review Q2): when a post is read via fan-out,
+    # these fields record its feed context. retweeted_by is INFERRED from
+    # author != profile_handle — not an absolute semantic fact about X's
+    # internal repost state.
+    appeared_on_profile: Optional[str] = None
+    retweeted_by: Optional[str] = None
+    retweeted_by_inferred: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

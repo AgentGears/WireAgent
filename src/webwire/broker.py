@@ -44,7 +44,7 @@ class ReadOnlyBroker:
         "navigate", "reload", "go_back", "go_forward",
         "observe", "extract",
         "list_tabs", "switch_tab",
-        "query_attr", "query_text",
+        "query_attr", "query_text", "enumerate_posts", "scroll",
     })
 
     def __init__(
@@ -186,6 +186,55 @@ class ReadOnlyBroker:
         r = await self._cdp_read(expr, f"query_text({selector!r})")
         if r.ok:
             r.data = {"selector": selector, "value": r.data}
+        return r
+
+    async def enumerate_posts(self) -> ActionResult:
+        """Enumerate all visible <article> posts on the current page in ONE call.
+
+        Returns a list of dicts, each with the lightweight fields needed for
+        fan-out (Phase 2): post_id, post_url, author_handle, created_at, text,
+        lang. Metrics are NOT included (deferred per review Q1 — feed metrics
+        are often partially loaded; Phase 1 deep-read owns metrics).
+
+        This is a bounded read primitive: the extraction JS is broker-owned
+        and fixed-shape (no caller-controlled code), returning structured data.
+        Satisfies the read-only contract (querySelectorAll + getAttribute +
+        innerText — all non-mutating).
+        """
+        if (r := self._guard()) is not None:
+            return r
+        expr = (
+            "(function(){"
+            "var arts=document.querySelectorAll('article');"
+            "return Array.from(arts).map(function(a){"
+            "  var link=a.querySelector(\"a[href*='/status/']\");"
+            "  var time=a.querySelector('time');"
+            "  var text=a.querySelector(\"[data-testid='tweetText']\");"
+            "  var href=link?link.getAttribute('href'):null;"
+            "  return {"
+            "    href: href,"
+            "    created_at: time?time.getAttribute('datetime'):null,"
+            "    text: text?text.innerText:null,"
+            "    lang: text?text.getAttribute('lang'):null"
+            "  };"
+            "});"
+            "})()"
+        )
+        r = await self._cdp_read(expr, "enumerate_posts()")
+        if r.ok:
+            posts = r.data or []
+            r.data = {"posts": posts, "count": len(posts)}
+        return r
+
+    async def scroll(self, pixels: int = 3000) -> ActionResult:
+        """Scroll the page down by N pixels. Read-only (scroll doesn't mutate
+        page content, only the viewport position). Used for infinite-scroll
+        pagination in fan-out."""
+        if (r := self._guard()) is not None:
+            return r
+        safe = int(pixels)
+        expr = f"window.scrollBy(0, {safe})"
+        r = await self._cdp_read(expr, f"scroll({pixels})")
         return r
 
     # -- diagnostics ---------------------------------------------------------

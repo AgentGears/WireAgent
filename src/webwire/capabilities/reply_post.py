@@ -152,15 +152,21 @@ class ReplyPostCapability:
                              "Submit clicked but posted URL not captured.",
                              normalized, target_post_id)
 
-        # Steps 14-15: read-back verification.
-        read_back_text = await _read_back_post_text(broker, posted_url)
-        if read_back_text is None:
+        # Steps 14-15: thread-aware read-back verification (ChatGPT's Phase 4c-v fix).
+        # X redirects reply status URLs to the thread root, so navigating to
+        # posted_url shows the TARGET as the first article, not the reply.
+        # Fix: navigate to the PARENT post URL, enumerate articles, find the
+        # reply by posted_post_id, and verify its text + that it's after the target.
+        await asyncio.sleep(2)
+        verified = await _verify_reply_in_thread(broker, post_url, target_post_id, posted_post_id, normalized)
+
+        if not verified["found"]:
             return _degraded("posted_url_captured_verification_failed",
-                             f"Posted URL captured ({posted_url}) but read-back failed.",
+                             f"Reply {posted_post_id} not found in thread of {target_post_id}.",
                              normalized, target_post_id, posted_url, posted_post_id)
-        if _normalize_for_compare(read_back_text) != _normalize_for_compare(normalized):
+        if not verified["text_matches"]:
             return _degraded("posted_url_captured_verification_failed",
-                             f"Text mismatch on read-back. Expected {normalized!r}, got {read_back_text!r}.",
+                             f"Reply text mismatch. Expected {normalized!r}, got {verified['text']!r}.",
                              normalized, target_post_id, posted_url, posted_post_id)
 
         # Step 16: posted_and_verified.
@@ -220,25 +226,63 @@ def _degraded(code: str, message: str, normalized: str,
     return r
 
 
-async def _read_back_post_text(broker: Any, posted_url: str) -> Optional[str]:
+async def _verify_reply_in_thread(
+    broker: Any, parent_post_url: str, target_post_id: str,
+    posted_reply_id: str, normalized_text: str,
+) -> dict:
+    """Thread-aware reply verification (ChatGPT's Phase 4c-v fix).
+
+    X redirects reply status URLs to the thread root, so first-article read-back
+    returns the TARGET's text, not the reply's. Fix: navigate to the parent
+    post's URL, enumerate articles via CDP, find the reply by posted_reply_id,
+    and verify its text + that it appears after the target.
+
+    Returns: {found: bool, text_matches: bool, text: str|None}
+    """
     try:
         import asyncio
-        if hasattr(broker, "_sb"):
-            nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
-            if not nav.ok:
-                return None
-            await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
-            expr = (
-                '(function(){var t=document.querySelector("[data-testid=\'tweetText\']");'
-                'return t?t.innerText:null;})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                return result.data.get("result", {}).get("value")
-        return None
+        import re
+        if not hasattr(broker, "_sb"):
+            return {"found": False, "text_matches": False, "text": None}
+
+        # Navigate to the parent post (the target we replied to).
+        nav = await broker._sb.navigate(parent_post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return {"found": False, "text_matches": False, "text": None}
+        await asyncio.sleep(4)
+
+        # Enumerate all visible articles and find the one matching posted_reply_id.
+        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        # Get all articles' hrefs + texts in order.
+        expr = (
+            "(function(){"
+            "var arts=document.querySelectorAll('article');"
+            "return Array.from(arts).map(function(a){"
+            "var link=a.querySelector(\"a[href*='/status/']\");"
+            "var text=a.querySelector(\"[data-testid='tweetText']\");"
+            "return {"
+            "href: link?link.getAttribute('href'):null,"
+            "text: text?text.innerText:null"
+            "};"
+            "});"
+            "})()"
+        )
+        result = await cdp.evaluate(expr)
+        if not result.ok or "exceptionDetails" in result.data:
+            return {"found": False, "text_matches": False, "text": None}
+
+        articles = result.data.get("result", {}).get("value") or []
+        for art in articles:
+            href = art.get("href") or ""
+            m = re.search(r"/status/(\d+)", href)
+            if m and m.group(1) == posted_reply_id:
+                reply_text = art.get("text") or ""
+                matches = _normalize_for_compare(reply_text) == _normalize_for_compare(normalized_text)
+                return {"found": True, "text_matches": matches, "text": reply_text}
+
+        return {"found": False, "text_matches": False, "text": None}
     except Exception:  # noqa: BLE001
-        return None
+        return {"found": False, "text_matches": False, "text": None}
 
 
 async def _capture_reply_url(broker: Any, target_post_id: str) -> tuple[Optional[str], Optional[str]]:

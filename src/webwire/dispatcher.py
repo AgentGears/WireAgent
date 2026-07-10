@@ -203,7 +203,17 @@ class Dispatcher:
                     capability, self._broker, input, actor_identity=actor,
                 )
             else:
-                result = await capability.run(self._broker, input)
+                # download_image uses the DownloadBroker (separate local-output
+                # boundary), not the ReadOnlyBroker.
+                if name == "download_image":
+                    from webwire.download_broker import DownloadBroker
+                    dl_dir = self._config.state_dir / "downloads"
+                    dl_broker = DownloadBroker(
+                        self._session.sb, self._kill, dl_dir,
+                    )
+                    result = await capability.run(dl_broker, input)
+                else:
+                    result = await capability.run(self._broker, input)
         except Exception as exc:  # noqa: BLE001 — envelope the error
             logger.exception("Capability %r raised", name)
             from webwire.envelope import hard_failure
@@ -294,6 +304,10 @@ class Dispatcher:
         # with media validation, attachment state machine, attachment verification.
         from webwire.capabilities.post_photo import PostPhotoCapability
         self._registry.register(PostPhotoCapability())
+        # download_image — v0.2 M2: download a tweet image to local filesystem.
+        # Uses the separate DownloadBroker (local-output boundary), not ReadOnlyBroker.
+        from webwire.capabilities.download_image import DownloadImageCapability
+        self._registry.register(DownloadImageCapability())
         self._registered_default = True
 
     def _journal_write(

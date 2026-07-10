@@ -513,3 +513,96 @@ class WriteBroker:
             return ok_result(data={"filled": True, "text_length": len(text)})
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"fill_quote_composer error: {exc!r}")
+
+    # ------------------------------------------------------------------
+    # Media port (v0.2 M1) — photo upload
+    # ------------------------------------------------------------------
+
+    async def attach_media(self, image_path: str) -> ActionResult:
+        """Upload an image file to the X compose page via the file input.
+
+        Must be called AFTER fill_composer (or fill_reply/quote_composer) —
+        the composer must be open. X's compose page has an
+        input[type='file'] for image upload.
+
+        ChatGPT concern #6: upload is a state machine. After upload_file(),
+        wait for the attachment preview to appear before returning.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        try:
+            # X's image upload input: a hidden input[type='file'] on the compose page.
+            upload_r = await self._sb.upload_file(
+                "input[type='file']",
+                image_path,
+            )
+            if not upload_r.ok:
+                return soft_failure(
+                    f"attach_media: upload_file failed: {upload_r.error.message if upload_r.error else upload_r}",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            # State machine: wait for the attachment preview to appear.
+            # X shows [data-testid='attachments'] or image previews after upload.
+            await asyncio.sleep(2)  # initial processing
+            # Verify attachment preview is present.
+            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            check_expr = (
+                '(function(){'
+                'var att=document.querySelector("[data-testid=\'attachments\']");'
+                'if(att)return "attachment_preview";'
+                'var imgs=document.querySelectorAll("img");'
+                'for(var i=0;i<imgs.length;i++){'
+                'if(imgs[i].src&&imgs[i].src.indexOf("blob:")>=0)return "blob_image";'
+                'if(imgs[i].src&&imgs[i].naturalWidth>100)return "large_image";'
+                '}'
+                'return "no_preview";'
+                '})()'
+            )
+            # Retry a few times for the preview to appear.
+            for attempt in range(5):
+                result = await cdp.evaluate(check_expr)
+                state = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
+                if state and state != "no_preview":
+                    return ok_result(data={"attached": True, "preview_state": state})
+                await asyncio.sleep(1)
+
+            return soft_failure(
+                "attach_media: attachment preview did not appear after upload (timeout).",
+                failure_category=FailureCategory.TIMEOUT if hasattr(FailureCategory, "TIMEOUT") else FailureCategory.UNKNOWN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"attach_media error: {exc!r}")
+
+    async def verify_attachment_ready(self) -> ActionResult:
+        """Verify X has finished processing the attachment (ChatGPT concern #6).
+
+        Checks: no processing spinner, attachment preview present, submit
+        button is enabled. Returns ok=True when ready.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        try:
+            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            # Check that the submit button is enabled (not disabled while processing).
+            expr = (
+                '(function(){'
+                'var btn=document.querySelector("[data-testid=\'tweetButton\']");'
+                'if(!btn)return "no_submit_button";'
+                'if(btn.getAttribute("disabled"))return "disabled";'
+                'return "enabled";'
+                '})()'
+            )
+            for attempt in range(5):
+                result = await cdp.evaluate(expr)
+                state = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
+                if state == "enabled":
+                    return ok_result(data={"attachment_ready": True})
+                await asyncio.sleep(1)
+            return soft_failure(
+                f"verify_attachment_ready: submit button {state} after 5s.",
+                failure_category=FailureCategory.TIMEOUT if hasattr(FailureCategory, "TIMEOUT") else FailureCategory.UNKNOWN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"verify_attachment_ready error: {exc!r}")

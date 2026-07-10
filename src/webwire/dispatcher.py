@@ -290,6 +290,10 @@ class Dispatcher:
         # Target-scoped repost→Quote flow + dual verification (text + quote attachment).
         from webwire.capabilities.quote_post import QuotePostCapability
         self._registry.register(QuotePostCapability())
+        # post_photo — v0.2 M1: post text + image. Extends write pipeline
+        # with media validation, attachment state machine, attachment verification.
+        from webwire.capabilities.post_photo import PostPhotoCapability
+        self._registry.register(PostPhotoCapability())
         self._registered_default = True
 
     def _journal_write(

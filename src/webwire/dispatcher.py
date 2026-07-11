@@ -312,6 +312,10 @@ class Dispatcher:
         # reply flow with media pipeline. Composition atomicity enforced.
         from webwire.capabilities.reply_photo import ReplyPhotoCapability
         self._registry.register(ReplyPhotoCapability())
+        # quote_photo — v0.2 M3b: quote with text + image. Dual attachment
+        # (quote-target + media) verified separately. Identity-aware post-submit.
+        from webwire.capabilities.quote_photo import QuotePhotoCapability
+        self._registry.register(QuotePhotoCapability())
         self._registered_default = True
 
     def _journal_write(

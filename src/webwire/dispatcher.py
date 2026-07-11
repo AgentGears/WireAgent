@@ -308,6 +308,10 @@ class Dispatcher:
         # Uses the separate DownloadBroker (local-output boundary), not ReadOnlyBroker.
         from webwire.capabilities.download_image import DownloadImageCapability
         self._registry.register(DownloadImageCapability())
+        # reply_photo — v0.2 M3a: reply with text + image. Combines target-scoped
+        # reply flow with media pipeline. Composition atomicity enforced.
+        from webwire.capabilities.reply_photo import ReplyPhotoCapability
+        self._registry.register(ReplyPhotoCapability())
         self._registered_default = True
 
     def _journal_write(

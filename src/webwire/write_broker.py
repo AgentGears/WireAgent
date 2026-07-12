@@ -606,3 +606,71 @@ class WriteBroker:
             )
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"verify_attachment_ready error: {exc!r}")
+
+    async def count_attachments(self) -> ActionResult:
+        """Count the number of image attachments currently in the composer.
+
+        ChatGPT's M4 gate #2: after each attachment operation, verify the composer
+        contains the expected cumulative count. Returns data={'count': int}.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        try:
+            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            # X renders uploaded images in [data-testid='attachments'] or as
+            # img elements with blob: src inside the compose area. Count them.
+            expr = (
+                '(function(){'
+                # Method 1: count tweetPhoto-style previews in attachments container
+                'var att=document.querySelector("[data-testid=\'attachments\']");'
+                'if(att){var imgs=att.querySelectorAll("img");return imgs.length;}'
+                # Method 2: count blob: images in the primary column compose area
+                'var compose=document.querySelector("[data-testid=\'tweetTextarea_0\']");'
+                'if(compose){var container=compose.closest("form")||compose.closest("div");'
+                'if(container){var blobs=container.querySelectorAll("img[src*=\'blob:\']");'
+                'if(blobs.length>0)return blobs.length;}}'
+                # Method 3: count any img in the compose form
+                'var form=document.querySelector("form");'
+                'if(form){return form.querySelectorAll("img").length;}'
+                'return 0;'
+                '})()'
+            )
+            result = await cdp.evaluate(expr)
+            if result.ok and "exceptionDetails" not in result.data:
+                count = result.data.get("result", {}).get("value", 0)
+                return ok_result(data={"count": count})
+            return ok_result(data={"count": 0})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"count_attachments error: {exc!r}")
+
+    async def close_composer(self) -> ActionResult:
+        """Close/clear the compose modal (ChatGPT's M4 gate #3: abort and cleanup).
+
+        On partial-failure: close composer, verify the partially attached
+        composition is gone.
+        """
+        if (r := self._guard()) is not None:
+            return r
+        import asyncio
+        try:
+            # Try clicking a close/dismiss button if present.
+            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            close_expr = (
+                '(function(){'
+                'var btns=document.querySelectorAll("button");'
+                'for(var i=0;i<btns.length;i++){'
+                'var aria=btns[i].getAttribute("aria-label")||"";'
+                'if(aria.indexOf("Close")>=0||aria.indexOf("Cancel")>=0){btns[i].click();return "closed";}'
+                '}'
+                'return "no_close_button";'
+                '})()'
+            )
+            result = await cdp.evaluate(close_expr)
+            state = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
+            await asyncio.sleep(1)
+            # Navigate away to ensure the compose is cleared.
+            await self._sb.navigate("https://x.com/home", wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+            return ok_result(data={"cleanup": state or "navigated_away"})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"close_composer error: {exc!r}")

@@ -316,6 +316,10 @@ class Dispatcher:
         # (quote-target + media) verified separately. Identity-aware post-submit.
         from webwire.capabilities.quote_photo import QuotePhotoCapability
         self._registry.register(QuotePhotoCapability())
+        # post_multi_image — v0.2 M4a: post text + multiple images. Ordered
+        # media-manifest transaction with partial-failure abort + cleanup.
+        from webwire.capabilities.post_multi_image import PostMultiImageCapability
+        self._registry.register(PostMultiImageCapability())
         self._registered_default = True
 
     def _journal_write(

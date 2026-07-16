@@ -17,7 +17,7 @@
 
 ## Current version
 
-**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 196 tests, 27 commits.
+**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 203 tests, 28 commits.
 
 ## Architecture invariants (do not violate)
 
@@ -62,7 +62,7 @@
 | Phase | Scope | Status |
 |-------|-------|--------|
 | **0a** | session + whoami + health + envelope + journal + kill switch + read-only broker | **LIVE-VERIFIED** |
-| **0b** | write-safety kernel (token-bound confirmation, 4-tier risk, global+per-action limits, dedupe) | **DONE** (196 tests) |
+| **0b** | write-safety kernel (token-bound confirmation, 4-tier risk, global+per-action limits, dedupe) | **DONE** (203 tests) |
 | **1** | golden read (`read <post_url>`) | **LIVE-VERIFIED** |
 | **1b** | quote-tweet impl, display_name fix, unavailable-post handling | **DONE** |
 | **2** | read_profile (fan-out) | **LIVE-VERIFIED** |
@@ -81,7 +81,7 @@
 | **v0.2 M2** | download_image (separate DownloadBroker, HTTP fetch) | **LIVE-VERIFIED** |
 | **v0.2 M3a** | reply_photo (target-scoped + media, composition atomicity) | **DONE** (verification gap flagged) |
 | **v0.2 M3b** | quote_photo (dual attachment, identity-aware capture) | **LIVE-VERIFIED** |
-| **v0.2 M4a** | post_multi_image (ordered media-manifest transaction) | **LIVE-VERIFIED** |
+| **v0.2 M4a** | post_multi_image (ordered media-manifest transaction) | **LIVE-VERIFIED** + runtime tests |
 | **v0.2 M4b** | reply_multi_image | next |
 | **v0.2 M4c** | quote_multi_image | after M4b |
 
@@ -170,8 +170,9 @@
 
 ## Known gaps / open items
 
-- [ ] M4b reply_multi_image
+- [ ] M4b reply_multi_image (ChatGPT decision: B-with-gate — shared harness, M4a runtime tests must be green first; ✅ done)
 - [ ] M4c quote_multi_image
+- [x] ~~M4a runtime test gap (ChatGPT blocker)~~ — closed: 7 runtime tests added (attach-fail, count-mismatch, preview-not-ready, composer-mutation, kill-before-submit, transcoding-honest, rendered-order)
 - [ ] reply_photo URL capture gap (submit_clicked_verification_pending — identity-aware verifier should be retrofitted)
 - [ ] Phase 1b edge cases (quote-tweet, media-only, reply) need real fixtures
 - [ ] Screenshot capture plumbed but unimplemented
@@ -192,6 +193,7 @@
 
 ## History
 
+- 2026-07-12: M4a runtime blocker closed. 7 failure-path tests added (test_post_multi_image_runtime.py) — ChatGPT's 7 enumerated cases now covered. 203 tests. ChatGPT decision: B-with-gate (shared harness, M4a green before M4b live).
 - 2026-07-12: v0.2 M1-M4a complete. 17 capabilities, 196 tests, 27 commits. Media pipeline (post_photo, download_image, reply_photo, quote_photo, post_multi_image) with full safety (manifest, SHA-256 binding, EXIF, abort-cleanup, identity-aware verifier). ChatGPT bridge diagnosis delivered to PM.
 - 2026-07-09: Phase 4 complete (post_text, reply_post, quote_post — all live-verified). v0.1 tagged.
 - 2026-07-08: Phase 0a-LIVE PASSED through Phase 3b. Session persistence, write-safety kernel, bookmark + like live-verified.

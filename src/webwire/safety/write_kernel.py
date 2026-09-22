@@ -75,6 +75,13 @@ class WriteCapability(Protocol):
 
     name: str
 
+    @property
+    def tier(self) -> Any:
+        """CapabilityTier; Any-typed because the enum lives in
+        webwire.capabilities.base and importing it here would cycle through
+        the capabilities package __init__ (which imports this module)."""
+        ...
+
     def compose(self, input: dict[str, Any], actor_identity: Optional[str]) -> WriteIntent:
         """Produce a declarative WriteIntent from input. NO browser interaction."""
         ...
@@ -243,15 +250,15 @@ class WriteKernel:
             })
 
         # Second phase: validate the token.
-        token = self._pending_tokens.get(provided_token)
-        decision = self._validate_token(token, intent, input)
+        pending = self._pending_tokens.get(provided_token)
+        decision = self._validate_token(pending, intent, input)
         if decision is not None:
             trace["stages"].append(f"denied:{decision.blocked_by}")
             return self._finish(decision, trace, None)
 
         # Token valid — consume it.
-        assert token is not None
-        token.consumed = True
+        assert pending is not None
+        pending.consumed = True
         trace["stages"].append("confirmed")
 
         # 6. Execute. Construct a WriteBroker (narrow write surface) for the

@@ -38,7 +38,7 @@ class ReplyPhotoCapability:
     name = "reply_photo"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -54,7 +54,7 @@ class ReplyPhotoCapability:
 
         attachment = validate_media_file(image_path)
 
-        meta, comp = DEFAULT_REGISTRY.get("reply")
+        meta, comp = DEFAULT_REGISTRY.require("reply")
         # action_type is the BASE action "reply" (P0 rate-limit fix, 2026-09-22):
         # media replies share the reply budget. Media identity lives in
         # semantic_variant (text hash + attachment digest).
@@ -229,8 +229,8 @@ def _failure(code: str, message: str) -> ActionResult:
 
 
 def _degraded(code: str, message: str, normalized: str,
-              target_post_id: str = None, posted_url: str = None,
-              posted_post_id: str = None) -> ActionResult:
+              target_post_id: Optional[str] = None, posted_url: Optional[str] = None,
+              posted_post_id: Optional[str] = None) -> ActionResult:
     from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
@@ -249,7 +249,7 @@ async def _capture_reply_url(broker: Any, target_post_id: str) -> tuple[Optional
     try:
         if hasattr(broker, "_sb"):
             import json
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){'
                 'var links=document.querySelectorAll("a[href*=\'/status/\']");'
@@ -278,7 +278,7 @@ async def _capture_reply_url(broker: Any, target_post_id: str) -> tuple[Optional
 
 async def _verify_reply_in_thread(
     broker: Any, parent_post_url: str, target_post_id: str,
-    posted_reply_id: str, normalized_text: str,
+    posted_reply_id: Optional[str], normalized_text: str,
 ) -> dict:
     """Thread-aware reply verification (same as reply_post Phase 4c-v)."""
     try:
@@ -292,7 +292,7 @@ async def _verify_reply_in_thread(
             return {"found": False, "text_matches": False}
         await asyncio.sleep(4)
 
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         expr = (
             "(function(){"
             "var arts=document.querySelectorAll('article');"
@@ -330,7 +330,7 @@ async def _verify_attachment_on_post(broker: Any, posted_url: str) -> bool:
             if not nav.ok:
                 return False
             await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){'
                 'var photo=document.querySelector("[data-testid=\'tweetPhoto\']");'

@@ -45,7 +45,7 @@ class DeletePostCapability:
     name = "delete_post"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -55,7 +55,7 @@ class DeletePostCapability:
         if not target_post_id and post_url:
             m = re.search(r"/status/(\d+)", post_url)
             target_post_id = m.group(1) if m else post_url
-        meta, comp = DEFAULT_REGISTRY.get("delete_post")
+        meta, comp = DEFAULT_REGISTRY.require("delete_post")
         return WriteIntent(
             action_type="delete_post",
             target_type="post",

@@ -32,7 +32,7 @@ class BookmarkCapability:
 
     # Import tier lazily to avoid circular import at module level.
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -45,7 +45,7 @@ class BookmarkCapability:
             import re
             m = re.search(r"/status/(\d+)", post_url)
             post_id = m.group(1) if m else post_url
-        meta, comp = DEFAULT_REGISTRY.get("bookmark")
+        meta, comp = DEFAULT_REGISTRY.require("bookmark")
         return WriteIntent(
             action_type="bookmark",
             target_type="post",

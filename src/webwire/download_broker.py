@@ -65,7 +65,7 @@ class DownloadBroker:
         await asyncio.sleep(4)
 
         try:
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             # Find the tweet photo — X uses pbs.twimg.com/media/ for tweet images.
             # Exclude profile avatars (which use /profile_images/).
             expr = (

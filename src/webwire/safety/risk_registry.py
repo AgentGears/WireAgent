@@ -41,6 +41,18 @@ class RiskRegistry:
     def get(self, action_type: str) -> Optional[tuple[RiskMeta, CompensationMeta]]:
         return self._entries.get(action_type)
 
+    def require(self, action_type: str) -> tuple[RiskMeta, CompensationMeta]:
+        """Get an entry or raise KeyError — the ergonomic for capabilities'
+        compose(), which cannot proceed without risk metadata. The kernel's
+        registry gate remains the enforcement; this fails loud at compose
+        time for typos and unregistered actions instead of unpacking None."""
+        entry = self._entries.get(action_type)
+        if entry is None:
+            raise KeyError(
+                f"action_type {action_type!r} is not registered in the risk registry"
+            )
+        return entry
+
     def get_meta(self, action_type: str) -> Optional[RiskMeta]:
         e = self._entries.get(action_type)
         return e[0] if e else None

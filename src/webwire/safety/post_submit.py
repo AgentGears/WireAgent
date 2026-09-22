@@ -27,7 +27,7 @@ async def capture_pre_submit_ids(broker: Any) -> set[str]:
     Returns a set of post_id strings currently visible as article hrefs.
     """
     try:
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         expr = (
             '(function(){'
             'var links=document.querySelectorAll("a[href*=\'/status/\']");'
@@ -67,7 +67,7 @@ async def capture_new_post_id(
     """
     exclude = pre_submit_ids | (exclude_ids or set())
     try:
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         expr = (
             '(function(){'
             'var links=document.querySelectorAll("a[href*=\'/status/\']");'

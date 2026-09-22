@@ -52,7 +52,7 @@ class QuoteMultiImageCapability:
     name = "quote_multi_image"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -69,7 +69,7 @@ class QuoteMultiImageCapability:
 
         manifest = preflight_manifest(image_paths, alt_texts=alt_texts)
 
-        meta, comp = DEFAULT_REGISTRY.get("quote")
+        meta, comp = DEFAULT_REGISTRY.require("quote")
         # action_type is the BASE action "quote" (P0 rate-limit fix): media
         # quotes share the quote budget. Media identity lives in the variant
         # (text hash + manifest hash); the quoted target is in target_id.

@@ -43,7 +43,7 @@ class PostPhotoCapability:
     name = "post_photo"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -56,7 +56,7 @@ class PostPhotoCapability:
         # This is synchronous; it reads the file + computes SHA-256.
         attachment = validate_media_file(image_path)
 
-        meta, comp = DEFAULT_REGISTRY.get("post")
+        meta, comp = DEFAULT_REGISTRY.require("post")
         # Dedupe key includes media hash (ChatGPT: same caption + different images ≠ duplicate).
         # action_type is the BASE action "post" (P0 rate-limit fix, 2026-09-22):
         # media posts draw from the same per-action budget as text posts and
@@ -233,7 +233,8 @@ def _failure(code: str, message: str) -> ActionResult:
 
 
 def _degraded(code: str, message: str, normalized: str,
-              posted_url: str = None, posted_post_id: str = None) -> ActionResult:
+              posted_url: Optional[str] = None,
+              posted_post_id: Optional[str] = None) -> ActionResult:
     from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
@@ -256,7 +257,7 @@ async def _read_back_post_text(broker: Any, posted_url: str) -> Optional[str]:
             if not nav.ok:
                 return None
             await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){var t=document.querySelector("[data-testid=\'tweetText\']");'
                 'return t?t.innerText:null;})()'
@@ -277,7 +278,7 @@ async def _verify_attachment_presence(broker: Any, posted_url: str) -> bool:
     """
     try:
         if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){'
                 'var photo=document.querySelector("[data-testid=\'tweetPhoto\']");'

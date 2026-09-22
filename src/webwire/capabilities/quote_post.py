@@ -28,7 +28,7 @@ class QuotePostCapability:
     name = "quote_post"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -41,7 +41,7 @@ class QuotePostCapability:
         raw_text = input.get("text", "")
         normalized = normalize_text(raw_text)
 
-        meta, comp = DEFAULT_REGISTRY.get("quote")
+        meta, comp = DEFAULT_REGISTRY.require("quote")
         return WriteIntent(
             action_type="quote",
             target_type="post",
@@ -226,8 +226,8 @@ def _failure(code: str, message: str) -> ActionResult:
 
 
 def _degraded(code: str, message: str, normalized: str,
-              target_post_id: str = None, posted_url: str = None,
-              posted_post_id: str = None) -> ActionResult:
+              target_post_id: Optional[str] = None, posted_url: Optional[str] = None,
+              posted_post_id: Optional[str] = None) -> ActionResult:
     from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
@@ -248,7 +248,7 @@ async def _capture_quote_url(broker: Any, target_post_id: str) -> tuple[Optional
     Same pattern as _capture_reply_url."""
     try:
         if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){'
                 'var links=document.querySelectorAll("a[href*=\'/status/\']");'
@@ -278,7 +278,7 @@ async def _capture_quote_url(broker: Any, target_post_id: str) -> tuple[Optional
 
 
 async def _verify_quote(
-    broker: Any, posted_url: str, posted_post_id: str,
+    broker: Any, posted_url: Optional[str], posted_post_id: Optional[str],
     target_post_id: str, normalized_text: str,
 ) -> dict:
     """Dual verification (ChatGPT's invariant #7): verify BOTH text AND quote attachment.
@@ -300,7 +300,7 @@ async def _verify_quote(
             return {"found": False, "text_matches": False, "quote_target_matches": False, "text": None}
         await asyncio.sleep(4)
 
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         # Read the first article's text + check for quoteTweet container.
         # A quote post has [data-testid='quoteTweet'] containing the quoted article.
         # The quoted article's status href reveals the quoted target post_id.

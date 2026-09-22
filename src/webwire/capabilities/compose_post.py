@@ -40,7 +40,7 @@ class ComposePostCapability:
     name = "compose_post"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -49,7 +49,7 @@ class ComposePostCapability:
         raw_text = input.get("text", "")
         normalized = normalize_text(raw_text)
 
-        meta, comp = DEFAULT_REGISTRY.get("post")
+        meta, comp = DEFAULT_REGISTRY.require("post")
         return WriteIntent(
             action_type="post",
             target_type="none",  # posts don't target a specific post

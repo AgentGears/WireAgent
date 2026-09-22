@@ -33,7 +33,7 @@ class ReplyPostCapability:
     name = "reply_post"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -46,7 +46,7 @@ class ReplyPostCapability:
         raw_text = input.get("text", "")
         normalized = normalize_text(raw_text)
 
-        meta, comp = DEFAULT_REGISTRY.get("reply")
+        meta, comp = DEFAULT_REGISTRY.require("reply")
         return WriteIntent(
             action_type="reply",
             target_type="post",
@@ -206,8 +206,8 @@ def _failure(code: str, message: str) -> ActionResult:
 
 
 def _degraded(code: str, message: str, normalized: str,
-              target_post_id: str = None, posted_url: str = None,
-              posted_post_id: str = None) -> ActionResult:
+              target_post_id: Optional[str] = None, posted_url: Optional[str] = None,
+              posted_post_id: Optional[str] = None) -> ActionResult:
     from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
@@ -225,7 +225,7 @@ def _degraded(code: str, message: str, normalized: str,
 
 async def _verify_reply_in_thread(
     broker: Any, parent_post_url: str, target_post_id: str,
-    posted_reply_id: str, normalized_text: str,
+    posted_reply_id: Optional[str], normalized_text: str,
 ) -> dict:
     """Thread-aware reply verification (ChatGPT's Phase 4c-v fix).
 
@@ -249,7 +249,7 @@ async def _verify_reply_in_thread(
         await asyncio.sleep(4)
 
         # Enumerate all visible articles and find the one matching posted_reply_id.
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         # Get all articles' hrefs + texts in order.
         expr = (
             "(function(){"
@@ -291,7 +291,7 @@ async def _capture_reply_url(broker: Any, target_post_id: str) -> tuple[Optional
     """
     try:
         if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             # Find all status hrefs and pick the first one that ISN'T the target.
             expr = (
                 '(function(){'

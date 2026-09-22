@@ -38,7 +38,7 @@ class QuotePhotoCapability:
     name = "quote_photo"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -54,7 +54,7 @@ class QuotePhotoCapability:
 
         attachment = validate_media_file(image_path)
 
-        meta, comp = DEFAULT_REGISTRY.get("quote")
+        meta, comp = DEFAULT_REGISTRY.require("quote")
         # action_type is the BASE action "quote" (P0 rate-limit fix, 2026-09-22):
         # media quotes share the quote budget. Media identity lives in
         # semantic_variant (text hash + attachment digest).
@@ -233,8 +233,8 @@ def _failure(code: str, message: str) -> ActionResult:
 
 
 def _degraded(code: str, message: str, normalized: str,
-              target_post_id: str = None, posted_url: str = None,
-              posted_post_id: str = None) -> ActionResult:
+              target_post_id: Optional[str] = None, posted_url: Optional[str] = None,
+              posted_post_id: Optional[str] = None) -> ActionResult:
     from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
@@ -248,7 +248,7 @@ def _degraded(code: str, message: str, normalized: str,
     return r
 
 
-async def _verify_text(broker: Any, posted_url: str, normalized: str) -> bool:
+async def _verify_text(broker: Any, posted_url: Optional[str], normalized: str) -> bool:
     """Verify the posted quote's text matches."""
     try:
         if hasattr(broker, "_sb"):
@@ -256,7 +256,7 @@ async def _verify_text(broker: Any, posted_url: str, normalized: str) -> bool:
             if not nav.ok:
                 return False
             await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){var t=document.querySelector("[data-testid=\'tweetText\']");'
                 'return t?t.innerText:null;})()'
@@ -270,11 +270,11 @@ async def _verify_text(broker: Any, posted_url: str, normalized: str) -> bool:
         return False
 
 
-async def _verify_media(broker: Any, posted_url: str) -> bool:
+async def _verify_media(broker: Any, posted_url: Optional[str]) -> bool:
     """Verify the posted quote has an image attachment."""
     try:
         if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){'
                 'var photo=document.querySelector("[data-testid=\'tweetPhoto\']");'

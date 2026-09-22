@@ -130,7 +130,7 @@ class ReadOnlyBroker:
     async def _cdp_read(self, expr: str, label: str) -> ActionResult:
         """Shared CDP-evaluate read helper. Returns ok+value or soft failure."""
         try:
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             result = await cdp.evaluate(expr)
             if result.ok and "exceptionDetails" not in result.data:
                 value = result.data.get("result", {}).get("value")
@@ -331,7 +331,7 @@ class ReadOnlyBroker:
             except ValueError:
                 continue
         frozen = frozenset(hosts)
-        self._allowed_hosts_cached = frozen  # type: ignore[attr-defined]
+        self._allowed_hosts_cached = frozen
         return frozen
 
     @staticmethod

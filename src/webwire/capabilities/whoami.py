@@ -85,6 +85,7 @@ class WhoamiCapability:
         # attribute via read-only CDP getAttribute.
         logger.info("whoami: reading Profile link href from DOM (primary path)")
         profile_href = await _read_profile_href(broker)
+        identity: dict[str, Any] | None = None
         if profile_href:
             handle = profile_href.strip("/").split("/")[-1]
             if handle and "/" not in handle and len(handle) >= 2:
@@ -100,19 +101,20 @@ class WhoamiCapability:
         # 5. Fallback: deterministic parse off the AX snapshot targets.
         # (Weaker — relies on @-handle link names, which X often doesn't expose
         #  on the home timeline. Kept as fallback for surfaces that do.)
-        identity = _parse_identity_from_observation(obs_data)
-        if identity is not None and identity.get("handle") and identity.get("profile_url"):
-            identity["session_status"] = "authenticated"
+        parsed = _parse_identity_from_observation(obs_data)
+        if parsed is not None and parsed.get("handle") and parsed.get("profile_url"):
+            parsed["session_status"] = "authenticated"
+            identity = parsed
             return ok_result(data=identity, success_category=SuccessCategory.INSPECTION)
 
         # 6. Last resort: scan the AX compact string for a handle-like path.
         ext = await broker.extract("identity")
         if ext.ok and ext.data:
-            extracted_str = (
+            extracted_str: str = (
                 ext.data.get("extracted") if isinstance(ext.data, dict) else str(ext.data)
             ) or ""
-            handle = _scan_for_handle_in_ax(extracted_str, obs_data)
-            if handle:
+            scanned = _scan_for_handle_in_ax(extracted_str, obs_data)
+            if scanned:
                 identity = {
                     "handle": handle,
                     "display_name": None,

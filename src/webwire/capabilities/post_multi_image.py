@@ -47,7 +47,7 @@ class PostMultiImageCapability:
     name = "post_multi_image"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -60,7 +60,7 @@ class PostMultiImageCapability:
         # Gate #1: preflight ALL before ANY upload.
         manifest = preflight_manifest(image_paths, alt_texts=alt_texts)
 
-        meta, comp = DEFAULT_REGISTRY.get("post")
+        meta, comp = DEFAULT_REGISTRY.require("post")
         # Dedupe key includes combined hash of all attachment digests (ChatGPT M4).
         # action_type is the BASE action "post" (P0 rate-limit fix, 2026-09-22):
         # multi-image posts draw from the same post budget as text posts.

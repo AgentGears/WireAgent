@@ -42,14 +42,14 @@ class PostTextCapability:
     name = "post_text"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
     def compose(self, input: dict[str, Any], actor_identity: Optional[str]) -> WriteIntent:
         raw_text = input.get("text", "")
         normalized = normalize_text(raw_text)
-        meta, comp = DEFAULT_REGISTRY.get("post")
+        meta, comp = DEFAULT_REGISTRY.require("post")
         return WriteIntent(
             action_type="post",
             target_type="none",
@@ -195,7 +195,7 @@ def _failure(code: str, message: str) -> ActionResult:
 
 
 def _degraded(code: str, message: str, normalized: str,
-              posted_url: str = None, posted_post_id: str = None) -> ActionResult:
+              posted_url: Optional[str] = None, posted_post_id: Optional[str] = None) -> ActionResult:
     """Degraded result: public side effect MAY have occurred."""
     from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
@@ -224,7 +224,7 @@ async def _read_back_post_text(broker: Any, posted_url: str) -> Optional[str]:
                 return None
             await asyncio.sleep(4)
             # Read tweetText via CDP evaluate.
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 "(function(){var t=document.querySelector(\"[data-testid='tweetText']\");"
                 "return t?t.innerText:null;})()"

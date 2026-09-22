@@ -46,9 +46,11 @@ class PostSubmitHooks:
     Injected per-capability so module-level monkeypatching in tests stays
     authoritative; the definitions live once in safety/media_verify.py."""
     capture_pre_submit_ids: Callable[[Any], Awaitable[set]]
-    capture_new_post_id: Callable[[Any, set], Awaitable[tuple[Optional[str], Optional[str]]]]
-    verify_text: Callable[[Any, str, str], Awaitable[bool]]
-    count_media: Callable[[Any, str], Awaitable[int]]
+    # Varargs-typed: implementations take keyword extras (exclude_ids=...) and
+    # tests monkeypatch with narrower signatures; the contract is the RETURN.
+    capture_new_post_id: Callable[..., Awaitable[tuple[Optional[str], Optional[str]]]]
+    verify_text: Callable[..., Awaitable[bool]]
+    count_media: Callable[..., Awaitable[int]]
 
 
 @dataclass(frozen=True)
@@ -235,7 +237,7 @@ async def run_media_compose(
     posted_post_id, posted_url = await hooks.capture_new_post_id(
         broker, pre_submit_ids, exclude_ids=set(spec.exclude_ids),
     )
-    if not posted_post_id:
+    if not posted_post_id or not posted_url:
         return degraded("submit_clicked_verification_pending",
                         "Submit clicked but no new post ID captured.",
                         spec.normalized_text,

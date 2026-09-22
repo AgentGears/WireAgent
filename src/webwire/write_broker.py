@@ -100,7 +100,7 @@ class WriteBroker:
         await asyncio.sleep(4)
         # Check which bookmark button variant is present.
         # Reuse the CDP evaluate path to check button state.
-        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = self._sb._controller._cdp
         expr = (
             "(function(){"
             "var bm=document.querySelector(\"[data-testid='bookmark']\");"
@@ -197,7 +197,7 @@ class WriteBroker:
         if not nav.ok:
             return nav
         await asyncio.sleep(4)
-        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = self._sb._controller._cdp
         expr = (
             "(function(){"
             "var l=document.querySelector(\"[data-testid='like']\");"
@@ -250,8 +250,8 @@ class WriteBroker:
             # type_text(selector, text) don't work because Draft manages its
             # own state. Use backend_page.keyboard.type() which sends real
             # keyboard events to the focused element — Draft picks these up.
-            page = self._sb._page  # type: ignore[attr-defined]
-            backend_page = page.engine_page.backend_page  # type: ignore[attr-defined]
+            page = self._sb._page
+            backend_page = page.engine_page.backend_page
             await backend_page.keyboard.type(text, delay=10)
             await asyncio.sleep(1)
             return ok_result(data={"filled": True, "text_length": len(text)})
@@ -263,7 +263,7 @@ class WriteBroker:
         assertion (ChatGPT's step 10: composer_dom_text == normalized_text)."""
         if (r := self._guard()) is not None:
             return r
-        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = self._sb._controller._cdp
         # NOTE: the selector contains single quotes (data-testid='tweetTextarea_0')
         # which conflict with JS string delimiters. Use double quotes in the JS
         # and escape properly. This was a real bug — the unescaped single quote
@@ -322,7 +322,7 @@ class WriteBroker:
             })
 
         # Fallback: look for the first article with a /status/ href (the new post).
-        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = self._sb._controller._cdp
         expr = (
             "(function(){"
             "var a=document.querySelector(\"a[href*='/status/']\");"
@@ -373,7 +373,7 @@ class WriteBroker:
         try:
             # Find the article with the matching post_id and click its reply button.
             # X's reply button: data-testid='reply' inside the article.
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             # Use CDP to find + click the reply button on the target article.
             # First, locate the article by its status href.
             expr = (
@@ -416,8 +416,8 @@ class WriteBroker:
                 description="reply composer textarea",
             )
             await asyncio.sleep(0.5)
-            page = self._sb._page  # type: ignore[attr-defined]
-            backend_page = page.engine_page.backend_page  # type: ignore[attr-defined]
+            page = self._sb._page
+            backend_page = page.engine_page.backend_page
             await backend_page.keyboard.type(text, delay=10)
             await asyncio.sleep(1)
             return ok_result(data={"filled": True, "text_length": len(text)})
@@ -444,7 +444,7 @@ class WriteBroker:
         await asyncio.sleep(4)
 
         try:
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             # Step 1: find the target article and click its repost button.
             click_repost_expr = (
                 '(function(){'
@@ -505,8 +505,8 @@ class WriteBroker:
                 description="quote composer textarea",
             )
             await asyncio.sleep(0.5)
-            page = self._sb._page  # type: ignore[attr-defined]
-            backend_page = page.engine_page.backend_page  # type: ignore[attr-defined]
+            page = self._sb._page
+            backend_page = page.engine_page.backend_page
             await backend_page.keyboard.type(text, delay=10)
             await asyncio.sleep(1)
             return ok_result(data={"filled": True, "text_length": len(text)})
@@ -545,7 +545,7 @@ class WriteBroker:
             # X shows [data-testid='attachments'] or image previews after upload.
             await asyncio.sleep(2)  # initial processing
             # Verify attachment preview is present.
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             check_expr = (
                 '(function(){'
                 'var att=document.querySelector("[data-testid=\'attachments\']");'
@@ -583,7 +583,7 @@ class WriteBroker:
             return r
         import asyncio
         try:
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             # Check that the submit button is enabled (not disabled while processing).
             expr = (
                 '(function(){'
@@ -615,7 +615,7 @@ class WriteBroker:
         if (r := self._guard()) is not None:
             return r
         try:
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             # Count UPLOADED images. Uploads render with blob: src URLs; that
             # is the only reliable upload signal across composer types — the
             # QUOTE composer additionally renders the quoted author's avatar
@@ -659,7 +659,7 @@ class WriteBroker:
         import asyncio
         try:
             # Try clicking a close/dismiss button if present.
-            cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = self._sb._controller._cdp
             close_expr = (
                 '(function(){'
                 'var btns=document.querySelectorAll("button");'
@@ -694,7 +694,7 @@ class WriteBroker:
 
     async def _delete_eval(self, expr: str) -> ActionResult:
         """CDP evaluate for the delete flow (may mutate via el.click())."""
-        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = self._sb._controller._cdp
         result = await cdp.evaluate(expr)
         if result.ok and "exceptionDetails" not in result.data:
             from webwire.envelope import ok_result

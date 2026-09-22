@@ -51,7 +51,7 @@ class ReplyMultiImageCapability:
     name = "reply_multi_image"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -69,7 +69,7 @@ class ReplyMultiImageCapability:
         # Gate #1 (in the harness too, at execute time): preflight ALL before ANY.
         manifest = preflight_manifest(image_paths, alt_texts=alt_texts)
 
-        meta, comp = DEFAULT_REGISTRY.get("reply")
+        meta, comp = DEFAULT_REGISTRY.require("reply")
         # action_type is the BASE action "reply" (P0 rate-limit fix): media
         # replies share the reply budget. Media identity lives in the variant
         # (text hash + manifest hash); the target is in target_id.

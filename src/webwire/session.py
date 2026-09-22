@@ -263,8 +263,8 @@ class SessionManager:
         else:
             return None
         # Strip any trailing path on the origin for the version query.
-        origin = origin.split("/", 3)
-        origin = "/".join(origin[:3])  # scheme://host:port
+        parts = origin.split("/", 3)
+        origin = "/".join(parts[:3])  # scheme://host:port
         try:
             with urllib.request.urlopen(f"{origin}/json/version", timeout=5) as resp:
                 data = _json.loads(resp.read().decode("utf-8"))

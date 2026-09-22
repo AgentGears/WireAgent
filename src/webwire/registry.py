@@ -9,9 +9,12 @@ explicitly enables the write tier.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from webwire.capabilities.base import Capability, CapabilityTier
+
+if TYPE_CHECKING:
+    from webwire.safety.write_kernel import WriteCapability
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +29,12 @@ class CapabilityRegistry:
     _ALLOWED_TIERS = frozenset({CapabilityTier.READ, CapabilityTier.WRITE, CapabilityTier.ANALYTICS})
 
     def __init__(self) -> None:
-        self._caps: dict[str, Capability] = {}
+        self._caps: dict[str, "Capability | WriteCapability"] = {}
 
-    def register(self, cap: Capability) -> None:
-        """Register a capability. Raises if tier not allowed."""
+    def register(self, cap: "Capability | WriteCapability") -> None:
+        """Register a capability (READ shape: run(); WRITE shape:
+        compose/preview/execute/verify — routed by the dispatcher through the
+        WriteKernel). Raises if tier not allowed."""
         if cap.tier not in self._ALLOWED_TIERS:
             tier_name = cap.tier.value if hasattr(cap.tier, "value") else str(cap.tier)
             raise PermissionError(
@@ -41,7 +46,7 @@ class CapabilityRegistry:
         self._caps[cap.name] = cap
         logger.info("Registered capability %r (tier=%s)", cap.name, cap.tier.value)
 
-    def get(self, name: str) -> Optional[Capability]:
+    def get(self, name: str) -> "Optional[Capability | WriteCapability]":
         return self._caps.get(name)
 
     def names(self) -> list[str]:

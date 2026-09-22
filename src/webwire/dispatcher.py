@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from webwire.broker import ReadOnlyBroker
 from webwire.capabilities.base import Capability, CapabilityTier
@@ -33,6 +33,9 @@ from webwire.journal import BrowserActionEntry, Journal, JournalRecord
 from webwire.registry import CapabilityRegistry
 from webwire.safety import KillSwitch
 from webwire.session import SessionManager
+
+if TYPE_CHECKING:
+    from webwire.safety.write_kernel import WriteCapability
 
 logger = logging.getLogger(__name__)
 
@@ -215,21 +218,27 @@ class Dispatcher:
                 # whoami-verified handle (set by the post-whoami hook). None
                 # until whoami succeeds this run.
                 actor = self._session.resolved_handle
+                from typing import cast
+
+                from webwire.safety.write_kernel import WriteCapability
+                write_cap = cast(WriteCapability, capability)
                 result = await self._write_kernel.execute(
-                    capability, self._broker, input, actor_identity=actor,
+                    write_cap, self._broker, input, actor_identity=actor,
                 )
             else:
                 # download_image uses the DownloadBroker (separate local-output
                 # boundary), not the ReadOnlyBroker.
+                from typing import cast as _cast
+                read_cap = _cast("Capability", capability)
                 if name == "download_image":
                     from webwire.download_broker import DownloadBroker
                     dl_dir = self._config.state_dir / "downloads"
                     dl_broker = DownloadBroker(
                         self._session.sb, self._kill, dl_dir,
                     )
-                    result = await capability.run(dl_broker, input)
+                    result = await read_cap.run(dl_broker, input)
                 else:
-                    result = await capability.run(self._broker, input)
+                    result = await read_cap.run(self._broker, input)
         except Exception as exc:  # noqa: BLE001 — envelope the error
             logger.exception("Capability %r raised", name)
             from super_browser.results.types import FailureCategory
@@ -298,7 +307,9 @@ class Dispatcher:
             logger.warning("post-whoami checkpoint failed: %r", exc)
 
     @staticmethod
-    def _write_facts(capability: Optional[Capability], result: ActionResult) -> dict[str, Optional[str]]:
+    def _write_facts(
+        capability: "Optional[Capability | WriteCapability]", result: ActionResult,
+    ) -> dict[str, Optional[str]]:
         """Extract the journal write-fact fields from a WRITE-tier result.
 
         dedupe_key is journaled ONLY when the kernel recorded the write

@@ -34,7 +34,7 @@ class LikeCapability:
     name = "like_post"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -44,7 +44,7 @@ class LikeCapability:
         if not post_id and post_url:
             m = re.search(r"/status/(\d+)", post_url)
             post_id = m.group(1) if m else post_url
-        meta, comp = DEFAULT_REGISTRY.get("like")
+        meta, comp = DEFAULT_REGISTRY.require("like")
         return WriteIntent(
             action_type="like",
             target_type="post",

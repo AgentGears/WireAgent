@@ -66,7 +66,7 @@ async def verify_post_text(broker: Any, posted_url: str, normalized: str) -> boo
         nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
         if not nav.ok:
             return False
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         expr = (
             '(function(){'
             f'var arts=document.querySelectorAll("article");'
@@ -106,7 +106,7 @@ async def count_post_media(broker: Any, posted_url: str) -> int:
         nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
         if not nav.ok:
             return 0
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         expr = (
             '(function(){'
             'var arts=document.querySelectorAll("article");'
@@ -152,7 +152,7 @@ async def verify_reply_in_thread(
         if not nav.ok:
             return {"found": False, "text_matches": False}
         await asyncio.sleep(4)
-        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        cdp = broker._sb._controller._cdp
         expr = (
             "(function(){"
             "var arts=document.querySelectorAll('article');"

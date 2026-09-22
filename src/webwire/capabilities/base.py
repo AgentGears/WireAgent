@@ -11,7 +11,6 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-from webwire.broker import ReadOnlyBroker
 from webwire.envelope import ActionResult
 
 
@@ -29,16 +28,20 @@ class CapabilityTier(StrEnum):
 
 @runtime_checkable
 class Capability(Protocol):
-    """A capability contract.
+    """A capability contract (READ tier shape).
 
     Capabilities receive only a :class:`ReadOnlyBroker` (never the raw facade)
-    plus arbitrary input. They return an :class:`ActionResult`.
+    plus arbitrary input. They return an :class:`ActionResult`. WRITE-tier
+    capabilities satisfy the WriteCapability protocol instead (compose/
+    preview/execute/verify) — both are registrable; see CapabilityRegistry.
     """
 
     name: str
-    tier: CapabilityTier
 
-    async def run(self, broker: ReadOnlyBroker, input: dict[str, Any]) -> ActionResult:
+    @property
+    def tier(self) -> CapabilityTier: ...
+
+    async def run(self, broker: Any, input: dict[str, Any]) -> ActionResult:
         ...
 
 

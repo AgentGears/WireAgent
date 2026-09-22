@@ -24,46 +24,112 @@ def normalize_for_compare(text: str) -> str:
     return _re.sub(r"\s+", " ", text.strip())
 
 
+def _post_id_from_url(url: str) -> Optional[str]:
+    """Extract the status id from a post permalink (used to scope article
+    selection — on a REPLY permalink the first article is the PARENT post,
+    so first-article scoping counts/reads the wrong post)."""
+    m = re.search(r"/status/(\d+)", url or "")
+    return m.group(1) if m else None
+
+
+# Post-navigation render wait: X hydrates client-side; a fixed sleep races it
+# (caught live during M4b verification — a 4s sleep evaluated a blank page).
+# Poll until the scoped answer exists or the deadline passes.
+_RENDER_TIMEOUT_S = 8.0
+_RENDER_POLL_INTERVAL_S = 1.0
+
+
+async def _poll_until_present(factory) -> Optional[Any]:
+    """Poll factory() until it returns a non-None answer or deadline.
+    factory returns None while the page hasn't rendered the answer."""
+    import time
+    deadline = time.monotonic() + _RENDER_TIMEOUT_S
+    while True:
+        value = await factory()
+        if value is not None:
+            return value
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_RENDER_POLL_INTERVAL_S)
+
+
 async def verify_post_text(broker: Any, posted_url: str, normalized: str) -> bool:
-    """Navigate to the posted URL and compare its tweetText (whitespace-
-    collapsed) against the submitted text. False on any failure."""
+    """Navigate to the posted URL and compare ITS article's tweetText
+    (whitespace-collapsed) against the submitted text. The article is scoped
+    by the posted status id — not the first article, which on a reply
+    permalink is the parent. Polls until the article renders or deadline.
+    False on any failure."""
     try:
-        if hasattr(broker, "_sb"):
-            nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
-            if not nav.ok:
-                return False
-            await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
-            expr = (
-                '(function(){var t=document.querySelector("[data-testid=\'tweetText\']");'
-                'return t?t.innerText:null;})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                text = result.data.get("result", {}).get("value") or ""
-                return normalize_for_compare(text) == normalize_for_compare(normalized)
-        return False
+        post_id = _post_id_from_url(posted_url)
+        if post_id is None or not hasattr(broker, "_sb"):
+            return False
+        nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return False
+        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        expr = (
+            '(function(){'
+            f'var arts=document.querySelectorAll("article");'
+            f'for(var i=0;i<arts.length;i++){{'
+            f'var link=arts[i].querySelector("a[href*=\'/status/{post_id}\']");'
+            f'if(!link)continue;'
+            f'var t=arts[i].querySelector("[data-testid=\'tweetText\']");'
+            f'return t?t.innerText:null;}}'
+            f'return null;}})()'
+        )
+
+        async def _read() -> Optional[str]:
+            r = await cdp.evaluate(expr)
+            if not r.ok or "exceptionDetails" in r.data:
+                return None
+            return r.data.get("result", {}).get("value")
+
+        # None while the page hasn't rendered the article; empty string only
+        # once the element exists (definitive — a text post can be empty-text).
+        text = await _poll_until_present(_read)
+        if text is None:
+            return False
+        return normalize_for_compare(text) == normalize_for_compare(normalized)
     except Exception:  # noqa: BLE001
         return False
 
 
 async def count_post_media(broker: Any, posted_url: str) -> int:
-    """Count tweetPhoto elements on the posted page (article-scoped where
-    available). 0 on any failure — callers treat 0 as unverified, honestly."""
+    """Count tweetPhoto elements in the posted status's OWN article (scoped
+    by the status id — the first article on a reply permalink is the parent).
+    Polls until the article renders and photos load, or deadline. 0 on any
+    failure — callers treat 0 as unverified, honestly."""
     try:
-        if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
-            expr = (
-                '(function(){'
-                'var art=document.querySelector("article");'
-                'if(!art)return 0;'
-                'return art.querySelectorAll("[data-testid=\'tweetPhoto\']").length;'
-                '})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                return result.data.get("result", {}).get("value", 0)
-        return 0
+        post_id = _post_id_from_url(posted_url)
+        if post_id is None or not hasattr(broker, "_sb"):
+            return 0
+        nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return 0
+        cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+        expr = (
+            '(function(){'
+            'var arts=document.querySelectorAll("article");'
+            'for(var i=0;i<arts.length;i++){'
+            f'var link=arts[i].querySelector("a[href*=\'/status/{post_id}\']");'
+            'if(!link)continue;'
+            'return arts[i].querySelectorAll("[data-testid=\'tweetPhoto\']").length;}'
+            'return null;})()'
+        )
+
+        async def _read() -> Optional[int]:
+            r = await cdp.evaluate(expr)
+            if not r.ok or "exceptionDetails" in r.data:
+                return None
+            value = r.data.get("result", {}).get("value")
+            if value is None:
+                return None        # article not rendered yet — keep polling
+            if value == 0:
+                return None        # photos may still be loading — keep polling
+            return int(value)
+
+        count = await _poll_until_present(_read)
+        return int(count) if count is not None else 0
     except Exception:  # noqa: BLE001
         return 0
 

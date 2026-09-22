@@ -17,10 +17,9 @@
 
 ## Current version
 
-**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 237 tests, 32 commits.
-ALL P0 + P1 review items landed 2026-09-22 and live-validated (hydration,
-media normalization, registry gate, kernel hygiene, fixture post, health
-probes). M4b is next. See History.
+**v0.2 (M1-M4b complete; M4c next)** — 18 capabilities, 247 tests, 35 commits.
+All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
+(quote_multi_image) is next. See History.
 
 ## Architecture invariants (do not violate)
 
@@ -95,10 +94,10 @@ probes). M4b is next. See History.
 | **v0.2 M3a** | reply_photo (target-scoped + media, composition atomicity) | **DONE** (verification gap flagged) |
 | **v0.2 M3b** | quote_photo (dual attachment, identity-aware capture) | **LIVE-VERIFIED** |
 | **v0.2 M4a** | post_multi_image (ordered media-manifest transaction) | **LIVE-VERIFIED** + runtime tests |
-| **v0.2 M4b** | reply_multi_image | next |
+| **v0.2 M4b** | reply_multi_image (shared media-compose harness) | **LIVE-VERIFIED** + runtime tests |
 | **v0.2 M4c** | quote_multi_image | after M4b |
 
-## Capabilities (17)
+## Capabilities (18)
 
 | Capability | Tier | Status | Notes |
 |-----------|------|--------|-------|
@@ -119,6 +118,7 @@ probes). M4b is next. See History.
 | reply_photo | write | DONE | Reply posted, composition atomicity verified, URL capture gap |
 | quote_photo | write | LIVE-VERIFIED | Dual attachment (quote+media) verified separately, identity-aware capture |
 | post_multi_image | write | LIVE-VERIFIED | Ordered manifest, exact-count, abort-cleanup, media_batch_verified |
+| reply_multi_image | write | LIVE-VERIFIED | Shared harness, reply hook (target-first), thread-target verified, honest codes |
 
 ## Safety kernel
 
@@ -175,8 +175,10 @@ probes). M4b is next. See History.
 | `safety/text_normalize.py` | Deterministic text normalization + hash |
 | `safety/attachment.py` | Attachment model + media validation (SHA-256, MIME, EXIF) |
 | `safety/media_manifest.py` | Ordered media manifest + preflight |
+| `safety/media_compose.py` | Shared media-compose harness (M4a/M4b transaction, target-context hook) |
+| `safety/media_verify.py` | Shared post-submit verifiers (id-scoped article selection, render polling) |
 | `safety/post_submit.py` | Identity-aware post-submit verifier |
-| `capabilities/*.py` | 17 capability implementations |
+| `capabilities/*.py` | 18 capability implementations |
 
 ## Recent commits
 
@@ -232,7 +234,11 @@ probes). M4b is next. See History.
   declare themselves side-effect-free (`dry_run=True`) record NO dedupe key;
   a confirmed dry-run no longer blocks the same-text post_text for the TTL.
 
-- [ ] M4b reply_multi_image (ChatGPT decision: B-with-gate — shared harness, M4a runtime tests must be green first; ✅ done)
+- [x] ~~M4b reply_multi_image~~ — DONE 2026-09-22: shared harness extracted
+  (safety/media_compose.py — M4a delegates, tests unchanged, 237 green at the
+  refactor commit); reply_multi_image on it with the target-first hook; 10
+  runtime tests; live-verified (reply 2102493233989529629, thread-target
+  verified, media_count 2 after the verifier fix below).
 - [ ] M4c quote_multi_image
 - [x] ~~M4a runtime test gap (ChatGPT blocker)~~ — closed: 7 runtime tests added (attach-fail, count-mismatch, preview-not-ready, composer-mutation, kill-before-submit, transcoding-honest, rendered-order)
 - [ ] reply_photo URL capture gap (submit_clicked_verification_pending — identity-aware verifier should be retrofitted)
@@ -258,6 +264,19 @@ probes). M4b is next. See History.
 
 ## History
 
+- 2026-09-22 (g): M4b COMPLETE. Shared media-compose harness extracted
+  behavior-preservingly (neutrality gate: all 237 tests green with ZERO
+  test changes; M4a demonstrably delegates); reply_multi_image built on it
+  (action_type 'reply', target-first hook, thread-target verification,
+  honest result codes); 10 runtime tests (suite 247). LIVE: two-phase
+  reply with 2 images on the fixture post — posted, thread-target verified,
+  actor 'infaag|' in key, write facts journaled. Live run caught TWO shared-
+  verifier bugs: (1) first-article scoping — on a reply permalink the first
+  article is the PARENT (verifier read the wrong post; images were posted
+  fine — 2 tweetPhotos on the reply's article); (2) fixed-sleep hydration
+  race. Fixed: verifiers now scope by the posted status id and poll until
+  render; re-verified live read-only (text_verified=True, media_count=2).
+  The original run's honest mismatch result stands in the journal.
 - 2026-09-22 (f): P1 health probes fixed. Root cause doubled: probes ran
   BEFORE X's client-side render (everything false on a healthy session) AND
   inferred from the observe() snapshot. Now: broker.probe_selectors (new

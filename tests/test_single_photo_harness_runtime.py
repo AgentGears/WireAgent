@@ -16,15 +16,13 @@ import zlib
 from pathlib import Path
 from typing import Any, Optional
 
-import pytest
-
 import webwire.capabilities.post_photo as pp_mod
 import webwire.capabilities.quote_photo as qp_mod
 import webwire.capabilities.reply_photo as rp_mod
 from webwire.capabilities.post_photo import PostPhotoCapability
 from webwire.capabilities.quote_photo import QuotePhotoCapability
 from webwire.capabilities.reply_photo import ReplyPhotoCapability
-from webwire.envelope import ok_result, soft_failure
+from webwire.envelope import ok_result
 
 TARGET_URL = "https://x.com/infaag/status/2102451358305771541"
 TARGET_ID = "2102451358305771541"

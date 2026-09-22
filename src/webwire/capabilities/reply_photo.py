@@ -31,12 +31,16 @@ from webwire.safety.attachment import validate_media_file
 from webwire.safety.media_compose import MediaComposeSpec, PostSubmitHooks, run_media_compose
 from webwire.safety.media_verify import (
     count_post_media as _count_post_media,
+)
+from webwire.safety.media_verify import (
     verify_post_text as _verify_text,
+)
+from webwire.safety.media_verify import (
     verify_reply_in_thread as _verify_reply_in_thread,
 )
 from webwire.safety.post_submit import capture_pre_submit_ids
-from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.text_normalize import normalize_text, text_hash
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +53,7 @@ async def _capture_reply_url(broker: Any, target_post_id: str):
     inner step."""
     try:
         if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            cdp = broker._sb._controller._cdp
             expr = (
                 '(function(){'
                 'var links=document.querySelectorAll("a[href*=\'/status/\']");'
@@ -91,7 +95,7 @@ class ReplyPhotoCapability:
     name = "reply_photo"
 
     @property
-    def tier(self):  # type: ignore[no-untyped-def]
+    def tier(self):
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 

@@ -17,7 +17,7 @@
 
 ## Current version
 
-**v0.2 (M1-M4b complete; M4c next)** — 18 capabilities, 247 tests, 35 commits.
+**v0.2 (M1-M4c complete — M4c full live post pending budget window)** — 19 capabilities, 256 tests, 37 commits.
 All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 (quote_multi_image) is next. See History.
 
@@ -95,9 +95,9 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 | **v0.2 M3b** | quote_photo (dual attachment, identity-aware capture) | **LIVE-VERIFIED** |
 | **v0.2 M4a** | post_multi_image (ordered media-manifest transaction) | **LIVE-VERIFIED** + runtime tests |
 | **v0.2 M4b** | reply_multi_image (shared media-compose harness) | **LIVE-VERIFIED** + runtime tests |
-| **v0.2 M4c** | quote_multi_image | after M4b |
+| **v0.2 M4c** | quote_multi_image (shared harness, quote hook) | **CODE COMPLETE + gates live-proven**; full live post pending quote budget window (history h) |
 
-## Capabilities (18)
+## Capabilities (19)
 
 | Capability | Tier | Status | Notes |
 |-----------|------|--------|-------|
@@ -119,6 +119,7 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 | quote_photo | write | LIVE-VERIFIED | Dual attachment (quote+media) verified separately, identity-aware capture |
 | post_multi_image | write | LIVE-VERIFIED | Ordered manifest, exact-count, abort-cleanup, media_batch_verified |
 | reply_multi_image | write | LIVE-VERIFIED | Shared harness, reply hook (target-first), thread-target verified, honest codes |
+| quote_multi_image | write | CODE COMPLETE + gates live-proven | Shared harness, quote hook; dual attachment honest; full live post pending budget (history h) |
 
 ## Safety kernel
 
@@ -264,6 +265,19 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-22 (h): M4c CODE COMPLETE (commit 4036cb3; harness quote-hook extension
+  additive, 247-green neutrality; 9 runtime tests; suite 256). LIVE attempt:
+  the exact-count gate ABORTED CLEANLY (expected 1 after upload 1, got 2;
+  public_side_effect=false, nothing posted) — M4c was the first multi-image
+  flow inside a QUOTE composer, and count_attachments over-counted there:
+  the quote composer renders the QUOTED AUTHOR'S AVATAR (pbs.twimg.com img)
+  inside the attachments container alongside the blob: upload (diagnosed
+  live via structure+src dumps, quote vs reply). FIX: count_attachments now
+  counts blob: uploads first (legacy img-counts as fallback). Live-proven
+  against the exact failing gate: quote composer 1→2 per upload, reply 1.
+  FULL two-phase public quote DEFERRED: the failed attempt consumed 2 of
+  the 3-per-hour quote budget; a full rerun needs 2 — run it when the
+  window frees (~1h). Diagnostics: scripts/diag_m4c_*.py.
 - 2026-09-22 (g): M4b COMPLETE. Shared media-compose harness extracted
   behavior-preservingly (neutrality gate: all 237 tests green with ZERO
   test changes; M4a demonstrably delegates); reply_multi_image built on it

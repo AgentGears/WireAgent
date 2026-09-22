@@ -617,19 +617,25 @@ class WriteBroker:
             return r
         try:
             cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
-            # X renders uploaded images in [data-testid='attachments'] or as
-            # img elements with blob: src inside the compose area. Count them.
+            # Count UPLOADED images. Uploads render with blob: src URLs; that
+            # is the only reliable upload signal across composer types — the
+            # QUOTE composer additionally renders the quoted author's avatar
+            # (a pbs.twimg.com img) inside the same attachments container,
+            # which raw img counts double (caught live during M4c: "expected
+            # 1 after upload 1, got 2" — clean abort, nothing posted).
             expr = (
                 '(function(){'
-                # Method 1: count tweetPhoto-style previews in attachments container
+                # Method 1: blob: uploads inside the attachments container.
                 'var att=document.querySelector("[data-testid=\'attachments\']");'
-                'if(att){var imgs=att.querySelectorAll("img");return imgs.length;}'
-                # Method 2: count blob: images in the primary column compose area
-                'var compose=document.querySelector("[data-testid=\'tweetTextarea_0\']");'
-                'if(compose){var container=compose.closest("form")||compose.closest("div");'
-                'if(container){var blobs=container.querySelectorAll("img[src*=\'blob:\']");'
-                'if(blobs.length>0)return blobs.length;}}'
-                # Method 3: count any img in the compose form
+                'if(att){var b=att.querySelectorAll("img[src*=\'blob:\']").length;'
+                'if(b>0)return b;}'
+                # Method 2: blob: uploads anywhere on the compose surface.
+                'var any=document.querySelectorAll("img[src*=\'blob:\']").length;'
+                'if(any>0)return any;'
+                # Method 3 (legacy fallback): raw imgs in the attachments tray
+                # (correct in post/reply composers, over-counts in quote).
+                'if(att){var imgs=att.querySelectorAll("img");if(imgs.length>0)return imgs.length;}'
+                # Method 4 (legacy fallback): any img in the compose form.
                 'var form=document.querySelector("form");'
                 'if(form){return form.querySelectorAll("img").length;}'
                 'return 0;'

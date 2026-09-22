@@ -1,44 +1,97 @@
 """reply_photo capability — reply to a post with text + an image (v0.2 M3a).
 
-Combines:
-- reply_post's target-scoped flow (open reply on the target article)
-- post_photo's media pipeline (validate, attach, state machine, verify)
+M4b-extraction follow-up (2026-09-23, C4): execute() DELEGATES to the shared
+harness `safety.media_compose.run_media_compose` with the REPLY context hook
+(target opens BEFORE media — the M3a lesson is the hook contract) and a
+single-item manifest, exactly like reply_multi_image. The single-item path
+GAINS the exact-count gate it previously lacked (accepted tightening).
 
-ChatGPT's M3 concern: "Reply target lost when the media picker changes compose
-state." Mitigated by: open reply on target FIRST, then attach media, then
-re-verify composer text before submit (composition atomicity).
+Post-harness: thread-aware TARGET verification (the reply must appear in the
+target's thread) via the shared verify_reply_in_thread, reported honestly.
 
 Result codes:
-- reply_photo_posted_and_target_verified (full success)
-- reply_photo_posted_text_verified_target_unverified (text ok, target not verified)
-- pre_submit_mismatch, killed_before_submit, attachment_upload_failed, etc.
+- reply_photo_posted_and_target_verified (text + media + thread target)
+- reply_photo_posted_text_verified_media_unverified
+- degraded submit_clicked_verification_pending / posted_url_captured_...
+- target_not_found_before_reply, attachment_* / pre_submit_mismatch /
+  killed_before_submit (harness gates)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any, Optional
 
 from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
-from webwire.safety.attachment import file_sha256, validate_media_file
-from webwire.safety.text_normalize import normalize_text, text_hash
-from webwire.safety.write_kernel import PreviewResult
+from webwire.safety.attachment import validate_media_file
+from webwire.safety.media_compose import MediaComposeSpec, PostSubmitHooks, run_media_compose
+from webwire.safety.media_verify import (
+    count_post_media as _count_post_media,
+    verify_post_text as _verify_text,
+    verify_reply_in_thread as _verify_reply_in_thread,
+)
+from webwire.safety.post_submit import capture_pre_submit_ids
+from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
+from webwire.safety.write_kernel import PreviewResult, WriteCapability
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["ReplyPhotoCapability"]
 
 
+async def _capture_reply_url(broker: Any, target_post_id: str):
+    """Find the first non-target status href on the page (the reply).
+    Historical capture method, preserved verbatim as the harness adapter's
+    inner step."""
+    try:
+        if hasattr(broker, "_sb"):
+            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
+            expr = (
+                '(function(){'
+                'var links=document.querySelectorAll("a[href*=\'/status/\']");'
+                'var seen={};'
+                'for(var i=0;i<links.length;i++){'
+                'var href=links[i].getAttribute("href");'
+                'if(href&&href.indexOf("/status/")>=0&&!seen[href]){'
+                'seen[href]=1;var m=href.match(/\\/status\\/(\\d+)/);'
+                f'if(m&&m[1]!=="{target_post_id}"){{'
+                'return JSON.stringify({{href:href,id:m[1]}});}}}}}}'
+                'return null;})()'
+            )
+            result = await cdp.evaluate(expr)
+            if result.ok and "exceptionDetails" not in result.data:
+                raw = result.data.get("result", {}).get("value")
+                if raw:
+                    data = json.loads(raw)
+                    href = data.get("href", "")
+                    pid = data.get("id")
+                    full_url = f"https://x.com{href}" if href.startswith("/") else href
+                    return full_url, pid
+        return None, None
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+async def _capture_adapter(broker: Any, pre_ids: set, exclude_ids=None):
+    """Harness-shaped capture adapter: historical reply-URL capture."""
+    target = next(iter(exclude_ids or {""}))
+    await asyncio.sleep(5)
+    url, pid = await _capture_reply_url(broker, target)
+    return pid, url
+
+
 class ReplyPhotoCapability:
-    """Reply to a post with text + image. PUBLIC_CONTENT_IRREVERSIBLE + target binding + media."""
+    """Reply to a post with text + image. PUBLIC_CONTENT_IRREVERSIBLE +
+    target binding + media."""
 
     name = "reply_photo"
 
     @property
-    def tier(self):
+    def tier(self):  # type: ignore[no-untyped-def]
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -55,9 +108,8 @@ class ReplyPhotoCapability:
         attachment = validate_media_file(image_path)
 
         meta, comp = DEFAULT_REGISTRY.require("reply")
-        # action_type is the BASE action "reply" (P0 rate-limit fix, 2026-09-22):
-        # media replies share the reply budget. Media identity lives in
-        # semantic_variant (text hash + attachment digest).
+        # action_type is the BASE action "reply" (P0 rate-limit fix): media
+        # replies share the reply budget. Media identity lives in the variant.
         return WriteIntent(
             action_type="reply",
             target_type="post",
@@ -102,100 +154,65 @@ class ReplyPhotoCapability:
         )
 
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        """Target-scoped reply with photo. Composition atomicity enforced."""
+        """Delegate to the shared harness (reply hook, single-item manifest),
+        then verify the thread-target relationship and shape the result."""
         normalized = intent.payload.get("normalized_text", "")
         target_post_id = intent.payload.get("target_post_id", "")
         post_url = intent.payload.get("post_url", "")
-        image_path = intent.payload.get("image_path", "")
-        expected_sha256 = intent.payload.get("image_sha256", "")
 
-        # Recompute digest before upload (concern #1).
-        try:
-            current_sha256 = file_sha256(image_path)
-        except OSError as exc:
-            return _failure("media_changed_after_confirmation", f"Cannot read file: {exc!r}")
-        if current_sha256 != expected_sha256:
-            return _failure("media_changed_after_confirmation", "File changed since confirmation.")
+        spec = MediaComposeSpec(
+            normalized_text=normalized,
+            items=[{
+                "index": 0,
+                "source_path": intent.payload.get("image_path", ""),
+                "sha256": intent.payload.get("image_sha256", ""),
+            }],
+            expected_count=1,
+            target_post_url=post_url,
+            target_post_id=target_post_id,
+            context="reply",
+            exclude_ids=frozenset({target_post_id} if target_post_id else ()),
+        )
+        hooks = PostSubmitHooks(
+            capture_pre_submit_ids=capture_pre_submit_ids,
+            capture_new_post_id=_capture_adapter,
+            verify_text=_verify_text,
+            count_media=_count_post_media,
+        )
+        r = await run_media_compose(broker, spec, hooks)
+        if not r.ok:
+            return r
 
-        # Step 1: open reply on target-scoped article (target binding).
-        open_r = await broker.open_reply_on_target(post_url, target_post_id)
-        if not open_r.ok:
-            return _failure("target_not_found_before_reply",
-                            f"Could not open reply on target: {open_r.error}")
+        outcome = (r.data or {}).get("outcome", {})
+        posted_url = outcome.get("posted_url")
+        posted_post_id = outcome.get("posted_post_id")
+        text_ok = outcome.get("text_verified", False)
+        media_count = outcome.get("media_count", 0)
 
-        # Step 2: fill reply text.
-        fill_r = await broker.fill_reply_composer(normalized)
-        if not fill_r.ok:
-            return _failure("pre_submit_mismatch", f"Could not fill reply composer: {fill_r.error}")
+        # Thread-aware target verification (Phase 4c-v semantics).
+        thread = await _verify_reply_in_thread(
+            broker, post_url, target_post_id, posted_post_id, normalized,
+        )
 
-        # Step 3: attach media.
-        attach_r = await broker.attach_media(image_path)
-        if not attach_r.ok:
-            return _failure("attachment_upload_failed", f"Could not attach media: {attach_r.error}")
-
-        # Step 4: verify attachment ready.
-        ready_r = await broker.verify_attachment_ready()
-        if not ready_r.ok:
-            return _failure("attachment_not_ready", f"Attachment not ready: {ready_r.error}")
-
-        # Step 5: re-verify composer text (composition atomicity — media may have
-        # changed compose state). ChatGPT's M3 concern: "Reply target lost when
-        # the media picker changes compose state."
-        read_r = await broker.read_composer_text()
-        if not read_r.ok:
-            return _failure("pre_submit_mismatch", "Could not read composer text.")
-        composer_text = (read_r.data or {}).get("composer_text", "")
-        if _normalize_for_compare(composer_text) != _normalize_for_compare(normalized):
-            return _failure("pre_submit_mismatch",
-                            "Composer text mismatch after media attach. NO submit.")
-
-        # Step 6: final kill check.
-        if hasattr(broker, "_kill") and broker._kill and broker._kill.tripped():
-            return _failure("killed_before_submit", "Kill switch tripped. NO submit clicked.")
-
-        # Step 7: submit.
-        submit_r = await broker.click_submit()
-        if not submit_r.ok:
-            return _degraded("submit_clicked_verification_pending",
-                             "Submit clicked but result uncertain.",
-                             normalized, target_post_id)
-
-        # Step 8: capture posted reply URL (non-target status href).
-        await asyncio.sleep(5)
-        posted_url, posted_post_id = await _capture_reply_url(broker, target_post_id)
-
-        if not posted_url:
-            return _degraded("submit_clicked_verification_pending",
-                             "Submit clicked but reply URL not captured.",
-                             normalized, target_post_id)
-
-        # Step 9: thread-aware verification (text + media + target relationship).
-        await asyncio.sleep(2)
-        verified = await _verify_reply_in_thread(broker, post_url, target_post_id, posted_post_id, normalized)
-
-        if not verified["found"]:
-            return _degraded("posted_url_captured_verification_failed",
-                             f"Reply {posted_post_id} not found in thread.",
-                             normalized, target_post_id, posted_url, posted_post_id)
-
-        # Check attachment on the reply.
-        media_verified = await _verify_attachment_on_post(broker, posted_url)
-
-        if not verified["text_matches"]:
-            return _degraded("posted_url_captured_verification_failed",
-                             "Reply text mismatch.",
-                             normalized, target_post_id, posted_url, posted_post_id)
+        media_verified = media_count >= 1
+        if text_ok and media_verified and thread["found"] and thread["text_matches"]:
+            result_code = "reply_photo_posted_and_target_verified"
+        elif text_ok and media_verified:
+            result_code = "reply_photo_posted_text_verified_media_unverified"
+        else:
+            result_code = "posted_url_captured_verification_failed"
 
         return ok_result(data={
-            "result": "reply_photo_posted_and_target_verified" if media_verified
-                      else "reply_photo_posted_text_verified_media_unverified",
+            "result": result_code,
             "posted_url": posted_url,
             "posted_post_id": posted_post_id,
             "target_post_id": target_post_id,
             "submitted_text": normalized,
             "media_attachment_verified": media_verified,
+            "target_verified_in_thread": thread["found"] and thread["text_matches"],
+            "target_verified_by": "thread_readback" if thread["found"] else "execution_path",
             "source_byte_equivalence_verified": False,
-            "verified_by": "thread_readback" if verified["found"] else "execution_path",
+            "verified_by": "thread_readback" if thread["found"] else "execution_path",
             "write_tier": "public_content_irreversible",
             "supports_compensation": False,
             "residual_side_effects": [
@@ -208,138 +225,3 @@ class ReplyPhotoCapability:
 
     async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
         return ok_result(data={"verified": True, "note": "Inline verification in execute."})
-
-
-# ---------------------------------------------------------------------------
-# Helpers (shared patterns from reply_post + post_photo)
-# ---------------------------------------------------------------------------
-
-def _normalize_for_compare(text: str) -> str:
-    import re as _re
-    return _re.sub(r"\s+", " ", text.strip())
-
-
-def _failure(code: str, message: str) -> ActionResult:
-    from super_browser.results import ActionError, ErrorCategory, action_result
-    r = action_result(ok=False, error=ActionError(
-        ErrorCategory.SECURITY, message, recoverable=False,
-    ))
-    r.data = {"result": code, "message": message, "public_side_effect": False}
-    return r
-
-
-def _degraded(code: str, message: str, normalized: str,
-              target_post_id: Optional[str] = None, posted_url: Optional[str] = None,
-              posted_post_id: Optional[str] = None) -> ActionResult:
-    from super_browser.results import ActionError, ErrorCategory, action_result
-    r = action_result(ok=False, error=ActionError(
-        ErrorCategory.UNKNOWN, message, recoverable=False,
-    ))
-    r.data = {
-        "result": code, "message": message, "public_side_effect": True,
-        "submitted_text": normalized, "target_post_id": target_post_id,
-        "posted_url": posted_url, "posted_post_id": posted_post_id,
-        "supports_compensation": False,
-    }
-    return r
-
-
-async def _capture_reply_url(broker: Any, target_post_id: str) -> tuple[Optional[str], Optional[str]]:
-    """Find the first non-target status href on the page (the reply)."""
-    try:
-        if hasattr(broker, "_sb"):
-            import json
-            cdp = broker._sb._controller._cdp
-            expr = (
-                '(function(){'
-                'var links=document.querySelectorAll("a[href*=\'/status/\']");'
-                'var seen={};'
-                'for(var i=0;i<links.length;i++){'
-                'var href=links[i].getAttribute("href");'
-                'if(href&&href.indexOf("/status/")>=0&&!seen[href]){'
-                'seen[href]=1;var m=href.match(/\\/status\\/(\\d+)/);'
-                f'if(m&&m[1]!=="{target_post_id}"){{'
-                'return JSON.stringify({{href:href,id:m[1]}});}}}}}}'
-                'return null;})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                raw = result.data.get("result", {}).get("value")
-                if raw:
-                    data = json.loads(raw)
-                    href = data.get("href", "")
-                    pid = data.get("id")
-                    full_url = f"https://x.com{href}" if href.startswith("/") else href
-                    return full_url, pid
-        return None, None
-    except Exception:  # noqa: BLE001
-        return None, None
-
-
-async def _verify_reply_in_thread(
-    broker: Any, parent_post_url: str, target_post_id: str,
-    posted_reply_id: Optional[str], normalized_text: str,
-) -> dict:
-    """Thread-aware reply verification (same as reply_post Phase 4c-v)."""
-    try:
-        import asyncio
-        import re
-        if not hasattr(broker, "_sb"):
-            return {"found": False, "text_matches": False}
-
-        nav = await broker._sb.navigate(parent_post_url, wait_until="domcontentloaded")
-        if not nav.ok:
-            return {"found": False, "text_matches": False}
-        await asyncio.sleep(4)
-
-        cdp = broker._sb._controller._cdp
-        expr = (
-            "(function(){"
-            "var arts=document.querySelectorAll('article');"
-            "return Array.from(arts).map(function(a){"
-            "var link=a.querySelector(\"a[href*='/status/']\");"
-            "var text=a.querySelector(\"[data-testid='tweetText']\");"
-            "return {href: link?link.getAttribute('href'):null,"
-            "text: text?text.innerText:null};});"
-            "})()"
-        )
-        result = await cdp.evaluate(expr)
-        if not result.ok or "exceptionDetails" in result.data:
-            return {"found": False, "text_matches": False}
-
-        articles = result.data.get("result", {}).get("value") or []
-        for art in articles:
-            href = art.get("href") or ""
-            m = re.search(r"/status/(\d+)", href)
-            if m and m.group(1) == posted_reply_id:
-                reply_text = art.get("text") or ""
-                matches = _normalize_for_compare(reply_text) == _normalize_for_compare(normalized_text)
-                return {"found": True, "text_matches": matches}
-
-        return {"found": False, "text_matches": False}
-    except Exception:  # noqa: BLE001
-        return {"found": False, "text_matches": False}
-
-
-async def _verify_attachment_on_post(broker: Any, posted_url: str) -> bool:
-    """Verify the posted reply has an image attachment."""
-    try:
-        import asyncio
-        if hasattr(broker, "_sb"):
-            nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
-            if not nav.ok:
-                return False
-            await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp
-            expr = (
-                '(function(){'
-                'var photo=document.querySelector("[data-testid=\'tweetPhoto\']");'
-                'return photo?"present":"absent";'
-                '})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                return result.data.get("result", {}).get("value") == "present"
-        return False
-    except Exception:  # noqa: BLE001
-        return False

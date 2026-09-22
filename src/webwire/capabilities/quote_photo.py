@@ -1,31 +1,36 @@
 """quote_photo capability — quote a post with text + an image (v0.2 M3b).
 
-Combines:
-- quote_post's target-scoped flow (repost→Quote menu on the target article)
-- post_photo's media pipeline (validate, attach, state machine, verify)
+M4b-extraction follow-up (2026-09-23, C4): execute() DELEGATES to the shared
+harness `safety.media_compose.run_media_compose` with the QUOTE context hook
+(quote context opens BEFORE media) and a single-item manifest, exactly like
+quote_multi_image. The single-item path GAINS the exact-count gate it
+previously lacked (accepted tightening).
 
-ChatGPT's M3b caution: quote_photo has TWO INDEPENDENT attachments:
-1. The quoted-target attachment (the post being quoted)
-2. The uploaded-media attachment (the user's image)
-These must be verified and reported SEPARATELY — not collapsed into one flag.
+ChatGPT's M3b caution carried over: TWO INDEPENDENT attachments — the
+quoted-target attachment and the uploaded media — verified and reported
+SEPARATELY. Quote attachment by execution path (X's DOM does not expose the
+quoted target); media by id-scoped DOM count.
 
-Also uses the identity-aware post-submit verifier (M3 tranche requirement):
-record pre-submit IDs → submit → poll for new ID → exclude known IDs.
+Also uses the identity-aware post-submit verifier (M3 tranche requirement).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 from typing import Any, Optional
 
 from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
-from webwire.safety.attachment import file_sha256, validate_media_file
-from webwire.safety.post_submit import capture_new_post_id, capture_pre_submit_ids
-from webwire.safety.text_normalize import normalize_text, text_hash
-from webwire.safety.write_kernel import PreviewResult
+from webwire.safety.attachment import validate_media_file
+from webwire.safety.media_compose import MediaComposeSpec, PostSubmitHooks, run_media_compose
+from webwire.safety.media_verify import (
+    count_post_media as _count_post_media,
+    verify_post_text as _verify_text,
+)
+from webwire.safety.post_submit import capture_pre_submit_ids, capture_new_post_id
+from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
+from webwire.safety.write_kernel import PreviewResult, WriteCapability
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +43,7 @@ class QuotePhotoCapability:
     name = "quote_photo"
 
     @property
-    def tier(self):
+    def tier(self):  # type: ignore[no-untyped-def]
         from webwire.capabilities.base import CapabilityTier
         return CapabilityTier.WRITE
 
@@ -55,9 +60,8 @@ class QuotePhotoCapability:
         attachment = validate_media_file(image_path)
 
         meta, comp = DEFAULT_REGISTRY.require("quote")
-        # action_type is the BASE action "quote" (P0 rate-limit fix, 2026-09-22):
-        # media quotes share the quote budget. Media identity lives in
-        # semantic_variant (text hash + attachment digest).
+        # action_type is the BASE action "quote" (P0 rate-limit fix): media
+        # quotes share the quote budget. Media identity lives in the variant.
         return WriteIntent(
             action_type="quote",
             target_type="post",
@@ -102,83 +106,44 @@ class QuotePhotoCapability:
         )
 
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        """Target-scoped quote with photo. Dual attachment (quote + media) verified separately."""
+        """Delegate to the shared harness (quote hook, single-item manifest),
+        then report the dual attachment honestly."""
         normalized = intent.payload.get("normalized_text", "")
         target_post_id = intent.payload.get("target_post_id", "")
         post_url = intent.payload.get("post_url", "")
-        image_path = intent.payload.get("image_path", "")
-        expected_sha256 = intent.payload.get("image_sha256", "")
 
-        # Recompute digest before upload.
-        try:
-            current_sha256 = file_sha256(image_path)
-        except OSError as exc:
-            return _failure("media_changed_after_confirmation", f"Cannot read file: {exc!r}")
-        if current_sha256 != expected_sha256:
-            return _failure("media_changed_after_confirmation", "File changed since confirmation.")
-
-        # Step 1: open quote on target-scoped article.
-        open_r = await broker.open_quote_on_target(post_url, target_post_id)
-        if not open_r.ok:
-            return _failure("quote_action_not_available",
-                            f"Could not open quote on target: {open_r.error}")
-
-        # Step 2: fill quote text.
-        fill_r = await broker.fill_quote_composer(normalized)
-        if not fill_r.ok:
-            return _failure("pre_submit_mismatch", f"Could not fill quote composer: {fill_r.error}")
-
-        # Step 3: attach media.
-        attach_r = await broker.attach_media(image_path)
-        if not attach_r.ok:
-            return _failure("attachment_upload_failed", f"Could not attach media: {attach_r.error}")
-
-        # Step 4: verify attachment ready.
-        ready_r = await broker.verify_attachment_ready()
-        if not ready_r.ok:
-            return _failure("attachment_not_ready", f"Attachment not ready: {ready_r.error}")
-
-        # Step 5: re-verify composer text (composition atomicity — ChatGPT's M3b caution:
-        # "The media picker could preserve text while displacing the quote composition context").
-        read_r = await broker.read_composer_text()
-        if not read_r.ok:
-            return _failure("pre_submit_mismatch", "Could not read composer text.")
-        composer_text = (read_r.data or {}).get("composer_text", "")
-        if _normalize_for_compare(composer_text) != _normalize_for_compare(normalized):
-            return _failure("pre_submit_mismatch",
-                            "Composer text mismatch after media attach. NO submit.")
-
-        # Step 6: identity-aware pre-submit capture.
-        pre_submit_ids = await capture_pre_submit_ids(broker)
-
-        # Step 7: final kill check.
-        if hasattr(broker, "_kill") and broker._kill and broker._kill.tripped():
-            return _failure("killed_before_submit", "Kill switch tripped. NO submit clicked.")
-
-        # Step 8: submit.
-        submit_r = await broker.click_submit()
-        if not submit_r.ok:
-            return _degraded("submit_clicked_verification_pending",
-                             "Submit clicked but result uncertain.",
-                             normalized, target_post_id)
-
-        # Step 9: identity-aware post-submit capture (M3 tranche requirement).
-        await asyncio.sleep(3)
-        posted_post_id, posted_url = await capture_new_post_id(
-            broker, pre_submit_ids, exclude_ids={target_post_id},
+        spec = MediaComposeSpec(
+            normalized_text=normalized,
+            items=[{
+                "index": 0,
+                "source_path": intent.payload.get("image_path", ""),
+                "sha256": intent.payload.get("image_sha256", ""),
+            }],
+            expected_count=1,
+            target_post_url=post_url,
+            target_post_id=target_post_id,
+            context="quote",
+            exclude_ids=frozenset({target_post_id} if target_post_id else ()),
         )
+        hooks = PostSubmitHooks(
+            capture_pre_submit_ids=capture_pre_submit_ids,
+            capture_new_post_id=capture_new_post_id,
+            verify_text=_verify_text,
+            count_media=_count_post_media,
+        )
+        r = await run_media_compose(broker, spec, hooks)
+        if not r.ok:
+            return r
 
-        if not posted_post_id:
-            return _degraded("submit_clicked_verification_pending",
-                             "Submit clicked but no new post ID captured.",
-                             normalized, target_post_id)
+        outcome = (r.data or {}).get("outcome", {})
+        posted_url = outcome.get("posted_url")
+        posted_post_id = outcome.get("posted_post_id")
+        text_ok = outcome.get("text_verified", False)
+        media_count = outcome.get("media_count", 0)
 
-        # Step 10: dual verification — text + quote attachment + media attachment.
-        await asyncio.sleep(3)
-        text_ok = await _verify_text(broker, posted_url, normalized)
-        media_ok = await _verify_media(broker, posted_url)
-
-        # Quote attachment: verified by execution path (X doesn't expose quote target in DOM).
+        media_ok = media_count >= 1
+        # Quote attachment: verified by execution path (X doesn't expose the
+        # quote target in the DOM) — stated, never overstated.
         quote_attachment_verified = True  # open_quote_on_target succeeded (target-scoped)
 
         result_code = "quote_photo_posted_and_target_verified"
@@ -212,78 +177,3 @@ class QuotePhotoCapability:
 
     async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
         return ok_result(data={"verified": True, "note": "Inline verification in execute."})
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _normalize_for_compare(text: str) -> str:
-    import re as _re
-    return _re.sub(r"\s+", " ", text.strip())
-
-
-def _failure(code: str, message: str) -> ActionResult:
-    from super_browser.results import ActionError, ErrorCategory, action_result
-    r = action_result(ok=False, error=ActionError(
-        ErrorCategory.SECURITY, message, recoverable=False,
-    ))
-    r.data = {"result": code, "message": message, "public_side_effect": False}
-    return r
-
-
-def _degraded(code: str, message: str, normalized: str,
-              target_post_id: Optional[str] = None, posted_url: Optional[str] = None,
-              posted_post_id: Optional[str] = None) -> ActionResult:
-    from super_browser.results import ActionError, ErrorCategory, action_result
-    r = action_result(ok=False, error=ActionError(
-        ErrorCategory.UNKNOWN, message, recoverable=False,
-    ))
-    r.data = {
-        "result": code, "message": message, "public_side_effect": True,
-        "submitted_text": normalized, "target_post_id": target_post_id,
-        "posted_url": posted_url, "posted_post_id": posted_post_id,
-        "supports_compensation": False,
-    }
-    return r
-
-
-async def _verify_text(broker: Any, posted_url: Optional[str], normalized: str) -> bool:
-    """Verify the posted quote's text matches."""
-    try:
-        if hasattr(broker, "_sb"):
-            nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
-            if not nav.ok:
-                return False
-            await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp
-            expr = (
-                '(function(){var t=document.querySelector("[data-testid=\'tweetText\']");'
-                'return t?t.innerText:null;})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                text = result.data.get("result", {}).get("value") or ""
-                return _normalize_for_compare(text) == _normalize_for_compare(normalized)
-        return False
-    except Exception:  # noqa: BLE001
-        return False
-
-
-async def _verify_media(broker: Any, posted_url: Optional[str]) -> bool:
-    """Verify the posted quote has an image attachment."""
-    try:
-        if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp
-            expr = (
-                '(function(){'
-                'var photo=document.querySelector("[data-testid=\'tweetPhoto\']");'
-                'return photo?"present":"absent";'
-                '})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                return result.data.get("result", {}).get("value") == "present"
-        return False
-    except Exception:  # noqa: BLE001
-        return False

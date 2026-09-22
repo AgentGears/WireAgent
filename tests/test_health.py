@@ -55,7 +55,11 @@ class _FakeBroker:
     async def probe_selectors(self, specs: dict[str, list[str]]) -> Any:
         if not self._probe_ok:
             return soft_failure("cdp unavailable (simulated)")
-        return ok_result(data={"probes": dict(self._dom), "count": len(self._dom)})
+        # Answer per requested spec: overrides from self._dom, absent keys True.
+        return ok_result(data={
+            "probes": {name: bool(self._dom.get(name, True)) for name in specs},
+            "count": len(specs),
+        })
 
 
 def _health(tmp_path):
@@ -198,3 +202,39 @@ async def test_login_wall_returns_auth_required(tmp_path) -> None:
 def test_core_probe_names() -> None:
     """The gate is explicit and small: surface, login, main content."""
     assert _CORE_PROBES == ("on_x_surface", "login_wall_absent", "main_landmark_or_content")
+
+
+async def test_capability_selector_probes_surfaced_not_gating(tmp_path) -> None:
+    """2026-09-23 supplementary group: capability selectors (tweetText,
+    bookmark, composer) surface strictly, but a failure does NOT gate ready —
+    shell landmarks can be healthy while capability testids churn."""
+    h = _health(tmp_path)
+    broker = _FakeBroker(dom_probes={
+        # Shell probes all healthy:
+        "main_landmark_or_content": True,
+        "navigation_affordance": True,
+        "account_affordance": True,
+        # Capability selectors churned:
+        "feed_article_text": False,
+        "feed_bookmark_action": False,
+        "composer_inline": True,
+    })
+    r = await h.run(broker, {})
+    assert r.ok is True, "ready is NOT gated by capability selectors"
+    cs = r.data["checks"]["capability_selectors"]
+    assert cs["ok"] is False
+    assert cs["passed"] == 1 and cs["total"] == 3
+    assert cs["probes"]["feed_article_text"] is False
+    assert "does not gate ready" in cs["note"]
+
+
+async def test_capability_selector_probes_pass_shape(tmp_path) -> None:
+    h = _health(tmp_path)
+    r = await h.run(_FakeBroker(), {})
+    assert r.ok is True
+    cs = r.data["checks"]["capability_selectors"]
+    assert cs["ok"] is True
+    assert cs["passed"] == cs["total"] == 3
+    assert set(cs["probes"]) == {
+        "feed_article_text", "feed_bookmark_action", "composer_inline",
+    }

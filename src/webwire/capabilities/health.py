@@ -61,6 +61,31 @@ _PROBE_SELECTOR_SET: dict[str, list[str]] = {
 # is not present — the system is NOT ready, whatever navigation reports.
 _CORE_PROBES = ("on_x_surface", "login_wall_absent", "main_landmark_or_content")
 
+# Capability-selector probes (2026-09-23) — the selectors the READ/WRITE
+# capabilities themselves depend on, probed in the same round-trip as the
+# shell set but SUPPLEMENTARY: surfaced strictly, never gating `ready`
+# (capability selectors can churn without the shell landmarks moving, and
+# vice versa — the re-evaluation's top residual risk). Battery-verified on
+# the live home DOM 2026-09-23 (scripts battery via json.dumps embedding):
+# tweetText/bookmark present per feed article; composer entries present once.
+# Excluded, deliberately: `tweetButton` (modal-only — exists only while a
+# compose modal is open; statically 0 on home) and `tweetPhoto`
+# (content-dependent — present only when the feed happens to contain photo
+# posts; per-post verification is the capabilities' own job).
+_CAPABILITY_SELECTOR_SET: dict[str, list[str]] = {
+    "feed_article_text": [
+        "[data-testid='tweetText']",
+    ],
+    "feed_bookmark_action": [
+        "[data-testid='bookmark']",
+        "[data-testid='removeBookmark']",
+    ],
+    "composer_inline": [
+        "[data-testid='tweetButtonInline']",
+        "a[data-testid='SideNav_NewTweet_Button']",
+    ],
+}
+
 
 class HealthCapability:
     """Aggregate diagnostic across session, identity, kill switch, and probes."""
@@ -132,8 +157,9 @@ class HealthCapability:
         # sleeping a fixed time. Observation heuristics remain as fallback
         # only if the DOM probe round-trip itself fails.
         dom_probes: dict[str, bool] = {}
+        capability_probes: dict[str, bool] = {}
         if nav_ok:
-            dom_probes = await _poll_dom_probes(broker)
+            dom_probes, capability_probes = await _poll_dom_probes(broker)
         if obs_data:
             diag["checks"]["selector_readiness"] = _probe_readiness(obs_data, dom_probes)
         else:
@@ -141,6 +167,21 @@ class HealthCapability:
                 "ok": False, "probes": {}, "note": "no observation",
                 "core_passed": False,
             }
+        # Capability-selector probes (2026-09-23): the selectors the read/write
+        # capabilities depend on, surfaced SUPPLEMENTARY — strict aggregation,
+        # never gating `ready` (they can churn independently of the shell
+        # landmarks; the re-evaluation's top residual risk).
+        diag["checks"]["capability_selectors"] = (
+            {
+                "ok": bool(capability_probes) and all(capability_probes.values()),
+                "probes": capability_probes,
+                "passed": sum(1 for v in capability_probes.values() if v),
+                "total": len(capability_probes),
+                "note": "supplementary — does not gate ready",
+            }
+            if capability_probes
+            else {"ok": False, "probes": {}, "note": "not probed (probe round-trip failed)"}
+        )
 
         # 5. Login state — inferred from URL/title vs login-wall heuristics.
         url = (obs_data.get("url") or "").lower()
@@ -204,33 +245,42 @@ _HYDRATION_TIMEOUT_S = 8.0
 _HYDRATION_POLL_INTERVAL_S = 1.0
 
 
-async def _poll_dom_probes(broker: ReadOnlyBroker) -> dict[str, bool]:
-    """Poll probe_selectors until ALL DOM probes pass or deadline. Returns the
-    last probe dict (possibly empty if the round-trip never succeeded — caller
-    falls back to observation heuristics). Early-exiting on the main probe
-    alone races: main content renders before the side nav, which reported
-    nav/account as false on a healthy hydrated session (live-verified
-    2026-09-22)."""
+async def _poll_dom_probes(broker: ReadOnlyBroker) -> tuple[dict[str, bool], dict[str, bool]]:
+    """Poll probe_selectors (shell set + capability set in ONE round-trip)
+    until BOTH sets pass or deadline. Returns (shell, capability) probe
+    dicts — empty dicts if the round-trip never succeeded (caller falls back
+    to observation heuristics). Two race lessons encoded: (1) exiting on the
+    main probe alone races the side nav (2026-09-22); (2) exiting on the
+    SHELL set alone races the FEED — app chrome renders before feed articles,
+    so capability selectors (tweetText/bookmark per article) probe false on a
+    healthy-but-slow feed (caught live 2026-09-23). Both sets are waited for;
+    only the SHELL set gates `ready` — the capability set stays supplementary."""
     import asyncio
     import time
 
+    merged = {**_PROBE_SELECTOR_SET, **_CAPABILITY_SELECTOR_SET}
+    shell_keys = set(_PROBE_SELECTOR_SET)
     deadline = time.monotonic() + _HYDRATION_TIMEOUT_S
     probes: dict[str, bool] = {}
     attempts = 0
     while True:
         attempts += 1
-        r = await broker.probe_selectors(_PROBE_SELECTOR_SET)
+        r = await broker.probe_selectors(merged)
         if r.ok:
             probes = (r.data or {}).get("probes", {})
             if probes and all(probes.values()):
-                return probes  # fully hydrated
+                shell = {k: v for k, v in probes.items() if k in shell_keys}
+                cap = {k: v for k, v in probes.items() if k not in shell_keys}
+                return shell, cap
         if time.monotonic() >= deadline:
             if not probes:
                 logger.warning(
                     "probe_selectors failed %d attempts; falling back to observation",
                     attempts,
                 )
-            return probes
+            shell = {k: v for k, v in probes.items() if k in shell_keys}
+            cap = {k: v for k, v in probes.items() if k not in shell_keys}
+            return shell, cap
         await asyncio.sleep(_HYDRATION_POLL_INTERVAL_S)
 
 

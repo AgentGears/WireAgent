@@ -19,6 +19,7 @@
 
 **v0.2 (M1-M4c complete — M4c full live post pending budget window)** — 19 capabilities, 256 tests, 38 commits.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
+Health capability-selector probes landed (history i).
 All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 (quote_multi_image) is next. See History.
 
@@ -269,6 +270,17 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-23 (i): Health capability-selector probes (the re-evaluation's top
+  residual risk, closed). New supplementary check `capability_selectors` —
+  tweetText, bookmark/removeBookmark, inline composer — rides the same
+  probe_selectors round-trip, strict-aggregated, NEVER gating ready. Live
+  battery first (json.dumps embedding): tweetButton excluded (modal-only,
+  statically absent), tweetPhoto excluded (content-dependent — presence
+  depends on feed contents, not app structure). The first live run caught a
+  NEW race: shell landmarks render BEFORE feed articles, so shell-exit
+  polling reported capability selectors false on a healthy feed — the poll
+  now waits for BOTH sets (same deadline); shell still solely gates ready.
+  Live: shell 5/5, capability 3/3, ready=true. Suite 258 (+2 tests).
 - 2026-09-22 (h): M4c CODE COMPLETE (commit 4036cb3; harness quote-hook extension
   additive, 247-green neutrality; 9 runtime tests; suite 256). LIVE attempt:
   the exact-count gate ABORTED CLEANLY (expected 1 after upload 1, got 2;

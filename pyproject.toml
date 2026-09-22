@@ -89,3 +89,9 @@ warn_redundant_casts = true
 module = "super_browser.*"
 ignore_missing_imports = true
 follow_imports = "skip"
+
+# Pillow is an OPTIONAL runtime dep (dimensions/EXIF niceties); not installed
+# in CI — and its untyped-private-API surface differs per environment.
+[[tool.mypy.overrides]]
+module = "PIL.*"
+ignore_missing_imports = true

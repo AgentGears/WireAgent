@@ -147,7 +147,10 @@ def detect_exif_warnings(path: Path, mime: str) -> tuple[bool, list[str]]:
         from PIL import Image
         from PIL.ExifTags import TAGS
         with Image.open(path) as img:
-            exif = img._getexif()  # type: ignore[attr-defined]  # PIL private API, intentional
+            # PIL's private _getexif; getattr-probed so no type-ignore is
+            # needed and absent-PIL environments degrade identically.
+            getexif = getattr(img, "_getexif", None)
+            exif = getexif() if callable(getexif) else None
         if exif:
             warnings.append("EXIF metadata present in image")
             for tag_id, _value in exif.items():

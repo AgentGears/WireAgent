@@ -245,7 +245,7 @@ class Dispatcher:
         # This keeps capabilities pure (no persistence coupling) — policy lives
         # in the dispatcher.
         if name == "whoami" and result.ok:
-            self._post_whoami_hook(result)
+            await self._post_whoami_hook(result)
 
         # Write facts (P0 hydration fix): for WRITE-tier results that reached
         # the kernel's policy stage, extract the facts both safety stores

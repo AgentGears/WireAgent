@@ -136,6 +136,49 @@ async def test_actor_flows_into_write_dedupe_key(tmp_path: Path) -> None:
     assert r.data["trace"]["intent"]["dedupe_key"].startswith("infaag|")
 
 
+async def test_invoke_whoami_awaits_the_hook(tmp_path: Path) -> None:
+    """Regression (caught live 2026-09-22): the post-whoami hook was called
+    WITHOUT await, so it never ran — the live fixture post journaled a '?'
+    actor. This drives the REAL invoke() call site with a stubbed whoami
+    capability and asserts identity actually binds."""
+    from webwire.broker import ReadOnlyBroker
+    from webwire.capabilities.base import Capability, CapabilityTier
+
+    class _StubSB:
+        _page = None
+        _controller = None
+
+    class _StubSessionManager(SessionManager):
+        def __init__(self, config: WebWireConfig) -> None:
+            super().__init__(config)
+            self._sb = _StubSB()  # type: ignore[assignment]
+            self._started = True
+
+    class _FakeWhoamiCap:
+        name = "whoami"
+        tier = CapabilityTier.READ
+
+        async def run(self, broker, input):
+            return ok_result(data={
+                "handle": "ghost", "profile_url": "https://x.com/ghost",
+                "session_status": "authenticated",
+            })
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    sm = _StubSessionManager(cfg)
+    d = Dispatcher(cfg, session_manager=sm)  # type: ignore[arg-type]
+    d._broker = ReadOnlyBroker(sm.sb, d._kill, cfg)  # type: ignore[arg-type]
+    d._registry._caps["whoami"] = _FakeWhoamiCap()  # type: ignore[assignment]
+
+    r = await d.invoke("whoami")
+    assert r.ok is True
+    assert d._session.resolved_handle == "ghost", (
+        "the invoke() path must AWAIT the post-whoami hook — a missing await "
+        "silently skips identity binding"
+    )
+    assert d._session.authenticated is True
+
+
 # ---------------------------------------------------------------------------
 # 2. Verify honesty
 # ---------------------------------------------------------------------------

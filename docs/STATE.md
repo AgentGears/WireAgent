@@ -17,10 +17,9 @@
 
 ## Current version
 
-**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 229 tests, 29 commits.
-ALL P0 review fixes landed 2026-09-22: hydration (invariant 15) + media
-rate-limit normalization + kernel registry gate + kernel hygiene (actor
-identity, verify honesty, dry-run dedupe exception). See History.
+**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 230 tests, 31 commits.
+ALL P0 review fixes landed 2026-09-22 + live-validated by the fixture post
+(hydration, media normalization, registry gate, kernel hygiene). See History.
 
 ## Architecture invariants (do not violate)
 
@@ -242,12 +241,23 @@ identity, verify honesty, dry-run dedupe exception). See History.
 
 ## Test fixtures
 
+- **Test target post (CURRENT):** `https://x.com/infaag/status/2102451358305771541`
+  (2026-09-22 fixture post, posted via post_text as the P0 live validation —
+  posted_and_verified, read-back confirmed. The prior M1 fixture post
+  `2075426870883954690` was DELETED from X; @infaag profile had 0 posts.)
 - **Test images:** `.webwire/test-media/test_red.png` (200x200 red), `.webwire/test-media/test_blue.png` (150x150 blue)
-- **Test target post:** `https://x.com/infaag/status/2075426870883954690` (M1 photo post — Phase 4b post was DELETED from X)
-- **Session:** `.webwire/session.json` (22 cookies incl. auth_token, for @infaag)
+- **Session:** `.webwire/session.json` (22 cookies incl. auth_token, for @infaag; verified working 2026-09-22, 2+ months old)
 
 ## History
 
+- 2026-09-22 (e): P1 fixture post landed via post_text — posted_and_verified
+  (status/2102451358305771541), read-back confirmed; doubles as live
+  validation of all four P0 batches (registry gate passed, write facts
+  journaled, posted key hydrated). LIVE RUN CAUGHT A BUG the offline suite
+  missed: the post-whoami hook was called without await, so actor binding
+  never ran (first post journaled a '?' actor). Fixed; regression test drives
+  the real invoke() path; re-verified live (phase-1 only) — dedupe key now
+  'infaag|post|...'. 230 tests. Old M1 fixture post confirmed deleted from X.
 - 2026-09-22 (d): Final kernel-hygiene batch — actor identity bound from
   whoami (dedupe keys carry the real handle); verify gated on execute success
   with honest state semantics; dry-run no-ops exempt from dedupe recording.

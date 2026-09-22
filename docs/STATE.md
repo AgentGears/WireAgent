@@ -240,7 +240,10 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
   refactor commit); reply_multi_image on it with the target-first hook; 10
   runtime tests; live-verified (reply 2102493233989529629, thread-target
   verified, media_count 2 after the verifier fix below).
-- [ ] M4c quote_multi_image
+- [x] ~~M4c quote_multi_image~~ — code complete 2026-09-22 (4036cb3 + 17fc258);
+  gates live-proven after the count fix; FULL two-phase public post pending
+  the quote budget window (~1h — the failed first attempt consumed 2 of 3;
+  run scripts/smoke_m4c_live.py when free and mark LIVE-VERIFIED above)
 - [x] ~~M4a runtime test gap (ChatGPT blocker)~~ — closed: 7 runtime tests added (attach-fail, count-mismatch, preview-not-ready, composer-mutation, kill-before-submit, transcoding-honest, rendered-order)
 - [ ] reply_photo URL capture gap (submit_clicked_verification_pending — identity-aware verifier should be retrofitted)
 - [ ] Phase 1b edge cases (quote-tweet, media-only, reply) need real fixtures

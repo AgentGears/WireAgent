@@ -22,15 +22,24 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Local path dependency — the user's own SDK. Editable install.
-    "superbrowser-sdk @ file:///C:/Next-Era/Super-Browser",
+    # Deliberately EMPTY: the Super-Browser SDK is a local path dependency
+    # (editable install of the user's own SDK) and cannot resolve on CI or
+    # other machines. Live/browser work installs it via the [browser] extra;
+    # offline tests run against tests/stubs/super_browser when the SDK is
+    # absent (enforced shape-parity locally by tests/test_stub_parity.py).
 ]
 
 [project.optional-dependencies]
+browser = [
+    # Local path dependency — the user's own SDK. Editable install.
+    "superbrowser-sdk @ file:///C:/Next-Era/Super-Browser",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
 
 [tool.hatch.build.targets.wheel]

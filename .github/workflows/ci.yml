@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (offline — no SDK dependency)
+        # The Super-Browser SDK is a local path dependency and cannot resolve
+        # on CI. The offline test suite runs against tests/stubs/super_browser
+        # (activated automatically by tests/conftest.py when the real SDK is
+        # absent; shape-parity enforced on dev machines by test_stub_parity).
+        run: |
+          pip install --no-deps -e .
+          pip install "pytest>=8.0" "pytest-asyncio>=0.23" "pytest-cov>=5.0" "ruff>=0.6" "mypy>=1.11"
+      - name: Tests
+        run: python -m pytest -q
+      - name: Lint (ruff)
+        run: python -m ruff check src tests
+      - name: Types (mypy)
+        run: python -m mypy src/webwire

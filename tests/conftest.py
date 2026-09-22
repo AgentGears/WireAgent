@@ -9,11 +9,22 @@ its action_type consciously (bucket + risk registry) and add a sample here.
 from __future__ import annotations
 
 import struct
+import sys
 import zlib
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# CI/stub guard: when the real Super-Browser SDK is not installed (CI
+# installs with --no-deps), fall back to the offline stub package so the
+# suite can import webwire without the file:/// dependency. On machines with
+# the real SDK the stub never activates; tests/test_stub_parity.py enforces
+# shape parity between stub and real SDK there.
+try:
+    import super_browser  # noqa: F401
+except ImportError:  # pragma: no cover - CI-only path
+    sys.path.insert(0, str(Path(__file__).parent / "stubs"))
 
 
 def create_png(path: Path, w: int = 100, h: int = 100, color: tuple = (255, 0, 0)) -> None:

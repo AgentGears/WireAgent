@@ -17,9 +17,10 @@
 
 ## Current version
 
-**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 230 tests, 31 commits.
-ALL P0 review fixes landed 2026-09-22 + live-validated by the fixture post
-(hydration, media normalization, registry gate, kernel hygiene). See History.
+**v0.2 (M1-M4a complete; M4b/M4c next)** — 17 capabilities, 237 tests, 32 commits.
+ALL P0 + P1 review items landed 2026-09-22 and live-validated (hydration,
+media normalization, registry gate, kernel hygiene, fixture post, health
+probes). M4b is next. See History.
 
 ## Architecture invariants (do not violate)
 
@@ -192,6 +193,13 @@ ALL P0 review fixes landed 2026-09-22 + live-validated by the fixture post
 
 ## Known gaps / open items
 
+- [x] ~~P1: health selector probes stale (3/5 failed on a healthy logged-in
+  session; `ready` stayed true)~~ — fixed 2026-09-22: probes are DOM-direct
+  (new broker.probe_selectors, live-verified selector alternatives) and POLL
+  until hydration — the root cause was probing BEFORE X's client-side render,
+  not merely stale selectors; `ready` now gates on the 3 core probes;
+  supplementary failures surface without gating; the not-ready path now
+  attaches the diagnostic blob (was dropped). Live: 5/5, ready=true, 3.8s.
 - [x] ~~P0: dedupe hydration broken (hydrated 0 entries — reader/journal field
   mismatch, untested)~~ — fixed 2026-09-22: write facts journaled, both stores
   hydrate, budgets survive restart, 9 tests in tests/test_hydration.py
@@ -250,6 +258,14 @@ ALL P0 review fixes landed 2026-09-22 + live-validated by the fixture post
 
 ## History
 
+- 2026-09-22 (f): P1 health probes fixed. Root cause doubled: probes ran
+  BEFORE X's client-side render (everything false on a healthy session) AND
+  inferred from the observe() snapshot. Now: broker.probe_selectors (new
+  bounded read primitive, one round-trip, selector groups with alternatives
+  live-verified via diag_selector_battery_live.py), hydration polling with
+  deadline (early-exit on full pass), core-probe gate on ready, diagnostic
+  attached on failure. Live: 5/5, ready=true, 3.8s. 237 tests. First test
+  file for health (test_health.py — 7 tests).
 - 2026-09-22 (e): P1 fixture post landed via post_text — posted_and_verified
   (status/2102451358305771541), read-back confirmed; doubles as live
   validation of all four P0 batches (registry gate passed, write facts

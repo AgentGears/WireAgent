@@ -45,6 +45,7 @@ class ReadOnlyBroker:
         "observe", "extract",
         "list_tabs", "switch_tab",
         "query_attr", "query_text", "enumerate_posts", "scroll",
+        "probe_selectors",
     })
 
     def __init__(
@@ -224,6 +225,40 @@ class ReadOnlyBroker:
         if r.ok:
             posts = r.data or []
             r.data = {"posts": posts, "count": len(posts)}
+        return r
+
+    async def probe_selectors(self, specs: dict[str, list[str]]) -> ActionResult:
+        """Existence-probe named selector groups in ONE CDP round-trip.
+
+        ``specs`` maps probe name -> list of alternative CSS selectors; a probe
+        passes if ANY alternative matches. Broker-owned fixed-shape JS (the
+        caller supplies selector strings, never executable code — same
+        contract as query_attr/query_text). Returns ``{name: bool}`` in data.
+        Read-only; used by health's selector_readiness probes (2026-09-22
+        refresh: probes must test the DOM directly — the observe() snapshot's
+        targets stopped carrying roles, silently failing 3/5 probes)."""
+        if (r := self._guard()) is not None:
+            return r
+        import json as _json
+        try:
+            payload = _json.dumps(specs)
+        except (TypeError, ValueError) as exc:
+            from webwire.envelope import soft_failure
+            return soft_failure(f"probe_selectors: specs not serializable: {exc!r}")
+        expr = (
+            "(function(){var specs=" + payload + ";"
+            "var out={};"
+            "for(var k in specs){var hit=false;"
+            "for(var i=0;i<specs[k].length;i++){"
+            "try{if(document.querySelector(specs[k][i])!==null){hit=true;break;}}catch(e){}"
+            "}"
+            "out[k]=hit;}"
+            "return out;})()"
+        )
+        r = await self._cdp_read(expr, "probe_selectors()")
+        if r.ok:
+            probes = r.data if isinstance(r.data, dict) else {}
+            r.data = {"probes": probes, "count": len(probes)}
         return r
 
     async def scroll(self, pixels: int = 3000) -> ActionResult:

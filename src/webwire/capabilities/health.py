@@ -1,13 +1,21 @@
-"""health capability — probe-set diagnostic, not a universal hard gate.
+"""health capability — probe-set diagnostic with a CORE-probe gate.
 
-Per the Phase 0a design (Point 5 decision):
+Per the Phase 0a design (Point 5 decision), refreshed 2026-09-22 (P1):
 - Checks: browser session alive, X reachable, login state known, whoami can
   resolve identity OR returns AUTH_REQUIRED, kill-switch state, read-only broker
   policy active, selector/readiness probes.
-- Selector readiness is a DIAGNOSTIC field using a small probe set with
-  alternatives — NOT one brittle data-testid. Missing probes are not a universal
-  hard failure unless they prevent identity/session determination.
-- Returns a structured diagnostic blob; ``ok`` reflects overall readiness but
+- Selector readiness probes the DOM DIRECTLY (broker.probe_selectors —
+  selector groups with alternatives, live-verified 2026-09-22) and POLLS
+  until hydration: X renders client-side after domcontentloaded, and probing
+  before render returns false for everything. The 2026-09-22 live E2E caught
+  the prior design failing exactly this way — 3/5 probes failed on a healthy
+  logged-in session (probes ran pre-hydration, inferred from an equally
+  pre-hydration observe() snapshot), and ready stayed true.
+- ``ready`` now REQUIRES the three core probes (on_x_surface,
+  login_wall_absent, main_landmark_or_content): if the DOM the capabilities
+  depend on isn't there, the diagnostic must say so. Supplementary probes
+  (navigation, account affordances) are surfaced but don't gate ready.
+- Returns a structured diagnostic blob; ``ok`` reflects overall readiness and
   individual probe failures are surfaced, not hidden.
 """
 
@@ -28,6 +36,30 @@ from webwire.session import SessionManager
 logger = logging.getLogger(__name__)
 
 __all__ = ["HealthCapability"]
+
+# DOM probe set — live-verified against x.com/home on 2026-09-22 (see
+# scripts/diag_selector_battery_live.py). Each probe passes if ANY alternative
+# matches. Alternatives hedge single-testid churn.
+_PROBE_SELECTOR_SET: dict[str, list[str]] = {
+    "main_landmark_or_content": [
+        "[data-testid='primaryColumn']",
+        "main[role='main']",
+        "article",
+    ],
+    "navigation_affordance": [
+        "nav[role='navigation']",
+        "[data-testid='AppTabBar_Explore_Link']",
+        "a[aria-label][role='link']",
+    ],
+    "account_affordance": [
+        "[data-testid='SideNav_AccountSwitcher_Button']",
+        "a[data-testid='AppTabBar_Profile_Link']",
+    ],
+}
+
+# Probes that gate `ready`. If these fail, the DOM the capabilities depend on
+# is not present — the system is NOT ready, whatever navigation reports.
+_CORE_PROBES = ("on_x_surface", "login_wall_absent", "main_landmark_or_content")
 
 
 class HealthCapability:
@@ -88,11 +120,27 @@ class HealthCapability:
         else:
             diag["checks"]["observe"] = {"ok": False, "error": "skipped — navigation failed"}
 
-        # 4. Readiness probes — diagnostic, multiple alternatives, not a single testid.
+        # 4. Readiness probes — DOM-direct via broker.probe_selectors, POLLED
+        # until hydration or deadline. The 2026-09-22 live E2E caught the prior
+        # design failing two ways at once: probes ran immediately after
+        # domcontentloaded — BEFORE X's React app renders, so every selector
+        # probe missed — and they inferred from the observe() snapshot, whose
+        # targets were equally pre-hydration. A live selector battery
+        # (scripts/diag_selector_battery_live.py) proved all selectors exist
+        # on the hydrated DOM; so health now waits for hydration, polling
+        # (early-exit as soon as the main-content probe passes) rather than
+        # sleeping a fixed time. Observation heuristics remain as fallback
+        # only if the DOM probe round-trip itself fails.
+        dom_probes: dict[str, bool] = {}
+        if nav_ok:
+            dom_probes = await _poll_dom_probes(broker)
         if obs_data:
-            diag["checks"]["selector_readiness"] = _probe_readiness(obs_data)
+            diag["checks"]["selector_readiness"] = _probe_readiness(obs_data, dom_probes)
         else:
-            diag["checks"]["selector_readiness"] = {"ok": False, "probes": {}, "note": "no observation"}
+            diag["checks"]["selector_readiness"] = {
+                "ok": False, "probes": {}, "note": "no observation",
+                "core_passed": False,
+            }
 
         # 5. Login state — inferred from URL/title vs login-wall heuristics.
         url = (obs_data.get("url") or "").lower()
@@ -104,13 +152,20 @@ class HealthCapability:
             "login_wall_detected": login_wall,
         }
 
-        # Overall readiness: X reachable + observe works + login state known.
-        # Selector-probe failures do NOT make health fail (they're diagnostic),
-        # UNLESS observation itself failed (then we can't determine anything).
+        # Overall readiness (2026-09-22 policy): X reachable + observe works +
+        # login state known + ALL CORE PROBES pass. A stale-DOM system must
+        # report ready=false — the prior majority-vote policy reported ready
+        # while 3/5 probes failed, defeating the diagnostic's purpose.
+        core_passed = all(
+            diag["checks"]["selector_readiness"]["probes"].get(p, False)
+            for p in _CORE_PROBES
+        ) if "probes" in diag["checks"]["selector_readiness"] else False
+        diag["checks"]["selector_readiness"]["core_passed"] = core_passed
         ready = bool(
             nav_ok
             and diag["checks"]["observe"]["ok"]
             and diag["checks"]["login_state"]["known"]
+            and core_passed
         )
         diag["ready"] = ready
 
@@ -123,10 +178,12 @@ class HealthCapability:
             r = auth_required("Login wall detected — not authenticated.")
             r.data = diag
             return r
-        return soft_failure(
+        r = soft_failure(
             "Health checks failed — see diagnostic data.",
             failure_category=FailureCategory.UNKNOWN,
         )
+        r.data = diag  # the diagnostic IS the payload of a failed health check
+        return r
 
 
 # ---------------------------------------------------------------------------
@@ -139,32 +196,94 @@ def _is_login_wall(url: str, title: str) -> bool:
     return any(f in url for f in frags_url) or any(f in title for f in frags_title)
 
 
-def _probe_readiness(obs_data: dict[str, Any]) -> dict[str, Any]:
-    """Run a small probe set with alternatives. Diagnostic, not a hard gate."""
+# Hydration poll: X renders client-side after domcontentloaded; selector
+# probes before render return false for everything. Poll until the
+# main-content probe passes, with a deadline. Polling beats a fixed sleep:
+# fast when warm, bounded when slow (2026-09-22, replaces fixed-sleep drift).
+_HYDRATION_TIMEOUT_S = 8.0
+_HYDRATION_POLL_INTERVAL_S = 1.0
+
+
+async def _poll_dom_probes(broker: ReadOnlyBroker) -> dict[str, bool]:
+    """Poll probe_selectors until ALL DOM probes pass or deadline. Returns the
+    last probe dict (possibly empty if the round-trip never succeeded — caller
+    falls back to observation heuristics). Early-exiting on the main probe
+    alone races: main content renders before the side nav, which reported
+    nav/account as false on a healthy hydrated session (live-verified
+    2026-09-22)."""
+    import asyncio
+    import time
+
+    deadline = time.monotonic() + _HYDRATION_TIMEOUT_S
+    probes: dict[str, bool] = {}
+    attempts = 0
+    while True:
+        attempts += 1
+        r = await broker.probe_selectors(_PROBE_SELECTOR_SET)
+        if r.ok:
+            probes = (r.data or {}).get("probes", {})
+            if probes and all(probes.values()):
+                return probes  # fully hydrated
+        if time.monotonic() >= deadline:
+            if not probes:
+                logger.warning(
+                    "probe_selectors failed %d attempts; falling back to observation",
+                    attempts,
+                )
+            return probes
+        await asyncio.sleep(_HYDRATION_POLL_INTERVAL_S)
+
+
+def _probe_readiness(obs_data: dict[str, Any], dom_probes: dict[str, bool]) -> dict[str, Any]:
+    """Run the probe set. DOM-direct probes take precedence; the observe()
+    heuristics serve as fallback for each probe the DOM round-trip couldn't
+    answer. Strict aggregation: ok requires ALL probes (it is the DOM-drift
+    detector); `ready` gating is decided by the caller on the core subset."""
     url = (obs_data.get("url") or "").lower()
     title = (obs_data.get("title") or "").lower()
     targets = obs_data.get("targets", []) or []
     roles = {t.get("role") for t in targets if isinstance(t, dict)}
+
+    def _dom(name: str) -> Optional[bool]:
+        v = dom_probes.get(name)
+        return v if isinstance(v, bool) else None
+
+    dom_main = _dom("main_landmark_or_content")
+    dom_nav = _dom("navigation_affordance")
+    dom_acc = _dom("account_affordance")
 
     probes = {
         # URL on expected X surface
         "on_x_surface": url.startswith(("https://x.com/", "https://twitter.com/")),
         # login wall absent
         "login_wall_absent": not _is_login_wall(url, title),
-        # a main/content landmark present (role=main or large target count)
-        "main_landmark_or_content": ("main" in roles) or len(targets) >= 5,
+        # a main/content landmark present (DOM probe; legacy: role=main or
+        # a populated target snapshot)
+        "main_landmark_or_content": (
+            dom_main if dom_main is not None
+            else (("main" in roles) or len(targets) >= 5)
+        ),
         # some navigation affordance present
-        "navigation_affordance": bool(roles & {"link", "menuitem", "tab"}),
-        # a profile-like / account affordance (link target present)
-        "account_affordance": any(
-            (t.get("role") == "link") and (t.get("name") or "").strip()
-            for t in targets if isinstance(t, dict)
+        "navigation_affordance": (
+            dom_nav if dom_nav is not None
+            else bool(roles & {"link", "menuitem", "tab"})
+        ),
+        # a profile-like / account affordance present
+        "account_affordance": (
+            dom_acc if dom_acc is not None
+            else any(
+                (t.get("role") == "link") and (t.get("name") or "").strip()
+                for t in targets if isinstance(t, dict)
+            )
         ),
     }
     passed = sum(1 for v in probes.values() if v)
     return {
-        "ok": passed >= 3,  # majority of probes — tolerant
+        "ok": passed == len(probes),  # strict — this IS the drift detector
         "probes": probes,
         "passed": passed,
         "total": len(probes),
+        "basis": "dom_probes" if any(isinstance(v, bool) for v in (
+            dom_main, dom_nav, dom_acc,
+        )) else "observation_fallback",
     }

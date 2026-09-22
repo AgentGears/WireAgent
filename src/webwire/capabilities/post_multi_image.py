@@ -3,24 +3,24 @@
 ChatGPT's M4 framework: ordered media-manifest transaction, not repeated
 single-image operations.
 
+M4b extraction (2026-09-22): the transaction now lives in the shared harness
+`webwire.safety.media_compose.run_media_compose` — this capability's execute()
+DEMONSTRABLY DELEGATES there (the shared-primitive constraint). The gate
+sequence, failure codes, and honest-reporting shape are unchanged; the
+post-submit helpers are the single definitions in safety/media_verify.py,
+imported here under their historical names so module-level monkeypatching
+(in tests) still takes effect.
+
 State machine:
   validated → manifest_bound → composer_open → uploading_item_1 → item_1_ready
   → ... → uploading_item_n → item_n_ready → composition_reverified
   → submit_authorized → submitted → identity_captured → media_batch_verified
 
 Any failure before submit_authorized → abort-and-cleanup, never submission.
-
-Key gates:
-1. Preflight ALL before ANY upload (one invalid → entire invocation rejected).
-2. Exact-count verification after each upload (1→2→…→N).
-3. Abort and cleanup on partial failure (close composer, verify gone).
-4. Order preservation (per-item evidence, not just count).
-5. Transcoding-honest per-item verification.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Optional
 
@@ -29,6 +29,9 @@ from super_browser.results.types import FailureCategory
 from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
 from webwire.safety.attachment import file_sha256
+from webwire.safety.media_compose import MediaComposeSpec, PostSubmitHooks, run_media_compose
+from webwire.safety.media_verify import count_post_media as _count_post_media
+from webwire.safety.media_verify import verify_post_text as _verify_text
 from webwire.safety.media_manifest import MediaManifest, MediaManifestItem, preflight_manifest, MAX_IMAGES_PER_POST
 from webwire.safety.post_submit import capture_pre_submit_ids, capture_new_post_id
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
@@ -116,88 +119,34 @@ class PostMultiImageCapability:
         )
 
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        normalized = intent.payload.get("normalized_text", "")
+        """Delegate the transaction to the shared harness (M4b extraction),
+        then shape the outcome into this capability's reporting vocabulary.
+        The post-submit hooks are resolved from THIS module's globals at call
+        time — monkeypatch-based tests keep working unchanged."""
         items_data = intent.payload.get("manifest_items", [])
         expected_count = intent.payload.get("image_count", 0)
 
-        # Recompute digests before upload (concern #1 from M1).
-        for item in items_data:
-            try:
-                current = file_sha256(item["source_path"])
-            except OSError as exc:
-                return await self._abort(broker, "media_changed_after_confirmation",
-                                         f"Cannot read {item['source_path']}: {exc!r}")
-            if current != item["sha256"]:
-                return await self._abort(broker, "media_changed_after_confirmation",
-                                         f"Image {item['index']} changed since confirmation.")
-
-        # Open compose + fill text.
-        fill_r = await broker.fill_composer(normalized)
-        if not fill_r.ok:
-            return await self._abort(broker, "pre_submit_mismatch", f"Could not fill composer: {fill_r.error}")
-
-        # Upload each image in order. Gate #2: exact-count verification after each.
-        for i, item in enumerate(items_data):
-            attach_r = await broker.attach_media(item["source_path"])
-            if not attach_r.ok:
-                return await self._abort(broker, "attachment_upload_failed",
-                                         f"Image {item['index']} upload failed: {attach_r.error}")
-
-            # Verify cumulative count matches expected (i+1 after i+1 uploads).
-            ready_r = await broker.verify_attachment_ready()
-            if not ready_r.ok:
-                return await self._abort(broker, "attachment_not_ready",
-                                         f"Image {item['index']} not ready: {ready_r.error}")
-
-            count_r = await broker.count_attachments()
-            actual_count = (count_r.data or {}).get("count", 0) if count_r.ok else 0
-            if actual_count != i + 1:
-                return await self._abort(broker, "attachment_count_mismatch",
-                                         f"Expected {i+1} attachments after upload {i+1}, "
-                                         f"got {actual_count}. Aborting — no partial post.")
-
-        # Gate: composition reverification (text still correct after all uploads).
-        read_r = await broker.read_composer_text()
-        if not read_r.ok:
-            return await self._abort(broker, "pre_submit_mismatch", "Could not read composer text.")
-        composer_text = (read_r.data or {}).get("composer_text", "")
-        if _normalize_for_compare(composer_text) != _normalize_for_compare(normalized):
-            return await self._abort(broker, "pre_submit_mismatch",
-                                     f"Composer text mismatch after all uploads. Aborting.")
-
-        # Final count check (all present).
-        final_count_r = await broker.count_attachments()
-        final_count = (final_count_r.data or {}).get("count", 0) if final_count_r.ok else 0
-        if final_count != expected_count:
-            return await self._abort(broker, "attachment_count_mismatch",
-                                     f"Final count {final_count} != expected {expected_count}.")
-
-        # Pre-submit identity capture.
-        pre_submit_ids = await capture_pre_submit_ids(broker)
-
-        # Final kill check.
-        if hasattr(broker, "_kill") and broker._kill and broker._kill.tripped():
-            return await self._abort(broker, "killed_before_submit", "Kill switch tripped. Aborting.")
-
-        # Submit.
-        submit_r = await broker.click_submit()
-        if not submit_r.ok:
-            return _degraded("submit_clicked_verification_pending",
-                             "Submit clicked but result uncertain.", normalized)
-
-        # Identity-aware post-submit capture.
-        await asyncio.sleep(3)
-        posted_post_id, posted_url = await capture_new_post_id(
-            broker, pre_submit_ids, exclude_ids=set(),
+        spec = MediaComposeSpec(
+            normalized_text=intent.payload.get("normalized_text", ""),
+            items=items_data,
+            expected_count=expected_count,
         )
-        if not posted_post_id:
-            return _degraded("submit_clicked_verification_pending",
-                             "Submit clicked but no new post ID captured.", normalized)
+        hooks = PostSubmitHooks(
+            capture_pre_submit_ids=capture_pre_submit_ids,
+            capture_new_post_id=capture_new_post_id,
+            verify_text=_verify_text,
+            count_media=_count_post_media,
+        )
+        r = await run_media_compose(broker, spec, hooks)
+        if not r.ok:
+            return r  # failure / degraded — harness already shaped it
 
-        # Post-submit verification: text + media count.
-        await asyncio.sleep(3)
-        text_ok = await _verify_text(broker, posted_url, normalized)
-        media_count = await _count_post_media(broker, posted_url)
+        outcome = (r.data or {}).get("outcome", {})
+        posted_url = outcome.get("posted_url")
+        posted_post_id = outcome.get("posted_post_id")
+        text_ok = outcome.get("text_verified", False)
+        media_count = outcome.get("media_count", 0)
+        normalized = intent.payload.get("normalized_text", "")
 
         media_items_verified = []
         for item in items_data:
@@ -235,85 +184,3 @@ class PostMultiImageCapability:
 
     async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
         return ok_result(data={"verified": True, "note": "Inline verification in execute."})
-
-    async def _abort(self, broker: Any, code: str, message: str) -> ActionResult:
-        """Gate #3: abort and cleanup. Never submit on partial failure."""
-        try:
-            await broker.close_composer()
-        except Exception:  # noqa: BLE001
-            pass
-        return _failure(code, message)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _normalize_for_compare(text: str) -> str:
-    import re as _re
-    return _re.sub(r"\s+", " ", text.strip())
-
-
-def _failure(code: str, message: str) -> ActionResult:
-    from super_browser.results import action_result, ActionError, ErrorCategory
-    r = action_result(ok=False, error=ActionError(
-        ErrorCategory.SECURITY, message, recoverable=False,
-    ))
-    r.data = {"result": code, "message": message, "public_side_effect": False}
-    return r
-
-
-def _degraded(code: str, message: str, normalized: str,
-              posted_url: str = None, posted_post_id: str = None) -> ActionResult:
-    from super_browser.results import action_result, ActionError, ErrorCategory
-    r = action_result(ok=False, error=ActionError(
-        ErrorCategory.UNKNOWN, message, recoverable=False,
-    ))
-    r.data = {
-        "result": code, "message": message, "public_side_effect": True,
-        "submitted_text": normalized,
-        "posted_url": posted_url, "posted_post_id": posted_post_id,
-        "supports_compensation": False,
-    }
-    return r
-
-
-async def _verify_text(broker: Any, posted_url: str, normalized: str) -> bool:
-    try:
-        if hasattr(broker, "_sb"):
-            nav = await broker._sb.navigate(posted_url, wait_until="domcontentloaded")
-            if not nav.ok:
-                return False
-            await asyncio.sleep(4)
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
-            expr = (
-                '(function(){var t=document.querySelector("[data-testid=\'tweetText\']");'
-                'return t?t.innerText:null;})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                text = result.data.get("result", {}).get("value") or ""
-                return _normalize_for_compare(text) == _normalize_for_compare(normalized)
-        return False
-    except Exception:  # noqa: BLE001
-        return False
-
-
-async def _count_post_media(broker: Any, posted_url: str) -> int:
-    """Count tweetPhoto elements on the posted page."""
-    try:
-        if hasattr(broker, "_sb"):
-            cdp = broker._sb._controller._cdp  # type: ignore[attr-defined]
-            expr = (
-                '(function(){'
-                'var art=document.querySelector("article");'
-                'if(!art)return 0;'
-                'return art.querySelectorAll("[data-testid=\'tweetPhoto\']").length;'
-                '})()'
-            )
-            result = await cdp.evaluate(expr)
-            if result.ok and "exceptionDetails" not in result.data:
-                return result.data.get("result", {}).get("value", 0)
-        return 0
-    except Exception:  # noqa: BLE001
-        return 0

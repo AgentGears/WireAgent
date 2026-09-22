@@ -58,8 +58,12 @@ class PostPhotoCapability:
 
         meta, comp = DEFAULT_REGISTRY.get("post")
         # Dedupe key includes media hash (ChatGPT: same caption + different images ≠ duplicate).
+        # action_type is the BASE action "post" (P0 rate-limit fix, 2026-09-22):
+        # media posts draw from the same per-action budget as text posts and
+        # count against the same "3 posts/hour" cap. Media identity lives in
+        # semantic_variant; the journal's `capability` field keeps the name.
         return WriteIntent(
-            action_type="post_photo",
+            action_type="post",
             target_type="none",
             target_id="none",
             risk_meta=meta,

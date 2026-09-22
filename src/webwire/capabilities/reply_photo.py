@@ -57,8 +57,11 @@ class ReplyPhotoCapability:
         attachment = validate_media_file(image_path)
 
         meta, comp = DEFAULT_REGISTRY.get("reply")
+        # action_type is the BASE action "reply" (P0 rate-limit fix, 2026-09-22):
+        # media replies share the reply budget. Media identity lives in
+        # semantic_variant (text hash + attachment digest).
         return WriteIntent(
-            action_type="reply_photo",
+            action_type="reply",
             target_type="post",
             target_id=str(target_post_id),
             risk_meta=meta,

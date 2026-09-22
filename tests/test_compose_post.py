@@ -138,15 +138,24 @@ async def test_compose_normalized_text_in_preview(dispatcher) -> None:
     assert "Hello world" in preview  # normalized (stripped + collapsed)
 
 
-async def test_compose_dedupe_blocks_identical_text(dispatcher) -> None:
-    """Invariant #6: same normalized text → same dedupe key → blocked on replay."""
+async def test_compose_dedupe_key_identical_but_dry_run_records_nothing(dispatcher) -> None:
+    """Invariant #6 (key semantics) + kernel-hygiene fix (2026-09-22): same
+    normalized text → same dedupe KEY, but compose_post's execute is a
+    deliberate side-effect-free no-op (dry_run=True), so it records NO dedupe
+    entry — a confirmed dry-run must not block the real same-text post_text
+    for the TTL. Replay therefore reaches confirmation again, not dedupe."""
     r1 = await dispatcher.invoke("compose_post", {"text": "Same text"})
     token = r1.data["data"]["confirmation_token"]
-    await dispatcher.invoke("compose_post", {"text": "Same text", "confirmation_token": token})
-    # Replay same text — dedupe should block.
+    r2 = await dispatcher.invoke("compose_post", {"text": "Same text", "confirmation_token": token})
+    # Same semantic key both invocations…
+    assert r1.data["trace"]["intent"]["dedupe_key"] == r2.data["trace"]["intent"]["dedupe_key"]
+    # …but the no-op execute recorded nothing.
+    assert r2.data["trace"]["dedupe_recorded"] is False
+    assert dispatcher._write_kernel._dedupe.size() == 0
+    # Replay same text — NOT dedupe-blocked; it reaches confirmation again.
     r3 = await dispatcher.invoke("compose_post", {"text": "Same text"})
-    assert r3.ok is False
-    assert r3.data["policy"]["blocked_by"] == "dedupe"
+    assert r3.ok is True
+    assert r3.data["policy"]["verdict"] == "confirmation_required"
 
 
 async def test_compose_different_text_not_dedupe_blocked(dispatcher) -> None:

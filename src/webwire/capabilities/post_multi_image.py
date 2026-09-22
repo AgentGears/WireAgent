@@ -60,8 +60,11 @@ class PostMultiImageCapability:
 
         meta, comp = DEFAULT_REGISTRY.get("post")
         # Dedupe key includes combined hash of all attachment digests (ChatGPT M4).
+        # action_type is the BASE action "post" (P0 rate-limit fix, 2026-09-22):
+        # multi-image posts draw from the same post budget as text posts.
+        # Media identity lives in semantic_variant (text hash + manifest hash).
         return WriteIntent(
-            action_type="post_multi_image",
+            action_type="post",
             target_type="none",
             target_id="none",
             risk_meta=meta,

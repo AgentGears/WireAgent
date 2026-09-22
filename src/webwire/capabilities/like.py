@@ -129,11 +129,23 @@ class LikeCapability:
         return ok_result(data=result_data) if click_r.ok else click_r
 
     async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        """Verify the like state."""
+        """Verify the like state.
+
+        Honest-envelope rule (kernel-hygiene fix, 2026-09-22): ok=True means
+        VERIFIED — the like state reads 'liked'. 'unknown' (selectors absent)
+        and 'not_liked' are verification failures, not passes."""
         post_url = intent.payload.get("post_url") or f"https://x.com/i/status/{intent.target_id}"
         if not hasattr(broker, "read_like_state"):
             return soft_failure("like verify requires read_like_state()")
-        return await broker.read_like_state(post_url)
+        r = await broker.read_like_state(post_url)
+        if r.ok:
+            state = (r.data or {}).get("like_state")
+            if state != "liked":
+                return soft_failure(
+                    f"like verify could not confirm (state={state!r}) "
+                    f"for post {intent.target_id}"
+                )
+        return r
 
 
 def _transition_dict(t: StateTransition) -> dict:

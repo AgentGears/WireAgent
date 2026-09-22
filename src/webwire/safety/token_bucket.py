@@ -11,11 +11,14 @@ actions, the global public cap is much tighter.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Iterable, Optional
 
 from webwire.safety.models import RiskTier
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["TokenBucket", "BucketLimits", "DEFAULT_LIMITS"]
 
@@ -99,3 +102,30 @@ class TokenBucket:
         cutoff = now - limits.window_seconds
         active = [t for t in state.timestamps if t >= cutoff]
         return max(0, limits.max_count - len(active))
+
+    # -- hydration ----------------------------------------------------------
+
+    def hydrate_records(self, records: Iterable[dict[str, Any]]) -> int:
+        """Rebuild budget consumption from journal write records (each carrying
+        ``action_type`` and ``_epoch``). Returns the number of events replayed.
+
+        Semantics (P0 hydration spec, decision 2): every journaled write
+        invocation that reached the policy stage is replayed, including ones a
+        gate later denied — so hydrated budgets are marginally more
+        conservative than live accounting, never less protective. A crash
+        mid-execute journals nothing, losing at most one line's accounting;
+        the global breaker rehydrates from the same lines either way.
+        """
+        replayed = 0
+        for rec in records:
+            action = rec.get("action_type")
+            epoch = rec.get("_epoch")
+            if not action or epoch is None:
+                continue
+            self._states.setdefault("_global", _WindowState()).timestamps.append(float(epoch))
+            if action in self._limits:
+                self._states.setdefault(action, _WindowState()).timestamps.append(float(epoch))
+            replayed += 1
+        if replayed:
+            logger.info("TokenBucket hydrated %d budget events from journal", replayed)
+        return replayed

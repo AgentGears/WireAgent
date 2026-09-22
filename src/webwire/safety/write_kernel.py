@@ -147,16 +147,49 @@ class WriteKernel:
 
         # 2. Compose the intent.
         intent = write_cap.compose(input, actor_identity)
+        risk_tier = intent.risk_tier()
         trace["intent"] = {
             "action_type": intent.action_type,
             "target": f"{intent.target_type}:{intent.target_id}",
             "dedupe_key": intent.dedupe_key(),
             "intent_hash": intent.intent_hash(),
+            "risk_tier": risk_tier.value,
         }
         trace["stages"].append("intent_created")
 
+        # 2b. Registry gate (P0 gap-3 fix, 2026-09-22): policy runs on REGISTRY
+        # truth, not self-declared metadata. The action_type must be a known
+        # registry entry, and the capability's declared risk/compensation meta
+        # must match it exactly. A mismatch is a capability bug (drift between
+        # its compose() and the registry) or a downgrade attempt — the honest
+        # answer in both cases is a loud denial, not a silent override that
+        # would mask the drift.
+        reg_entry = self._risk.get(intent.action_type)
+        if reg_entry is None:
+            trace["stages"].append("denied:unknown_action")
+            return self._finish(PolicyDecision(
+                verdict=PolicyVerdict.DENY,
+                reason=(
+                    f"action_type {intent.action_type!r} is not registered in the "
+                    "risk registry — refusing to run unregistered writes"
+                ),
+                risk_tier=risk_tier, intent_hash=intent.intent_hash(),
+                blocked_by="unknown_action",
+            ), trace, None)
+        reg_meta, reg_comp = reg_entry
+        if intent.risk_meta != reg_meta or intent.compensation != reg_comp:
+            trace["stages"].append("denied:risk_meta_mismatch")
+            return self._finish(PolicyDecision(
+                verdict=PolicyVerdict.DENY,
+                reason=(
+                    f"declared risk/compensation meta for {intent.action_type!r} "
+                    "differs from the risk registry (drift or downgrade attempt)"
+                ),
+                risk_tier=risk_tier, intent_hash=intent.intent_hash(),
+                blocked_by="risk_meta_mismatch",
+            ), trace, None)
+
         # 3. Policy evaluation (before preview — cheap gates first).
-        risk_tier = intent.risk_tier()
 
         # 3a. Token bucket.
         allowed, reason = self._bucket.acquire(intent.action_type, risk_tier)
@@ -231,17 +264,37 @@ class WriteKernel:
         exec_result = await write_cap.execute(intent, write_broker)
         trace["execute_ok"] = exec_result.ok
 
-        if exec_result.ok:
-            # Record in dedupe (so a retry is blocked within TTL).
+        exec_data = exec_result.data if isinstance(exec_result.data, dict) else {}
+        side_effect_free = exec_data.get("dry_run") is True
+        if (exec_result.ok or exec_data.get("public_side_effect") is True) and not side_effect_free:
+            # Record in dedupe (so a retry is blocked within TTL). Rule (P0
+            # hydration spec, decision 1): a clean success records, AND an
+            # uncertain submit (degraded result flagged public_side_effect,
+            # e.g. submit_clicked_verification_pending) records too — for
+            # irreversible writes, "we don't know" is treated as "it happened".
+            # EXCEPT: an execute that declares itself side-effect-free
+            # (dry_run=True, e.g. compose_post's deliberate no-op) records
+            # nothing — dedupe guards side effects, and a no-op has none
+            # (otherwise a confirmed dry-run would block the real post).
             self._dedupe.record(intent.dedupe_key())
+            trace["dedupe_recorded"] = True
+        else:
+            trace["dedupe_recorded"] = False
 
         # 7. Journal — record the full pipeline trace.
         trace["stages"].append("journalled")
 
-        # 8. Verify.
-        verify_result = await write_cap.verify(intent, write_broker)
-        trace["verify_ok"] = verify_result.ok
-        trace["stages"].append("verified" if verify_result.ok else "verify_failed")
+        # 8. Verify — only after a successful execute. Running verify after a
+        # failed execute wastes browser work and produced misleading traces
+        # (verify_ok=True beside execute_ok=False, because "unknown" state
+        # reads counted as pass). Failed execute → verify skipped, honestly.
+        if exec_result.ok:
+            verify_result = await write_cap.verify(intent, write_broker)
+            trace["verify_ok"] = verify_result.ok
+            trace["stages"].append("verified" if verify_result.ok else "verify_failed")
+        else:
+            trace["verify_ok"] = False
+            trace["stages"].append("verify_skipped_execute_failed")
 
         return self._finish(PolicyDecision(
             verdict=PolicyVerdict.ALLOW if exec_result.ok else PolicyVerdict.DENY,

@@ -4,22 +4,31 @@ Per review Q3 hardening:
 - Dedupe key is canonical semantic intent (actor + action + target + variant),
   not just (action, target). Inverse actions (like vs unlike) are distinct.
 - TTL-based (default 1h), so re-liking after the window is allowed.
-- In-memory hot cache, BUT hydrated from the recent journal window on boot,
-  so a process restart during a loop doesn't erase the guard.
+- In-memory hot cache, hydrated from the recent journal window on boot, so a
+  process restart during a loop doesn't erase the guard.
+
+P0 hydration fix (2026-09-22): hydration now reads the write-fact fields the
+journal actually writes (``dedupe_key`` on kernel-recorded writes), via the
+shared tail-scan reader in ``webwire.journal``. The previous implementation
+expected fields the journal never wrote and silently hydrated 0 entries.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Optional
+
+from webwire.journal import read_recent_write_records
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["DedupeStore"]
 
 
 class DedupeStore:
-    """TTL-based dedupe with optional journal hydration on boot."""
+    """TTL-based dedupe with journal hydration on boot."""
 
     def __init__(self, ttl_seconds: float = 3600.0) -> None:
         self._ttl = ttl_seconds
@@ -41,46 +50,35 @@ class DedupeStore:
         t = now if now is not None else time.time()
         self._entries[key] = t + self._ttl
 
-    def hydrate_from_journal(self, journal_path: Path) -> int:
-        """Hydrate the dedupe store from recent journal entries (review Q3).
+    # -- hydration ----------------------------------------------------------
 
-        Reads the journal NDJSON, finds write records within the TTL window,
-        and re-records their dedupe keys. Returns the count hydrated.
-        """
-        if not journal_path.exists():
-            return 0
-        now = time.time()
-        cutoff = now - self._ttl
+    def hydrate_records(self, records: Iterable[dict[str, Any]], now: Optional[float] = None) -> int:
+        """Rebuild entries from journal write records (each carrying ``_epoch``
+        and, for kernel-recorded writes, ``dedupe_key``). Returns the count
+        hydrated. Records without a dedupe_key (gate-denied attempts) are
+        skipped — they created no semantic write."""
+        t = now if now is not None else time.time()
         hydrated = 0
-        try:
-            with journal_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    # Only write records with a dedupe key, within the TTL window.
-                    if rec.get("policy_decision") != "allowed":
-                        continue
-                    if rec.get("capability_tier") != "write":
-                        continue
-                    dk = rec.get("dedupe_key")
-                    ts = rec.get("timestamp_epoch") or rec.get("duration_ms")
-                    if not dk:
-                        continue
-                    # Journal records ISO timestamp; parse it for window check.
-                    iso = rec.get("timestamp")
-                    rec_time = _parse_iso(iso) if iso else None
-                    if rec_time is None or rec_time < cutoff:
-                        continue
-                    self._entries[dk] = rec_time + self._ttl
-                    hydrated += 1
-        except OSError:
-            pass
+        for rec in records:
+            key = rec.get("dedupe_key")
+            epoch = rec.get("_epoch")
+            if not key or epoch is None:
+                continue
+            expiry = float(epoch) + self._ttl
+            if expiry <= t:
+                continue  # already outside the TTL window
+            self._entries[key] = expiry
+            hydrated += 1
+        if hydrated:
+            logger.info("DedupeStore hydrated %d entries from journal", hydrated)
         return hydrated
+
+    def hydrate_from_journal(self, journal_path: Path, now: Optional[float] = None) -> int:
+        """Hydrate from the journal at ``journal_path`` (compat entry point;
+        the dispatcher feeds both stores from one shared read)."""
+        t = now if now is not None else time.time()
+        records = read_recent_write_records(journal_path, t - self._ttl)
+        return self.hydrate_records(records, now=t)
 
     def _prune(self, now: float) -> None:
         """Remove expired entries."""
@@ -90,15 +88,3 @@ class DedupeStore:
 
     def size(self) -> int:
         return len(self._entries)
-
-
-def _parse_iso(iso: str) -> Optional[float]:
-    """Parse an ISO 8601 timestamp to epoch seconds. Returns None on failure."""
-    try:
-        # Handle the 'Z' suffix and fractional seconds.
-        s = iso.replace("Z", "+00:00")
-        from datetime import datetime
-        dt = datetime.fromisoformat(s)
-        return dt.timestamp()
-    except (ValueError, TypeError):
-        return None

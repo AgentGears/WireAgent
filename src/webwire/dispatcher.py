@@ -65,6 +65,7 @@ class Dispatcher:
             WriteKernel,
         )
         self._dedupe = DedupeStore(ttl_seconds=3600)
+        self._bucket = TokenBucket()
         # WriteBroker factory: constructs a narrow WriteBroker from the live
         # SuperBrowser session. Called by the kernel during execute/verify.
         # Defined as a closure so it captures self._session (which isn't
@@ -78,7 +79,7 @@ class Dispatcher:
         self._write_kernel = WriteKernel(
             kill_switch=self._kill,
             risk_registry=DEFAULT_REGISTRY,
-            token_bucket=TokenBucket(),
+            token_bucket=self._bucket,
             dedupe=self._dedupe,
             journal=self._journal,
             write_broker_factory=_make_write_broker,
@@ -110,15 +111,28 @@ class Dispatcher:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("session restore failed: %r", exc)
         self._broker = ReadOnlyBroker(sb, self._kill, self._config)
-        # Hydrate the dedupe store from recent journal entries (Phase 0b review
-        # requirement): closes the restart-during-loop hole. Safe no-op if the
-        # journal is empty or doesn't exist yet.
+        # Hydrate BOTH safety stores from one journal read (P0 hydration fix):
+        # dedupe memory AND token-bucket budgets are rebuilt from the write
+        # facts the journal records, so a restart during a loop no longer
+        # resets either guard. Fail-open by design: a missing or corrupt
+        # journal means empty stores and full budgets — the confirmation gate
+        # never depends on the journal. One hour covers the dedupe TTL and the
+        # widest bucket window.
         try:
-            hydrated = self._dedupe.hydrate_from_journal(self._config.journal_path())
-            if hydrated:
-                logger.info("DedupeStore hydrated %d entries from journal", hydrated)
+            import time as _time
+            from webwire.journal import read_recent_write_records
+            records = read_recent_write_records(
+                self._config.journal_path(), _time.time() - 3600.0,
+            )
+            n_dedupe = self._dedupe.hydrate_records(records)
+            n_budget = self._bucket.hydrate_records(records)
+            if n_dedupe or n_budget:
+                logger.info(
+                    "Hydrated safety stores from journal: %d dedupe entries, %d budget events",
+                    n_dedupe, n_budget,
+                )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("dedupe hydration failed: %r", exc)
+            logger.warning("safety-store hydration failed: %r", exc)
         # Defaults already registered in __init__; ensure idempotent.
         self._register_defaults()
         # Enrich the start result with session/ownership state for callers.
@@ -197,8 +211,9 @@ class Dispatcher:
         try:
             if capability.tier == CapabilityTier.WRITE:
                 # Actor identity: resolved per-invocation from the session's
-                # authenticated handle (set by whoami). None until whoami runs.
-                actor = getattr(self._session, '_resolved_handle', None)
+                # whoami-verified handle (set by the post-whoami hook). None
+                # until whoami succeeds this run.
+                actor = self._session.resolved_handle
                 result = await self._write_kernel.execute(
                     capability, self._broker, input, actor_identity=actor,
                 )
@@ -224,21 +239,29 @@ class Dispatcher:
             )
 
         # Session checkpoint policy (review Q3): on a successful whoami, mark
-        # authenticated and eagerly checkpoint the cookie jar. whoami is the
-        # only capability that establishes identity; other capabilities benefit
-        # from the checkpoint but don't trigger it. This keeps capabilities pure
-        # (no persistence coupling) — policy lives in the dispatcher.
+        # authenticated, record the actor identity, and eagerly checkpoint the
+        # cookie jar. whoami is the only capability that establishes identity;
+        # other capabilities benefit from the checkpoint but don't trigger it.
+        # This keeps capabilities pure (no persistence coupling) — policy lives
+        # in the dispatcher.
         if name == "whoami" and result.ok:
-            self._session.mark_authenticated()
-            try:
-                await self._session.checkpoint_session()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("post-whoami checkpoint failed: %r", exc)
+            self._post_whoami_hook(result)
+
+        # Write facts (P0 hydration fix): for WRITE-tier results that reached
+        # the kernel's policy stage, extract the facts both safety stores
+        # rebuild from.
+        write_facts = self._write_facts(capability, result)
 
         self._journal_write(
             trace_id=trace_id, capability=name, input=input,
             result=result, policy_decision="allowed",
             actions=[], started_monotonic=started_monotonic,
+            capability_tier=(
+                capability.tier.value
+                if capability is not None and capability.tier == CapabilityTier.WRITE
+                else None
+            ),
+            **write_facts,
         )
         return result
 
@@ -257,6 +280,48 @@ class Dispatcher:
         return self._session
 
     # -- internals -----------------------------------------------------------
+
+    async def _post_whoami_hook(self, result: ActionResult) -> None:
+        """After a successful whoami: mark authenticated, bind the actor
+        identity (the handle flows into every write's dedupe key), and eagerly
+        checkpoint the cookie jar. Persistence never sets identity — whoami is
+        the only authority (review Q1-Q3)."""
+        self._session.mark_authenticated()
+        data = result.data if isinstance(result.data, dict) else None
+        if data and data.get("handle"):
+            self._session.set_resolved_handle(str(data["handle"]))
+        try:
+            await self._session.checkpoint_session()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("post-whoami checkpoint failed: %r", exc)
+
+    @staticmethod
+    def _write_facts(capability: Optional[Capability], result: ActionResult) -> dict[str, Optional[str]]:
+        """Extract the journal write-fact fields from a WRITE-tier result.
+
+        dedupe_key is journaled ONLY when the kernel recorded the write
+        (trace.dedupe_recorded — success, or uncertain submit flagged
+        public_side_effect). Gate-denied attempts journal no key, so they
+        never hydrate as executed writes.
+        """
+        facts: dict[str, Optional[str]] = {}
+        if capability is None or capability.tier != CapabilityTier.WRITE:
+            return facts
+        data = result.data if isinstance(result.data, dict) else None
+        if data and isinstance(data.get("trace"), dict):
+            trace_info = data["trace"]
+            intent_info = trace_info.get("intent") or {}
+            policy_info = data.get("policy") or {}
+            facts = {
+                "action_type": intent_info.get("action_type"),
+                "risk_tier": intent_info.get("risk_tier") or policy_info.get("risk_tier"),
+                "dedupe_key": (
+                    intent_info.get("dedupe_key")
+                    if trace_info.get("dedupe_recorded") is True
+                    else None
+                ),
+            }
+        return facts
 
     def _register_defaults(self) -> None:
         if self._registered_default:
@@ -332,6 +397,10 @@ class Dispatcher:
         policy_decision: str,
         actions: list[BrowserActionEntry],
         started_monotonic: float,
+        capability_tier: Optional[str] = None,
+        action_type: Optional[str] = None,
+        risk_tier: Optional[str] = None,
+        dedupe_key: Optional[str] = None,
     ) -> None:
         duration_ms = (time.monotonic() - started_monotonic) * 1000
         err = result.error
@@ -349,6 +418,10 @@ class Dispatcher:
             error_message=(err.message if err else None),
             browser_actions=[a.__dict__ for a in actions] if actions else [],
             duration_ms=duration_ms,
+            capability_tier=capability_tier,
+            action_type=action_type,
+            risk_tier=risk_tier,
+            dedupe_key=dedupe_key,
         )
         # Screenshot policy: default failure-only (Point 4 decision).
         if self._journal.should_capture_screenshot(failed=not result.ok):

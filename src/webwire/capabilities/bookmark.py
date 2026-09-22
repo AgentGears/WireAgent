@@ -81,11 +81,24 @@ class BookmarkCapability:
         return await broker.click_bookmark(post_url)
 
     async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        """Verify the bookmark took effect. Duck-typed."""
+        """Verify the bookmark took effect. Duck-typed.
+
+        Honest-envelope rule (kernel-hygiene fix, 2026-09-22): ok=True means
+        VERIFIED — the bookmark state reads 'bookmarked'. 'unknown' (selectors
+        absent) and 'not_bookmarked' are verification failures, not passes."""
         post_url = intent.payload.get("post_url") or f"https://x.com/i/status/{intent.target_id}"
         if not hasattr(broker, "read_bookmark_state"):
             return soft_failure(
                 "bookmark verify requires a broker with read_bookmark_state()",
                 failure_category=FailureCategory.SECURITY,
             )
-        return await broker.read_bookmark_state(post_url)
+        r = await broker.read_bookmark_state(post_url)
+        if r.ok:
+            state = (r.data or {}).get("bookmark_state")
+            if state != "bookmarked":
+                return soft_failure(
+                    f"bookmark verify could not confirm (state={state!r}) "
+                    f"for post {intent.target_id}",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+        return r

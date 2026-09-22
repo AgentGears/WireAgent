@@ -156,7 +156,7 @@ class PolicyDecision:
     # Set when verdict == CONFIRMATION_REQUIRED.
     confirmation_token: Optional[ConfirmationToken] = None
     # Set when verdict == DENY (which gate blocked).
-    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "expired_token" | "intent_mismatch" | "consumed_token"
+    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "unknown_action" | "risk_meta_mismatch" | "expired_token" | "intent_mismatch" | "consumed_token"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

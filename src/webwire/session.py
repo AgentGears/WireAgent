@@ -58,6 +58,10 @@ class SessionManager:
         # "Loading belongs early; trusting belongs never" — load_session sets
         # cookies but does NOT set this flag.
         self._authenticated = False
+        # Actor identity (the whoami-resolved handle). Part of every write's
+        # dedupe key, so multi-account writes never collide. None until whoami
+        # succeeds this run — persistence never sets it (cookies are not identity).
+        self._resolved_handle: Optional[str] = None
         self._session_loaded_state: str = "no_file"  # no_file|loaded|load_failed
 
     # -- accessors -----------------------------------------------------------
@@ -85,6 +89,19 @@ class SessionManager:
     def mark_authenticated(self) -> None:
         """Called by the dispatcher after whoami success. Enables checkpointing."""
         self._authenticated = True
+
+    @property
+    def resolved_handle(self) -> Optional[str]:
+        """The whoami-resolved handle for this run, or None. This is the actor
+        identity bound into write intents and dedupe keys."""
+        return self._resolved_handle
+
+    def set_resolved_handle(self, handle: Optional[str]) -> None:
+        """Record the actor identity after a verified whoami. Empty/None is
+        ignored (a failed or handle-less whoami must not clear a known-good
+        identity mid-run)."""
+        if handle and isinstance(handle, str) and handle.strip():
+            self._resolved_handle = handle.strip()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -280,6 +297,7 @@ class SessionManager:
             self._sb = None
             self._started = False
             self._authenticated = False
+            self._resolved_handle = None
         return ok_result(data={"stopped": True})
 
     # -- accessors -----------------------------------------------------------

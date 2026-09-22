@@ -57,8 +57,11 @@ class QuotePhotoCapability:
         attachment = validate_media_file(image_path)
 
         meta, comp = DEFAULT_REGISTRY.get("quote")
+        # action_type is the BASE action "quote" (P0 rate-limit fix, 2026-09-22):
+        # media quotes share the quote budget. Media identity lives in
+        # semantic_variant (text hash + attachment digest).
         return WriteIntent(
-            action_type="quote_photo",
+            action_type="quote",
             target_type="post",
             target_id=str(target_post_id),
             risk_meta=meta,

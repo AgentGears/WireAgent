@@ -103,6 +103,7 @@ def test_media_caps_normalize_to_base_actions(tmp_path: Path, write_sample_input
         "reply_photo": "reply",
         "quote_photo": "quote",
         "reply_multi_image": "reply",
+        "quote_multi_image": "quote",
     }
     for cap_name, base in expected.items():
         intent = d._registry.get(cap_name).compose(write_sample_inputs[cap_name], actor_identity="t")

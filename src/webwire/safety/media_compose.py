@@ -54,14 +54,18 @@ class PostSubmitHooks:
 @dataclass(frozen=True)
 class MediaComposeSpec:
     """One media-compose transaction. `items` mirrors the M4a manifest items
-    (index/source_path/sha256 dicts); target fields drive the reply hook."""
+    (index/source_path/sha256 dicts); target fields drive the context hook."""
     normalized_text: str
     items: list[dict[str, Any]]
     expected_count: int
-    # Target-context hook (None → plain post composer):
+    # Target-context hook (target_post_id None → plain post composer):
     target_post_url: Optional[str] = None
     target_post_id: Optional[str] = None
-    # Failure-code overrides (capability-specific vocabulary):
+    # Which context the hook opens: "reply" (open_reply_on_target) or "quote"
+    # (open_quote_on_target). Same contract either way: context BEFORE media.
+    context: str = "reply"
+    # Failure code when the reply-context open fails (capability vocabulary);
+    # the quote context uses quote_action_not_available (quote_photo's code).
     target_open_failure_code: str = "target_not_found_before_reply"
     # IDs the post-submit capture must exclude (e.g. the quoted/replied target).
     exclude_ids: frozenset[str] = frozenset()
@@ -143,20 +147,29 @@ async def run_media_compose(
                 "media_changed_after_confirmation",
                 f"Image {item['index']} changed since confirmation.")
 
-    # Gate 2: target-context hook FIRST (M3a lesson) — reply context before media.
+    # Gate 2: target-context hook FIRST (M3a lesson) — context before media.
     if spec.target_post_id is not None:
-        open_r = await broker.open_reply_on_target(
-            spec.target_post_url, spec.target_post_id,
-        )
+        if spec.context == "quote":
+            open_r = await broker.open_quote_on_target(
+                spec.target_post_url, spec.target_post_id,
+            )
+            open_fail_code = "quote_action_not_available"
+            fill = broker.fill_quote_composer
+        else:
+            open_r = await broker.open_reply_on_target(
+                spec.target_post_url, spec.target_post_id,
+            )
+            open_fail_code = spec.target_open_failure_code
+            fill = broker.fill_reply_composer
         if not open_r.ok:
             # Nothing opened — no composer to close, no media attached.
-            return failure(spec.target_open_failure_code,
-                           f"Could not open reply on target: {open_r.error}")
-        fill_r = await broker.fill_reply_composer(spec.normalized_text)
+            return failure(open_fail_code,
+                           f"Could not open {spec.context} on target: {open_r.error}")
+        fill_r = await fill(spec.normalized_text)
         if not fill_r.ok:
             return await _fail_after_open(
                 "pre_submit_mismatch",
-                f"Could not fill reply composer: {fill_r.error}")
+                f"Could not fill {spec.context} composer: {fill_r.error}")
     else:
         fill_r = await broker.fill_composer(spec.normalized_text)
         if not fill_r.ok:

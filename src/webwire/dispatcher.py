@@ -391,6 +391,11 @@ class Dispatcher:
         # hook (target opens before media — M3a lesson).
         from webwire.capabilities.reply_multi_image import ReplyMultiImageCapability
         self._registry.register(ReplyMultiImageCapability())
+        # quote_multi_image — v0.2 M4c: quote with text + multiple images.
+        # Shared harness with the QUOTE hook; dual attachment reported
+        # separately (quote by execution path, media by DOM count).
+        from webwire.capabilities.quote_multi_image import QuoteMultiImageCapability
+        self._registry.register(QuoteMultiImageCapability())
         self._registered_default = True
 
     def _journal_write(

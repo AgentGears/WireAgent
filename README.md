@@ -33,6 +33,16 @@ verification per attachment, composition re-verification, abort-and-cleanup
 on any partial failure, and honest verification (never claims byte
 equivalence, rendered order, or unproven attachments).
 
+## Development
+
+```bash
+pip install -e ".[dev]"        # offline dev (tests run against the stub SDK)
+pip install -e ".[browser]"    # + the Super-Browser SDK for live runs
+bash scripts/check.sh           # the gate: pytest + ruff + mypy
+```
+
+CI (GitHub Actions, Python 3.11/3.12) runs the same three steps on every push.
+
 ## Install (editable, local)
 
 ```bash

@@ -17,7 +17,8 @@
 
 ## Current version
 
-**v0.2+ (M1-M4c complete; delete_post added)** — 20 capabilities, 264 tests, 43 commits.
+**v0.3 (stabilized)** — 20 capabilities, 272 tests, CI-enforced (AgentGears/WireAgent).
+Type- and lint-clean; all media writes share ONE harness; offline stub SDK powers CI.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
 Health capability-selector probes landed (history i).
 All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
@@ -270,6 +271,24 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-23 (l): STABILIZATION BATCH complete. New home pushed (46-commit history,
+  verified secret-free: sweep + full-blob scan of tracked tool-state; remote's
+  wizard stub replaced). C1 CI foundation: offline stub of the Super-Browser SDK
+  (tests/stubs — every SuperBrowser method fails LOUDLY), conftest activates it
+  only when the real SDK is absent, test_stub_parity enforces shape parity on dev
+  machines; pyproject deps emptied (SDK → [browser] extra); scripts/check.sh gate;
+  GitHub Actions (3.11/3.12). C2 ruff: 264 findings → 0 (real finds: duplicate
+  started property, blocking HTTP in download_broker, zip strictness, blind
+  raises narrowed). C3 mypy: 117 → 0 (real finds: RiskRegistry.require() —
+  compose fails loud on unknown actions; the registry/protocol union lie fixed;
+  16 str=None annotation bugs; 50 stale ignores stripped). CI caught a real
+  environment split on run 1 (PIL optional) — fixed with override + getattr-probe.
+  C4 single-photo migration: post/reply/quote_photo delegate to the shared
+  harness (zero harness changes; M4a/M4b/M4c suites untouched), single-item paths
+  GAIN the exact-count gate (accepted tightening, test-locked); local helper
+  duplication deleted; capture adapters preserve historical capture semantics.
+  Suite 272; gate (pytest+ruff+mypy) fully green; parked list RETIRED.
+  Process lesson twice-learned: never pipe the gate through tail.
 - 2026-09-23 (k): delete_post LIVE-VERIFIED (capability a2c9218 + fixes). The
   compensation metadata is now an executable: registry 'delete_post' entry
   (irreversible, de-amplifying → conservative tier), 10/hour bucket, WriteBroker

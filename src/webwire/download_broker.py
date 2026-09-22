@@ -19,9 +19,10 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from super_browser.results.types import FailureCategory
+
 from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.safety.kill_switch import KillSwitch
 
@@ -132,8 +133,12 @@ class DownloadBroker:
                 download_url,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = resp.read()
+            def _fetch() -> bytes:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.read()
+
+            import asyncio
+            data = await asyncio.to_thread(_fetch)
 
             if not data:
                 return soft_failure(

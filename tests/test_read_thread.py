@@ -12,7 +12,6 @@ from webwire.capabilities.read_thread import (
     _looks_like_login_wall,
 )
 
-
 # -- post_id extraction ----------------------------------------------------
 
 def test_extract_post_id_standard_url() -> None:

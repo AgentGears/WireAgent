@@ -26,7 +26,6 @@ from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
 from webwire.safety import DEFAULT_LIMITS, DEFAULT_REGISTRY
 
-
 # ---------------------------------------------------------------------------
 # The permanent guard: every WRITE action_type has bucket + registry entries
 # ---------------------------------------------------------------------------

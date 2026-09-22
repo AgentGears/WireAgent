@@ -12,16 +12,13 @@ Covers the 7 Phase 4 invariants (ChatGPT's gate-level requirements):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
-from webwire.envelope import ok_result
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
 from webwire.session import SessionManager
-
 
 # -- text normalization ----------------------------------------------------
 

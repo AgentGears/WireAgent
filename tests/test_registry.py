@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from webwire.capabilities.base import Capability, CapabilityTier
+from webwire.capabilities.base import CapabilityTier
 from webwire.registry import CapabilityRegistry
 
 

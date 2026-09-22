@@ -11,7 +11,6 @@ from webwire.capabilities.read_profile import (
     _looks_like_missing_profile,
 )
 
-
 # -- article → post conversion + retweet inference -------------------------
 
 def test_article_self_post_no_retweet() -> None:

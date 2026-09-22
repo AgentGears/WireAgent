@@ -10,8 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
 from webwire.envelope import ok_result
@@ -114,9 +112,7 @@ async def test_like_case_b_compensation_not_eligible(tmp_path: Path) -> None:
     token = r1.data["data"]["confirmation_token"]
     r2 = await d.invoke("like_post", {"post_url": "https://x.com/jack/status/20", "confirmation_token": token})
     assert r2.data["trace"]["execute_ok"] is True
-    # The capability's result data is in the kernel trace under data.
-    exec_data = r2.data.get("data", {})
-    # already_satisfied result should be reflected.
+    # already_satisfied result should be reflected in the kernel trace data.
 
 
 # ---------------------------------------------------------------------------

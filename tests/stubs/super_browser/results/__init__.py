@@ -1,7 +1,7 @@
 from super_browser.results.types import (
     ActionError,
-    ErrorCategory,
     ActionResult,
+    ErrorCategory,
     FailureCategory,
     SuccessCategory,
     action_result,

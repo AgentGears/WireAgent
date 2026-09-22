@@ -99,7 +99,6 @@ class WriteBroker:
             return nav
         await asyncio.sleep(4)
         # Check which bookmark button variant is present.
-        from webwire.broker import ReadOnlyBroker
         # Reuse the CDP evaluate path to check button state.
         cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
         expr = (
@@ -560,7 +559,7 @@ class WriteBroker:
                 '})()'
             )
             # Retry a few times for the preview to appear.
-            for attempt in range(5):
+            for _attempt in range(5):
                 result = await cdp.evaluate(check_expr)
                 state = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
                 if state and state != "no_preview":
@@ -594,7 +593,7 @@ class WriteBroker:
                 'return "enabled";'
                 '})()'
             )
-            for attempt in range(5):
+            for _attempt in range(5):
                 result = await cdp.evaluate(expr)
                 state = result.data.get("result", {}).get("value") if (result.ok and result.data) else None
                 if state == "enabled":

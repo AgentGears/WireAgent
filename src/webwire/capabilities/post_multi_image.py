@@ -24,18 +24,17 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from super_browser.results.types import FailureCategory
-
-from webwire.envelope import ActionResult, ok_result, soft_failure
+from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
-from webwire.safety.attachment import file_sha256
 from webwire.safety.media_compose import MediaComposeSpec, PostSubmitHooks, run_media_compose
+from webwire.safety.media_manifest import (
+    preflight_manifest,
+)
 from webwire.safety.media_verify import count_post_media as _count_post_media
 from webwire.safety.media_verify import verify_post_text as _verify_text
-from webwire.safety.media_manifest import MediaManifest, MediaManifestItem, preflight_manifest, MAX_IMAGES_PER_POST
-from webwire.safety.post_submit import capture_pre_submit_ids, capture_new_post_id
+from webwire.safety.post_submit import capture_new_post_id, capture_pre_submit_ids
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 

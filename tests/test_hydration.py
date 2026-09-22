@@ -21,8 +21,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import pytest
-
 from super_browser.results import ActionError, ErrorCategory, action_result
 
 from webwire.config import WebWireConfig
@@ -343,7 +341,7 @@ def test_rotation_by_size(tmp_path: Path) -> None:
     probe_dir.mkdir()
     probe = Journal(WebWireConfig(state_dir=probe_dir))
     probe.append(_write_record("probe"))
-    record_bytes = len((probe_dir / "journal.ndjson").read_text(encoding="utf-8")) 
+    record_bytes = len((probe_dir / "journal.ndjson").read_text(encoding="utf-8"))
     threshold = 2 * record_bytes + 10  # rotate when a 3rd record would land
 
     j = Journal(

@@ -63,8 +63,6 @@ def test_action_result_shape_matches() -> None:
     from super_browser.results import types as real_types
 
     stub_types = _load_stub_module("super_browser.results.types")
-    for attrs in ({"ok"}, {"ok", "data"}, {"ok", "error", "data"}):
-        r = real_types.action_result(ok=True, data=None) if attrs == {"ok"} else None
     real = real_types.action_result(ok=True, data={"a": 1})
     stub = stub_types.action_result(ok=True, data={"a": 1})
     for field_name in ("ok", "data", "error", "success_category", "failure_category"):

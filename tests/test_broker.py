@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import pytest
-
 from super_browser.results.types import ActionResult, SuccessCategory
+
 from webwire.broker import ReadOnlyBroker
 from webwire.config import WebWireConfig
 from webwire.envelope import ok_result

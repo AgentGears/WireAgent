@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from webwire.capabilities.health import HealthCapability, _CORE_PROBES
+from webwire.capabilities.health import _CORE_PROBES, HealthCapability
 from webwire.config import WebWireConfig
 from webwire.envelope import ok_result, soft_failure
 from webwire.safety import KillSwitch

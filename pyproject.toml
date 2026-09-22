@@ -58,3 +58,34 @@ addopts = "-ra --strict-markers"
 [tool.coverage.run]
 source = ["src/webwire"]
 branch = true
+
+[tool.ruff]
+line-length = 112
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "ASYNC"]
+# BLE001 (blind except) is this codebase's documented idiom (envelope-everything);
+# it is opted into per-site with noqa where intentional.
+
+[tool.ruff.lint.per-file-ignores]
+# Irreducible single-line units (embedded CDP JS expressions, long enum-member
+# comment lines): wrapping them would obscure review, not help it.
+"src/webwire/write_broker.py" = ["E501"]
+"src/webwire/safety/models.py" = ["E501"]
+"src/webwire/capabilities/*_image.py" = ["E501"]
+"tests/test_broker.py" = ["E501"]
+"tests/test_read_profile.py" = ["E501"]
+"tests/test_write_kernel.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+warn_redundant_casts = true
+# The SDK is untyped-external (or stub in CI).
+[[tool.mypy.overrides]]
+module = "super_browser.*"
+ignore_missing_imports = true
+follow_imports = "skip"

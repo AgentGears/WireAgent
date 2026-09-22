@@ -134,18 +134,21 @@ class ReadOnlyBroker:
             result = await cdp.evaluate(expr)
             if result.ok and "exceptionDetails" not in result.data:
                 value = result.data.get("result", {}).get("value")
-                from webwire.envelope import ok_result
                 from super_browser.results.types import SuccessCategory
+
+                from webwire.envelope import ok_result
                 return ok_result(data=value, success_category=SuccessCategory.INSPECTION)
-            from webwire.envelope import soft_failure
             from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import soft_failure
             return soft_failure(
                 f"{label}: CDP evaluate failed",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
         except Exception as exc:  # noqa: BLE001
-            from webwire.envelope import hard_failure
             from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import hard_failure
             return hard_failure(f"{label} error: {exc!r}")
 
     async def query_attr(self, selector: str, attr: str) -> ActionResult:

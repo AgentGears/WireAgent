@@ -12,7 +12,6 @@ import logging
 from typing import Optional
 
 from webwire.capabilities.base import Capability, CapabilityTier
-from webwire.envelope import unsupported_capability
 
 logger = logging.getLogger(__name__)
 

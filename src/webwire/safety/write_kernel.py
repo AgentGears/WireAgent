@@ -15,25 +15,23 @@ Hardened design (review conversation 6a4fb320):
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, TYPE_CHECKING, runtime_checkable
+from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
-from webwire.envelope import ActionResult, ok_result, policy_blocked, soft_failure
+from webwire.envelope import ActionResult, ok_result
 from webwire.journal import Journal
 from webwire.safety.dedupe import DedupeStore
+from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import (
     ConfirmationToken,
     PolicyDecision,
     PolicyVerdict,
-    RiskMeta,
     WriteIntent,
 )
 from webwire.safety.risk_registry import RiskRegistry
 from webwire.safety.token_bucket import TokenBucket
-from webwire.safety.kill_switch import KillSwitch
 
 if TYPE_CHECKING:
     from webwire.broker import ReadOnlyBroker
@@ -376,8 +374,7 @@ class WriteKernel:
             return ok_result(data=result_data)
         # DENY — carry the policy decision + trace in data so callers can see
         # which gate blocked (blocked_by). Don't discard the diagnostic info.
-        from super_browser.results import ActionError, ErrorCategory
-        from super_browser.results import action_result
+        from super_browser.results import ActionError, ErrorCategory, action_result
         r = action_result(
             ok=False,
             error=ActionError(

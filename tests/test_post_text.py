@@ -13,8 +13,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
 from webwire.envelope import ok_result
@@ -114,7 +112,7 @@ async def test_post_text_matching_composer_proceeds_to_submit(tmp_path: Path) ->
     d = _make_dispatcher(tmp_path, fake)
     r1 = await d.invoke("post_text", {"text": "Hello world"})
     token = r1.data["data"]["confirmation_token"]
-    r2 = await d.invoke("post_text", {"text": "Hello world", "confirmation_token": token})
+    await d.invoke("post_text", {"text": "Hello world", "confirmation_token": token})
     # Submit should have been clicked.
     assert fake.submit_clicked is True
 
@@ -124,7 +122,6 @@ async def test_post_text_matching_composer_proceeds_to_submit(tmp_path: Path) ->
 async def test_post_text_kill_before_submit_aborts(tmp_path: Path) -> None:
     """Kill switch tripped AFTER fill but BEFORE submit → killed_before_submit.
     No submit clicked. No public side effect."""
-    kill = None
     fake = _FakePostBroker(composer_text_after_fill="test", kill=None)
     d = _make_dispatcher(tmp_path, fake)
     r1 = await d.invoke("post_text", {"text": "test"})

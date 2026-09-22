@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from webwire.envelope import ActionResult, ok_result
@@ -86,7 +86,7 @@ class ComposeOutcome:
 
 def failure(code: str, message: str) -> ActionResult:
     """Clean pre-submit failure — no public side effect."""
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.SECURITY, message, recoverable=False,
     ))
@@ -100,7 +100,7 @@ def degraded(code: str, message: str, normalized: str,
              target_post_id: Optional[str] = None) -> ActionResult:
     """Uncertain submit — public side effect possible. The public_side_effect
     flag drives the kernel's dedupe rule (uncertain counts as happened)."""
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
     ))

@@ -21,8 +21,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from super_browser.results.types import SuccessCategory
-
 from webwire.broker import ReadOnlyBroker
 from webwire.capabilities.base import Capability, CapabilityTier
 from webwire.capabilities.health import HealthCapability
@@ -97,8 +95,9 @@ class Dispatcher:
             return r
         sb = self._session.sb
         if sb is None:
-            from webwire.envelope import hard_failure
             from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import hard_failure
             return hard_failure(
                 "Session reported started but sb is None",
                 failure_category=FailureCategory.BROWSER_CRASH,
@@ -120,6 +119,7 @@ class Dispatcher:
         # widest bucket window.
         try:
             import time as _time
+
             from webwire.journal import read_recent_write_records
             records = read_recent_write_records(
                 self._config.journal_path(), _time.time() - 3600.0,
@@ -190,8 +190,9 @@ class Dispatcher:
             return result
 
         if self._broker is None:
-            from webwire.envelope import hard_failure
             from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import hard_failure
             result = hard_failure(
                 "Dispatcher not started — call await dispatcher.start() first",
                 failure_category=FailureCategory.BROWSER_CRASH,
@@ -231,8 +232,9 @@ class Dispatcher:
                     result = await capability.run(self._broker, input)
         except Exception as exc:  # noqa: BLE001 — envelope the error
             logger.exception("Capability %r raised", name)
-            from webwire.envelope import hard_failure
             from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import hard_failure
             result = hard_failure(
                 f"Capability {name!r} raised: {exc!r}",
                 failure_category=FailureCategory.UNKNOWN,

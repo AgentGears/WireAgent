@@ -8,7 +8,6 @@ from __future__ import annotations
 from webwire.capabilities.metrics import parse_metric
 from webwire.capabilities.read import _parse_status_href, _text_from_title
 
-
 # -- metrics parser --------------------------------------------------------
 
 def test_metric_full_integer() -> None:

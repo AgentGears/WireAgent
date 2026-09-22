@@ -21,7 +21,7 @@ Session persistence uses Super-Browser's public save_session/load_session
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 from super_browser import Config as SBConfig
 from super_browser import SuperBrowser
@@ -310,9 +310,6 @@ class SessionManager:
         """
         return self._sb
 
-    @property
-    def started(self) -> bool:
-        return self._started
 
     # -- internals -----------------------------------------------------------
 

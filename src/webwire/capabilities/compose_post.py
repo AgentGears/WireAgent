@@ -27,7 +27,7 @@ from super_browser.results.types import FailureCategory
 from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 

@@ -146,7 +146,8 @@ def test_attachment_immutable() -> None:
         path="/tmp/test.png", basename="test.png", sha256="abc123",
         mime="image/png", byte_size=100,
     )
-    with pytest.raises(Exception):  # FrozenInstanceError
+    from dataclasses import FrozenInstanceError
+    with pytest.raises(FrozenInstanceError):
         att.basename = "changed.png"  # type: ignore[misc]
 
 

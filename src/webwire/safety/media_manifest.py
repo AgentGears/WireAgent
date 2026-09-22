@@ -18,9 +18,8 @@ item rejects the ENTIRE invocation — do not begin uploading a valid prefix.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from webwire.safety.attachment import (
     Attachment,
@@ -125,7 +124,7 @@ def preflight_manifest(
     items: list[MediaManifestItem] = []
     seen_digests: set[str] = set()
 
-    for i, (path, alt_text) in enumerate(zip(image_paths, alt_texts)):
+    for i, (path, alt_text) in enumerate(zip(image_paths, alt_texts, strict=False)):
         attachment = validate_media_file(path, upload_roots=upload_roots, alt_text=alt_text)
 
         # Duplicate-item policy (ChatGPT: no silent deduplication, but reject exact duplicates).

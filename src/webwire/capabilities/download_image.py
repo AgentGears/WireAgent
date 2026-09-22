@@ -15,8 +15,8 @@ from typing import Any
 
 from super_browser.results.types import FailureCategory, SuccessCategory
 
-from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.capabilities.base import CapabilityTier
+from webwire.envelope import ActionResult, ok_result, soft_failure
 
 logger = logging.getLogger(__name__)
 

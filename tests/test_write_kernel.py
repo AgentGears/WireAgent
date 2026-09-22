@@ -11,36 +11,28 @@ Covers the hardened design (review conversation 6a4fb320):
 
 from __future__ import annotations
 
-import asyncio
 import time
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-from webwire.broker import ReadOnlyBroker
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, ok_result
 from webwire.journal import Journal
 from webwire.safety import (
-    Amplification,
-    CompensationMeta,
     DEFAULT_REGISTRY,
+    Amplification,
     DedupeStore,
     KillSwitch,
     PolicyVerdict,
     Reversibility,
     RiskMeta,
-    RiskRegistry,
     RiskTier,
     TokenBucket,
     Visibility,
-    WriteCapability,
     WriteIntent,
     WriteKernel,
 )
 from webwire.safety.write_kernel import PreviewResult
-
 
 # ---------------------------------------------------------------------------
 # Test fixtures — a fake write capability + fake broker

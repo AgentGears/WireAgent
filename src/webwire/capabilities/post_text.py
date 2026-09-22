@@ -26,12 +26,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from super_browser.results.types import FailureCategory
-
-from webwire.envelope import ActionResult, ok_result, soft_failure
+from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +119,7 @@ class PostTextCapability:
         submit_r = await broker.click_submit()
         if not submit_r.ok:
             return _failure("submit_clicked_verification_pending",
-                            f"Submit click returned error. Status uncertain.")
+                            "Submit click returned error. Status uncertain.")
 
         # Step 13: capture posted URL.
         import asyncio
@@ -188,7 +186,7 @@ def _normalize_for_compare(text: str) -> str:
 
 def _failure(code: str, message: str) -> ActionResult:
     """Pre-submit failure: NO public side effect occurred."""
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.SECURITY, message, recoverable=False,
     ))
@@ -199,7 +197,7 @@ def _failure(code: str, message: str) -> ActionResult:
 def _degraded(code: str, message: str, normalized: str,
               posted_url: str = None, posted_post_id: str = None) -> ActionResult:
     """Degraded result: public side effect MAY have occurred."""
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
     ))

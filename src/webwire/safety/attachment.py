@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -151,7 +150,7 @@ def detect_exif_warnings(path: Path, mime: str) -> tuple[bool, list[str]]:
             exif = img._getexif()
         if exif:
             warnings.append("EXIF metadata present in image")
-            for tag_id, value in exif.items():
+            for tag_id, _value in exif.items():
                 tag = TAGS.get(tag_id, tag_id)
                 if tag in ("GPSInfo",):
                     has_gps = True

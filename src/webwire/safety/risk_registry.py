@@ -18,7 +18,6 @@ from webwire.safety.models import (
     CompensationMeta,
     Reversibility,
     RiskMeta,
-    RiskTier,
     Visibility,
 )
 

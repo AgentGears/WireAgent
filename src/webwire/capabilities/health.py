@@ -29,7 +29,7 @@ from super_browser.results.types import FailureCategory, SuccessCategory
 from webwire.broker import ReadOnlyBroker
 from webwire.capabilities.base import CapabilityTier
 from webwire.config import WebWireConfig
-from webwire.envelope import ActionResult, hard_failure, ok_result, soft_failure
+from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.safety import KillSwitch
 from webwire.session import SessionManager
 

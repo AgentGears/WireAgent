@@ -142,7 +142,7 @@ async def test_invoke_whoami_awaits_the_hook(tmp_path: Path) -> None:
     actor. This drives the REAL invoke() call site with a stubbed whoami
     capability and asserts identity actually binds."""
     from webwire.broker import ReadOnlyBroker
-    from webwire.capabilities.base import Capability, CapabilityTier
+    from webwire.capabilities.base import CapabilityTier
 
     class _StubSB:
         _page = None

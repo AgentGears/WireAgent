@@ -14,9 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from super_browser.results.types import FailureCategory
+
 from webwire.config import WebWireConfig
 from webwire.envelope import ok_result
 from webwire.session import SessionManager
@@ -29,7 +28,7 @@ class _StubSB:
         self.loaded_from: list[str] = []
     async def save_session(self, path: str) -> Any:
         self.saved_to.append(path)
-        Path(path).write_text('{"version":"1.0","cookies":[]}')
+        Path(path).write_text('{"version":"1.0","cookies":[]}')  # noqa: ASYNC240 — test fake; the blocking write is the point
         return ok_result(data={"path": path})
     async def load_session(self, path: str) -> Any:
         self.loaded_from.append(path)

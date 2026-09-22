@@ -16,7 +16,7 @@ narrow port each capability requests via the capability's `write_port_cls`.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from webwire.envelope import ActionResult
 

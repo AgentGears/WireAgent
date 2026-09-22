@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 from typing import Optional
 
 from webwire.config import WebWireConfig
-from webwire.envelope import kill_switched
-from webwire.envelope import ActionResult
+from webwire.envelope import ActionResult, kill_switched
 
 logger = logging.getLogger(__name__)
 

@@ -25,15 +25,19 @@ from typing import Any, Optional
 from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
 from webwire.safety.media_compose import MediaComposeSpec, PostSubmitHooks, run_media_compose
+from webwire.safety.media_manifest import preflight_manifest
 from webwire.safety.media_verify import (
     count_post_media as _count_post_media,
+)
+from webwire.safety.media_verify import (
     verify_post_text as _verify_text,
+)
+from webwire.safety.media_verify import (
     verify_reply_in_thread as _verify_reply_in_thread,
 )
-from webwire.safety.media_manifest import preflight_manifest
-from webwire.safety.post_submit import capture_pre_submit_ids, capture_new_post_id
+from webwire.safety.post_submit import capture_new_post_id, capture_pre_submit_ids
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 

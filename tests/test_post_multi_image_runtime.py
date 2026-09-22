@@ -21,12 +21,9 @@ import zlib
 from pathlib import Path
 from typing import Any, Optional
 
-import pytest
-
-from webwire.envelope import ok_result, soft_failure
 from webwire.capabilities.post_multi_image import PostMultiImageCapability
+from webwire.envelope import ok_result, soft_failure
 from webwire.safety import WriteIntent
-
 
 # ---------------------------------------------------------------------------
 # PNG fixture helper (same as test_media_manifest.py — minimal valid PNG)

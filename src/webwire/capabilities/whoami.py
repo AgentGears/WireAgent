@@ -14,7 +14,6 @@ so it is the single thing to fix when X's DOM churns.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Optional
 
 from super_browser.results.types import FailureCategory, SuccessCategory
@@ -178,7 +177,7 @@ def _scan_for_handle_in_ax(ax_str: str, obs_data: dict[str, Any]) -> Optional[st
     # Filter out obvious non-handles.
     non_profile = {
         "home", "explore", "notifications", "messages", "search", "compose",
-        "settings", "i", "login", "signup", "tos", "privacy", "search",
+        "settings", "i", "login", "signup", "tos", "privacy",
     }
     for c in candidates:
         if c.lower() not in non_profile and len(c) >= 2:

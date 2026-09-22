@@ -17,7 +17,6 @@ import pytest
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
 from webwire.session import SessionManager
-from webwire.write_broker import WriteBroker
 
 
 class _StubSB:

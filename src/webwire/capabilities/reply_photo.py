@@ -21,13 +21,11 @@ import logging
 import re
 from typing import Any, Optional
 
-from super_browser.results.types import FailureCategory
-
-from webwire.envelope import ActionResult, ok_result, soft_failure
+from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
-from webwire.safety.attachment import validate_media_file, file_sha256
-from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.attachment import file_sha256, validate_media_file
+from webwire.safety.text_normalize import normalize_text, text_hash
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +147,7 @@ class ReplyPhotoCapability:
         composer_text = (read_r.data or {}).get("composer_text", "")
         if _normalize_for_compare(composer_text) != _normalize_for_compare(normalized):
             return _failure("pre_submit_mismatch",
-                            f"Composer text mismatch after media attach. NO submit.")
+                            "Composer text mismatch after media attach. NO submit.")
 
         # Step 6: final kill check.
         if hasattr(broker, "_kill") and broker._kill and broker._kill.tripped():
@@ -185,7 +183,7 @@ class ReplyPhotoCapability:
 
         if not verified["text_matches"]:
             return _degraded("posted_url_captured_verification_failed",
-                             f"Reply text mismatch.",
+                             "Reply text mismatch.",
                              normalized, target_post_id, posted_url, posted_post_id)
 
         return ok_result(data={
@@ -222,7 +220,7 @@ def _normalize_for_compare(text: str) -> str:
 
 
 def _failure(code: str, message: str) -> ActionResult:
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.SECURITY, message, recoverable=False,
     ))
@@ -233,7 +231,7 @@ def _failure(code: str, message: str) -> ActionResult:
 def _degraded(code: str, message: str, normalized: str,
               target_post_id: str = None, posted_url: str = None,
               posted_post_id: str = None) -> ActionResult:
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
     ))

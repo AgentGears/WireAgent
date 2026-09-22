@@ -15,7 +15,7 @@ from webwire.safety.models import (
     WriteIntent,
 )
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
-from webwire.safety.token_bucket import BucketLimits, DEFAULT_LIMITS, TokenBucket
+from webwire.safety.token_bucket import DEFAULT_LIMITS, BucketLimits, TokenBucket
 from webwire.safety.write_kernel import PreviewResult, WriteCapability, WriteKernel
 
 __all__ = [

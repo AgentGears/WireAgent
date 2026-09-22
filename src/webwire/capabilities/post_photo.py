@@ -21,16 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Any, Optional
 
-from super_browser.results.types import FailureCategory
-
-from webwire.envelope import ActionResult, ok_result, soft_failure
+from webwire.envelope import ActionResult, ok_result
 from webwire.safety import DEFAULT_REGISTRY, WriteIntent
-from webwire.safety.attachment import Attachment, MediaValidationError, validate_media_file, file_sha256
+from webwire.safety.attachment import (
+    file_sha256,
+    validate_media_file,
+)
 from webwire.safety.text_normalize import normalize_text, text_hash, validate_length
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ class PostPhotoCapability:
         composer_text = (read_r.data or {}).get("composer_text", "")
         if _normalize_for_compare(composer_text) != _normalize_for_compare(normalized):
             return _failure("pre_submit_mismatch",
-                            f"Composer text mismatch. NO submit clicked.")
+                            "Composer text mismatch. NO submit clicked.")
 
         # ChatGPT concern: final kill-switch check.
         if hasattr(broker, "_kill") and broker._kill and broker._kill.tripped():
@@ -185,7 +185,7 @@ class PostPhotoCapability:
                              normalized, posted_url, posted_post_id)
         if _normalize_for_compare(read_back_text) != _normalize_for_compare(normalized):
             return _degraded("posted_url_captured_verification_failed",
-                             f"Text mismatch on read-back.",
+                             "Text mismatch on read-back.",
                              normalized, posted_url, posted_post_id)
 
         # ChatGPT concern #8: verify attachment presence (not byte equivalence).
@@ -224,7 +224,7 @@ def _normalize_for_compare(text: str) -> str:
 
 
 def _failure(code: str, message: str) -> ActionResult:
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.SECURITY, message, recoverable=False,
     ))
@@ -234,7 +234,7 @@ def _failure(code: str, message: str) -> ActionResult:
 
 def _degraded(code: str, message: str, normalized: str,
               posted_url: str = None, posted_post_id: str = None) -> ActionResult:
-    from super_browser.results import action_result, ActionError, ErrorCategory
+    from super_browser.results import ActionError, ErrorCategory, action_result
     r = action_result(ok=False, error=ActionError(
         ErrorCategory.UNKNOWN, message, recoverable=False,
     ))

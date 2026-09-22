@@ -11,8 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-import pytest
-
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
 from webwire.envelope import ok_result, soft_failure

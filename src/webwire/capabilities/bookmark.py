@@ -16,10 +16,9 @@ from typing import Any, Optional
 
 from super_browser.results.types import FailureCategory
 
-from webwire.envelope import ActionResult, ok_result, soft_failure
-from webwire.safety import CompensationMeta, DEFAULT_REGISTRY, RiskMeta, WriteIntent
-from webwire.safety.write_kernel import PreviewResult, WriteCapability
-from webwire.write_broker import WriteBroker
+from webwire.envelope import ActionResult, soft_failure
+from webwire.safety import DEFAULT_REGISTRY, WriteIntent
+from webwire.safety.write_kernel import PreviewResult
 
 logger = logging.getLogger(__name__)
 

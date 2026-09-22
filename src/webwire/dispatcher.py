@@ -383,8 +383,14 @@ class Dispatcher:
         self._registry.register(QuotePhotoCapability())
         # post_multi_image — v0.2 M4a: post text + multiple images. Ordered
         # media-manifest transaction with partial-failure abort + cleanup.
+        # (M4b: delegates to the shared media_compose harness.)
         from webwire.capabilities.post_multi_image import PostMultiImageCapability
         self._registry.register(PostMultiImageCapability())
+        # reply_multi_image — v0.2 M4b: reply with text + multiple images.
+        # Thin composition on the shared harness with the REPLY target-context
+        # hook (target opens before media — M3a lesson).
+        from webwire.capabilities.reply_multi_image import ReplyMultiImageCapability
+        self._registry.register(ReplyMultiImageCapability())
         self._registered_default = True
 
     def _journal_write(

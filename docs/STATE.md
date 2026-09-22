@@ -17,7 +17,7 @@
 
 ## Current version
 
-**v0.2 COMPLETE (M1-M4c, all live-verified)** — 19 capabilities, 258 tests, 41 commits.
+**v0.2+ (M1-M4c complete; delete_post added)** — 20 capabilities, 264 tests, 43 commits.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
 Health capability-selector probes landed (history i).
 All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
@@ -122,6 +122,7 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 | post_multi_image | write | LIVE-VERIFIED | Ordered manifest, exact-count, abort-cleanup, media_batch_verified |
 | reply_multi_image | write | LIVE-VERIFIED | Shared harness, reply hook (target-first), thread-target verified, honest codes |
 | quote_multi_image | write | LIVE-VERIFIED | Shared harness, quote hook; dual attachment reported separately (quote by execution path, media 2/2 DOM-verified) |
+| delete_post | write | LIVE-VERIFIED | Compensation made real; id-scoped, kill-before-confirm, tombstone verify (deleted throwaway 2102523479664804123) |
 
 ## Safety kernel
 
@@ -256,7 +257,6 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 - [ ] Super-Browser download() Patchright bug (bypassed in DownloadBroker)
 - [ ] Future: persistent-context feature in Super-Browser
 - [ ] Future: follow/unfollow capability
-- [ ] Future: delete/unpost capability
 - [ ] Future: Phase 5 analytics
 
 ## Test fixtures
@@ -270,6 +270,21 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-23 (k): delete_post LIVE-VERIFIED (capability a2c9218 + fixes). The
+  compensation metadata is now an executable: registry 'delete_post' entry
+  (irreversible, de-amplifying → conservative tier), 10/hour bucket, WriteBroker
+  delete port (id-scoped article → caret → text-matched 'Delete' menu item →
+  confirmationSheetConfirm, kill re-checked before the confirm, dialog
+  dismissal on every failure), honest read_post_state (present|deleted|
+  unknown). Live: throwaway post created via post_text, then deleted through
+  the full kernel — post_deleted, verify_ok=true (tombstone), zero residue.
+  THREE live-caught bugs during landing: (1) _delete_poll double-wrapped the
+  poll coroutine (never awaited — every stage failed); (2) preview's
+  single-shot existence probe fired pre-hydration (a just-created post read
+  'absent') — now polled; (3) missing asyncio import in the new methods
+  (the file imports per-method; NameError surfaced only at the first sleep).
+  Diagnostic discipline paid: caret/menu stages were proven read-only BEFORE
+  any delete click (menu dump: 13 items, 'Delete' first).
 - 2026-09-23 (j): M4c LIVE-VERIFIED — quote_multi_image posted and fully
   verified against the fixture post (status/2102520857155522777): text
   verified, media_count 2/2 (the blob-first count gates exact inside the

@@ -706,10 +706,16 @@ class WriteBroker:
     async def _delete_poll(self, expr_fn, *, want_true: bool, label: str) -> ActionResult:
         """Poll an evaluate predicate. expr_fn() -> ActionResult whose data
         is truthy/falsy; returns the satisfying result or soft-failure."""
+        import asyncio
         import time
         deadline = time.monotonic() + self._DELETE_STAGE_TIMEOUT_S
         while True:
-            r = await self._delete_eval(expr_fn())
+            # expr_fn() itself returns the awaited-step coroutine (it wraps
+            # _delete_eval) — await it DIRECTLY. Passing it through
+            # _delete_eval again double-wraps: the inner coroutine is never
+            # awaited (the live-caught bug of 2026-09-23) and every stage
+            # fails as "evaluate failed".
+            r = await expr_fn()
             truthy = bool(r.ok and r.data)
             if truthy == want_true:
                 return r
@@ -736,6 +742,7 @@ class WriteBroker:
     async def _dismiss_delete_dialog(self) -> None:
         """Best-effort cleanup: cancel the confirmation sheet so a failed
         delete leaves no open dialog."""
+        import asyncio
         try:
             await self._delete_eval(
                 '(function(){'
@@ -851,6 +858,7 @@ class WriteBroker:
     async def read_post_state(self, post_url: str, post_id: str) -> ActionResult:
         """Read-only: does the post still exist? Honest vocabulary —
         'present' | 'deleted' (tombstone or no article) | 'unknown'."""
+        import asyncio
         if (r := self._guard()) is not None:
             return r
         try:

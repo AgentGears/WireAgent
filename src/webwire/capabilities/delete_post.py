@@ -74,20 +74,24 @@ class DeletePostCapability:
         )
         state = "unknown"
         try:
-            # Existence probe via the broker's bounded round-trip: navigate +
-            # probe for the id-scoped article (or its absence).
+            # Existence probe via the broker's bounded round-trip — POLLED
+            # (the shell-before-feed lesson applies to permalinks too: a
+            # single-shot probe fired pre-hydration and reported a
+            # just-created post as absent, live-caught 2026-09-23).
             if hasattr(broker, "navigate"):
                 nav = await broker.navigate(post_url)
                 if nav.ok and hasattr(broker, "probe_selectors"):
-                    pr = await broker.probe_selectors({
-                        "target_article": [f"a[href*='/status/{intent.target_id}']"],
-                    })
-                    if pr.ok:
-                        state = (
-                            "present"
-                            if (pr.data or {}).get("probes", {}).get("target_article")
-                            else "absent"
-                        )
+                    import asyncio
+                    for _ in range(4):
+                        pr = await broker.probe_selectors({
+                            "target_article": [f"a[href*='/status/{intent.target_id}']"],
+                        })
+                        if pr.ok and (pr.data or {}).get("probes", {}).get("target_article"):
+                            state = "present"
+                            break
+                        await asyncio.sleep(1.0)
+                    else:
+                        state = "absent"
         except Exception:  # noqa: BLE001 — preview must never raise
             state = "unknown"
 

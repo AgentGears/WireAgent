@@ -3,7 +3,7 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.2 (M1–M4c).** 19 capabilities — 7 read, 12 write — every
+**Status: v0.2+ (M1–M4c + delete_post).** 20 capabilities — 7 read, 13 write — every
 live-verified capability proven against the real site, with a write-safety
 kernel that gates every mutation behind token-bound human confirmation.
 
@@ -25,6 +25,7 @@ Personal, single-user, local-only. Not a product, not multi-tenant.
 | `read_search` — top/latest/people/media tabs | `post_photo` / `reply_photo` / `quote_photo` |
 | `download_image` — separate local-output broker | `post_multi_image` / `reply_multi_image` — ordered manifest transaction |
 | `health` — DOM probes, hydration polling, core gating | `quote_multi_image` — quoted target + 2/2 media verified |
+| `delete_post` — compensation made real; tombstone-verified |
 
 All multi-image writes share one media-compose harness
 (`safety/media_compose.py`): preflight-all-before-any-upload, exact-count

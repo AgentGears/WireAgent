@@ -680,3 +680,203 @@ class WriteBroker:
             return ok_result(data={"cleanup": state or "navigated_away"})
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"close_composer error: {exc!r}")
+
+
+    # ------------------------------------------------------------------
+    # Delete port — delete_post (2026-09-23). One semantic method, every
+    # stage id-scoped and polled (the week's lessons applied at birth):
+    # article selection scoped by the posted status id, poll-until-render at
+    # each stage, kill re-checked immediately before the irreversible confirm
+    # (invariant 12 — "hand on the button"), honest post-state vocabulary.
+    # ------------------------------------------------------------------
+
+    _DELETE_STAGE_TIMEOUT_S = 8.0
+    _DELETE_POLL_INTERVAL_S = 1.0
+
+    async def _delete_eval(self, expr: str) -> ActionResult:
+        """CDP evaluate for the delete flow (may mutate via el.click())."""
+        cdp = self._sb._controller._cdp  # type: ignore[attr-defined]
+        result = await cdp.evaluate(expr)
+        if result.ok and "exceptionDetails" not in result.data:
+            from webwire.envelope import ok_result
+            return ok_result(data=result.data.get("result", {}).get("value"))
+        return soft_failure("delete stage evaluate failed",
+                            failure_category=FailureCategory.UNKNOWN)
+
+    async def _delete_poll(self, expr_fn, *, want_true: bool, label: str) -> ActionResult:
+        """Poll an evaluate predicate. expr_fn() -> ActionResult whose data
+        is truthy/falsy; returns the satisfying result or soft-failure."""
+        import time
+        deadline = time.monotonic() + self._DELETE_STAGE_TIMEOUT_S
+        while True:
+            r = await self._delete_eval(expr_fn())
+            truthy = bool(r.ok and r.data)
+            if truthy == want_true:
+                return r
+            if time.monotonic() >= deadline:
+                return soft_failure(
+                    f"delete stage timeout: {label}",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            await asyncio.sleep(self._DELETE_POLL_INTERVAL_S)
+
+    @staticmethod
+    def _delete_article_js(post_id: str, inner: str) -> str:
+        """JS scoped to the article whose status href matches post_id."""
+        return (
+            '(function(){'
+            'var arts=document.querySelectorAll("article");'
+            'for(var i=0;i<arts.length;i++){'
+            f"var link=arts[i].querySelector(\"a[href*='/status/{post_id}']\");"
+            'if(!link)continue;'
+            'var art=arts[i];' + inner + '}'
+            'return null;})()'
+        )
+
+    async def _dismiss_delete_dialog(self) -> None:
+        """Best-effort cleanup: cancel the confirmation sheet so a failed
+        delete leaves no open dialog."""
+        try:
+            await self._delete_eval(
+                '(function(){'
+                'var c=document.querySelector("[data-testid=\'confirmationSheetCancel\']");'
+                'if(c){c.click();return "cancelled";}'
+                'return "no_cancel_found";})()'
+            )
+            await asyncio.sleep(0.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def delete_post(self, post_url: str, post_id: str) -> ActionResult:
+        """Delete ONE of the user's own posts (post/reply/quote alike — all
+        are statuses). Flow: navigate → id-scoped article → its caret → the
+        Delete menu item (menu-scoped, text-matched) → the confirmation
+        button. Kill is re-checked immediately before the confirm click."""
+        if (r := self._guard()) is not None:
+            return r
+        try:
+            nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+            if not nav.ok:
+                return nav
+
+            # Stage 1: the target article (id-scoped) is rendered.
+            r1 = await self._delete_poll(
+                lambda: self._delete_eval(self._delete_article_js(
+                    post_id, 'return "found";')),
+                want_true=True, label="target article",
+            )
+            if not r1.ok:
+                return soft_failure(
+                    "delete_post: target post not found (deleted already, "
+                    "not yours, or URL invalid)",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+
+            # Stage 2: open the article's '...' (caret) menu.
+            r2 = await self._delete_eval(self._delete_article_js(
+                post_id,
+                'var c=art.querySelector("[data-testid=\'caret\']");'
+                'if(!c)return null;c.click();return "caret_clicked";'))
+            if not (r2.ok and r2.data):
+                return soft_failure(
+                    "delete_post: caret button not found on target article",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+
+            # Stage 3: the Delete menu item (menu-scoped, text-matched).
+            r3 = await self._delete_poll(
+                lambda: self._delete_eval(
+                    '(function(){'
+                    'var menus=document.querySelectorAll('
+                    '"[data-testid=\'Dropdown\'],[role=\'menu\']");'
+                    'for(var m=0;m<menus.length;m++){'
+                    'var items=menus[m].querySelectorAll("[role=\'menuitem\'],a,button");'
+                    'for(var i=0;i<items.length;i++){'
+                    'var t=(items[i].innerText||"").trim();'
+                    'if(t==="Delete"||t==="Delete post"||t==="删除"||t==="删除帖子"){'
+                    'items[i].click();return "delete_item_clicked:"+t;}}}'
+                    'return null;})()'
+                ),
+                want_true=True, label="delete menu item",
+            )
+            if not r3.ok:
+                await self._dismiss_delete_dialog()
+                return soft_failure(
+                    "delete_post: Delete item not in menu (post may not be yours)",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+
+            # Stage 4: the confirmation button. Invariant 12 — kill re-check
+            # immediately before the irreversible confirm.
+            if (r := self._guard()) is not None:
+                await self._dismiss_delete_dialog()
+                return r
+            r4 = await self._delete_poll(
+                lambda: self._delete_eval(
+                    '(function(){'
+                    'var b=document.querySelector('
+                    '"[data-testid=\'confirmationSheetConfirm\']");'
+                    'if(!b){var btns=document.querySelectorAll("button");'
+                    'for(var i=0;i<btns.length;i++){'
+                    'var t=(btns[i].innerText||"").trim();'
+                    'if(t==="Delete"){b=btns[i];break;}}}'
+                    'if(!b)return null;b.click();return "confirm_clicked";})()'
+                ),
+                want_true=True, label="confirmation button",
+            )
+            if not r4.ok:
+                await self._dismiss_delete_dialog()
+                return soft_failure(
+                    "delete_post: confirmation button never appeared",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+
+            # Stage 5: wait for the sheet to disappear (completion signal).
+            r5 = await self._delete_poll(
+                lambda: self._delete_eval(
+                    '(function(){return document.querySelector('
+                    '"[data-testid=\'confirmationSheetConfirm\']")===null;})()'
+                ),
+                want_true=True, label="confirmation sheet dismissed",
+            )
+            return ok_result(data={
+                "deleted": True,
+                "post_id": post_id,
+                "sheet_dismissed": bool(r5.ok),
+            })
+        except Exception as exc:  # noqa: BLE001
+            await self._dismiss_delete_dialog()
+            return soft_failure(f"delete_post error: {exc!r}")
+
+    async def read_post_state(self, post_url: str, post_id: str) -> ActionResult:
+        """Read-only: does the post still exist? Honest vocabulary —
+        'present' | 'deleted' (tombstone or no article) | 'unknown'."""
+        if (r := self._guard()) is not None:
+            return r
+        try:
+            nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+            if not nav.ok:
+                return ok_result(data={"post_state": "unknown"})
+            await asyncio.sleep(4)
+            r = await self._delete_eval(
+                '(function(){'
+                'var body=(document.body.innerText||"");'
+                'if(body.indexOf("This post was deleted")>=0'
+                '||body.indexOf("deleted by its author")>=0'
+                '||body.indexOf("Post deleted")>=0'
+                '||body.indexOf("This post is unavailable")>=0'
+                '||body.indexOf("Something went wrong")>=0) return "tombstone";'
+                'var arts=document.querySelectorAll("article");'
+                f"for(var i=0;i<arts.length;i++){{"
+                f"var link=arts[i].querySelector(\"a[href*='/status/{post_id}']\");"
+                'if(link)return "present";}'
+                'return "no_article";})()'
+            )
+            state = r.data if r.ok else None
+            if state == "present":
+                return ok_result(data={"post_state": "present"})
+            if state in ("tombstone", "no_article"):
+                return ok_result(data={"post_state": "deleted"})
+            return ok_result(data={"post_state": "unknown"})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"read_post_state error: {exc!r}")

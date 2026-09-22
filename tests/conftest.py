@@ -51,6 +51,7 @@ def build_write_sample_inputs(tmp_path: Path) -> dict[str, dict[str, Any]]:
         "quote_photo": {**target, "text": "hello", "image_path": str(red)},
         "reply_multi_image": {**target, "text": "hello", "image_paths": [str(red), str(blue)]},
         "quote_multi_image": {**target, "text": "hello", "image_paths": [str(red), str(blue)]},
+        "delete_post": {**target},
     }
 
 

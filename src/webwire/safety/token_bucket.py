@@ -40,6 +40,10 @@ _DEFAULTS = {
     "post": BucketLimits(max_count=3, window_seconds=3600),       # 3 / hour
     "reply": BucketLimits(max_count=5, window_seconds=3600),
     "quote": BucketLimits(max_count=3, window_seconds=3600),
+    # Deletion: generous enough to serve as compensation for creation flows
+    # (3 posts + 5 replies + 3 quotes / hour worst case), tight enough that
+    # a runaway mass-deletion loop stays bounded; global breaker caps anyway.
+    "delete_post": BucketLimits(max_count=10, window_seconds=3600),
     # Global circuit breaker — all writes combined.
     "_global": BucketLimits(max_count=20, window_seconds=300),    # 20 / 5min
 }

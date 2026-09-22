@@ -199,6 +199,31 @@ def _build_default() -> RiskRegistry:
             residual_side_effects=("deletion_is_not_undo",),
         ),
     )
+    # --- delete_post (2026-09-23): the compensation made real ---
+    # Deleting own content is IRREVERSIBLE (restoration is impossible; repost
+    # creates a new post) but de-amplifying and non-creative — it fails every
+    # specific derive_tier branch and lands, correctly, in the conservative
+    # PUBLIC_CONTENT_IRREVERSIBLE default. It cannot itself be compensated:
+    # recreation is a new post; thread replies/quotes break; copies persist.
+    reg.register(
+        "delete_post",
+        RiskMeta(
+            visibility=Visibility.PUBLIC,          # the effect is publicly visible
+            reversibility=Reversibility.IRREVERSIBLE,
+            amplification=Amplification.NONE,       # it de-amplifies
+            residual_side_effects=(
+                "deletion_breaks_threads_and_quotes",
+                "copies_screenshots_and_caches_may_persist",
+            ),
+        ),
+        CompensationMeta(
+            supports_compensation=False,
+            residual_side_effects=(
+                "deletion_is_not_undo",
+                "recreation_is_a_new_post",
+            ),
+        ),
+    )
 
     return reg
 

@@ -396,6 +396,11 @@ class Dispatcher:
         # separately (quote by execution path, media by DOM count).
         from webwire.capabilities.quote_multi_image import QuoteMultiImageCapability
         self._registry.register(QuoteMultiImageCapability())
+        # delete_post — 2026-09-23: the compensation made real. Removes one
+        # of the user's own posts (post/reply/quote alike). Id-scoped,
+        # kill-before-confirm, honest tombstone verification.
+        from webwire.capabilities.delete_post import DeletePostCapability
+        self._registry.register(DeletePostCapability())
         self._registered_default = True
 
     def _journal_write(

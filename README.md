@@ -24,7 +24,7 @@ Personal, single-user, local-only. Not a product, not multi-tenant.
 | `read_thread` — conversation slice | `post_text` / `reply_post` / `quote_post` |
 | `read_search` — top/latest/people/media tabs | `post_photo` / `reply_photo` / `quote_photo` |
 | `download_image` — separate local-output broker | `post_multi_image` / `reply_multi_image` — ordered manifest transaction |
-| `health` — DOM probes, hydration polling, core gating | `quote_multi_image` — code complete, gates live-proven; full live post pending quote budget window |
+| `health` — DOM probes, hydration polling, core gating | `quote_multi_image` — quoted target + 2/2 media verified |
 
 All multi-image writes share one media-compose harness
 (`safety/media_compose.py`): preflight-all-before-any-upload, exact-count

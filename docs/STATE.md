@@ -17,7 +17,7 @@
 
 ## Current version
 
-**v0.2 (M1-M4c complete — M4c full live post pending budget window)** — 19 capabilities, 256 tests, 38 commits.
+**v0.2 COMPLETE (M1-M4c, all live-verified)** — 19 capabilities, 258 tests, 41 commits.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
 Health capability-selector probes landed (history i).
 All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
@@ -97,7 +97,7 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 | **v0.2 M3b** | quote_photo (dual attachment, identity-aware capture) | **LIVE-VERIFIED** |
 | **v0.2 M4a** | post_multi_image (ordered media-manifest transaction) | **LIVE-VERIFIED** + runtime tests |
 | **v0.2 M4b** | reply_multi_image (shared media-compose harness) | **LIVE-VERIFIED** + runtime tests |
-| **v0.2 M4c** | quote_multi_image (shared harness, quote hook) | **CODE COMPLETE + gates live-proven**; full live post pending quote budget window (history h) |
+| **v0.2 M4c** | quote_multi_image (shared harness, quote hook) | **LIVE-VERIFIED** (quote 2102520857155522777) |
 
 ## Capabilities (19)
 
@@ -121,7 +121,7 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 | quote_photo | write | LIVE-VERIFIED | Dual attachment (quote+media) verified separately, identity-aware capture |
 | post_multi_image | write | LIVE-VERIFIED | Ordered manifest, exact-count, abort-cleanup, media_batch_verified |
 | reply_multi_image | write | LIVE-VERIFIED | Shared harness, reply hook (target-first), thread-target verified, honest codes |
-| quote_multi_image | write | CODE COMPLETE + gates live-proven | Shared harness, quote hook; dual attachment honest; full live post pending budget (history h) |
+| quote_multi_image | write | LIVE-VERIFIED | Shared harness, quote hook; dual attachment reported separately (quote by execution path, media 2/2 DOM-verified) |
 
 ## Safety kernel
 
@@ -242,10 +242,10 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
   refactor commit); reply_multi_image on it with the target-first hook; 10
   runtime tests; live-verified (reply 2102493233989529629, thread-target
   verified, media_count 2 after the verifier fix below).
-- [x] ~~M4c quote_multi_image~~ — code complete 2026-09-22 (4036cb3 + 17fc258);
-  gates live-proven after the count fix; FULL two-phase public post pending
-  the quote budget window (~1h — the failed first attempt consumed 2 of 3;
-  run scripts/smoke_m4c_live.py when free and mark LIVE-VERIFIED above)
+- [x] ~~M4c quote_multi_image~~ — LIVE-VERIFIED 2026-09-23 (quote 2102520857155522777:
+  posted_and_target_verified, media_count 2/2, blob-count gates exact through
+  the quote composer, dual attachment honest; ran after the budget window
+  freed — journal-verified 0 quote events in the hour before the run)
 - [x] ~~M4a runtime test gap (ChatGPT blocker)~~ — closed: 7 runtime tests added (attach-fail, count-mismatch, preview-not-ready, composer-mutation, kill-before-submit, transcoding-honest, rendered-order)
 - [ ] reply_photo URL capture gap (submit_clicked_verification_pending — identity-aware verifier should be retrofitted)
 - [ ] Phase 1b edge cases (quote-tweet, media-only, reply) need real fixtures
@@ -270,6 +270,13 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-23 (j): M4c LIVE-VERIFIED — quote_multi_image posted and fully
+  verified against the fixture post (status/2102520857155522777): text
+  verified, media_count 2/2 (the blob-first count gates exact inside the
+  quote composer), quote attachment by execution path, actor 'infaag|'
+  in the dedupe key, write facts journaled. The run executed only after a
+  journal-timestamp check confirmed 0 quote events in the preceding hour.
+  THE v0.2 MEDIA TRANCHE (M1-M4c) IS COMPLETE: 19 capabilities.
 - 2026-09-23 (i): Health capability-selector probes (the re-evaluation's top
   residual risk, closed). New supplementary check `capability_selectors` —
   tweetText, bookmark/removeBookmark, inline composer — rides the same

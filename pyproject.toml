@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "webwire"
-version = "0.0.1"
+version = "0.2.0"
 description = "Browser-native X/Twitter capability layer for AI agents — built on Super-Browser"
 readme = "README.md"
 license = { text = "Apache-2.0" }

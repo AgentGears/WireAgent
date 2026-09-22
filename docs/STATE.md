@@ -17,7 +17,8 @@
 
 ## Current version
 
-**v0.2 (M1-M4c complete — M4c full live post pending budget window)** — 19 capabilities, 256 tests, 37 commits.
+**v0.2 (M1-M4c complete — M4c full live post pending budget window)** — 19 capabilities, 256 tests, 38 commits.
+README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
 All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 (quote_multi_image) is next. See History.
 

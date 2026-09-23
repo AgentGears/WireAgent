@@ -416,6 +416,8 @@ class _PreparationBase:
                 "media_changed_after_approval",
                 f"media index {expected.index} digest changed",
             )
+        # Digesting may take time. Re-check approval/policy/epoch immediately
+        # before delegating the actual upload.
         self._require_live(PreparationVerb.ATTACH_MEDIA)
         result = await self.__attach_media(expected.source_path)
         if result.ok:
@@ -683,6 +685,28 @@ class ScopedAuthorityBroker:
             return QuotePreparationAuthority(**common)
         raise ScopedAuthorityDenied("preparation_not_supported", binding.action_type)
 
+    def authorize_commit(
+        self,
+        *,
+        grant: ApprovalGrant,
+        attempt: EffectAttempt,
+        intent: WriteIntent,
+    ) -> _EffectAuthorityBase:
+        """Validate browser-facing scope before permit mint, then authorize.
+
+        One-step actions have no preparation phase in which target/payload scope
+        would otherwise be validated. Performing the scoped binding first avoids
+        spending approval or creating a durable reservation for an intent that
+        can never be represented safely by a browser authority.
+        """
+        binding = self._capture_current_binding(intent)
+        permit = self.__gateway.authorize_commit(
+            grant=grant, attempt=attempt, intent=intent
+        )
+        return self._authorize_bound(
+            permit=permit, attempt=attempt, binding=binding
+        )
+
     def authorize(
         self,
         *,
@@ -691,6 +715,17 @@ class ScopedAuthorityBroker:
         intent: WriteIntent,
     ) -> _EffectAuthorityBase:
         binding = self._capture_current_binding(intent)
+        return self._authorize_bound(
+            permit=permit, attempt=attempt, binding=binding
+        )
+
+    def _authorize_bound(
+        self,
+        *,
+        permit: EffectPermit,
+        attempt: EffectAttempt,
+        binding: _IntentBinding,
+    ) -> _EffectAuthorityBase:
         if permit.intent_hash != binding.intent_hash:
             raise ScopedAuthorityDenied("intent_mismatch")
         if permit.actor_id != binding.actor_id:

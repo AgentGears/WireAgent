@@ -161,7 +161,7 @@ class CommitGateway:
         kill_switch: KillSwitch,
         authorization_epoch: AuthorizationEpoch,
         policies: EffectPolicyRegistry = DEFAULT_EFFECT_POLICIES,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
         permit_ttl_seconds: float = DEFAULT_PERMIT_TTL_S,
     ) -> None:
         if permit_ttl_seconds <= 0:
@@ -288,8 +288,8 @@ class CommitGateway:
         if not snapshot.actor_id or snapshot.actor_id != grant.actor_id:
             raise GatewayDenied("actor_mismatch")
         try:
-            # ApprovalGrant owns its own clock domain. Do not compare its
-            # expires_at against the gateway's permit clock.
+            # ApprovalGrant owns its own monotonic clock domain. Do not compare
+            # its expires_at against the gateway's permit clock.
             grant.validate_live(
                 intent_hash=snapshot.intent_hash,
                 actor_id=snapshot.actor_id,
@@ -410,8 +410,8 @@ class CommitGateway:
                                 attempt.mark_reserved(grant)
 
                             # Durable I/O and opportunistic expiry closure can
-                            # consume wall-clock time. Approval validity is
-                            # checked again in the grant's own clock domain;
+                            # consume elapsed time. Approval validity is checked
+                            # again in the grant's own monotonic clock domain;
                             # permit TTL starts later from the gateway clock.
                             mint_epoch = self._epoch.current
                             try:

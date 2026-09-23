@@ -103,74 +103,64 @@ class KillSwitch:
         Only the outermost notification traversal invokes callbacks. Re-entrant
         ``tripped()``, ``trip()``, ``reset()``, or ``add_trip_listener()`` calls
         may update active/generation state, but they cannot recursively invoke a
-        callback. If a callback resets and retrips, its successful invocation is
-        credited only to the generation captured before it ran; the traversal
-        then restarts and delivers the callback again for the new generation.
-        Failed callbacks remain unnotified and retry on a later observation.
+        callback. If a callback resets and retrips, its invocation belongs only
+        to the generation captured before it ran; the traversal restarts and
+        delivers it again for the new generation.
+
+        A failed callback is attempted at most once per traversal/generation.
+        It remains unnotified, so a later external observation retries it, while
+        successful later listeners in the same trip are still allowed to run.
         Caller must hold ``_state_lock``.
         """
         if self._notifying:
             return
 
         self._notifying = True
+        attempted: list[Callable[[], object]] = []
+        attempted_generation = -1
         try:
             while True:
                 if not self._sync_trip_generation_unlocked():
                     return
                 generation = self._trip_generation
+                if generation != attempted_generation:
+                    attempted.clear()
+                    attempted_generation = generation
+
                 pending = [
                     listener
                     for listener in tuple(self._trip_listeners)
                     if listener not in self._notified_listeners
                     and listener not in self._listeners_in_progress
+                    and listener not in attempted
                 ]
                 if not pending:
                     return
 
-                generation_changed = False
-                made_progress = False
-                for listener in pending:
-                    if not self._sync_trip_generation_unlocked():
-                        return
-                    if self._trip_generation != generation:
-                        generation_changed = True
-                        break
-                    if (
-                        listener in self._notified_listeners
-                        or listener in self._listeners_in_progress
-                    ):
-                        continue
+                listener = pending[0]
+                attempted.append(listener)
+                self._listeners_in_progress.append(listener)
+                succeeded = False
+                try:
+                    listener()
+                    succeeded = True
+                except Exception:
+                    logger.exception("KillSwitch trip listener failed: %r", listener)
+                finally:
+                    if listener in self._listeners_in_progress:
+                        self._listeners_in_progress.remove(listener)
 
-                    self._listeners_in_progress.append(listener)
-                    succeeded = False
-                    try:
-                        listener()
-                        succeeded = True
-                    except Exception:
-                        logger.exception("KillSwitch trip listener failed: %r", listener)
-                    finally:
-                        if listener in self._listeners_in_progress:
-                            self._listeners_in_progress.remove(listener)
-
-                    active = self._sync_trip_generation_unlocked()
-                    if active and self._trip_generation == generation and succeeded:
-                        if listener not in self._notified_listeners:
-                            self._notified_listeners.append(listener)
-                        made_progress = True
-                    elif self._trip_generation != generation:
-                        # The callback reset then retripped. Do not credit its old
-                        # invocation to the new generation; restart from the top.
-                        generation_changed = True
-                        break
-                    elif not active:
-                        return
-                    # On failure, leave it pending but do not spin in this same
-                    # traversal. Later tripped()/trip() observation performs retry.
-
-                if generation_changed:
-                    continue
-                if not made_progress:
+                active = self._sync_trip_generation_unlocked()
+                if not active:
                     return
+                if self._trip_generation != generation:
+                    # reset()+trip() occurred during the callback. The callback
+                    # just completed for the old generation and is still pending
+                    # for the newly-created generation; loop restart clears the
+                    # per-generation attempted set and delivers it again.
+                    continue
+                if succeeded and listener not in self._notified_listeners:
+                    self._notified_listeners.append(listener)
         finally:
             self._notifying = False
 

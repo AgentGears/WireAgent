@@ -288,6 +288,16 @@ class CommitGateway:
         if grant.action_type != snapshot.action_type:
             raise GatewayDenied("action_mismatch")
         if (
+            not isinstance(snapshot.target_type, str)
+            or not snapshot.target_type
+            or not isinstance(snapshot.target_id, str)
+            or not snapshot.target_id
+        ):
+            raise GatewayDenied(
+                "target_missing",
+                "target_type and target_id must be non-empty strings",
+            )
+        if (
             grant.target_type != snapshot.target_type
             or grant.target_id != snapshot.target_id
         ):

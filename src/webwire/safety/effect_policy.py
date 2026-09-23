@@ -1,9 +1,14 @@
 """M5 effect policy — independent risk, authority, replay, and durability axes.
 
-This module is the normative policy primitive for the M5 Effect Transaction
-Boundary. It deliberately does not execute browser mutations; it describes
-what an action is allowed to do. Handling of uncertain outcomes is global by
-frozen invariant 9, never a per-action policy.
+This module describes what an action is allowed to do and what crash/replay
+semantics the runtime may rely on. It deliberately does not execute browser
+mutations.
+
+A BEST_EFFORT durability assignment is therefore a positive claim: replay has
+been established to create no additional meaningful external effect. Explicitly
+recorded unknown outcomes still require reconciliation; the special case is a
+process crash before a BEST_EFFORT terminal record exists, where replay safety
+is the only available guarantee.
 
 Source of truth: docs/M5_DESIGN.md §4.
 """
@@ -49,13 +54,6 @@ class DurabilityPolicy(StrEnum):
     BEST_EFFORT = "best_effort"
 
 
-# No per-action uncertainty policy exists, deliberately (Codex review,
-# PR #2, 2026-09-23): docs/M5_DESIGN.md invariant 9 makes unknown-outcome
-# handling GLOBAL — an uncertain effect is never automatically retried;
-# only reconciliation clears it. A per-action safe-to-retry lever would
-# let any registered policy exempt itself from that guarantee.
-
-
 class EffectVerb(StrEnum):
     """Semantic authority verbs. These are not generic DOM primitives."""
 
@@ -78,8 +76,7 @@ def derive_durability(
     risk_tier: RiskTier,
     replay_semantics: ReplaySemantics,
 ) -> DurabilityPolicy:
-    """Derive fencing from risk *and* replay semantics."""
-
+    """Derive fencing from risk and replay semantics."""
     if risk_tier in {
         RiskTier.PUBLIC_AMPLIFYING_REVERSIBLE,
         RiskTier.PUBLIC_CONTENT_IRREVERSIBLE,
@@ -116,11 +113,11 @@ class EffectPolicy:
         allowed_effects: Iterable[EffectVerb],
         replay_semantics: ReplaySemantics,
     ) -> "EffectPolicy":
-        """Construct a policy whose durability follows the frozen derivation."""
-
         effects = frozenset(allowed_effects)
         if not effects:
-            raise ValueError(f"effect policy {action_type!r} must allow at least one effect")
+            raise ValueError(
+                f"effect policy {action_type!r} must allow at least one effect"
+            )
         return cls(
             action_type=action_type,
             risk_tier=risk_tier,
@@ -131,21 +128,22 @@ class EffectPolicy:
 
     def validate(self) -> None:
         """Fail loud on policy drift or attempted durability downgrade."""
-
         if not self.action_type:
             raise ValueError("effect policy action_type must not be empty")
         if not self.allowed_effects:
-            raise ValueError(f"effect policy {self.action_type!r} has no allowed effects")
+            raise ValueError(
+                f"effect policy {self.action_type!r} has no allowed effects"
+            )
         expected = derive_durability(self.risk_tier, self.replay_semantics)
         if self.durability != expected:
             raise ValueError(
-                f"effect policy {self.action_type!r} durability {self.durability.value!r} "
-                f"does not match derived requirement {expected.value!r}"
+                f"effect policy {self.action_type!r} durability "
+                f"{self.durability.value!r} does not match derived requirement "
+                f"{expected.value!r}"
             )
 
     def binding_hash(self) -> str:
-        """Stable identity bound into future ApprovalGrants/EffectPermits."""
-
+        """Stable identity bound into ApprovalGrants and EffectPermits."""
         payload = {
             "schema_version": self.schema_version,
             "action_type": self.action_type,
@@ -159,12 +157,7 @@ class EffectPolicy:
 
 
 class EffectPolicyRegistry:
-    """Authoritative, thread-safe action_type -> EffectPolicy map.
-
-    ``policy_fence()`` is the mutation-boundary synchronization primitive.
-    Registration and a gateway's final policy check share the same RLock, so a
-    P1→P2 update cannot linearize between binding validation and permit use.
-    """
+    """Authoritative, thread-safe action_type -> EffectPolicy map."""
 
     def __init__(self) -> None:
         self._entries: dict[str, EffectPolicy] = {}
@@ -202,8 +195,7 @@ class EffectPolicyRegistry:
 
 
 def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPolicyRegistry:
-    """Build the M5 initial policy table from existing risk-registry truth."""
-
+    """Build initial M5 policy truth from implemented evidence plus safe defaults."""
     reg = EffectPolicyRegistry()
 
     def add(
@@ -221,18 +213,23 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
             )
         )
 
+    # Directional broker implementations exist and are regression-backed.
     add("bookmark", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_BOOKMARK})
-    add("remove_bookmark", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.CLEAR_BOOKMARK})
+    add(
+        "remove_bookmark",
+        ReplaySemantics.SAFE_STATE_SET,
+        {EffectVerb.CLEAR_BOOKMARK},
+    )
     add("like", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_LIKE})
     add("unlike", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.CLEAR_LIKE})
-    add("follow", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.FOLLOW})
-    add("unfollow", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.UNFOLLOW})
 
-    # Repost may repeat notification/feed-amplification side effects; keep it
-    # explicitly fenced. Unrepost is replay-safe as a state clear, but its
-    # public-amplifying risk tier independently keeps durability REQUIRED.
-    add("repost", ReplaySemantics.REPLAY_HAS_RESIDUAL_EFFECTS, {EffectVerb.REPOST})
-    add("unrepost", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.UNREPOST})
+    # Future mutation families have no real broker implementation yet. Their
+    # replay behavior is UNKNOWN until an implementation + regression proves a
+    # stronger contract. This intentionally keeps them durably fenced.
+    add("follow", ReplaySemantics.UNKNOWN, {EffectVerb.FOLLOW})
+    add("unfollow", ReplaySemantics.UNKNOWN, {EffectVerb.UNFOLLOW})
+    add("repost", ReplaySemantics.UNKNOWN, {EffectVerb.REPOST})
+    add("unrepost", ReplaySemantics.UNKNOWN, {EffectVerb.UNREPOST})
 
     content_effects = {
         EffectVerb.OPEN_COMPOSER,

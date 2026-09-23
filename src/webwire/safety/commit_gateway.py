@@ -156,7 +156,9 @@ class CommitGateway:
 
     Kill-listener draining happens before the protocol lock. This avoids a
     callback lock inversion while ``execution_fence`` closes the race between
-    preflight and the authority transition.
+    preflight and the authority transition. External hot-file state is refreshed
+    callback-free again immediately before mint/consume because an external
+    process cannot participate in the Python state lock.
     """
 
     def __init__(
@@ -415,45 +417,63 @@ class CommitGateway:
                                 attempt.mark_reserved(grant)
 
                             # Durable I/O and opportunistic expiry closure can
-                            # consume elapsed time. Approval validity is checked
-                            # again in the grant's own monotonic clock domain.
-                            # The epoch fence makes direct revocation atomic with
-                            # spend + permit mint; the slow fsync above remains
-                            # outside the fence so a bump during I/O is observed.
+                            # consume elapsed time. The callback-free kill
+                            # refresh catches external hot-file activation that
+                            # cannot participate in the Python execution fence.
+                            # Grant validity is checked after that potentially
+                            # blocking filesystem observation, immediately before
+                            # spend/mint, under the direct epoch fence.
                             grant_error: Optional[GrantClaimDenied] = None
+                            kill_blocked_at_mint = False
                             with self._epoch.fence() as mint_epoch:
-                                try:
-                                    grant.validate_live(
-                                        intent_hash=snapshot.intent_hash,
-                                        actor_id=snapshot.actor_id,
-                                        policy_binding=binding,
-                                        authorization_epoch=mint_epoch,
-                                    )
-                                except GrantClaimDenied as exc:
-                                    grant_error = exc
+                                if self._kill.execution_blocked_now():
+                                    kill_blocked_at_mint = True
                                 else:
-                                    mint_now = self._clock()
-                                    grant.spend()
-                                    permit = EffectPermit(
-                                        grant_id=grant.grant_id,
-                                        attempt_id=attempt.attempt_id,
-                                        effect_id=effect_id,
-                                        semantic_key=semantic_key,
-                                        intent_hash=snapshot.intent_hash,
-                                        actor_id=snapshot.actor_id,
-                                        action_type=snapshot.action_type,
-                                        target_type=snapshot.target_type,
-                                        target_id=snapshot.target_id,
+                                    try:
+                                        grant.validate_live(
+                                            intent_hash=snapshot.intent_hash,
+                                            actor_id=snapshot.actor_id,
+                                            policy_binding=binding,
+                                            authorization_epoch=mint_epoch,
+                                        )
+                                    except GrantClaimDenied as exc:
+                                        grant_error = exc
+                                    else:
+                                        mint_now = self._clock()
+                                        grant.spend()
+                                        permit = EffectPermit(
+                                            grant_id=grant.grant_id,
+                                            attempt_id=attempt.attempt_id,
+                                            effect_id=effect_id,
+                                            semantic_key=semantic_key,
+                                            intent_hash=snapshot.intent_hash,
+                                            actor_id=snapshot.actor_id,
+                                            action_type=snapshot.action_type,
+                                            target_type=snapshot.target_type,
+                                            target_id=snapshot.target_id,
+                                            policy_binding=binding,
+                                            authorization_epoch=mint_epoch,
+                                            allowed_effects=policy.allowed_effects,
+                                            fenced=fenced,
+                                            issued_at=mint_now,
+                                            expires_at=mint_now + self._permit_ttl,
+                                        )
+                                        self._issued_permits[permit.permit_id] = permit
+                                        self._issued_attempts[permit.permit_id] = attempt
+                                        return permit
+
+                            if kill_blocked_at_mint:
+                                if fenced and attempt.state is AttemptState.RESERVED:
+                                    self._close_reserved_before_permit(
+                                        grant=grant,
+                                        attempt=attempt,
+                                        snapshot=snapshot,
                                         policy_binding=binding,
-                                        authorization_epoch=mint_epoch,
-                                        allowed_effects=policy.allowed_effects,
-                                        fenced=fenced,
-                                        issued_at=mint_now,
-                                        expires_at=mint_now + self._permit_ttl,
+                                        reason="kill_switch_before_permit",
                                     )
-                                    self._issued_permits[permit.permit_id] = permit
-                                    self._issued_attempts[permit.permit_id] = attempt
-                                    return permit
+                                else:
+                                    attempt.mark_no_effect_after_authority()
+                                raise GatewayDenied("kill_switch")
 
                             assert grant_error is not None
                             if fenced and attempt.state is AttemptState.RESERVED:
@@ -534,10 +554,15 @@ class CommitGateway:
                             ):
                                 raise GatewayDenied("target_mismatch")
 
-                            # Policy/epoch fences may block. TTL is elapsed-time
-                            # authority, so it must be sampled at the exact
-                            # consume transition rather than trusted from the
-                            # earlier fast-path check.
+                            # Re-observe external kill state immediately before
+                            # the authority transition; unlike programmatic trip,
+                            # a hot-file writer cannot share the Python lock.
+                            if self._kill.execution_blocked_now():
+                                raise GatewayDenied("kill_switch")
+
+                            # Policy/epoch/kill checks may block. TTL is elapsed-
+                            # time authority, so sample it last at the consume
+                            # transition rather than trusting the fast-path read.
                             boundary_now = self._clock()
                             if boundary_now >= permit.expires_at:
                                 expired_at_boundary = True

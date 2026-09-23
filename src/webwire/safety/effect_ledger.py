@@ -1,7 +1,7 @@
 """M5 durable effect ledger.
 
 The ledger is safety-critical and intentionally separate from ``journal.ndjson``.
-Writes are append-only NDJSON and fsync-backed.  A failure is propagated so the
+Writes are append-only NDJSON and fsync-backed. A failure is propagated so the
 future Commit Gateway can fail closed before a REQUIRED external effect.
 
 Source of truth: docs/M5_DESIGN.md §§10-12.
@@ -135,12 +135,47 @@ class EffectLedger:
     def path(self) -> Path:
         return self._path
 
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Persist directory metadata where the platform exposes that primitive.
+
+        POSIX requires the parent directory to be fsync'd for a newly created
+        child entry to be crash-durable. Python does not expose a portable
+        directory FlushFileBuffers equivalent on Windows, so NT relies on the
+        file-handle fsync while preserving the same fail-closed file contract.
+        """
+
+        if os.name == "nt":
+            return
+        fd: Optional[int] = None
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            os.fsync(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def _ensure_parent(self) -> None:
+        missing: list[Path] = []
+        cursor = self._path.parent
+        while not cursor.exists():
+            missing.append(cursor)
+            parent = cursor.parent
+            if parent == cursor:
+                break
+            cursor = parent
+
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            # mkdir durability is a parent-directory property. Persist each
+            # newly created directory and the entry that names it, top-down.
+            for created in reversed(missing):
+                self._fsync_directory(created)
+                self._fsync_directory(created.parent)
         except OSError as exc:
             raise EffectLedgerError(
-                f"could not create effect ledger directory {self._path.parent}: {exc!r}"
+                f"could not durably create effect ledger directory "
+                f"{self._path.parent}: {exc!r}"
             ) from exc
 
     @staticmethod
@@ -156,7 +191,7 @@ class EffectLedger:
     def append_durable(self, record: EffectLedgerRecord) -> None:
         """Append one record and fsync before returning.
 
-        Any creation/write/fsync failure raises EffectLedgerError.  The caller
+        Any creation/write/fsync failure raises EffectLedgerError. The caller
         must not perform a REQUIRED external effect after such a failure.
         """
 
@@ -181,27 +216,19 @@ class EffectLedger:
                 except OSError:
                     pass
 
-        # If this append created the file, persist the directory entry too.
+        # A new file needs its containing directory entry persisted too.
         if not existed:
-            dir_fd: Optional[int] = None
             try:
-                dir_fd = os.open(self._path.parent, os.O_RDONLY)
-                os.fsync(dir_fd)
+                self._fsync_directory(self._path.parent)
             except OSError as exc:
                 raise EffectLedgerError(
                     f"effect ledger directory fsync failed: {exc!r}"
                 ) from exc
-            finally:
-                if dir_fd is not None:
-                    try:
-                        os.close(dir_fd)
-                    except OSError:
-                        pass
 
     def read_records(self) -> list[EffectLedgerRecord]:
         """Read all records in append order.
 
-        Unlike the audit journal, malformed content is not skipped.  Losing a
+        Unlike the audit journal, malformed content is not skipped. Losing a
         safety fact could permit replay, so corruption fails closed.
         """
 

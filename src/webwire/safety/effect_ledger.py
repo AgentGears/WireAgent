@@ -2,7 +2,12 @@
 
 The ledger is safety-critical and intentionally separate from ``journal.ndjson``.
 Writes are append-only NDJSON and fsync-backed. A failure is propagated so the
-future Commit Gateway can fail closed before a REQUIRED external effect.
+Commit Gateway can fail closed before a REQUIRED external effect.
+
+The ledger owns not just record syntax but canonical history semantics. For one
+``effect_id`` the semantic lineage is immutable and effect-knowledge state may
+only move forward. Recovery therefore never accepts a contradictory "last row
+wins" history as authority.
 
 Source of truth: docs/M5_DESIGN.md §§10-12.
 """
@@ -30,20 +35,54 @@ __all__ = [
 
 
 class EffectLedgerError(RuntimeError):
-    """Durable ledger I/O failure. Callers must treat this as fail-closed."""
+    """Durable ledger I/O or validity failure. Callers must fail closed."""
 
 
 class EffectLedgerCorruptError(EffectLedgerError):
-    """Ledger content cannot be trusted enough to reconstruct safety state."""
+    """Ledger content/history cannot be trusted as safety authority."""
 
 
 class EffectState(StrEnum):
-    """Canonical effect-knowledge states from the frozen M5 design."""
+    """Canonical effect-knowledge states from the M5 design."""
 
     NO_EFFECT = "NO_EFFECT"
     RESERVED = "RESERVED"
     EFFECT_CONFIRMED = "EFFECT_CONFIRMED"
     EFFECT_UNKNOWN = "EFFECT_UNKNOWN"
+
+
+# A fenced effect begins with RESERVED. A replay-safe BEST_EFFORT effect has no
+# precommit reservation and can first appear only when its post-boundary outcome
+# is known/unknown. NO_EFFECT is therefore never a first durable fact in layer 3;
+# it closes an unused RESERVED permit.
+_INITIAL_STATES = frozenset(
+    {
+        EffectState.RESERVED,
+        EffectState.EFFECT_CONFIRMED,
+        EffectState.EFFECT_UNKNOWN,
+    }
+)
+_ALLOWED_SUCCESSORS: dict[EffectState, frozenset[EffectState]] = {
+    EffectState.RESERVED: frozenset(
+        {
+            EffectState.NO_EFFECT,
+            EffectState.EFFECT_CONFIRMED,
+            EffectState.EFFECT_UNKNOWN,
+        }
+    ),
+    EffectState.NO_EFFECT: frozenset(),
+    EffectState.EFFECT_CONFIRMED: frozenset(),
+    EffectState.EFFECT_UNKNOWN: frozenset(),
+}
+_LINEAGE_FIELDS = (
+    "semantic_key",
+    "action_type",
+    "intent_hash",
+    "policy_binding",
+    "actor_id",
+    "target_type",
+    "target_id",
+)
 
 
 @dataclass(frozen=True)
@@ -65,8 +104,6 @@ class EffectLedgerRecord:
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # A record cannot EXIST invalid — validation runs at construction,
-        # not only at parse/serialize boundaries.
         self.validate()
 
     def validate(self) -> None:
@@ -77,10 +114,9 @@ class EffectLedgerRecord:
             "intent_hash": self.intent_hash,
             "policy_binding": self.policy_binding,
         }
-        # Identity fields must be GENUINE non-empty strings. str() coercion at
+        # Identity fields must be genuine non-empty strings. str() coercion at
         # the from_dict boundary would turn a corrupt null into "None" and let
-        # it hydrate as a semantic key — exactly the evasion the recovery guard
-        # exists to prevent (Codex review, PR #2, 2026-09-23).
+        # it hydrate as a semantic key.
         for name, value in required.items():
             if not isinstance(value, str) or not value:
                 raise ValueError(
@@ -180,8 +216,6 @@ class EffectLedger:
 
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            # mkdir durability is a parent-directory property. Persist each
-            # newly created directory and the entry that names it, top-down.
             for created in reversed(missing):
                 self._fsync_directory(created)
                 self._fsync_directory(created.parent)
@@ -201,12 +235,58 @@ class EffectLedger:
                 raise OSError("effect ledger write returned no progress")
             total += written
 
-    def append_durable(self, record: EffectLedgerRecord) -> None:
-        """Append one record and fsync before returning.
+    @staticmethod
+    def _validate_history(records: list[EffectLedgerRecord]) -> None:
+        """Validate immutable lineage and the canonical per-effect state machine.
 
-        Any creation/write/fsync failure raises EffectLedgerError. The caller
-        must not perform a REQUIRED external effect after such a failure.
+        This runs both when reading durable state and before a local append. A
+        malformed or contradictory history is corruption: recovery must fail
+        closed rather than choose whichever record happened to be last.
         """
+        first_by_effect: dict[str, EffectLedgerRecord] = {}
+        last_by_effect: dict[str, EffectLedgerRecord] = {}
+
+        for record in records:
+            first = first_by_effect.get(record.effect_id)
+            if first is None:
+                if record.state not in _INITIAL_STATES:
+                    raise EffectLedgerCorruptError(
+                        f"effect_id {record.effect_id!r} has illegal initial state "
+                        f"{record.state.value}"
+                    )
+                first_by_effect[record.effect_id] = record
+                last_by_effect[record.effect_id] = record
+                continue
+
+            for field_name in _LINEAGE_FIELDS:
+                original = getattr(first, field_name)
+                current = getattr(record, field_name)
+                if current != original:
+                    raise EffectLedgerCorruptError(
+                        f"effect_id {record.effect_id!r} changed {field_name} "
+                        f"from {original!r} to {current!r}"
+                    )
+
+            previous = last_by_effect[record.effect_id]
+            allowed = _ALLOWED_SUCCESSORS[previous.state]
+            if record.state not in allowed:
+                raise EffectLedgerCorruptError(
+                    f"effect_id {record.effect_id!r} has illegal transition "
+                    f"{previous.state.value} -> {record.state.value}"
+                )
+            last_by_effect[record.effect_id] = record
+
+    def append_durable(self, record: EffectLedgerRecord) -> None:
+        """Validate, append, and fsync one canonical effect fact.
+
+        Any history/creation/write/fsync failure raises EffectLedgerError. The
+        caller must not perform a REQUIRED external effect after such a failure.
+        Local preflight validation catches impossible transitions before bytes
+        are appended; read-time validation remains authoritative after restart.
+        """
+        record.validate()
+        existing = self.read_records()
+        self._validate_history([*existing, record])
 
         payload = (record.to_jsonl() + "\n").encode("utf-8")
         self._ensure_parent()
@@ -229,7 +309,6 @@ class EffectLedger:
                 except OSError:
                     pass
 
-        # A new file needs its containing directory entry persisted too.
         if not existed:
             try:
                 self._fsync_directory(self._path.parent)
@@ -239,10 +318,11 @@ class EffectLedger:
                 ) from exc
 
     def read_records(self) -> list[EffectLedgerRecord]:
-        """Read all records in append order.
+        """Read and validate all records in append order.
 
-        Unlike the audit journal, malformed content is not skipped. Losing a
-        safety fact could permit replay, so corruption fails closed.
+        Unlike the audit journal, malformed content and impossible histories
+        are not skipped. Losing or contradicting a safety fact could permit
+        replay, so corruption fails closed.
         """
 
         if not self._path.exists():
@@ -253,7 +333,6 @@ class EffectLedger:
             raise EffectLedgerError(f"effect ledger read failed: {exc!r}") from exc
 
         records: list[EffectLedgerRecord] = []
-        identities: dict[str, str] = {}
         for lineno, line in enumerate(lines, start=1):
             if not line.strip():
                 continue
@@ -263,18 +342,13 @@ class EffectLedger:
                 raise EffectLedgerCorruptError(
                     f"effect ledger line {lineno} is not valid JSON"
                 ) from exc
-            record = EffectLedgerRecord.from_dict(raw)
-            prior_key = identities.setdefault(record.effect_id, record.semantic_key)
-            if prior_key != record.semantic_key:
-                raise EffectLedgerCorruptError(
-                    f"effect_id {record.effect_id!r} changed semantic_key "
-                    f"from {prior_key!r} to {record.semantic_key!r}"
-                )
-            records.append(record)
+            records.append(EffectLedgerRecord.from_dict(raw))
+
+        self._validate_history(records)
         return records
 
     def recovery_projection(self) -> list[RecoveryProjection]:
-        """Derive current per-effect recovery truth without rewriting the ledger."""
+        """Derive current per-effect recovery truth without rewriting evidence."""
 
         latest: dict[str, EffectLedgerRecord] = {}
         for record in self.read_records():

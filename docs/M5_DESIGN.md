@@ -30,7 +30,8 @@ ways that are now part of the contract:
   sequence: the gateway captures one immutable private snapshot;
 - approval/epoch validity is rechecked after REQUIRED durability and before
   authority exposure;
-- approval validity and permit TTL use their own clock domains;
+- approval validity and permit TTL use distinct process-local clock domains;
+- grant and permit TTL defaults use monotonic elapsed time, not wall-clock time;
 - permit TTL starts at actual permit mint, not at transaction entry;
 - if a durable fenced reservation exists but approval becomes invalid before
   permit exposure, the reservation is closed `NO_EFFECT` before denial; failure
@@ -196,9 +197,12 @@ Properties:
   mutation; lifecycle methods own transitions;
 - persistence of approval authority is intentionally out of scope.
 
-**Clock domain:** grant expiry is evaluated only by the `ApprovalGrant`'s own
-clock. Tests and future runtimes may inject a grant clock independent from the
-gateway permit clock; the two timestamps must never be compared directly.
+**Clock domain:** grant expiry is elapsed-time authority. The production default
+is `time.monotonic()`, so wall-clock rollback/forward correction cannot extend
+or prematurely expire a process-local approval. Tests and future runtimes may
+inject a grant clock independent from the gateway permit clock; the two clock
+values must never be compared directly. UTC wall time remains appropriate for
+ledger/audit timestamps, not authority TTL enforcement.
 
 ### 5.2 EffectAttempt
 
@@ -349,16 +353,19 @@ proven replay safety, not a fictitious missing ledger fact.
 ### 6.4 Permit clock domain
 
 `EffectPermit.issued_at` and `expires_at` use the gateway's permit clock and are
-computed **at actual mint**:
+computed **at actual mint**. The production default is `time.monotonic()` because
+the permit is a process-local elapsed-time capability:
 
 ```text
-mint_now = gateway_clock()
+mint_now = gateway_monotonic_clock()
 issued_at = mint_now
 expires_at = mint_now + permit_ttl
 ```
 
 Reservation fsync latency and expired-permit cleanup do not consume a newly
-returned permit's TTL.
+returned permit's TTL. System wall-clock correction cannot extend or prematurely
+expire the permit. Injected clocks remain supported for deterministic tests and
+special runtimes.
 
 ### 6.5 Spend is not reversed by permit expiry
 
@@ -567,8 +574,9 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 11. Approval/epoch validity is checked again after durability and before mint.
 12. A now-invalid fenced pre-permit reservation is closed `NO_EFFECT`, or remains
     unresolved if closure cannot be persisted.
-13. Permit TTL begins at actual mint and uses a separate clock domain from grant
-    expiry.
+13. Grant and permit TTLs are process-local elapsed-time authority: production
+    defaults are monotonic, permit TTL begins at actual mint, and grant/permit
+    clock values are never compared across domains.
 14. Durable unresolved reservation/unknown state blocks automatic semantic
     replay once RecoveryGuard is integrated.
 15. Explicit unknown outcomes are never blindly retried.
@@ -607,6 +615,7 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 | T16 | REQUIRED reservation/pruning consumes more than permit TTL | Returned permit still receives full TTL from actual mint time |
 | T17 | Approval expires or epoch changes after REQUIRED reservation but before permit mint | No permit; durable `RESERVED -> NO_EFFECT`; attempt terminalized without approval reuse |
 | T18 | T17 close append fails | No permit; raw `RESERVED` remains unresolved/fail-closed |
+| T19 | System wall clock moves while process-local authority is live | Grant/permit TTL enforcement is unaffected because production defaults use monotonic clocks; ledger timestamps remain UTC wall time |
 
 Additional mandatory regressions include:
 
@@ -637,6 +646,8 @@ Additional mandatory regressions include:
   permit lineage;
 - permit TTL begins after slow reservation work;
 - grant expiry during reservation uses the grant clock, not the gateway clock;
+- default grant/permit authority clocks are monotonic while ledger timestamps
+  remain UTC wall-clock provenance;
 - failed pre-permit cancellation leaves the reservation unresolved and mints no
   authority.
 

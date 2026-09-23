@@ -74,7 +74,7 @@ def test_listener_can_add_listener_during_notification(tmp_path: Path) -> None:
 
 
 def test_failed_reentrant_listener_remains_retryable_without_recursion(tmp_path: Path) -> None:
-    """Failure clears only in-progress state; later observation retries once."""
+    """Failure remains owed but retries only on a later observation."""
     kill = _kill(tmp_path)
     calls = 0
 
@@ -88,14 +88,14 @@ def test_failed_reentrant_listener_remains_retryable_without_recursion(tmp_path:
     kill.trip()
     assert calls == 1
 
-    # The failed callback was not marked notified, so a later observation
-    # retries it exactly once rather than recursively re-entering it.
+    # A later observation retries the still-owed generation once, rather than
+    # recursively or repeatedly retrying it in the original traversal.
     assert kill.tripped() is True
     assert calls == 2
 
 
-def test_listener_reset_stops_remaining_delivery_for_inactive_trip(tmp_path: Path) -> None:
-    """If re-entry resets the switch, later listeners are not called for that trip."""
+def test_listener_reset_does_not_suppress_remaining_trip_delivery(tmp_path: Path) -> None:
+    """A reset changes live state but cannot erase the trip event for later listeners."""
     kill = _kill(tmp_path)
     first_calls = 0
     second_calls = 0
@@ -114,7 +114,7 @@ def test_listener_reset_stops_remaining_delivery_for_inactive_trip(tmp_path: Pat
     kill.trip()
 
     assert first_calls == 1
-    assert second_calls == 0
+    assert second_calls == 1
     assert kill.tripped() is False
 
 
@@ -134,8 +134,8 @@ def test_listener_reset_then_retrip_is_notified_for_both_generations(tmp_path: P
     kill.trip()
 
     # The first callback belongs to generation 1. reset()+trip() creates
-    # generation 2 while it is in progress, so generation 2 must receive its
-    # own callback after the first invocation exits.
+    # generation 2 while it is in progress, so generation 2 receives its own
+    # callback after generation 1 is credited.
     assert calls == 2
     assert kill.tripped() is True
     assert calls == 2

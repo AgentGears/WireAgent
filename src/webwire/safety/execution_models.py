@@ -18,15 +18,23 @@ Gateway. That durable lineage identity survives an ambiguous reservation write:
 retrying authorization for the same attempt reuses the same effect fact rather
 than creating a second reservation.
 
+``reservation_started`` is an orthogonal protocol latch, not a canonical effect
+state. Once REQUIRED reservation I/O has begun, the generic clean-precommit
+NO_EFFECT path is forbidden: an append can have written bytes before reporting
+failure, so only gateway-owned durable closure may subsequently prove that the
+attempt can be abandoned.
+
 There are two distinct ways to reach NO_EFFECT:
-- clean precommit failure: release the claim and preserve ACTIVE approval;
+- clean precommit failure before reservation I/O: release the claim and preserve
+  ACTIVE approval;
 - unused authority expiry: approval is already SPENT, so only the attempt is
   terminalized. The claim is never released back into reusable authority.
 
-For fenced effects the gateway composes the frozen spend protocol while holding
-the grant's claim fence:
+For fenced effects the gateway composes the spend protocol while holding the
+grant's claim fence:
 
-    durable EFFECT_RESERVED append + fsync
+    attempt.begin_reservation(grant)
+        -> durable EFFECT_RESERVED append + fsync
         -> attempt.mark_reserved(grant)
         -> grant.spend()
 
@@ -273,6 +281,7 @@ class EffectAttempt:
     attempt_id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
     effect_id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     state: AttemptState = AttemptState.PREPARING
+    reservation_started: bool = False
 
     def _require(self, expected: AttemptState) -> None:
         if self.state is not expected:
@@ -288,10 +297,34 @@ class EffectAttempt:
                 f"{self.grant_id!r}, not {grant.grant_id!r}"
             )
 
-    def mark_no_effect(self, grant: ApprovalGrant) -> None:
-        """Clean precommit NO_EFFECT: release claim and preserve approval."""
+    def begin_reservation(self, grant: ApprovalGrant) -> None:
+        """Latch that REQUIRED reservation I/O is about to begin.
+
+        Idempotent for retry of the same PREPARING attempt. The latch is set
+        before the ledger append because a failed append can still have written
+        a durable or partially durable RESERVED fact.
+        """
         self._require(AttemptState.PREPARING)
         self._require_own_grant(grant)
+        if grant.claimed_by != self.attempt_id:
+            raise GrantStateError(
+                "begin_reservation requires this attempt to hold the grant claim"
+            )
+        self.reservation_started = True
+
+    def mark_no_effect(self, grant: ApprovalGrant) -> None:
+        """Clean precommit NO_EFFECT: release claim and preserve approval.
+
+        This path is valid only before REQUIRED reservation I/O starts. Once the
+        reservation latch is set, only a gateway-owned durable closure may
+        establish NO_EFFECT without risking contradiction with a written row.
+        """
+        self._require(AttemptState.PREPARING)
+        self._require_own_grant(grant)
+        if self.reservation_started:
+            raise GrantStateError(
+                "clean NO_EFFECT is forbidden after reservation I/O has started"
+            )
         grant.release_claim(self.attempt_id)
         self.state = AttemptState.NO_EFFECT
 
@@ -312,6 +345,10 @@ class EffectAttempt:
         """Record that the durable reservation exists; does not spend grant."""
         self._require(AttemptState.PREPARING)
         self._require_own_grant(grant)
+        if not self.reservation_started:
+            raise GrantStateError(
+                "mark_reserved requires begin_reservation before durable append"
+            )
         if grant.claimed_by != self.attempt_id:
             raise GrantStateError(
                 "mark_reserved requires this attempt to hold the grant claim"

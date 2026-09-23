@@ -73,11 +73,20 @@ class KillSwitch:
             self._refresh_trip_unlocked()
 
     def _notify_active_listeners_unlocked(self) -> None:
-        """Notify unnotified listeners. Caller must hold ``_state_lock``."""
+        """Notify every unnotified listener; one failure cannot block the rest.
+
+        Failed listeners remain unnotified so a later observation of the same
+        active trip retries them. Successful listeners are marked exactly once
+        for that trip. Caller must hold ``_state_lock``.
+        """
         for listener in tuple(self._trip_listeners):
             if listener in self._notified_listeners:
                 continue
-            listener()
+            try:
+                listener()
+            except Exception:
+                logger.exception("KillSwitch trip listener failed: %r", listener)
+                continue
             self._notified_listeners.append(listener)
 
     def _active_unlocked(self) -> bool:

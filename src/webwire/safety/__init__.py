@@ -15,6 +15,7 @@ from webwire.safety.effect_policy import (
     EffectPolicy,
     EffectPolicyRegistry,
     EffectVerb,
+    PreparationVerb,
     ReplaySemantics,
     derive_durability,
 )
@@ -32,6 +33,19 @@ from webwire.safety.models import (
     WriteIntent,
 )
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
+from webwire.safety.scoped_authority import (
+    ClearBookmarkAuthority,
+    ClearLikeAuthority,
+    DeletePostAuthority,
+    PostPreparationAuthority,
+    QuotePreparationAuthority,
+    ReplyPreparationAuthority,
+    ScopedAuthorityBroker,
+    ScopedAuthorityDenied,
+    SetBookmarkAuthority,
+    SetLikeAuthority,
+    SubmitContentAuthority,
+)
 from webwire.safety.token_bucket import DEFAULT_LIMITS, BucketLimits, TokenBucket
 from webwire.safety.write_kernel import PreviewResult, WriteCapability, WriteKernel
 
@@ -60,6 +74,7 @@ __all__ = [
     "EffectPolicyRegistry",
     "DEFAULT_EFFECT_POLICIES",
     "EffectVerb",
+    "PreparationVerb",
     "ReplaySemantics",
     "DurabilityPolicy",
     "derive_durability",
@@ -69,4 +84,15 @@ __all__ = [
     "EffectLedgerCorruptError",
     "EffectState",
     "RecoveryProjection",
+    "ScopedAuthorityBroker",
+    "ScopedAuthorityDenied",
+    "PostPreparationAuthority",
+    "ReplyPreparationAuthority",
+    "QuotePreparationAuthority",
+    "SetBookmarkAuthority",
+    "ClearBookmarkAuthority",
+    "SetLikeAuthority",
+    "ClearLikeAuthority",
+    "DeletePostAuthority",
+    "SubmitContentAuthority",
 ]

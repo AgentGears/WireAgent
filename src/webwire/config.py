@@ -80,8 +80,12 @@ class WebWireConfig:
         return self.state_dir / self.kill_file
 
     def journal_path(self) -> Path:
-        """Absolute path to the append-only journal."""
+        """Absolute path to the append-only audit journal."""
         return self.state_dir / "journal.ndjson"
+
+    def effects_path(self) -> Path:
+        """Absolute path to the fsync-backed M5 safety ledger."""
+        return self.state_dir / "effects.ndjson"
 
     def screenshot_dir(self) -> Path:
         """Directory for screenshot artifacts."""

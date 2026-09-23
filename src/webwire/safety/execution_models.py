@@ -13,6 +13,11 @@ EffectAttempt (one per execution try)
     RESERVED  -> NO_EFFECT | EFFECT_CONFIRMED | EFFECT_UNKNOWN
     unfenced effects may skip RESERVED entirely.
 
+Each EffectAttempt owns one stable ``effect_id`` before it reaches the Commit
+Gateway. That durable lineage identity survives an ambiguous reservation write:
+retrying authorization for the same attempt reuses the same effect fact rather
+than creating a second reservation.
+
 There are two distinct ways to reach NO_EFFECT:
 - clean precommit failure: release the claim and preserve ACTIVE approval;
 - unused authority expiry: approval is already SPENT, so only the attempt is
@@ -262,10 +267,11 @@ class ApprovalGrant:
 
 @dataclass
 class EffectAttempt:
-    """One execution try against a grant."""
+    """One execution try against a grant with one stable durable effect id."""
 
     grant_id: str
     attempt_id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
+    effect_id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     state: AttemptState = AttemptState.PREPARING
 
     def _require(self, expected: AttemptState) -> None:

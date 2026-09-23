@@ -108,3 +108,22 @@ def test_policy_binding_is_stable_and_sensitive_to_authority() -> None:
     )
     assert p1.binding_hash() == p2.binding_hash()
     assert p1.binding_hash() != broader.binding_hash()
+
+
+# ---------------------------------------------------------------------------
+# Codex review regression (PR #2, 2026-09-23): no per-action uncertainty axis
+# ---------------------------------------------------------------------------
+
+def test_no_per_action_uncertainty_policy_exists() -> None:
+    """Frozen invariant 9 makes unknown-outcome handling GLOBAL. The axis that
+    once lived here carried a safe-to-retry value that any registered policy
+    could have used to exempt itself from that guarantee; it is removed, and
+    this lock keeps it removed."""
+    from pathlib import Path as _Path
+
+    import webwire.safety.effect_policy as ep
+
+    assert not hasattr(ep, "UncertaintyPolicy")
+    assert not hasattr(ep.EffectPolicy, "uncertainty_policy")
+    src = _Path(ep.__file__).read_text(encoding="utf-8")
+    assert "uncertainty_policy" not in src

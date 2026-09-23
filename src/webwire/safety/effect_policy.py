@@ -2,7 +2,8 @@
 
 This module is the normative policy primitive for the M5 Effect Transaction
 Boundary.  It deliberately does not execute browser mutations; it describes
-what an action is allowed to do and how uncertainty must be handled.
+what an action is allowed to do. Handling of uncertain outcomes is
+global by frozen invariant 9, never a per-action policy.
 
 Source of truth: docs/M5_DESIGN.md §4.
 """
@@ -24,7 +25,6 @@ __all__ = [
     "EffectPolicyRegistry",
     "EffectVerb",
     "ReplaySemantics",
-    "UncertaintyPolicy",
     "DEFAULT_EFFECT_POLICIES",
     "derive_durability",
 ]
@@ -46,12 +46,11 @@ class DurabilityPolicy(StrEnum):
     REQUIRED = "required"
     BEST_EFFORT = "best_effort"
 
-
-class UncertaintyPolicy(StrEnum):
-    """What automatic execution may do after an outcome becomes uncertain."""
-
-    RECONCILE_BEFORE_RETRY = "reconcile_before_retry"
-    SAFE_TO_RETRY = "safe_to_retry"
+# No per-action uncertainty policy exists, deliberately (Codex review,
+# PR #2, 2026-09-23): docs/M5_DESIGN.md invariant 9 makes unknown-outcome
+# handling GLOBAL — an uncertain effect is never automatically retried;
+# only reconciliation clears it. A per-action safe-to-retry lever would
+# let any registered policy exempt itself from that guarantee.
 
 
 class EffectVerb(StrEnum):
@@ -112,7 +111,6 @@ class EffectPolicy:
     allowed_effects: frozenset[EffectVerb]
     replay_semantics: ReplaySemantics
     durability: DurabilityPolicy
-    uncertainty_policy: UncertaintyPolicy = UncertaintyPolicy.RECONCILE_BEFORE_RETRY
     schema_version: int = 1
 
     @classmethod
@@ -123,7 +121,6 @@ class EffectPolicy:
         risk_tier: RiskTier,
         allowed_effects: Iterable[EffectVerb],
         replay_semantics: ReplaySemantics,
-        uncertainty_policy: UncertaintyPolicy = UncertaintyPolicy.RECONCILE_BEFORE_RETRY,
     ) -> "EffectPolicy":
         """Construct a policy whose durability follows the frozen derivation."""
 
@@ -136,7 +133,6 @@ class EffectPolicy:
             allowed_effects=effects,
             replay_semantics=replay_semantics,
             durability=derive_durability(risk_tier, replay_semantics),
-            uncertainty_policy=uncertainty_policy,
         )
 
     def validate(self) -> None:
@@ -163,7 +159,6 @@ class EffectPolicy:
             "allowed_effects": sorted(effect.value for effect in self.allowed_effects),
             "replay_semantics": self.replay_semantics.value,
             "durability": self.durability.value,
-            "uncertainty_policy": self.uncertainty_policy.value,
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

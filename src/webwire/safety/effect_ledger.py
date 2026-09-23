@@ -64,6 +64,11 @@ class EffectLedgerRecord:
     )
     details: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # A record cannot EXIST invalid — validation runs at construction,
+        # not only at parse/serialize boundaries.
+        self.validate()
+
     def validate(self) -> None:
         required = {
             "effect_id": self.effect_id,
@@ -72,11 +77,16 @@ class EffectLedgerRecord:
             "intent_hash": self.intent_hash,
             "policy_binding": self.policy_binding,
         }
-        missing = [name for name, value in required.items() if not value]
-        if missing:
-            raise ValueError(
-                "effect ledger record missing required fields: " + ", ".join(missing)
-            )
+        # Identity fields must be GENUINE non-empty strings. str() coercion at
+        # the from_dict boundary would turn a corrupt null into "None" and let
+        # it hydrate as a semantic key — exactly the evasion the recovery guard
+        # exists to prevent (Codex review, PR #2, 2026-09-23).
+        for name, value in required.items():
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"effect ledger record field {name!r} must be a non-empty "
+                    f"string, got {type(value).__name__}"
+                )
 
     def to_jsonl(self) -> str:
         self.validate()
@@ -88,18 +98,21 @@ class EffectLedgerRecord:
     def from_dict(cls, raw: dict[str, Any]) -> "EffectLedgerRecord":
         try:
             state = EffectState(raw["state"])
+            details_raw = raw.get("details") or {}
+            if not isinstance(details_raw, dict):
+                raise ValueError("details must be an object when present")
             record = cls(
-                effect_id=str(raw["effect_id"]),
-                semantic_key=str(raw["semantic_key"]),
+                effect_id=raw["effect_id"],
+                semantic_key=raw["semantic_key"],
                 state=state,
-                action_type=str(raw["action_type"]),
-                intent_hash=str(raw["intent_hash"]),
-                policy_binding=str(raw["policy_binding"]),
+                action_type=raw["action_type"],
+                intent_hash=raw["intent_hash"],
+                policy_binding=raw["policy_binding"],
                 actor_id=raw.get("actor_id"),
                 target_type=raw.get("target_type"),
                 target_id=raw.get("target_id"),
-                timestamp=str(raw["timestamp"]),
-                details=dict(raw.get("details") or {}),
+                timestamp=raw["timestamp"],
+                details=details_raw,
             )
             record.validate()
             return record

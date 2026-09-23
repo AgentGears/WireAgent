@@ -16,7 +16,6 @@ from webwire.safety.effect_policy import (
     EffectPolicyRegistry,
     EffectVerb,
     ReplaySemantics,
-    UncertaintyPolicy,
     derive_durability,
 )
 from webwire.safety.kill_switch import KillSwitch
@@ -63,7 +62,6 @@ __all__ = [
     "EffectVerb",
     "ReplaySemantics",
     "DurabilityPolicy",
-    "UncertaintyPolicy",
     "derive_durability",
     "EffectLedger",
     "EffectLedgerRecord",

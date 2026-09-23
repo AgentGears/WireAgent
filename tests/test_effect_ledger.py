@@ -166,3 +166,48 @@ def test_effect_identity_cannot_change_semantic_key(tmp_path: Path) -> None:
 
     with pytest.raises(EffectLedgerCorruptError, match="changed semantic_key"):
         ledger.recovery_projection()
+
+
+# ---------------------------------------------------------------------------
+# Codex review regressions (PR #2, 2026-09-23)
+# ---------------------------------------------------------------------------
+
+def test_from_dict_rejects_non_string_identities() -> None:
+    """P2: a syntactically valid record whose identity fields are null or
+    numbers must FAIL CLOSED, not coerce to 'None'/'123' and hydrate."""
+    from webwire.safety.effect_ledger import EffectLedgerRecord
+    good = EffectLedgerRecord(
+        effect_id="e1", semantic_key="k1", state=EffectState.RESERVED,
+        action_type="post", intent_hash="h" * 32, policy_binding="p" * 32,
+    )
+    base = json.loads(good.to_jsonl())
+    for field in ("effect_id", "semantic_key", "action_type", "intent_hash", "policy_binding"):
+        for bad in (None, 123, 4.5, True):
+            raw = dict(base)
+            raw[field] = bad
+            with pytest.raises(EffectLedgerCorruptError):
+                EffectLedgerRecord.from_dict(raw)
+
+
+def test_validate_rejects_non_string_identity_direct_construction() -> None:
+    """In-code records are held to the same standard as parsed ones."""
+    with pytest.raises(ValueError, match="non-empty string"):
+        EffectLedgerRecord(
+            effect_id=None, semantic_key="k", state=EffectState.NO_EFFECT,
+            action_type="post", intent_hash="h", policy_binding="p",
+        )
+
+
+def test_fsync_directory_is_a_windows_no_op(monkeypatch: pytest.MonkeyPatch,
+                                             tmp_path: Path) -> None:
+    """P1 regression lock: on win32 the directory-fsync primitive does not
+    exist; _fsync_directory must return WITHOUT attempting os.open on the
+    directory (which would raise and poison a committed reservation)."""
+    from webwire.safety.effect_ledger import EffectLedger
+
+    def _no_opens(fd_or_path, *a, **k):  # pragma: no cover - must not run
+        raise AssertionError("os.open must not be called on Windows path")
+
+    monkeypatch.setattr("os.name", "nt")
+    monkeypatch.setattr("os.open", _no_opens)
+    EffectLedger._fsync_directory(tmp_path)  # must silently no-op

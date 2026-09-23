@@ -1,7 +1,7 @@
 """M5 layer 4 — intent-bound preparation and exact effect authorities.
 
 This module is the process-local least-authority adapter between Layer 3's
-CommitGateway/EffectPermit and the legacy concrete WriteBroker. It does not wire
+CommitGateway/EffectPermit and the concrete M5 write broker. It does not wire
 the live WriteKernel; capability migration remains Layer 5.
 
 Scoped objects retain only exact bound operations, never the concrete broker
@@ -22,6 +22,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from super_browser.results.types import FailureCategory
 
@@ -63,6 +64,20 @@ _AsyncTwoStr = Callable[[str, str], Awaitable[ActionResult]]
 _CommitGate = Callable[[], Optional[ActionResult]]
 _EffectInvocation = Callable[[_CommitGate], Awaitable[ActionResult]]
 
+_POST_TARGET_ACTIONS = frozenset(
+    {
+        "bookmark",
+        "remove_bookmark",
+        "like",
+        "unlike",
+        "reply",
+        "quote",
+        "delete_post",
+    }
+)
+_STATUS_HOSTS = frozenset({"x.com", "www.x.com", "twitter.com", "www.twitter.com"})
+_STATUS_PATH_RE = re.compile(r"/status/(\d+)(?:/|$)")
+
 
 class ScopedAuthorityDenied(RuntimeError):
     """A scoped-authority construction or use request violated its binding."""
@@ -73,6 +88,38 @@ class ScopedAuthorityDenied(RuntimeError):
         super().__init__(
             f"scoped authority denied: {reason}" + (f" — {detail}" if detail else "")
         )
+
+
+def _bind_status_url(raw_url: str, target_post_id: str) -> str:
+    """Return a target-safe X status URL or reject the binding.
+
+    A permit target id is not enough if the browser can be navigated to an
+    unrelated page and a page-global state-set selector can act on another post.
+    Supplied URLs therefore must themselves identify the approved status. When a
+    caller omits the URL, derive a canonical X status route from the approved id.
+    """
+    if not raw_url:
+        return f"https://x.com/i/status/{target_post_id}"
+
+    parsed = urlparse(raw_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() != "https" or host not in _STATUS_HOSTS:
+        raise ScopedAuthorityDenied(
+            "target_url_invalid",
+            "post target URL must be an HTTPS x.com/twitter.com status URL",
+        )
+    match = _STATUS_PATH_RE.search(parsed.path)
+    if match is None:
+        raise ScopedAuthorityDenied(
+            "target_url_invalid",
+            "post target URL must contain /status/<approved-id>",
+        )
+    if match.group(1) != target_post_id:
+        raise ScopedAuthorityDenied(
+            "target_mismatch",
+            f"URL target {match.group(1)!r} != approved target {target_post_id!r}",
+        )
+    return raw_url
 
 
 @dataclass(frozen=True)
@@ -115,17 +162,8 @@ class _IntentBinding:
         if not isinstance(target_id, str) or not target_id:
             raise ScopedAuthorityDenied("target_missing", "target_id must be non-empty")
 
-        post_target_actions = {
-            "bookmark",
-            "remove_bookmark",
-            "like",
-            "unlike",
-            "reply",
-            "quote",
-            "delete_post",
-        }
         if (
-            frozen.action_type in post_target_actions
+            frozen.action_type in _POST_TARGET_ACTIONS
             and (target_type != "post" or not target_id.isdigit())
         ):
             raise ScopedAuthorityDenied(
@@ -138,7 +176,6 @@ class _IntentBinding:
             post_url_raw = ""
         if not isinstance(post_url_raw, str):
             raise ScopedAuthorityDenied("payload_invalid", "post_url must be a string")
-        post_url = post_url_raw
 
         payload_target = payload.get("target_post_id", payload.get("post_id", ""))
         if payload_target is None:
@@ -154,17 +191,13 @@ class _IntentBinding:
                 "target_mismatch",
                 f"payload target {target_post_id!r} != intent target {target_id!r}",
             )
-        if frozen.action_type in post_target_actions and target_post_id != target_id:
+        if frozen.action_type in _POST_TARGET_ACTIONS and target_post_id != target_id:
             raise ScopedAuthorityDenied("target_mismatch")
 
-        if post_url and target_post_id:
-            match = re.search(r"/status/(\d+)", post_url)
-            if match and match.group(1) != target_post_id:
-                raise ScopedAuthorityDenied(
-                    "target_mismatch",
-                    f"URL target {match.group(1)!r} != approved target {target_post_id!r}",
-                )
-        if not post_url and target_post_id:
+        post_url = post_url_raw
+        if frozen.action_type in _POST_TARGET_ACTIONS:
+            post_url = _bind_status_url(post_url_raw, target_post_id)
+        elif not post_url and target_post_id:
             post_url = f"https://x.com/i/status/{target_post_id}"
 
         normalized_text_raw = payload.get("normalized_text", "")
@@ -183,9 +216,7 @@ class _IntentBinding:
         media: list[_MediaBinding] = []
         for expected_index, item in enumerate(media_raw):
             if not isinstance(item, dict):
-                raise ScopedAuthorityDenied(
-                    "payload_invalid", "manifest item must be a dict"
-                )
+                raise ScopedAuthorityDenied("payload_invalid", "manifest item must be a dict")
             index = item.get("index")
             source_path = item.get("source_path")
             digest = item.get("sha256")
@@ -244,6 +275,8 @@ class _PreparationBase:
         "__policies",
         "__gateway",
         "__next_media_index",
+        "__composer_opened",
+        "__text_filled",
         "__read_composer",
         "__verify_attachment",
         "__count_attachments",
@@ -267,6 +300,8 @@ class _PreparationBase:
         self.__policies = policies
         self.__gateway = gateway
         self.__next_media_index = 0
+        self.__composer_opened = False
+        self.__text_filled = False
         self.__read_composer: _AsyncNoArg = write_broker.read_composer_text
         self.__verify_attachment: _AsyncNoArg = write_broker.verify_attachment_ready
         self.__count_attachments: _AsyncNoArg = write_broker.count_attachments
@@ -289,6 +324,29 @@ class _PreparationBase:
 
     def _expected_target_post_id(self) -> str:
         return self.__binding.target_post_id
+
+    def _mark_composer_opened(self) -> None:
+        self.__composer_opened = True
+
+    def _mark_text_filled(self) -> None:
+        self.__text_filled = True
+
+    def _require_composer_opened(self) -> None:
+        if not self.__composer_opened:
+            raise ScopedAuthorityDenied(
+                "preparation_order", "approved composer context has not been opened"
+            )
+
+    def _require_text_filled(self) -> None:
+        if not self.__text_filled:
+            raise ScopedAuthorityDenied(
+                "preparation_order", "approved composer text has not been staged"
+            )
+
+    def _reset_preparation(self) -> None:
+        self.__composer_opened = False
+        self.__text_filled = False
+        self.__next_media_index = 0
 
     def _require_live(self, verb: PreparationVerb) -> None:
         grant = self.__grant
@@ -340,6 +398,7 @@ class _PreparationBase:
 
     async def attach_media(self, image_path: str) -> ActionResult:
         self._require_live(PreparationVerb.ATTACH_MEDIA)
+        self._require_text_filled()
         if self.__next_media_index >= len(self.__binding.media):
             raise ScopedAuthorityDenied("media_not_approved", image_path)
         expected = self.__binding.media[self.__next_media_index]
@@ -357,6 +416,7 @@ class _PreparationBase:
                 "media_changed_after_approval",
                 f"media index {expected.index} digest changed",
             )
+        self._require_live(PreparationVerb.ATTACH_MEDIA)
         result = await self.__attach_media(expected.source_path)
         if result.ok:
             self.__next_media_index += 1
@@ -364,7 +424,10 @@ class _PreparationBase:
 
     async def close_composer(self) -> ActionResult:
         """Reducing cleanup remains available even when approval was revoked."""
-        return await self.__close_composer()
+        result = await self.__close_composer()
+        if result.ok:
+            self._reset_preparation()
+        return result
 
 
 class PostPreparationAuthority(_PreparationBase):
@@ -382,7 +445,11 @@ class PostPreparationAuthority(_PreparationBase):
         expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "composer text differs")
-        return await self.__fill_composer(expected)
+        result = await self.__fill_composer(expected)
+        if result.ok:
+            self._mark_composer_opened()
+            self._mark_text_filled()
+        return result
 
 
 class ReplyPreparationAuthority(_PreparationBase):
@@ -404,16 +471,23 @@ class ReplyPreparationAuthority(_PreparationBase):
             or target_post_id != self._expected_target_post_id()
         ):
             raise ScopedAuthorityDenied("target_mismatch")
-        return await self.__open_reply(
+        result = await self.__open_reply(
             self._expected_post_url(), self._expected_target_post_id()
         )
+        if result.ok:
+            self._mark_composer_opened()
+        return result
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
+        self._require_composer_opened()
         expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "reply text differs")
-        return await self.__fill_reply(expected)
+        result = await self.__fill_reply(expected)
+        if result.ok:
+            self._mark_text_filled()
+        return result
 
 
 class QuotePreparationAuthority(_PreparationBase):
@@ -435,16 +509,23 @@ class QuotePreparationAuthority(_PreparationBase):
             or target_post_id != self._expected_target_post_id()
         ):
             raise ScopedAuthorityDenied("target_mismatch")
-        return await self.__open_quote(
+        result = await self.__open_quote(
             self._expected_post_url(), self._expected_target_post_id()
         )
+        if result.ok:
+            self._mark_composer_opened()
+        return result
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
+        self._require_composer_opened()
         expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "quote text differs")
-        return await self.__fill_quote(expected)
+        result = await self.__fill_quote(expected)
+        if result.ok:
+            self._mark_text_filled()
+        return result
 
 
 class _EffectAuthorityBase:
@@ -622,6 +703,8 @@ class ScopedAuthorityBroker:
             raise ScopedAuthorityDenied("policy_mismatch")
         if permit.attempt_id != attempt.attempt_id or permit.grant_id != attempt.grant_id:
             raise ScopedAuthorityDenied("attempt_mismatch")
+        if permit.consumed:
+            raise ScopedAuthorityDenied("permit_reused")
 
         expected = _EFFECT_BY_ACTION.get(binding.action_type)
         if expected is None:
@@ -642,9 +725,7 @@ class ScopedAuthorityBroker:
             cls = SetBookmarkAuthority
         elif expected is EffectVerb.CLEAR_BOOKMARK:
             async def invoke(gate: _CommitGate) -> ActionResult:
-                return await broker.click_remove_bookmark(
-                    binding.post_url, _commit_gate=gate
-                )
+                return await broker.click_remove_bookmark(binding.post_url, _commit_gate=gate)
             cls = ClearBookmarkAuthority
         elif expected is EffectVerb.SET_LIKE:
             async def invoke(gate: _CommitGate) -> ActionResult:

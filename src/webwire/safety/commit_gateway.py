@@ -303,6 +303,9 @@ class CommitGateway:
                             fenced = policy.durability is DurabilityPolicy.REQUIRED
 
                             if fenced:
+                                # Latch before I/O: append_durable can write bytes
+                                # and still report failure during fsync.
+                                attempt.begin_reservation(grant)
                                 record = EffectLedgerRecord(
                                     effect_id=effect_id,
                                     semantic_key=semantic_key,

@@ -271,7 +271,13 @@ class CommitGateway:
         attempt: EffectAttempt,
         intent: WriteIntent,
     ) -> EffectPermit:
-        """Grant commit authority and mint one exact single-use permit."""
+        """Grant commit authority and mint one exact single-use permit.
+
+        ``attempt.effect_id`` is stable for the whole attempt. If a durable
+        reservation write becomes ambiguous (for example, bytes were written
+        before fsync reported failure), retrying this same attempt targets the
+        same ledger fact rather than manufacturing a second reservation.
+        """
         self._preflight_kill_notifications()
         with self._protocol_lock:
             with self._kill.execution_fence() as blocked:
@@ -292,7 +298,7 @@ class CommitGateway:
                                 epoch,
                             )
 
-                            effect_id = secrets.token_urlsafe(16)
+                            effect_id = attempt.effect_id
                             semantic_key = intent.dedupe_key()
                             fenced = policy.durability is DurabilityPolicy.REQUIRED
 
@@ -415,6 +421,8 @@ class CommitGateway:
             raise GatewayStateError("permit/attempt mismatch")
         if permit.grant_id != attempt.grant_id:
             raise GatewayStateError("permit/attempt grant mismatch")
+        if permit.effect_id != attempt.effect_id:
+            raise GatewayStateError("permit/attempt effect mismatch")
         if not permit.consumed:
             raise GatewayStateError(
                 "effect outcome cannot be recorded before permit consumption"
@@ -450,18 +458,21 @@ class CommitGateway:
                 ),
             }
         )
-        return EffectLedgerRecord(
-            effect_id=permit.effect_id,
-            semantic_key=permit.semantic_key,
-            state=state,
-            action_type=permit.action_type,
-            intent_hash=permit.intent_hash,
-            policy_binding=permit.policy_binding,
-            actor_id=permit.actor_id,
-            target_type=permit.target_type,
-            target_id=permit.target_id,
-            details=evidence,
-        )
+        try:
+            return EffectLedgerRecord(
+                effect_id=permit.effect_id,
+                semantic_key=permit.semantic_key,
+                state=state,
+                action_type=permit.action_type,
+                intent_hash=permit.intent_hash,
+                policy_binding=permit.policy_binding,
+                actor_id=permit.actor_id,
+                target_type=permit.target_type,
+                target_id=permit.target_id,
+                details=evidence,
+            )
+        except ValueError as exc:
+            raise GatewayStateError(f"invalid effect evidence: {exc}") from exc
 
     def record_effect_confirmed(
         self,

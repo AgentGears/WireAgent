@@ -426,19 +426,16 @@ class CommitGateway:
                                     ) from exc
                                 attempt.mark_reserved(grant)
 
-                            # Durable I/O and opportunistic expiry closure can
-                            # consume elapsed time. The gateway permit clock is
-                            # sampled before the final approval transition so a
-                            # slow/injected clock cannot create an unchecked gap
-                            # between approval liveness validation and spend.
-                            # After that clock read, re-observe external hot-file
-                            # state and atomically revalidate+spend the grant in
-                            # its own monotonic clock domain under the direct
-                            # authorization-epoch fence.
+                            # Durable I/O can consume elapsed time. Final grant
+                            # liveness and ACTIVE -> SPENT are one grant-lock
+                            # transition. Only after that potentially blocking
+                            # grant-clock read succeeds do we refresh external
+                            # hot-file state and sample permit time, so neither
+                            # slow grant validation nor prior reservation work
+                            # consumes a newly returned permit's TTL.
                             grant_error: Optional[GrantClaimDenied] = None
                             kill_blocked_at_mint = False
                             with self._epoch.fence() as mint_epoch:
-                                mint_now = self._clock()
                                 if self._kill.execution_blocked_now():
                                     kill_blocked_at_mint = True
                                 else:
@@ -452,26 +449,34 @@ class CommitGateway:
                                     except GrantClaimDenied as exc:
                                         grant_error = exc
                                     else:
-                                        permit = EffectPermit(
-                                            grant_id=grant.grant_id,
-                                            attempt_id=attempt.attempt_id,
-                                            effect_id=effect_id,
-                                            semantic_key=semantic_key,
-                                            intent_hash=snapshot.intent_hash,
-                                            actor_id=snapshot.actor_id,
-                                            action_type=snapshot.action_type,
-                                            target_type=snapshot.target_type,
-                                            target_id=snapshot.target_id,
-                                            policy_binding=binding,
-                                            authorization_epoch=mint_epoch,
-                                            allowed_effects=policy.allowed_effects,
-                                            fenced=fenced,
-                                            issued_at=mint_now,
-                                            expires_at=mint_now + self._permit_ttl,
-                                        )
-                                        self._issued_permits[permit.permit_id] = permit
-                                        self._issued_attempts[permit.permit_id] = attempt
-                                        return permit
+                                        # A grant clock is injectable and may
+                                        # block. Re-observe external hot-file
+                                        # state after it, then sample permit time
+                                        # immediately before permit construction.
+                                        if self._kill.execution_blocked_now():
+                                            kill_blocked_at_mint = True
+                                        else:
+                                            mint_now = self._clock()
+                                            permit = EffectPermit(
+                                                grant_id=grant.grant_id,
+                                                attempt_id=attempt.attempt_id,
+                                                effect_id=effect_id,
+                                                semantic_key=semantic_key,
+                                                intent_hash=snapshot.intent_hash,
+                                                actor_id=snapshot.actor_id,
+                                                action_type=snapshot.action_type,
+                                                target_type=snapshot.target_type,
+                                                target_id=snapshot.target_id,
+                                                policy_binding=binding,
+                                                authorization_epoch=mint_epoch,
+                                                allowed_effects=policy.allowed_effects,
+                                                fenced=fenced,
+                                                issued_at=mint_now,
+                                                expires_at=mint_now + self._permit_ttl,
+                                            )
+                                            self._issued_permits[permit.permit_id] = permit
+                                            self._issued_attempts[permit.permit_id] = attempt
+                                            return permit
 
                             if kill_blocked_at_mint:
                                 if fenced and attempt.state is AttemptState.RESERVED:

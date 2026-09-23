@@ -20,7 +20,7 @@
 ## Current version
 
 **v0.3 stabilized live path + M5 layer-3 candidate** — 20 live/implemented
-capabilities; **467 tests** on the reviewed M5 branch; CI-enforced on Python
+capabilities; **469 tests** on the reviewed M5 branch; CI-enforced on Python
 3.11/3.12; Ruff clean; mypy clean across 51 source files.
 
 M5 status:
@@ -99,12 +99,15 @@ RecoveryGuard onto M5.
     forbids generic clean release afterward.
 18. **Approval, intent, epoch, and permit time are distinct authority concepts.**
     Grant expiry and permit TTL are process-local elapsed-time authority and
-    default to monotonic clocks; permit TTL begins at actual mint and is sampled
-    again at the actual consume transition after blocking policy/epoch/kill
-    checks. Grant and gateway clock values are never compared directly. Direct
-    authorization-epoch changes are fenced with final mint/consume; approval,
-    epoch, and kill validity are rechecked at final authority boundaries.
-    Durable ledger timestamps remain UTC wall-clock provenance.
+    default to monotonic clocks. In the final mint sequence the permit clock is
+    sampled after reservation work, then `spend_if_live()` refreshes grant expiry
+    and validates bindings/epoch while performing `ACTIVE → SPENT` under one
+    grant lock; no gateway-clock call separates final approval validation from
+    spend. Permit expiry is sampled again at the actual consume transition after
+    blocking policy/epoch/kill checks. Grant and gateway clock values are never
+    compared or claimed simultaneous. Direct authorization-epoch changes are
+    fenced with final mint/consume; kill validity is rechecked at final authority
+    boundaries. Durable ledger timestamps remain UTC wall-clock provenance.
 19. **Never blindly replay explicit uncertainty.** Durable `RESERVED` or
     `EFFECT_UNKNOWN` requires reconciliation once RecoveryGuard is integrated.
 20. **Same-process least authority is not a hostile-code sandbox.** Untrusted
@@ -127,7 +130,9 @@ Key current layer-3 facts:
   bookmark/remove-bookmark are `SAFE_STATE_SET`/BEST_EFFORT; like/unlike remain
   `UNKNOWN`/REQUIRED until concrete broker-level replay safety is proven.
 - `ApprovalGrant` is intentionally ephemeral; durable safety state belongs to
-  the EffectLedger, not persisted confirmation tokens.
+  the EffectLedger, not persisted confirmation tokens. Final approval spend uses
+  `spend_if_live()` so grant-clock expiry/binding validation and
+  `ACTIVE → SPENT` are one grant-lock transition.
 - `EffectAttempt` owns stable `attempt_id`, stable `effect_id`, and the monotonic
   `reservation_started` latch.
 - `CommitGateway` authorization lock order is protocol → kill fence → policy
@@ -137,13 +142,15 @@ Key current layer-3 facts:
 - Every permit target is validated as non-empty/persistable before either a
   REQUIRED reservation or a BEST_EFFORT permit can be created.
 - REQUIRED: snapshot → validate target/bindings → latch → durable `RESERVED` →
-  final callback-free kill refresh + fenced epoch/grant revalidation → spend →
-  mint.
+  fenced epoch → final permit-clock sample → callback-free kill refresh → atomic
+  grant `spend_if_live()` → mint.
 - BEST_EFFORT: only proven replay-safe semantics may omit precommit reservation;
-  final kill/epoch validity is still checked before spend/mint.
-- process-local approval/permit TTL defaults use `time.monotonic()`; permit TTL
-  begins at actual mint and is re-sampled immediately before consumption after
-  blocking authority checks. Ledger timestamps remain UTC wall time.
+  final permit-clock sample, kill/epoch check, and atomic grant spend still
+  precede mint.
+- process-local approval/permit TTL defaults use `time.monotonic()`; independent
+  grant/permit clock values are never compared. Permit time is sampled in the
+  final mint sequence and expiry is re-sampled immediately before consumption
+  after blocking authority checks. Ledger timestamps remain UTC wall time.
 - in-process `trip()` is process-local lock-linearized with authority crossing;
   external hot-file creation is callback-free re-observed at final mint/consume
   but cannot be made strictly cross-process atomic without a cooperating lock
@@ -186,7 +193,7 @@ Key current layer-3 facts:
 | **v0.2 M4c** | quote_multi_image | **LIVE-VERIFIED** |
 | **M5 L1** | EffectPolicy + durable EffectLedger | **DONE** |
 | **M5 L2** | ApprovalGrant + EffectAttempt | **DONE** |
-| **M5 L3** | CommitGateway + EffectPermit | **CANDIDATE — 467 green / independently reviewed** |
+| **M5 L3** | CommitGateway + EffectPermit | **CANDIDATE — 469 green / independently reviewed** |
 | **M5 L4** | scoped broker authorities | **NEXT** |
 | **M5 L5** | concrete capability migration | pending |
 | **M5 L6** | RecoveryGuard | pending |
@@ -248,9 +255,10 @@ M5 layer-3 additions:
 - exact-object `EffectPermit` and canonical-attempt lineage;
 - private immutable intent snapshot across blocking commit work;
 - non-empty persistable target lineage before authority creation;
-- mint-time permit TTL + boundary-time consume expiry check;
+- final permit-clock sample before atomic grant `spend_if_live()`;
+- atomic grant-clock liveness/binding validation + `ACTIVE → SPENT`;
+- boundary-time consume expiry check;
 - monotonic default clocks for grant/permit authority TTLs;
-- post-durability grant/epoch/kill revalidation;
 - durable terminal outcomes before in-memory terminalization;
 - strict JSON evidence and reserved correlation-key protection;
 - per-path process-local ledger writer serialization;
@@ -340,6 +348,22 @@ M5 layer-3 additions:
 
 ## History
 
+- 2026-09-24 (t): **M5 L3 ATOMIC APPROVAL-SPEND CLOSE-OUT.** Final exact-head
+  Codex review of `400a56e` found one new P2: grant expiry could be validated,
+  then cross expiry while a separately injected gateway-clock call ran, after
+  which low-level `grant.spend()` would still transition `ACTIVE → SPENT` and
+  mint a permit. Independently verified. `ApprovalGrant.spend_if_live()` now
+  refreshes the grant's own monotonic clock, validates intent/actor/policy/epoch,
+  and performs `ACTIVE → SPENT` under one grant lock. CommitGateway now samples
+  the permit clock first in the final mint sequence, re-observes kill state, then
+  uses `spend_if_live()` under the direct epoch fence; there is no unrelated call
+  between final grant validation and spend. Regressions include a model-level
+  expiry-at-spend case and an end-to-end REQUIRED case that forces grant expiry
+  during the final gateway-clock read and requires `RESERVED → NO_EFFECT`, no
+  permit, and an `EXPIRED` grant. Runtime `7b0e60b`: **469 tests**, Ruff clean,
+  mypy clean over 51 source files, Python 3.11/3.12 green (CI #113). Grant and
+  permit clocks remain independent domains; no simultaneous cross-clock sample
+  is claimed. Layer 4 scoped authorities remains next.
 - 2026-09-23 (s): **M5 L3 MAINTAINER/CODEX CLOSE-OUT.** After the prior
   `fb5620a` candidate, a fresh maintainer-first pass found and fixed: direct
   authorization-epoch mint/consume races (epoch fence); unsupported

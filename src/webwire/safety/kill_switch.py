@@ -9,13 +9,18 @@ Per the Phase 0a design (Point 3 decision):
   operations after the switch trips.
 - Tripping does NOT call ``sb.stop()``. The browser is left intact for
   debugging. Kill switch = refuse new Agent-WebWire actions.
+
+M5 layer 3 adds trip listeners.  The Commit Gateway binds the authorization
+epoch to this hook so a trip revokes already-minted execution authority even
+if the operator later resets the kill switch.  Hot-file trips are detected on
+the next ``tripped()`` observation and notify once per effective trip.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, kill_switched
@@ -28,7 +33,7 @@ __all__ = ["KillSwitch"]
 class KillSwitch:
     """Tri-state kill switch with hot-file + in-process flag + boot env var.
 
-    The switch is *trippled* (set) by any of:
+    The switch is *tripped* (set) by any of:
     - creating the hot file at ``config.kill_path()``;
     - calling :meth:`trip` programmatically (tests, CLI, future control plane);
     - setting the configured env var before boot (boot-time default only).
@@ -41,6 +46,8 @@ class KillSwitch:
     def __init__(self, config: Optional[WebWireConfig] = None) -> None:
         self._config = config or WebWireConfig()
         self._flag: bool = False
+        self._trip_listeners: list[Callable[[], object]] = []
+        self._trip_notified: bool = False
         # Boot-time default from env. Only consulted once at construction;
         # the env var is not the active kill mechanism.
         env_var = self._config.kill_env_var
@@ -51,18 +58,46 @@ class KillSwitch:
                 env_var, os.environ.get(env_var),
             )
 
+    # -- trip listeners ------------------------------------------------------
+
+    def add_trip_listener(self, listener: Callable[[], object]) -> None:
+        """Invoke ``listener`` once per effective trip transition.
+
+        M5 uses this to bump the authorization epoch.  Duplicate registration
+        is ignored.  If the switch is already tripped, registration observes
+        that state immediately so authority minted before binding cannot escape
+        revocation.
+        """
+        if listener not in self._trip_listeners:
+            self._trip_listeners.append(listener)
+        self.tripped()
+
+    def _notify_trip_once(self) -> None:
+        if self._trip_notified:
+            return
+        self._trip_notified = True
+        for listener in tuple(self._trip_listeners):
+            listener()
+
     # -- query ---------------------------------------------------------------
 
     def tripped(self) -> bool:
         """True if the switch is currently tripped (flag OR hot file)."""
         if self._flag:
-            return True
-        # Hot file check — cheap stat. Existence => tripped.
-        try:
-            return self._config.kill_path().exists()
-        except OSError:
-            # If we can't even stat the state dir, fail closed (tripped).
-            return True
+            active = True
+        else:
+            try:
+                active = self._config.kill_path().exists()
+            except OSError:
+                # If we can't even stat the state dir, fail closed (tripped).
+                active = True
+
+        if active:
+            self._notify_trip_once()
+        else:
+            # A subsequent trip is a new revocation event.
+            self._trip_notified = False
+        return active
 
     def state(self) -> dict:
         """Diagnostic snapshot of both mechanisms. For health/journal."""
@@ -87,6 +122,7 @@ class KillSwitch:
             path.touch()
         except OSError as exc:
             logger.warning("Could not write kill hot file %s: %r", path, exc)
+        self._notify_trip_once()
         logger.warning("KillSwitch tripped")
 
     def reset(self) -> None:
@@ -94,7 +130,8 @@ class KillSwitch:
 
         Note: if the hot file was created externally and cannot be removed
         (permissions), ``tripped()`` will remain True. That is intentional —
-        fail closed.
+        fail closed.  Reset never undoes a trip notification; authorization
+        epochs only move forward.
         """
         self._flag = False
         path = self._config.kill_path()
@@ -103,6 +140,9 @@ class KillSwitch:
                 path.unlink()
         except OSError as exc:
             logger.warning("Could not remove kill hot file %s: %r", path, exc)
+        # Refresh the transition latch. If removal failed, tripped() leaves it
+        # notified; if clear, a future trip may notify again.
+        self.tripped()
         logger.info("KillSwitch reset")
 
     # -- guard helper --------------------------------------------------------

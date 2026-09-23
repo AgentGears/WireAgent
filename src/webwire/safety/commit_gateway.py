@@ -1,8 +1,8 @@
 """M5 layer 3 — Commit Gateway and single-use EffectPermit.
 
 This module composes the frozen layer-1 policy/ledger primitives with the
-layer-2 ApprovalGrant/EffectAttempt lifecycle.  It deliberately does NOT expose
-scoped broker authority objects; those land in layer 4.  The gateway establishes
+layer-2 ApprovalGrant/EffectAttempt lifecycle. It deliberately does NOT expose
+scoped broker authority objects; those land in layer 4. The gateway establishes
 the transaction boundary and produces a permit that layer 4 will consume at the
 actual broker mutation boundary.
 
@@ -18,7 +18,7 @@ Protocol:
       -> record_effect_confirmed() OR record_effect_unknown()
 
 A crash after a fenced reservation and before a terminal record leaves raw
-RESERVED evidence; EffectLedger recovery projects it as EFFECT_UNKNOWN.  No
+RESERVED evidence; EffectLedger recovery projects it as EFFECT_UNKNOWN. No
 exactly-once claim is made.
 """
 
@@ -80,7 +80,7 @@ class GatewayStateError(RuntimeError):
 class EffectPermit:
     """Single-use authority descended from one human ApprovalGrant.
 
-    The permit is process-local and ephemeral.  For a fenced effect the durable
+    The permit is process-local and ephemeral. For a fenced effect the durable
     authority fact is the RESERVED ledger record; the permit merely carries the
     exact bindings layer 4 must re-check at the mutation boundary.
     """
@@ -110,7 +110,7 @@ class CommitGateway:
     """The one M5 commit-authority boundary.
 
     Layer 3 owns authorization, durable reservation, spend ordering, permit
-    validation/consumption, and terminal effect-knowledge recording.  It does
+    validation/consumption, and terminal effect-knowledge recording. It does
     not own browser methods; layer 4 will adapt a consumed permit to a scoped
     authority surface.
     """
@@ -131,6 +131,10 @@ class CommitGateway:
         self._policies = policies
         self._clock = clock
         self._permit_ttl = permit_ttl_seconds
+        # Frozen invariant 11: a kill activation revokes outstanding authority,
+        # not merely while the switch remains visibly tripped. KillSwitch emits
+        # one listener notification per effective trip, including hot-file trips.
+        self._kill.add_trip_listener(self._epoch.bump)
 
     @property
     def authorization_epoch(self) -> int:
@@ -143,6 +147,14 @@ class CommitGateway:
             raise GatewayDenied("policy_missing", str(exc)) from exc
         policy.validate()
         return policy
+
+    def _current_policy_binding(self, action_type: str) -> str:
+        try:
+            policy = self._policies.require(action_type)
+        except KeyError as exc:
+            raise GatewayDenied("policy_missing", str(exc)) from exc
+        policy.validate()
+        return policy.binding_hash()
 
     def _check_kill(self) -> None:
         if self._kill.tripped():
@@ -191,7 +203,7 @@ class CommitGateway:
     ) -> EffectPermit:
         """Grant commit authority and return a single-use permit.
 
-        REQUIRED effects are fenced first.  If the durable append fails, no
+        REQUIRED effects are fenced first. If the durable append fails, no
         permit exists and the grant is not spent (T1 fail-closed prerequisite).
         For fenced effects the durable RESERVED fact is the authoritative spend
         point; ``grant.spend()`` follows immediately in the same synchronous
@@ -203,7 +215,7 @@ class CommitGateway:
         epoch = self._epoch.current
         self._validate_grant_identity(grant, attempt, intent, binding, epoch)
 
-        # Final pre-authority kill check.  consume_permit() repeats this at the
+        # Final pre-authority kill check. consume_permit() repeats this at the
         # actual mutation boundary (the hand-on-the-button rule).
         self._check_kill()
 
@@ -266,7 +278,7 @@ class CommitGateway:
     ) -> None:
         """Validate and consume a permit immediately before external mutation.
 
-        A denied validation leaves the permit unconsumed.  Layer 4 must call
+        A denied validation leaves the permit unconsumed. Layer 4 must call
         this in the same synchronous boundary as selecting the scoped broker
         primitive; no browser method may run first.
         """
@@ -279,6 +291,14 @@ class CommitGateway:
             raise GatewayDenied("permit_expired")
         if permit.authorization_epoch != self._epoch.current:
             raise GatewayDenied("epoch_mismatch")
+
+        # The registry is authoritative at execution time too. An approval and
+        # permit minted under P1 cannot execute after action policy changes to P2.
+        current_binding = self._current_policy_binding(permit.action_type)
+        if current_binding != permit.policy_binding:
+            raise GatewayDenied("policy_mismatch", "registered policy changed after permit mint")
+        if policy_binding != permit.policy_binding:
+            raise GatewayDenied("policy_mismatch")
         if effect not in permit.allowed_effects:
             raise GatewayDenied("effect_not_allowed", effect.value)
         if intent_hash != permit.intent_hash:
@@ -287,8 +307,6 @@ class CommitGateway:
             raise GatewayDenied("actor_mismatch")
         if target_type != permit.target_type or target_id != permit.target_id:
             raise GatewayDenied("target_mismatch")
-        if policy_binding != permit.policy_binding:
-            raise GatewayDenied("policy_mismatch")
 
         permit.consumed = True
         permit.consumed_effect = effect
@@ -300,6 +318,11 @@ class CommitGateway:
             raise GatewayStateError("permit/attempt mismatch")
         if not permit.consumed:
             raise GatewayStateError("effect outcome cannot be recorded before permit consumption")
+        expected = AttemptState.RESERVED if permit.fenced else AttemptState.PREPARING
+        if attempt.state is not expected:
+            raise GatewayStateError(
+                f"effect outcome requires {expected.value}, got {attempt.state.value}"
+            )
 
     def _terminal_record(
         self,
@@ -335,7 +358,7 @@ class CommitGateway:
     ) -> None:
         """Record evidence-established success.
 
-        Fenced effects close the durable reservation.  Non-fenced effects have
+        Fenced effects close the durable reservation. Non-fenced effects have
         no precommit fence and only update the in-memory attempt here.
         """
 
@@ -363,7 +386,7 @@ class CommitGateway:
 
         Unknown outcomes are written durably even for non-fenced effects when
         the process is still alive, because the ledger is the authority for
-        known uncertainty.  For a fenced effect, failure to append this terminal
+        known uncertainty. For a fenced effect, failure to append this terminal
         record still leaves RESERVED as an unresolved recovery blocker.
         """
 

@@ -116,3 +116,26 @@ def test_listener_reset_stops_remaining_delivery_for_inactive_trip(tmp_path: Pat
     assert first_calls == 1
     assert second_calls == 0
     assert kill.tripped() is False
+
+
+def test_listener_reset_then_retrip_is_notified_for_both_generations(tmp_path: Path) -> None:
+    """Codex P2: an old callback cannot satisfy a newly-created trip generation."""
+    kill = _kill(tmp_path)
+    calls = 0
+
+    def listener() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            kill.reset()
+            kill.trip()
+
+    kill.add_trip_listener(listener)
+    kill.trip()
+
+    # The first callback belongs to generation 1. reset()+trip() creates
+    # generation 2 while it is in progress, so generation 2 must receive its
+    # own callback after the first invocation exits.
+    assert calls == 2
+    assert kill.tripped() is True
+    assert calls == 2

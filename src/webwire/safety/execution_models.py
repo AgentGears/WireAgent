@@ -220,8 +220,9 @@ class ApprovalGrant:
         """Hold claim ownership stable across the gateway commit protocol."""
         with self._lock:
             if self.claimed_by != attempt_id:
-                raise GrantStateError(
-                    f"claim fence requires {attempt_id!r}, held by {self.claimed_by!r}"
+                raise GrantClaimDenied(
+                    "claim_not_held",
+                    f"claim fence requires {attempt_id!r}, held by {self.claimed_by!r}",
                 )
             yield
 

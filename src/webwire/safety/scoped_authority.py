@@ -28,7 +28,12 @@ from super_browser.results.types import FailureCategory
 
 from webwire.envelope import ActionResult, soft_failure
 from webwire.safety.attachment import file_sha256
-from webwire.safety.commit_gateway import CommitGateway, EffectPermit, GatewayDenied
+from webwire.safety.commit_gateway import (
+    CommitGateway,
+    EffectPermit,
+    GatewayDenied,
+    GatewayStateError,
+)
 from webwire.safety.effect_policy import (
     DEFAULT_EFFECT_POLICIES,
     EffectPolicyRegistry,
@@ -622,6 +627,12 @@ class ScopedAuthorityBroker:
         *,
         policies: EffectPolicyRegistry = DEFAULT_EFFECT_POLICIES,
     ) -> None:
+        gateway_policies = getattr(commit_gateway, "_policies", None)
+        if gateway_policies is not policies:
+            raise ScopedAuthorityDenied(
+                "policy_registry_mismatch",
+                "scoped authority and CommitGateway must share one registry object",
+            )
         self.__write_broker = write_broker
         self.__gateway = commit_gateway
         self.__policies = policies
@@ -738,6 +749,12 @@ class ScopedAuthorityBroker:
             raise ScopedAuthorityDenied("policy_mismatch")
         if permit.attempt_id != attempt.attempt_id or permit.grant_id != attempt.grant_id:
             raise ScopedAuthorityDenied("attempt_mismatch")
+        try:
+            canonical_attempt = self.__gateway._canonical_attempt(permit)
+        except GatewayStateError as exc:
+            raise ScopedAuthorityDenied("permit_unknown", str(exc)) from exc
+        if canonical_attempt is not attempt:
+            raise ScopedAuthorityDenied("attempt_mismatch", "non-canonical attempt object")
         if permit.consumed:
             raise ScopedAuthorityDenied("permit_reused")
 

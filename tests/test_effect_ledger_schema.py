@@ -77,6 +77,21 @@ def test_direct_record_requires_dict_details() -> None:
         )
 
 
+@pytest.mark.parametrize("bad", [None, [], "", 0, False])
+def test_from_dict_rejects_falsy_non_object_details(bad: object) -> None:
+    raw = json.loads(_record(EffectState.RESERVED).to_jsonl())
+    raw["details"] = bad
+    with pytest.raises(EffectLedgerCorruptError, match="details must be an object"):
+        EffectLedgerRecord.from_dict(raw)
+
+
+def test_from_dict_allows_missing_details_as_empty_object() -> None:
+    raw = json.loads(_record(EffectState.RESERVED).to_jsonl())
+    raw.pop("details")
+    parsed = EffectLedgerRecord.from_dict(raw)
+    assert parsed.details == {}
+
+
 @pytest.mark.parametrize("bad", [None, "", 123, True])
 def test_timestamp_must_be_nonempty_string(bad: object) -> None:
     with pytest.raises(ValueError, match="timestamp"):

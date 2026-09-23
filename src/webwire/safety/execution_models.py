@@ -44,6 +44,9 @@ grant's claim fence:
         -> attempt.mark_reserved(grant)
         -> grant.spend()
 
+Grant/permit lifetime is elapsed-time authority, so default clocks are monotonic.
+Wall-clock UTC belongs to durable ledger timestamps, not process-local TTLs.
+
 Nothing here performs I/O. Durable safety state belongs to EffectLedger; grants
 and attempts are process-local lifecycle records.
 """
@@ -165,14 +168,14 @@ class ApprovalGrant:
     policy_binding: str
     authorization_epoch: int
     grant_id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
-    issued_at: float = field(default_factory=time.time)
+    issued_at: float = field(default_factory=time.monotonic)
     expires_at: float = 0.0
     max_precommit_attempts: int = DEFAULT_MAX_PRECOMMIT_ATTEMPTS
     state: GrantState = GrantState.ACTIVE
     claimed_by: Optional[str] = None
     precommit_attempts: int = 0
     clock: Callable[[], float] = field(
-        default_factory=lambda: time.time,
+        default_factory=lambda: time.monotonic,
         repr=False,
         compare=False,
     )
@@ -416,7 +419,7 @@ class ApprovalGrantStore:
 
     def __init__(
         self,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
         ttl_seconds: float = DEFAULT_GRANT_TTL_S,
         max_precommit_attempts: int = DEFAULT_MAX_PRECOMMIT_ATTEMPTS,
     ) -> None:

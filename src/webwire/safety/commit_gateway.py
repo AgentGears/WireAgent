@@ -214,9 +214,6 @@ class CommitGateway:
         binding = policy.binding_hash()
         epoch = self._epoch.current
         self._validate_grant_identity(grant, attempt, intent, binding, epoch)
-
-        # Final pre-authority kill check. consume_permit() repeats this at the
-        # actual mutation boundary (the hand-on-the-button rule).
         self._check_kill()
 
         now = self._clock()
@@ -243,8 +240,6 @@ class CommitGateway:
                 raise GatewayDenied("reservation_failed", str(exc)) from exc
             attempt.mark_reserved(grant)
 
-        # Frozen spend rule: fenced => after durable reservation; non-fenced =>
-        # this process-local transition itself is the authority grant point.
         grant.spend()
 
         return EffectPermit(
@@ -276,12 +271,7 @@ class CommitGateway:
         target_id: str,
         policy_binding: str,
     ) -> None:
-        """Validate and consume a permit immediately before external mutation.
-
-        A denied validation leaves the permit unconsumed. Layer 4 must call
-        this in the same synchronous boundary as selecting the scoped broker
-        primitive; no browser method may run first.
-        """
+        """Validate and consume a permit immediately before external mutation."""
 
         self._check_kill()
         now = self._clock()
@@ -292,8 +282,6 @@ class CommitGateway:
         if permit.authorization_epoch != self._epoch.current:
             raise GatewayDenied("epoch_mismatch")
 
-        # The registry is authoritative at execution time too. An approval and
-        # permit minted under P1 cannot execute after action policy changes to P2.
         current_binding = self._current_policy_binding(permit.action_type)
         if current_binding != permit.policy_binding:
             raise GatewayDenied("policy_mismatch", "registered policy changed after permit mint")
@@ -356,11 +344,7 @@ class CommitGateway:
         *,
         evidence: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Record evidence-established success.
-
-        Fenced effects close the durable reservation. Non-fenced effects have
-        no precommit fence and only update the in-memory attempt here.
-        """
+        """Record evidence-established success."""
 
         self._validate_outcome_objects(permit, attempt)
         if permit.fenced:
@@ -369,9 +353,6 @@ class CommitGateway:
                     self._terminal_record(permit, EffectState.EFFECT_CONFIRMED, evidence)
                 )
             except EffectLedgerError as exc:
-                # The existing RESERVED remains unresolved and therefore safe
-                # across restart; surface the recording failure rather than
-                # pretending the terminal evidence became durable.
                 raise GatewayStateError(f"could not persist confirmed outcome: {exc}") from exc
         attempt.mark_effect_confirmed()
 
@@ -382,19 +363,21 @@ class CommitGateway:
         *,
         evidence: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Record an uncertain outcome; automatic retry is never authorized.
+        """Persist uncertainty before making the in-memory attempt terminal.
 
-        Unknown outcomes are written durably even for non-fenced effects when
-        the process is still alive, because the ledger is the authority for
-        known uncertainty. For a fenced effect, failure to append this terminal
-        record still leaves RESERVED as an unresolved recovery blocker.
+        This ordering matters when the ledger is temporarily unavailable: a
+        failed append leaves the attempt in RESERVED/PREPARING, so the caller
+        may retry *outcome persistence* with the already-consumed permit. It
+        does not restore execution authority: the grant is SPENT and the permit
+        remains consumed. For fenced effects, the prior RESERVED record remains
+        an unresolved restart blocker throughout.
         """
 
         self._validate_outcome_objects(permit, attempt)
-        attempt.mark_effect_unknown()
         try:
             self._ledger.append_durable(
                 self._terminal_record(permit, EffectState.EFFECT_UNKNOWN, evidence)
             )
         except EffectLedgerError as exc:
             raise GatewayStateError(f"could not persist unknown outcome: {exc}") from exc
+        attempt.mark_effect_unknown()

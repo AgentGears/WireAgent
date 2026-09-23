@@ -23,6 +23,7 @@ from webwire.safety.execution_models import (
     AuthorizationEpoch,
     EffectAttempt,
     GrantState,
+    GrantStateError,
 )
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import WriteIntent
@@ -121,7 +122,13 @@ def test_written_then_fsync_failed_reservation_retries_same_effect_fact(
     assert first[0].state is EffectState.RESERVED
     assert first[0].effect_id == attempt.effect_id
     assert attempt.state is AttemptState.PREPARING
+    assert attempt.reservation_started is True
     assert grant.state is GrantState.ACTIVE
+    assert grant.claimed_by == attempt.attempt_id
+
+    # Because reservation I/O started, this is NOT a clean precommit failure.
+    with pytest.raises(GrantStateError, match="reservation I/O"):
+        attempt.mark_no_effect(grant)
     assert grant.claimed_by == attempt.attempt_id
 
     # Same attempt retries the SAME effect fact. EffectLedger re-fsyncs that
@@ -192,7 +199,7 @@ def test_invalid_terminal_evidence_fails_without_losing_retryable_outcome(
     assert ledger.read_records()[-1].state is EffectState.EFFECT_CONFIRMED
 
 
-def test_mutated_attempt_effect_identity_is_rejected_at_outcome_boundary(
+def test_attempt_effect_identity_cannot_be_mutated_after_creation(
     tmp_path: Path,
 ) -> None:
     cfg = WebWireConfig(state_dir=tmp_path)
@@ -204,6 +211,7 @@ def test_mutated_attempt_effect_identity_is_rejected_at_outcome_boundary(
     )
     intent = _intent()
     grant, attempt = _claimed(intent, epoch)
+    original_effect_id = attempt.effect_id
     permit = gateway.authorize_commit(
         grant=grant,
         attempt=attempt,
@@ -211,9 +219,9 @@ def test_mutated_attempt_effect_identity_is_rejected_at_outcome_boundary(
     )
     _consume(gateway, permit, intent)
 
-    attempt.effect_id = "mutated"
-    with pytest.raises(GatewayStateError, match="effect mismatch"):
-        gateway.record_effect_confirmed(permit, attempt)
+    with pytest.raises(GrantStateError, match="effect_id"):
+        attempt.effect_id = "mutated"
 
-    assert permit.consumed is True
-    assert attempt.state is AttemptState.RESERVED
+    assert attempt.effect_id == original_effect_id == permit.effect_id
+    gateway.record_effect_confirmed(permit, attempt, evidence={"proof": "sealed"})
+    assert attempt.state is AttemptState.EFFECT_CONFIRMED

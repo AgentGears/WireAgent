@@ -33,8 +33,8 @@ def _intent() -> WriteIntent:
     )
 
 
-def test_outcome_rejects_attempt_with_matching_id_but_wrong_grant(tmp_path: Path) -> None:
-    """Codex P2: outcome recording validates attempt and grant lineage together."""
+def test_outcome_rejects_reconstructed_attempt_even_with_matching_id(tmp_path: Path) -> None:
+    """Outcome mutation requires the exact attempt retained at permit issuance."""
     cfg = WebWireConfig(state_dir=tmp_path)
     epoch = AuthorizationEpoch()
     ledger = EffectLedger(cfg)
@@ -80,11 +80,12 @@ def test_outcome_rejects_attempt_with_matching_id_but_wrong_grant(tmp_path: Path
         attempt_id=attempt.attempt_id,
         state=attempt.state,
     )
-    with pytest.raises(GatewayStateError, match="grant mismatch"):
+    with pytest.raises(GatewayStateError, match="canonical EffectAttempt"):
         gateway.record_effect_confirmed(permit, forged)
 
-    # The rejected object cannot consume the terminal transition. The real
-    # attempt and permit remain available only for outcome persistence.
+    # Correlation fields cannot substitute a reconstructed lifecycle object.
+    # The rejected object cannot consume the terminal transition; the real
+    # attempt and permit remain available for outcome persistence.
     assert forged.state is attempt.state
     assert attempt.state.value == "reserved"
     assert permit.permit_id in gateway._issued_permits

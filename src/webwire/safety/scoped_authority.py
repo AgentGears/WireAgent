@@ -1,13 +1,13 @@
 """M5 layer 4 — intent-bound preparation and exact effect authorities.
 
 This module is the process-local least-authority adapter between Layer 3's
-CommitGateway/EffectPermit and the concrete M5 write broker. It does not wire
-the live WriteKernel; capability migration remains Layer 5.
+CommitGateway/EffectPermit and the concrete M5 write broker. It deliberately
+does not wire the live WriteKernel; capability migration remains Layer 5.
 
-Scoped objects retain only exact bound operations, never the concrete broker
-object itself. Effect authorities also do not expose outcome-recording APIs:
-verification and durable terminal truth remain CommitGateway orchestration owned
-by Layer 5.
+The trusted Layer-5 orchestrator may retain an :class:`AuthorizedEffect` receipt
+containing exact permit/attempt lineage. Capability code receives only the
+narrow ``authority`` object from that receipt. No scoped authority exposes the
+concrete broker, browser, terminal-outcome API, or inverse semantic effect.
 
 Threat model: same-process engineering boundary against accidental overreach,
 not a hostile-Python sandbox. Untrusted code still requires process/OS isolation
@@ -50,6 +50,7 @@ from webwire.safety.execution_models import (
 from webwire.safety.models import WriteIntent
 
 __all__ = [
+    "AuthorizedEffect",
     "ScopedAuthorityBroker",
     "ScopedAuthorityDenied",
     "PostPreparationAuthority",
@@ -67,6 +68,7 @@ _AsyncNoArg = Callable[[], Awaitable[ActionResult]]
 _AsyncOneStr = Callable[[str], Awaitable[ActionResult]]
 _AsyncTwoStr = Callable[[str, str], Awaitable[ActionResult]]
 _CommitGate = Callable[[], Optional[ActionResult]]
+_AsyncPrecommitCheck = Callable[[], Awaitable[Optional[ActionResult]]]
 _EffectInvocation = Callable[[_CommitGate], Awaitable[ActionResult]]
 
 _POST_TARGET_ACTIONS = frozenset(
@@ -80,8 +82,10 @@ _POST_TARGET_ACTIONS = frozenset(
         "delete_post",
     }
 )
+_CONTENT_ACTIONS = frozenset({"post", "reply", "quote"})
 _STATUS_HOSTS = frozenset({"x.com", "www.x.com", "twitter.com", "www.twitter.com"})
 _STATUS_PATH_RE = re.compile(r"/status/(\d+)(?:/|$)")
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class ScopedAuthorityDenied(RuntimeError):
@@ -96,13 +100,7 @@ class ScopedAuthorityDenied(RuntimeError):
 
 
 def _bind_status_url(raw_url: str, target_post_id: str) -> str:
-    """Return a target-safe X status URL or reject the binding.
-
-    A permit target id is not enough if the browser can be navigated to an
-    unrelated page and a page-global state-set selector can act on another post.
-    Supplied URLs therefore must themselves identify the approved status. When a
-    caller omits the URL, derive a canonical X status route from the approved id.
-    """
+    """Return an HTTPS X/Twitter status URL that names the approved target."""
     if not raw_url:
         return f"https://x.com/i/status/{target_post_id}"
 
@@ -136,7 +134,7 @@ class _MediaBinding:
 
 @dataclass(frozen=True)
 class _IntentBinding:
-    """Private immutable values extracted from one deep-copied WriteIntent."""
+    """Immutable browser-facing values extracted from one private intent copy."""
 
     action_type: str
     target_type: str
@@ -150,8 +148,12 @@ class _IntentBinding:
     media: tuple[_MediaBinding, ...]
 
     @classmethod
-    def capture(cls, intent: WriteIntent, *, policy_binding: str) -> "_IntentBinding":
-        frozen = deepcopy(intent)
+    def capture_frozen(
+        cls,
+        frozen: WriteIntent,
+        *,
+        policy_binding: str,
+    ) -> "_IntentBinding":
         actor_id = frozen.actor_identity or ""
         if not actor_id:
             raise ScopedAuthorityDenied("actor_missing")
@@ -218,6 +220,7 @@ class _IntentBinding:
             media_raw = []
         if not isinstance(media_raw, list):
             raise ScopedAuthorityDenied("payload_invalid", "manifest_items must be a list")
+
         media: list[_MediaBinding] = []
         for expected_index, item in enumerate(media_raw):
             if not isinstance(item, dict):
@@ -234,7 +237,7 @@ class _IntentBinding:
                 raise ScopedAuthorityDenied(
                     "payload_invalid", f"manifest item {expected_index} has invalid path"
                 )
-            if not isinstance(digest, str) or not digest:
+            if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
                 raise ScopedAuthorityDenied(
                     "payload_invalid", f"manifest item {expected_index} has invalid digest"
                 )
@@ -242,7 +245,7 @@ class _IntentBinding:
                 _MediaBinding(
                     index=expected_index,
                     source_path=source_path,
-                    sha256=digest,
+                    sha256=digest.lower(),
                 )
             )
 
@@ -258,6 +261,41 @@ class _IntentBinding:
             normalized_text=normalized_text_raw,
             media=tuple(media),
         )
+
+
+@dataclass
+class _PreparationTracker:
+    """Attempt-local proof that approved staging completed in the required order."""
+
+    intent_hash: str
+    action_type: str
+    target_id: str
+    expected_media: int
+    composer_opened: bool = False
+    text_filled: bool = False
+    media_attached: int = 0
+
+    def require_binding(self, binding: _IntentBinding) -> None:
+        if (
+            self.intent_hash != binding.intent_hash
+            or self.action_type != binding.action_type
+            or self.target_id != binding.target_id
+            or self.expected_media != len(binding.media)
+        ):
+            raise ScopedAuthorityDenied("preparation_binding_mismatch")
+
+    def ready(self, binding: _IntentBinding) -> bool:
+        self.require_binding(binding)
+        return (
+            self.composer_opened
+            and self.text_filled
+            and self.media_attached == self.expected_media
+        )
+
+    def reset(self) -> None:
+        self.composer_opened = False
+        self.text_filled = False
+        self.media_attached = 0
 
 
 _EFFECT_BY_ACTION: dict[str, EffectVerb] = {
@@ -279,9 +317,7 @@ class _PreparationBase:
         "__binding",
         "__policies",
         "__gateway",
-        "__next_media_index",
-        "__composer_opened",
-        "__text_filled",
+        "__tracker",
         "__read_composer",
         "__verify_attachment",
         "__count_attachments",
@@ -298,15 +334,14 @@ class _PreparationBase:
         binding: _IntentBinding,
         policies: EffectPolicyRegistry,
         gateway: CommitGateway,
+        tracker: _PreparationTracker,
     ) -> None:
         self.__grant = grant
         self.__attempt = attempt
         self.__binding = binding
         self.__policies = policies
         self.__gateway = gateway
-        self.__next_media_index = 0
-        self.__composer_opened = False
-        self.__text_filled = False
+        self.__tracker = tracker
         self.__read_composer: _AsyncNoArg = write_broker.read_composer_text
         self.__verify_attachment: _AsyncNoArg = write_broker.verify_attachment_ready
         self.__count_attachments: _AsyncNoArg = write_broker.count_attachments
@@ -330,28 +365,8 @@ class _PreparationBase:
     def _expected_target_post_id(self) -> str:
         return self.__binding.target_post_id
 
-    def _mark_composer_opened(self) -> None:
-        self.__composer_opened = True
-
-    def _mark_text_filled(self) -> None:
-        self.__text_filled = True
-
-    def _require_composer_opened(self) -> None:
-        if not self.__composer_opened:
-            raise ScopedAuthorityDenied(
-                "preparation_order", "approved composer context has not been opened"
-            )
-
-    def _require_text_filled(self) -> None:
-        if not self.__text_filled:
-            raise ScopedAuthorityDenied(
-                "preparation_order", "approved composer text has not been staged"
-            )
-
-    def _reset_preparation(self) -> None:
-        self.__composer_opened = False
-        self.__text_filled = False
-        self.__next_media_index = 0
+    def _tracker(self) -> _PreparationTracker:
+        return self.__tracker
 
     def _require_live(self, verb: PreparationVerb) -> None:
         grant = self.__grant
@@ -403,17 +418,22 @@ class _PreparationBase:
 
     async def attach_media(self, image_path: str) -> ActionResult:
         self._require_live(PreparationVerb.ATTACH_MEDIA)
-        self._require_text_filled()
-        if self.__next_media_index >= len(self.__binding.media):
+        tracker = self.__tracker
+        if not tracker.text_filled:
+            raise ScopedAuthorityDenied(
+                "preparation_order", "approved composer text has not been staged"
+            )
+        if tracker.media_attached >= len(self.__binding.media):
             raise ScopedAuthorityDenied("media_not_approved", image_path)
-        expected = self.__binding.media[self.__next_media_index]
+
+        expected = self.__binding.media[tracker.media_attached]
         if image_path != expected.source_path:
             raise ScopedAuthorityDenied(
                 "media_order_mismatch",
                 f"expected {expected.source_path!r}, got {image_path!r}",
             )
         try:
-            digest = file_sha256(Path(expected.source_path))
+            digest = file_sha256(Path(expected.source_path)).lower()
         except OSError as exc:
             raise ScopedAuthorityDenied("media_unreadable", str(exc)) from exc
         if digest != expected.sha256:
@@ -421,19 +441,20 @@ class _PreparationBase:
                 "media_changed_after_approval",
                 f"media index {expected.index} digest changed",
             )
-        # Digesting may take time. Re-check approval/policy/epoch immediately
-        # before delegating the actual upload.
+
+        # Hashing can take time; revalidate approval/policy/epoch immediately
+        # before the actual upload staging operation.
         self._require_live(PreparationVerb.ATTACH_MEDIA)
         result = await self.__attach_media(expected.source_path)
         if result.ok:
-            self.__next_media_index += 1
+            tracker.media_attached += 1
         return result
 
     async def close_composer(self) -> ActionResult:
-        """Reducing cleanup remains available even when approval was revoked."""
+        """Reducing cleanup stays available after revocation/kill/spend."""
         result = await self.__close_composer()
         if result.ok:
-            self._reset_preparation()
+            self.__tracker.reset()
         return result
 
 
@@ -449,13 +470,16 @@ class PostPreparationAuthority(_PreparationBase):
             raise ScopedAuthorityDenied("action_mismatch")
         self._require_live(PreparationVerb.OPEN_COMPOSER)
         self._require_live(PreparationVerb.FILL_COMPOSER)
+        tracker = self._tracker()
+        if tracker.text_filled or tracker.media_attached:
+            raise ScopedAuthorityDenied("preparation_order", "composer already staged")
         expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "composer text differs")
         result = await self.__fill_composer(expected)
         if result.ok:
-            self._mark_composer_opened()
-            self._mark_text_filled()
+            tracker.composer_opened = True
+            tracker.text_filled = True
         return result
 
 
@@ -473,6 +497,9 @@ class ReplyPreparationAuthority(_PreparationBase):
         if self.action_type != "reply":
             raise ScopedAuthorityDenied("action_mismatch")
         self._require_live(PreparationVerb.OPEN_COMPOSER)
+        tracker = self._tracker()
+        if tracker.composer_opened or tracker.text_filled or tracker.media_attached:
+            raise ScopedAuthorityDenied("preparation_order", "reply context already opened")
         if (
             post_url != self._expected_post_url()
             or target_post_id != self._expected_target_post_id()
@@ -482,18 +509,22 @@ class ReplyPreparationAuthority(_PreparationBase):
             self._expected_post_url(), self._expected_target_post_id()
         )
         if result.ok:
-            self._mark_composer_opened()
+            tracker.composer_opened = True
         return result
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        self._require_composer_opened()
+        tracker = self._tracker()
+        if not tracker.composer_opened or tracker.text_filled:
+            raise ScopedAuthorityDenied(
+                "preparation_order", "reply context must be opened exactly once before fill"
+            )
         expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "reply text differs")
         result = await self.__fill_reply(expected)
         if result.ok:
-            self._mark_text_filled()
+            tracker.text_filled = True
         return result
 
 
@@ -511,6 +542,9 @@ class QuotePreparationAuthority(_PreparationBase):
         if self.action_type != "quote":
             raise ScopedAuthorityDenied("action_mismatch")
         self._require_live(PreparationVerb.OPEN_COMPOSER)
+        tracker = self._tracker()
+        if tracker.composer_opened or tracker.text_filled or tracker.media_attached:
+            raise ScopedAuthorityDenied("preparation_order", "quote context already opened")
         if (
             post_url != self._expected_post_url()
             or target_post_id != self._expected_target_post_id()
@@ -520,18 +554,22 @@ class QuotePreparationAuthority(_PreparationBase):
             self._expected_post_url(), self._expected_target_post_id()
         )
         if result.ok:
-            self._mark_composer_opened()
+            tracker.composer_opened = True
         return result
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        self._require_composer_opened()
+        tracker = self._tracker()
+        if not tracker.composer_opened or tracker.text_filled:
+            raise ScopedAuthorityDenied(
+                "preparation_order", "quote context must be opened exactly once before fill"
+            )
         expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "quote text differs")
         result = await self.__fill_quote(expected)
         if result.ok:
-            self._mark_text_filled()
+            tracker.text_filled = True
         return result
 
 
@@ -562,7 +600,6 @@ class _EffectAuthorityBase:
         return self.__permit.consumed
 
     def _commit_gate(self) -> Optional[ActionResult]:
-        """Consume exact permit at the concrete broker's final mutation seam."""
         binding = self.__binding
         try:
             self.__gateway.consume_permit(
@@ -615,10 +652,34 @@ class DeletePostAuthority(_EffectAuthorityBase):
         return await self._invoke_exact()
 
 
-class ScopedAuthorityBroker:
-    """Factory that never returns a caller-visible concrete broker."""
+EffectAuthority = (
+    SetBookmarkAuthority
+    | ClearBookmarkAuthority
+    | SetLikeAuthority
+    | ClearLikeAuthority
+    | SubmitContentAuthority
+    | DeletePostAuthority
+)
 
-    __slots__ = ("__write_broker", "__gateway", "__policies")
+
+@dataclass(frozen=True)
+class AuthorizedEffect:
+    """Trusted-orchestrator receipt; capabilities receive only ``authority``.
+
+    The exact permit remains available to Layer 5 for gateway-owned terminal
+    outcome recording. Keeping this receipt outside capability code preserves
+    least authority while avoiding a second/direct gateway mint path.
+    """
+
+    authority: EffectAuthority
+    permit: EffectPermit
+    attempt: EffectAttempt
+
+
+class ScopedAuthorityBroker:
+    """Factory for preparation authority and exact permit-backed effects."""
+
+    __slots__ = ("__write_broker", "__gateway", "__policies", "__preparations")
 
     def __init__(
         self,
@@ -636,30 +697,48 @@ class ScopedAuthorityBroker:
         self.__write_broker = write_broker
         self.__gateway = commit_gateway
         self.__policies = policies
+        self.__preparations: dict[str, _PreparationTracker] = {}
 
-    def _capture_current_binding(self, intent: WriteIntent) -> _IntentBinding:
+    def _freeze_binding(self, intent: WriteIntent) -> tuple[WriteIntent, _IntentBinding]:
+        # One private copy feeds BOTH browser scope and Layer-3 authorization.
+        # Caller mutation after this point cannot create two independent views.
+        frozen = deepcopy(intent)
         try:
-            policy = self.__policies.require(intent.action_type)
+            policy = self.__policies.require(frozen.action_type)
         except KeyError as exc:
             raise ScopedAuthorityDenied("policy_missing", str(exc)) from exc
         policy.validate()
-        return _IntentBinding.capture(intent, policy_binding=policy.binding_hash())
+        binding = _IntentBinding.capture_frozen(
+            frozen,
+            policy_binding=policy.binding_hash(),
+        )
+        self._require_exact_effect_scope(binding)
+        return frozen, binding
 
-    def prepare(
-        self,
-        *,
-        grant: ApprovalGrant,
-        attempt: EffectAttempt,
-        intent: WriteIntent,
-    ) -> PostPreparationAuthority | ReplyPreparationAuthority | QuotePreparationAuthority:
-        binding = self._capture_current_binding(intent)
+    def _require_exact_effect_scope(self, binding: _IntentBinding) -> EffectVerb:
+        expected = _EFFECT_BY_ACTION.get(binding.action_type)
+        if expected is None:
+            raise ScopedAuthorityDenied("effect_not_supported", binding.action_type)
         try:
             policy = self.__policies.require(binding.action_type)
         except KeyError as exc:
             raise ScopedAuthorityDenied("policy_missing", str(exc)) from exc
-        if not policy.preparation_effects:
-            raise ScopedAuthorityDenied("preparation_not_allowed", binding.action_type)
+        if policy.allowed_effects != frozenset({expected}):
+            raise ScopedAuthorityDenied(
+                "effect_scope_not_exact",
+                f"expected only {expected.value}, got "
+                f"{sorted(effect.value for effect in policy.allowed_effects)!r}",
+            )
+        return expected
 
+    @staticmethod
+    def _validate_grant_for_binding(
+        grant: ApprovalGrant,
+        attempt: EffectAttempt,
+        binding: _IntentBinding,
+        *,
+        authorization_epoch: int,
+    ) -> None:
         if attempt.grant_id != grant.grant_id:
             raise ScopedAuthorityDenied("grant_mismatch")
         if grant.claimed_by != attempt.attempt_id:
@@ -675,10 +754,44 @@ class ScopedAuthorityBroker:
                 intent_hash=binding.intent_hash,
                 actor_id=binding.actor_id,
                 policy_binding=binding.policy_binding,
-                authorization_epoch=self.__gateway.authorization_epoch,
+                authorization_epoch=authorization_epoch,
             )
         except GrantClaimDenied as exc:
             raise ScopedAuthorityDenied(exc.reason, str(exc)) from exc
+
+    def prepare(
+        self,
+        *,
+        grant: ApprovalGrant,
+        attempt: EffectAttempt,
+        intent: WriteIntent,
+    ) -> PostPreparationAuthority | ReplyPreparationAuthority | QuotePreparationAuthority:
+        _, binding = self._freeze_binding(intent)
+        try:
+            policy = self.__policies.require(binding.action_type)
+        except KeyError as exc:
+            raise ScopedAuthorityDenied("policy_missing", str(exc)) from exc
+        if binding.action_type not in _CONTENT_ACTIONS or not policy.preparation_effects:
+            raise ScopedAuthorityDenied("preparation_not_allowed", binding.action_type)
+
+        self._validate_grant_for_binding(
+            grant,
+            attempt,
+            binding,
+            authorization_epoch=self.__gateway.authorization_epoch,
+        )
+
+        tracker = self.__preparations.get(attempt.attempt_id)
+        if tracker is None:
+            tracker = _PreparationTracker(
+                intent_hash=binding.intent_hash,
+                action_type=binding.action_type,
+                target_id=binding.target_id,
+                expected_media=len(binding.media),
+            )
+            self.__preparations[attempt.attempt_id] = tracker
+        else:
+            tracker.require_binding(binding)
 
         common: dict[str, Any] = {
             "write_broker": self.__write_broker,
@@ -687,6 +800,7 @@ class ScopedAuthorityBroker:
             "binding": binding,
             "policies": self.__policies,
             "gateway": self.__gateway,
+            "tracker": tracker,
         }
         if binding.action_type == "post":
             return PostPreparationAuthority(**common)
@@ -702,33 +816,41 @@ class ScopedAuthorityBroker:
         grant: ApprovalGrant,
         attempt: EffectAttempt,
         intent: WriteIntent,
-    ) -> _EffectAuthorityBase:
-        """Validate browser-facing scope before permit mint, then authorize.
+    ) -> AuthorizedEffect:
+        """Validate scoped intent first, then mint and wrap one exact permit."""
+        frozen, binding = self._freeze_binding(intent)
+        self._validate_grant_for_binding(
+            grant,
+            attempt,
+            binding,
+            authorization_epoch=self.__gateway.authorization_epoch,
+        )
 
-        One-step actions have no preparation phase in which target/payload scope
-        would otherwise be validated. Performing the scoped binding first avoids
-        spending approval or creating a durable reservation for an intent that
-        can never be represented safely by a browser authority.
-        """
-        binding = self._capture_current_binding(intent)
+        tracker: Optional[_PreparationTracker] = None
+        if binding.action_type in _CONTENT_ACTIONS:
+            tracker = self.__preparations.get(attempt.attempt_id)
+            if tracker is None or not tracker.ready(binding):
+                raise ScopedAuthorityDenied(
+                    "preparation_incomplete",
+                    "approved composer context/text/media have not completed",
+                )
+
+        # The same private intent copy that produced ``binding`` is handed to the
+        # gateway. This avoids unnecessary split-view denial from caller mutation.
         permit = self.__gateway.authorize_commit(
-            grant=grant, attempt=attempt, intent=intent
+            grant=grant,
+            attempt=attempt,
+            intent=frozen,
         )
-        return self._authorize_bound(
-            permit=permit, attempt=attempt, binding=binding
+        authority = self._authorize_bound(
+            permit=permit,
+            attempt=attempt,
+            binding=binding,
+            tracker=tracker,
         )
-
-    def authorize(
-        self,
-        *,
-        permit: EffectPermit,
-        attempt: EffectAttempt,
-        intent: WriteIntent,
-    ) -> _EffectAuthorityBase:
-        binding = self._capture_current_binding(intent)
-        return self._authorize_bound(
-            permit=permit, attempt=attempt, binding=binding
-        )
+        if tracker is not None:
+            self.__preparations.pop(attempt.attempt_id, None)
+        return AuthorizedEffect(authority=authority, permit=permit, attempt=attempt)
 
     def _authorize_bound(
         self,
@@ -736,7 +858,17 @@ class ScopedAuthorityBroker:
         permit: EffectPermit,
         attempt: EffectAttempt,
         binding: _IntentBinding,
-    ) -> _EffectAuthorityBase:
+        tracker: Optional[_PreparationTracker],
+    ) -> EffectAuthority:
+        # Require the exact in-memory permit object, not merely matching lineage.
+        try:
+            self.__gateway._require_issued_permit(permit)
+            canonical_attempt = self.__gateway._canonical_attempt(permit)
+        except (GatewayDenied, GatewayStateError) as exc:
+            raise ScopedAuthorityDenied("permit_unknown", str(exc)) from exc
+        if canonical_attempt is not attempt:
+            raise ScopedAuthorityDenied("attempt_mismatch", "non-canonical attempt object")
+
         if permit.intent_hash != binding.intent_hash:
             raise ScopedAuthorityDenied("intent_mismatch")
         if permit.actor_id != binding.actor_id:
@@ -749,57 +881,105 @@ class ScopedAuthorityBroker:
             raise ScopedAuthorityDenied("policy_mismatch")
         if permit.attempt_id != attempt.attempt_id or permit.grant_id != attempt.grant_id:
             raise ScopedAuthorityDenied("attempt_mismatch")
-        try:
-            canonical_attempt = self.__gateway._canonical_attempt(permit)
-        except GatewayStateError as exc:
-            raise ScopedAuthorityDenied("permit_unknown", str(exc)) from exc
-        if canonical_attempt is not attempt:
-            raise ScopedAuthorityDenied("attempt_mismatch", "non-canonical attempt object")
         if permit.consumed:
             raise ScopedAuthorityDenied("permit_reused")
 
-        expected = _EFFECT_BY_ACTION.get(binding.action_type)
-        if expected is None:
-            raise ScopedAuthorityDenied("effect_not_supported", binding.action_type)
+        expected = self._require_exact_effect_scope(binding)
         if permit.allowed_effects != frozenset({expected}):
-            raise ScopedAuthorityDenied(
-                "effect_scope_not_exact",
-                f"expected only {expected.value}, got "
-                f"{sorted(effect.value for effect in permit.allowed_effects)!r}",
-            )
+            raise ScopedAuthorityDenied("effect_scope_not_exact")
 
         broker = self.__write_broker
         cls: type[_EffectAuthorityBase]
         invoke: _EffectInvocation
+
         if expected is EffectVerb.SET_BOOKMARK:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_bookmark(binding.post_url, _commit_gate=gate)
+
             cls = SetBookmarkAuthority
         elif expected is EffectVerb.CLEAR_BOOKMARK:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
-                return await broker.click_remove_bookmark(binding.post_url, _commit_gate=gate)
+                return await broker.click_remove_bookmark(
+                    binding.post_url,
+                    _commit_gate=gate,
+                )
+
             cls = ClearBookmarkAuthority
         elif expected is EffectVerb.SET_LIKE:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_like(binding.post_url, _commit_gate=gate)
+
             cls = SetLikeAuthority
         elif expected is EffectVerb.CLEAR_LIKE:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_unlike(binding.post_url, _commit_gate=gate)
+
             cls = ClearLikeAuthority
         elif expected is EffectVerb.SUBMIT_CONTENT:
+            if tracker is None:
+                raise ScopedAuthorityDenied("preparation_incomplete")
+
+            async def precommit_check() -> Optional[ActionResult]:
+                if not tracker.ready(binding):
+                    return soft_failure(
+                        "approved preparation state is no longer complete",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+
+                text_r = await broker.read_composer_text()
+                if not text_r.ok:
+                    return text_r
+                actual_text = (text_r.data or {}).get("composer_text", "")
+                if actual_text != binding.normalized_text:
+                    return soft_failure(
+                        "composer text no longer matches approved intent",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+
+                count_r = await broker.count_attachments()
+                if not count_r.ok:
+                    return count_r
+                actual_count = (count_r.data or {}).get("count")
+                if actual_count != len(binding.media):
+                    return soft_failure(
+                        "composer attachment count no longer matches approved intent",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+
+                if binding.media:
+                    ready_r = await broker.verify_attachment_ready()
+                    if not ready_r.ok:
+                        return ready_r
+                    ready_data = ready_r.data or {}
+                    if ready_data.get("ready") is not True:
+                        return soft_failure(
+                            "approved attachment is not ready at submit boundary",
+                            failure_category=FailureCategory.SECURITY,
+                        )
+                return None
+
             async def invoke(gate: _CommitGate) -> ActionResult:
-                return await broker.click_submit(_commit_gate=gate)
+                return await broker.click_submit(
+                    _commit_gate=gate,
+                    _precommit_check=precommit_check,
+                )
+
             cls = SubmitContentAuthority
         elif expected is EffectVerb.DELETE_POST:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.delete_post(
                     binding.post_url,
                     binding.target_post_id,
                     _commit_gate=gate,
                 )
+
             cls = DeletePostAuthority
-        else:
+        else:  # pragma: no cover - exhaustive over supported map
             raise ScopedAuthorityDenied("effect_not_implemented", expected.value)
 
         return cls(

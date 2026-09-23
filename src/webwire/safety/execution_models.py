@@ -13,6 +13,10 @@ EffectAttempt (one per execution try)
     RESERVED  -> NO_EFFECT | EFFECT_CONFIRMED | EFFECT_UNKNOWN
     unfenced effects may skip RESERVED entirely.
 
+Approval bindings and attempt lineage are sealed after construction. Human-
+approved identity, policy/actor/target bindings, validity bounds, grant ids,
+attempt ids, and effect ids are not mutable lifecycle state.
+
 Each EffectAttempt owns one stable ``effect_id`` before it reaches the Commit
 Gateway. That durable lineage identity survives an ambiguous reservation write:
 retrying authorization for the same attempt reuses the same effect fact rather
@@ -67,6 +71,24 @@ __all__ = [
 DEFAULT_GRANT_TTL_S = 300.0
 DEFAULT_MAX_PRECOMMIT_ATTEMPTS = 3
 
+_GRANT_SEALED_FIELDS = frozenset(
+    {
+        "intent_hash",
+        "actor_id",
+        "action_type",
+        "target_type",
+        "target_id",
+        "policy_binding",
+        "authorization_epoch",
+        "grant_id",
+        "issued_at",
+        "expires_at",
+        "max_precommit_attempts",
+        "clock",
+    }
+)
+_ATTEMPT_SEALED_FIELDS = frozenset({"grant_id", "attempt_id", "effect_id"})
+
 
 class GrantState(StrEnum):
     ACTIVE = "active"
@@ -97,7 +119,7 @@ class GrantClaimDenied(ApprovalGrantError):
 
 
 class GrantStateError(ApprovalGrantError):
-    """An illegal transition or terminal-state re-entry was attempted."""
+    """An illegal transition or mutation of sealed authority was attempted."""
 
 
 class AuthorizationEpoch:
@@ -126,7 +148,7 @@ class AuthorizationEpoch:
 
 @dataclass
 class ApprovalGrant:
-    """One human approval with an atomic orthogonal claim lock."""
+    """One human approval with sealed bindings and an atomic claim lock."""
 
     intent_hash: str
     actor_id: str
@@ -153,6 +175,11 @@ class ApprovalGrant:
         repr=False,
         compare=False,
     )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _GRANT_SEALED_FIELDS and name in self.__dict__:
+            raise GrantStateError(f"approval binding {name!r} is immutable after issue")
+        object.__setattr__(self, name, value)
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         t = now if now is not None else self.clock()
@@ -275,13 +302,18 @@ class ApprovalGrant:
 
 @dataclass
 class EffectAttempt:
-    """One execution try against a grant with one stable durable effect id."""
+    """One execution try with sealed grant/attempt/effect lineage."""
 
     grant_id: str
     attempt_id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
     effect_id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     state: AttemptState = AttemptState.PREPARING
     reservation_started: bool = False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _ATTEMPT_SEALED_FIELDS and name in self.__dict__:
+            raise GrantStateError(f"attempt lineage {name!r} is immutable")
+        object.__setattr__(self, name, value)
 
     def _require(self, expected: AttemptState) -> None:
         if self.state is not expected:

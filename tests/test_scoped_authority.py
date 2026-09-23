@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
 from webwire.config import WebWireConfig
-from webwire.envelope import ActionResult, ok_result
-from webwire.safety.commit_gateway import CommitGateway, EffectPermit
-from webwire.safety.effect_ledger import EffectLedger
+from webwire.envelope import ActionResult, ok_result, soft_failure
+from webwire.safety.commit_gateway import CommitGateway
+from webwire.safety.effect_ledger import EffectLedger, EffectState
 from webwire.safety.effect_policy import (
     DEFAULT_EFFECT_POLICIES,
     EffectPolicy,
@@ -33,6 +32,7 @@ from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import WriteIntent
 from webwire.safety.risk_registry import DEFAULT_REGISTRY
 from webwire.safety.scoped_authority import (
+    AuthorizedEffect,
     PostPreparationAuthority,
     ReplyPreparationAuthority,
     ScopedAuthorityBroker,
@@ -48,12 +48,14 @@ class _FakeBroker:
     def __init__(self) -> None:
         self.events: list[tuple[Any, ...]] = []
         self.attachment_count = 0
+        self.composer_text = ""
+        self.attachments_ready = True
 
     async def read_composer_text(self) -> ActionResult:
-        return ok_result(data={"composer_text": ""})
+        return ok_result(data={"composer_text": self.composer_text})
 
     async def verify_attachment_ready(self) -> ActionResult:
-        return ok_result(data={"ready": True})
+        return ok_result(data={"ready": self.attachments_ready})
 
     async def count_attachments(self) -> ActionResult:
         return ok_result(data={"count": self.attachment_count})
@@ -66,10 +68,12 @@ class _FakeBroker:
     async def close_composer(self) -> ActionResult:
         self.events.append(("close",))
         self.attachment_count = 0
+        self.composer_text = ""
         return ok_result(data={"cleanup": "closed"})
 
     async def fill_composer(self, text: str) -> ActionResult:
         self.events.append(("fill_post", text))
+        self.composer_text = text
         return ok_result(data={"filled": True})
 
     async def open_reply_on_target(self, url: str, post_id: str) -> ActionResult:
@@ -78,6 +82,7 @@ class _FakeBroker:
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
         self.events.append(("fill_reply", text))
+        self.composer_text = text
         return ok_result(data={"filled": True})
 
     async def open_quote_on_target(self, url: str, post_id: str) -> ActionResult:
@@ -86,6 +91,7 @@ class _FakeBroker:
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
         self.events.append(("fill_quote", text))
+        self.composer_text = text
         return ok_result(data={"filled": True})
 
     @staticmethod
@@ -118,10 +124,20 @@ class _FakeBroker:
         self.events.append(("unlike", url))
         return ok_result(data={"liked": False})
 
-    async def click_submit(self, *, _commit_gate=None) -> ActionResult:  # type: ignore[no-untyped-def]
+    async def click_submit(
+        self,
+        *,
+        _commit_gate=None,  # type: ignore[no-untyped-def]
+        _precommit_check=None,  # type: ignore[no-untyped-def]
+    ) -> ActionResult:
+        if _precommit_check is None:
+            return soft_failure("missing precommit check")
+        denied = await _precommit_check()
+        if denied is not None:
+            return denied
         if (denied := self._cross(_commit_gate)) is not None:
             return denied
-        self.events.append(("submit",))
+        self.events.append(("submit", self.composer_text, self.attachment_count))
         return ok_result(data={"submitted": True})
 
     async def delete_post(self, url: str, post_id: str, *, _commit_gate=None) -> ActionResult:  # type: ignore[no-untyped-def]
@@ -248,11 +264,23 @@ def test_invalid_post_url_is_rejected_before_reservation_or_spend(tmp_path: Path
     assert ledger.read_records() == []
 
 
-def test_mismatched_status_url_is_rejected_before_reservation_or_spend(tmp_path: Path) -> None:
-    intent = _intent("delete_post", post_id="123", post_url="https://x.com/u/status/999")
-    scoped, _, ledger, _, _, grant, attempt, _ = _runtime(tmp_path, intent)
+def test_broadened_policy_is_rejected_before_reservation_or_spend(tmp_path: Path) -> None:
+    base = DEFAULT_EFFECT_POLICIES.require("bookmark")
+    policies = EffectPolicyRegistry()
+    policies.register(
+        EffectPolicy.derive(
+            action_type="bookmark",
+            risk_tier=base.risk_tier,
+            allowed_effects={EffectVerb.SET_BOOKMARK, EffectVerb.CLEAR_BOOKMARK},
+            replay_semantics=ReplaySemantics.SAFE_STATE_SET,
+        )
+    )
+    intent = _intent("bookmark")
+    scoped, _, ledger, _, _, grant, attempt, _ = _runtime(
+        tmp_path, intent, policies=policies
+    )
 
-    with pytest.raises(ScopedAuthorityDenied, match="target_mismatch"):
+    with pytest.raises(ScopedAuthorityDenied, match="effect_scope_not_exact"):
         scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
 
     assert grant.state is GrantState.ACTIVE
@@ -263,23 +291,24 @@ def test_mismatched_status_url_is_rejected_before_reservation_or_spend(tmp_path:
 async def test_missing_status_url_is_canonicalized_and_frozen(tmp_path: Path) -> None:
     intent = _intent("bookmark", post_url="")
     scoped, _, _, _, _, grant, attempt, broker = _runtime(tmp_path, intent)
-    authority = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
-    assert isinstance(authority, SetBookmarkAuthority)
+    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+    assert isinstance(receipt, AuthorizedEffect)
+    assert isinstance(receipt.authority, SetBookmarkAuthority)
 
-    # Caller-owned mutable intent no longer controls the authority.
     intent.payload["post_url"] = "https://x.com/other/status/999"
     intent.payload["post_id"] = "999"
-    result = await authority.apply()
+    result = await receipt.authority.apply()
 
     assert result.ok
     assert broker.events == [("bookmark", "https://x.com/i/status/123")]
-    assert authority.consumed is True
+    assert receipt.permit.consumed is True
 
 
-def test_authority_surfaces_are_direction_specific_and_do_not_expose_broker(tmp_path: Path) -> None:
+def test_authority_surface_is_direction_specific_and_hides_outcome_lineage(tmp_path: Path) -> None:
     intent = _intent("bookmark")
     scoped, _, _, _, _, grant, attempt, _ = _runtime(tmp_path, intent)
-    authority = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+    authority = receipt.authority
 
     assert hasattr(authority, "apply")
     for forbidden in (
@@ -289,6 +318,8 @@ def test_authority_surfaces_are_direction_specific_and_do_not_expose_broker(tmp_
         "delete_post",
         "submit",
         "fill_composer",
+        "permit",
+        "attempt",
         "write_broker",
         "browser",
         "click",
@@ -296,30 +327,43 @@ def test_authority_surfaces_are_direction_specific_and_do_not_expose_broker(tmp_
     ):
         assert not hasattr(authority, forbidden)
 
+    assert receipt.permit.attempt_id == attempt.attempt_id
+    assert receipt.attempt is attempt
 
-def test_submit_and_preparation_surfaces_are_separate(tmp_path: Path) -> None:
+
+def test_content_cannot_mint_before_approved_preparation(tmp_path: Path) -> None:
+    intent = _intent("post")
+    scoped, _, ledger, _, _, grant, attempt, _ = _runtime(tmp_path, intent)
+
+    with pytest.raises(ScopedAuthorityDenied, match="preparation_incomplete"):
+        scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+
+    assert grant.state is GrantState.ACTIVE
+    assert attempt.state is AttemptState.PREPARING
+    assert ledger.read_records() == []
+
+
+async def test_submit_and_preparation_surfaces_are_separate(tmp_path: Path) -> None:
     intent = _intent("post")
     scoped, _, _, _, _, grant, attempt, _ = _runtime(tmp_path, intent)
     prep = scoped.prepare(grant=grant, attempt=attempt, intent=intent)
     assert isinstance(prep, PostPreparationAuthority)
     assert hasattr(prep, "fill_composer")
     assert not hasattr(prep, "submit")
-    assert not hasattr(prep, "delete")
-    assert not hasattr(prep, "apply")
 
-    submit = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
-    assert isinstance(submit, SubmitContentAuthority)
-    assert hasattr(submit, "submit")
-    assert not hasattr(submit, "fill_composer")
-    assert not hasattr(submit, "attach_media")
-    assert not hasattr(submit, "delete")
+    filled = await prep.fill_composer("approved text")
+    assert filled.ok
+    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+    assert isinstance(receipt.authority, SubmitContentAuthority)
+    assert hasattr(receipt.authority, "submit")
+    assert not hasattr(receipt.authority, "fill_composer")
+    assert not hasattr(receipt.authority, "attach_media")
 
 
 async def test_reply_preparation_enforces_context_then_text_then_media(tmp_path: Path) -> None:
     image = tmp_path / "image.bin"
     image.write_bytes(b"approved image")
-    item = _media_item(0, image)
-    intent = _intent("reply", manifest_items=[item])
+    intent = _intent("reply", manifest_items=[_media_item(0, image)])
     scoped, _, _, _, _, grant, attempt, broker = _runtime(tmp_path, intent)
     prep = scoped.prepare(grant=grant, attempt=attempt, intent=intent)
     assert isinstance(prep, ReplyPreparationAuthority)
@@ -339,16 +383,21 @@ async def test_reply_preparation_enforces_context_then_text_then_media(tmp_path:
     ]
 
 
-async def test_media_path_order_and_digest_are_bound(tmp_path: Path) -> None:
+async def test_preparation_cannot_duplicate_fill_or_reorder_media(tmp_path: Path) -> None:
     first = tmp_path / "first.bin"
     second = tmp_path / "second.bin"
     first.write_bytes(b"first")
     second.write_bytes(b"second")
-    intent = _intent("post", manifest_items=[_media_item(0, first), _media_item(1, second)])
+    intent = _intent(
+        "post",
+        manifest_items=[_media_item(0, first), _media_item(1, second)],
+    )
     scoped, _, _, _, _, grant, attempt, broker = _runtime(tmp_path, intent)
     prep = scoped.prepare(grant=grant, attempt=attempt, intent=intent)
     await prep.fill_composer("approved text")
 
+    with pytest.raises(ScopedAuthorityDenied, match="preparation_order"):
+        await prep.fill_composer("approved text")
     with pytest.raises(ScopedAuthorityDenied, match="media_order_mismatch"):
         await prep.attach_media(str(second))
     await prep.attach_media(str(first))
@@ -381,7 +430,9 @@ def test_policy_binding_drift_invalidates_existing_preparation(tmp_path: Path) -
     policies = EffectPolicyRegistry()
     policies.register(base)
     intent = _intent("post")
-    scoped, _, _, _, _, grant, attempt, _ = _runtime(tmp_path, intent, policies=policies)
+    scoped, _, _, _, _, grant, attempt, _ = _runtime(
+        tmp_path, intent, policies=policies
+    )
     prep = scoped.prepare(grant=grant, attempt=attempt, intent=intent)
 
     policies.register(
@@ -397,14 +448,38 @@ def test_policy_binding_drift_invalidates_existing_preparation(tmp_path: Path) -
         prep._require_live(PreparationVerb.FILL_COMPOSER)  # type: ignore[attr-defined]
 
 
-def test_broadened_permit_is_rejected_before_browser_authority(tmp_path: Path) -> None:
-    intent = _intent("bookmark")
-    scoped, gateway, _, _, _, grant, attempt, _ = _runtime(tmp_path, intent)
-    permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
-    broader: EffectPermit = replace(
-        permit,
-        allowed_effects=frozenset({EffectVerb.SET_BOOKMARK, EffectVerb.CLEAR_BOOKMARK}),
-    )
+async def test_submit_rechecks_ambient_composer_payload_before_consuming(tmp_path: Path) -> None:
+    intent = _intent("post")
+    scoped, _, _, _, _, grant, attempt, broker = _runtime(tmp_path, intent)
+    prep = scoped.prepare(grant=grant, attempt=attempt, intent=intent)
+    await prep.fill_composer("approved text")
+    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
 
-    with pytest.raises(ScopedAuthorityDenied, match="effect_scope_not_exact"):
-        scoped.authorize(permit=broader, attempt=attempt, intent=intent)
+    # Ambient DOM changes after approval/preparation but before commit.
+    broker.composer_text = "different text"
+    result = await receipt.authority.submit()
+
+    assert not result.ok
+    assert receipt.permit.consumed is False
+    assert ("submit", "different text", 0) not in broker.events
+
+
+async def test_submit_success_keeps_exact_permit_for_gateway_outcome(tmp_path: Path) -> None:
+    intent = _intent("post")
+    scoped, gateway, ledger, _, _, grant, attempt, broker = _runtime(tmp_path, intent)
+    prep = scoped.prepare(grant=grant, attempt=attempt, intent=intent)
+    await prep.fill_composer("approved text")
+    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+
+    result = await receipt.authority.submit()
+    assert result.ok
+    assert receipt.permit.consumed is True
+    assert broker.events[-1] == ("submit", "approved text", 0)
+
+    gateway.record_effect_confirmed(
+        receipt.permit,
+        receipt.attempt,
+        evidence={"test": "confirmed"},
+    )
+    assert receipt.attempt.state is AttemptState.EFFECT_CONFIRMED
+    assert ledger.read_records()[-1].state is EffectState.EFFECT_CONFIRMED

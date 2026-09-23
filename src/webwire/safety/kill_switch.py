@@ -13,9 +13,14 @@ Per the Phase 0a design (Point 3 decision):
 M5 layer 3 adds trip listeners. The Commit Gateway binds the authorization
 epoch to this hook so a trip revokes already-minted execution authority even
 if the operator later resets the kill switch. Hot-file trips are detected on
-the next ``tripped()`` observation. Listener delivery is tied to a monotonically
-increasing trip generation, so re-entrant reset/retrip cannot make a callback
-from one activation count as notification for a later activation.
+the next ``tripped()`` observation.
+
+Trip notification is event-based, not merely derived from the current boolean
+state. Each observed inactive -> active transition creates a monotonically
+increasing trip generation. Every listener that was registered for that
+generation retains an obligation to receive it exactly once, even if an earlier
+listener resets or retrips the switch while callbacks are being delivered.
+Failed callbacks remain owed and are retried only on a later observation.
 
 Programmatic trip/reset and M5 authority crossing share the state lock exposed
 by :meth:`execution_fence`. This gives them a process-local linearization point:
@@ -49,16 +54,17 @@ class KillSwitch:
         self._state_lock = threading.RLock()
         self._flag: bool = False
         self._trip_listeners: list[Callable[[], object]] = []
-        self._notified_listeners: list[Callable[[], object]] = []
+        # Aligned with ``_trip_listeners``. Entry i is the latest trip
+        # generation successfully delivered to listener i. This is the small
+        # process-local event ledger that prevents reset/retrip from erasing a
+        # revocation event before all registered listeners observe it.
+        self._listener_generations: list[int] = []
         self._listeners_in_progress: list[Callable[[], object]] = []
-        # ``_last_active`` + ``_trip_generation`` identify distinct observed
-        # inactive -> active transitions. The generation is the once-per-trip
-        # identity; a callback may reset and retrip while the RLock is re-entered.
         self._last_active = False
         self._trip_generation = 0
-        # Nested refreshes during a callback update active/generation state but
-        # never start a second notification traversal. The outer traversal drains
-        # all pending listeners for the newest generation after the callback exits.
+        # Nested refreshes during callbacks update active/generation state but
+        # never recurse into another delivery traversal. The outer traversal
+        # drains all outstanding generation obligations after the callback exits.
         self._notifying = False
         env_var = self._config.kill_env_var
         if env_var and os.environ.get(env_var, "").lower() in ("1", "true", "yes"):
@@ -71,10 +77,18 @@ class KillSwitch:
     # -- trip listeners ------------------------------------------------------
 
     def add_trip_listener(self, listener: Callable[[], object]) -> None:
-        """Invoke ``listener`` once for the current trip and once per future trip."""
+        """Register for the current active trip (if any) and all future trips.
+
+        A listener added while the switch is active owes the current generation
+        and is notified immediately. A listener added while inactive begins at
+        the current generation and therefore does not receive historical trips.
+        """
         with self._state_lock:
+            active = self._sync_trip_generation_unlocked()
             if listener not in self._trip_listeners:
                 self._trip_listeners.append(listener)
+                delivered = self._trip_generation - 1 if active else self._trip_generation
+                self._listener_generations.append(delivered)
             self._refresh_trip_unlocked()
 
     def _active_unlocked(self) -> bool:
@@ -87,58 +101,66 @@ class KillSwitch:
             return True
 
     def _sync_trip_generation_unlocked(self) -> bool:
-        """Observe active state and advance generation on a fresh activation."""
+        """Observe state and mint one generation per inactive -> active edge."""
         active = self._active_unlocked()
         if active and not self._last_active:
             self._trip_generation += 1
-            self._notified_listeners.clear()
-        elif not active and self._last_active:
-            self._notified_listeners.clear()
         self._last_active = active
         return active
 
-    def _notify_active_listeners_unlocked(self) -> None:
-        """Drain pending callbacks for the current trip generation.
+    def _has_pending_listener_events_unlocked(self) -> bool:
+        return any(
+            delivered < self._trip_generation
+            for delivered in self._listener_generations
+        )
 
-        Only the outermost notification traversal invokes callbacks. Re-entrant
-        ``tripped()``, ``trip()``, ``reset()``, or ``add_trip_listener()`` calls
-        may update active/generation state, but they cannot recursively invoke a
-        callback. If a callback resets and retrips, its invocation belongs only
-        to the generation captured before it ran; the traversal restarts and
-        delivers it again for the new generation.
+    def _notify_pending_listeners_unlocked(self) -> None:
+        """Deliver all currently owed trip-generation events without recursion.
 
-        A failed callback is attempted at most once per traversal/generation.
-        It remains unnotified, so a later external observation retries it, while
-        successful later listeners in the same trip are still allowed to run.
+        Delivery is independent of the switch's *current* active state: once a
+        generation has existed, its safety side effects (especially authorization
+        epoch revocation) remain owed even if another callback resets the switch.
+
+        Only the outermost traversal invokes callbacks. Re-entrant ``tripped()``,
+        ``trip()``, ``reset()``, or ``add_trip_listener()`` calls may update the
+        active state and create newer generations, but those nested calls cannot
+        recursively invoke listeners. A successful callback advances exactly one
+        owed generation. A failed callback remains behind and is retried on a
+        later external observation, never repeatedly in the same traversal.
         Caller must hold ``_state_lock``.
         """
         if self._notifying:
             return
 
         self._notifying = True
-        attempted: list[Callable[[], object]] = []
-        attempted_generation = -1
+        attempted: list[tuple[int, int]] = []
         try:
             while True:
-                if not self._sync_trip_generation_unlocked():
-                    return
-                generation = self._trip_generation
-                if generation != attempted_generation:
-                    attempted.clear()
-                    attempted_generation = generation
+                self._sync_trip_generation_unlocked()
 
-                pending = [
-                    listener
-                    for listener in tuple(self._trip_listeners)
-                    if listener not in self._notified_listeners
-                    and listener not in self._listeners_in_progress
-                    and listener not in attempted
-                ]
-                if not pending:
+                candidate_index: Optional[int] = None
+                candidate_generation: Optional[int] = None
+                for index, listener in enumerate(tuple(self._trip_listeners)):
+                    delivered = self._listener_generations[index]
+                    if delivered >= self._trip_generation:
+                        continue
+                    if listener in self._listeners_in_progress:
+                        continue
+                    target_generation = delivered + 1
+                    if (index, target_generation) in attempted:
+                        continue
+                    if (
+                        candidate_generation is None
+                        or target_generation < candidate_generation
+                    ):
+                        candidate_index = index
+                        candidate_generation = target_generation
+
+                if candidate_index is None or candidate_generation is None:
                     return
 
-                listener = pending[0]
-                attempted.append(listener)
+                listener = self._trip_listeners[candidate_index]
+                attempted.append((candidate_index, candidate_generation))
                 self._listeners_in_progress.append(listener)
                 succeeded = False
                 try:
@@ -150,25 +172,24 @@ class KillSwitch:
                     if listener in self._listeners_in_progress:
                         self._listeners_in_progress.remove(listener)
 
-                active = self._sync_trip_generation_unlocked()
-                if not active:
-                    return
-                if self._trip_generation != generation:
-                    # reset()+trip() occurred during the callback. The callback
-                    # just completed for the old generation and is still pending
-                    # for the newly-created generation; loop restart clears the
-                    # per-generation attempted set and delivers it again.
-                    continue
-                if succeeded and listener not in self._notified_listeners:
-                    self._notified_listeners.append(listener)
+                # Re-entry may have changed active state or created a newer trip
+                # generation. Capture that before crediting the event we just
+                # delivered. The old generation remains valid historical work.
+                self._sync_trip_generation_unlocked()
+                if succeeded:
+                    # Listener ordering is stable because there is no removal API.
+                    # Dynamic registration appends and cannot shift this index.
+                    current = self._listener_generations[candidate_index]
+                    if current < candidate_generation:
+                        self._listener_generations[candidate_index] = candidate_generation
         finally:
             self._notifying = False
 
     def _refresh_trip_unlocked(self) -> bool:
-        """Refresh active generation and listeners. Caller holds ``_state_lock``."""
+        """Refresh active state and drain pending trip events. Caller holds lock."""
         active = self._sync_trip_generation_unlocked()
-        if active and not self._notifying:
-            self._notify_active_listeners_unlocked()
+        if not self._notifying and self._has_pending_listener_events_unlocked():
+            self._notify_pending_listeners_unlocked()
             active = self._sync_trip_generation_unlocked()
         return active
 
@@ -205,7 +226,7 @@ class KillSwitch:
     # -- mutations -----------------------------------------------------------
 
     def trip(self) -> None:
-        """Atomically activate the in-process trip and notify this generation."""
+        """Atomically activate the in-process trip and publish its generation."""
         with self._state_lock:
             self._flag = True
             path = self._config.kill_path()
@@ -218,7 +239,7 @@ class KillSwitch:
         logger.warning("KillSwitch tripped")
 
     def reset(self) -> None:
-        """Clear the flag and hot file; authorization epochs never move back."""
+        """Clear active mechanisms; already-created trip events remain owed."""
         with self._state_lock:
             self._flag = False
             path = self._config.kill_path()

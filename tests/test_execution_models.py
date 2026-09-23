@@ -59,6 +59,7 @@ def _claim_args(**overrides) -> dict:
     base = dict(
         intent_hash="a" * 32,
         actor_id="infaag",
+        policy_binding="b" * 64,
         authorization_epoch=0,
     )
     base.update(overrides)
@@ -231,7 +232,8 @@ def test_stale_epoch_cannot_validate(store: ApprovalGrantStore) -> None:
     grant = store.get(grant_id)
     with pytest.raises(GrantClaimDenied):
         grant.validate_live(
-            intent_hash="a" * 32, actor_id="infaag", authorization_epoch=4
+            intent_hash="a" * 32, actor_id="infaag",
+            policy_binding="b" * 64, authorization_epoch=4,
         )
 
 
@@ -355,3 +357,37 @@ def test_grants_are_ephemeral_by_design(store: ApprovalGrantStore) -> None:
 
     src = inspect.getsource(S)
     assert "save" not in src and "load" not in src and "persist" not in src
+
+
+# ---------------------------------------------------------------------------
+# Codex review regressions (PR #3, 2026-09-23)
+# ---------------------------------------------------------------------------
+
+def test_policy_binding_mismatch_denies_claim(store: ApprovalGrantStore) -> None:
+    """P1: an approval issued under policy P1 must not claim after the
+    registry moved to P2 — authority broadened between approval and commit
+    changes the rules the human approved under."""
+    grant_id = _mint(store)
+    grant = store.get(grant_id)
+    a = EffectAttempt(grant_id=grant_id)
+    with pytest.raises(GrantClaimDenied) as exc:
+        grant.claim(a.attempt_id, **_claim_args(policy_binding="c" * 64))
+    assert exc.value.reason == "policy_mismatch"
+    assert grant.claimed_by is None
+
+
+def test_wrong_grant_rejected_on_transitions(store: ApprovalGrantStore) -> None:
+    """P2: grant-taking transitions verify grant identity — a wrong-grant
+    mixup must not release or reserve against another approval."""
+    g1 = store.get(_mint(store))
+    g2 = store.get(_mint(store))
+    a1 = EffectAttempt(grant_id=g1.grant_id)
+    g1.claim(a1.attempt_id, **_claim_args())
+
+    with pytest.raises(GrantStateError):
+        a1.mark_no_effect(g2)
+    with pytest.raises(GrantStateError):
+        a1.mark_reserved(g2)
+    assert g2.claimed_by is None, "the other approval was untouched"
+    assert g1.claimed_by == a1.attempt_id
+    assert a1.state is AttemptState.PREPARING

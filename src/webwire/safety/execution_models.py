@@ -162,12 +162,15 @@ class ApprovalGrant:
         *,
         intent_hash: str,
         actor_id: str,
+        policy_binding: str,
         authorization_epoch: int,
         now: Optional[float] = None,
     ) -> None:
         """Raise GrantClaimDenied unless this grant is live for exactly this
-        intent/actor/epoch. Never mutates except the lazy EXPIRED demotion
-        and epoch-driven REVOKED (spec 7: epoch mismatch revokes)."""
+        intent/actor/policy/epoch. Never mutates except the lazy EXPIRED
+        demotion and epoch-driven REVOKED (spec 7: epoch mismatch revokes).
+        The policy comparison is spec 5.1/7.8: an approval issued under
+        policy P1 must not execute after the registry changes to P2."""
         self._refresh_state(now)
         if self.state is GrantState.EXPIRED:
             raise GrantClaimDenied("expired")
@@ -185,6 +188,8 @@ class ApprovalGrant:
             raise GrantClaimDenied("intent_mismatch")
         if actor_id != self.actor_id:
             raise GrantClaimDenied("actor_mismatch")
+        if policy_binding != self.policy_binding:
+            raise GrantClaimDenied("policy_mismatch")
 
     # -- the orthogonal claim lock (spec 5.1: CAS, not a state) --------------
 
@@ -194,6 +199,7 @@ class ApprovalGrant:
         *,
         intent_hash: str,
         actor_id: str,
+        policy_binding: str,
         authorization_epoch: int,
         now: Optional[float] = None,
     ) -> None:
@@ -208,6 +214,7 @@ class ApprovalGrant:
         self.validate_live(
             intent_hash=intent_hash,
             actor_id=actor_id,
+            policy_binding=policy_binding,
             authorization_epoch=authorization_epoch,
             now=now,
         )
@@ -287,10 +294,21 @@ class EffectAttempt:
                 f"{expected.value}, got {self.state.value}"
             )
 
+    def _require_own_grant(self, grant: ApprovalGrant) -> None:
+        """A grant-taking transition must receive THIS attempt's grant — a
+        wrong-grant mixup would release or reserve against another approval
+        (Codex review, PR #3, 2026-09-23)."""
+        if grant.grant_id != self.grant_id:
+            raise GrantStateError(
+                f"attempt {self.attempt_id!r} belongs to grant "
+                f"{self.grant_id!r}, not {grant.grant_id!r}"
+            )
+
     def mark_no_effect(self, grant: ApprovalGrant) -> None:
         """PROVEN no external effect was possible: release the grant's claim;
         the grant remains ACTIVE (the T13 path)."""
         self._require(AttemptState.PREPARING)
+        self._require_own_grant(grant)
         grant.release_claim(self.attempt_id)
         self.state = AttemptState.NO_EFFECT
 
@@ -298,6 +316,7 @@ class EffectAttempt:
         """The durable reservation exists. The gateway — NOT this method —
         spends the grant immediately after the fsync (spec 6.1 ordering)."""
         self._require(AttemptState.PREPARING)
+        self._require_own_grant(grant)
         if grant.claimed_by != self.attempt_id:
             raise GrantStateError(
                 "mark_reserved requires this attempt to hold the grant claim"

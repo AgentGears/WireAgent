@@ -323,8 +323,13 @@ invariant or assumption.
   fsync) — the ordering contract is documented at spend(). Store: ephemeral,
   in-memory, zero persistence surface by design (test-locked); grants carry
   the store's injected clock for deterministic expiry. T13 and T14 run
-  end-to-end at model level. Suite 320 (301 + 19 lifecycle tests). Gateway,
-  authorities, RecoveryGuard all absent — layer 3+ composes these.
+  end-to-end at model level. Codex review resolved: P1 policy_binding was
+  stored but never compared — now a required claim argument, mismatch denies
+  (approval under P1 cannot execute under P2, per the spec's own binding
+  rule); P2 grant-taking transitions verify grant identity (wrong-grant
+  mixup cannot release or reserve another approval). Suite 322 (301 + 21
+  lifecycle tests, count from the run). Gateway, authorities, RecoveryGuard
+  all absent — layer 3+ composes these.
 - 2026-09-23 (o): M5 LAYER 1 (PR #2, squash c15c3ce): EffectPolicy + durable
   EffectLedger primitives per the frozen build order. Four-axis policy with
   derivation locks (UNKNOWN/non-idempotent/residual-effect → REQUIRED;

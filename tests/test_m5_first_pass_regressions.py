@@ -249,7 +249,7 @@ def test_outcome_rejects_reconstructed_attempt_even_with_matching_lineage(
 def test_gateway_holds_grant_claim_fence_through_reservation_and_spend(
     tmp_path: Path,
 ) -> None:
-    """F4: a concurrent clean-failure release cannot race the commit protocol."""
+    """F4: reservation start fail-closes a concurrent clean release."""
     cfg = WebWireConfig(state_dir=tmp_path)
     ledger = _BlockingReservationLedger(cfg)
     epoch = AuthorizationEpoch()
@@ -286,11 +286,18 @@ def test_gateway_holds_grant_claim_fence_through_reservation_and_spend(
     authorize_thread = threading.Thread(target=authorize)
     authorize_thread.start()
     assert ledger.entered.wait(timeout=5)
+    assert attempt.reservation_started is True
 
     clean_thread = threading.Thread(target=clean_failure)
     clean_thread.start()
     assert clean_started.wait(timeout=5)
-    assert clean_done.wait(timeout=0.1) is False
+    assert clean_done.wait(timeout=5) is True
+    assert len(clean_result) == 1
+    assert isinstance(clean_result[0], GrantStateError)
+    assert "reservation I/O" in str(clean_result[0])
+    assert grant.claimed_by == attempt.attempt_id
+    assert grant.state is GrantState.ACTIVE
+    assert attempt.state is AttemptState.PREPARING
 
     ledger.release.set()
     authorize_thread.join(timeout=10)
@@ -300,9 +307,8 @@ def test_gateway_holds_grant_claim_fence_through_reservation_and_spend(
 
     assert len(authorize_result) == 1
     assert not isinstance(authorize_result[0], Exception)
-    assert len(clean_result) == 1
-    assert isinstance(clean_result[0], GrantStateError)
     assert grant.state is GrantState.SPENT
+    assert grant.claimed_by == attempt.attempt_id
     assert attempt.state is AttemptState.RESERVED
 
 

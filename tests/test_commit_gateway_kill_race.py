@@ -5,8 +5,10 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from webwire.config import WebWireConfig
-from webwire.safety.commit_gateway import CommitGateway
+from webwire.safety.commit_gateway import CommitGateway, GatewayDenied
 from webwire.safety.effect_ledger import EffectLedger
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectVerb
 from webwire.safety.execution_models import ApprovalGrantStore, AuthorizationEpoch, EffectAttempt
@@ -148,9 +150,6 @@ def test_trip_before_boundary_denies_old_authority_even_after_reset(tmp_path: Pa
     kill.trip()
     assert epoch.current == 1
     kill.reset()
-
-    from webwire.safety.commit_gateway import GatewayDenied
-    import pytest
 
     with pytest.raises(GatewayDenied, match="epoch_mismatch"):
         gateway.consume_permit(

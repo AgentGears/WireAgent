@@ -17,7 +17,8 @@
 
 ## Current version
 
-**v0.3 (stabilized)** — 20 capabilities, 272 tests, CI-enforced (AgentGears/WireAgent).
+**v0.3 (stabilized; M5 design FROZEN)** — 20 capabilities, 279 tests, CI-enforced.
+Next: M5 per docs/M5_DESIGN.md (normative; baseline 7d081b9).
 Type- and lint-clean; all media writes share ONE harness; offline stub SDK powers CI.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
 Health capability-selector probes landed (history i).
@@ -72,6 +73,30 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
     budgets); the confirmation gate never depends on the journal. The journal
     is never rewritten — rotated whole at 10 MB / 31 days, 6 files retained.
 
+## M5 — Effect Transaction Boundary (design FROZEN)
+
+The full contract lives in **docs/M5_DESIGN.md** — normative and
+self-contained; build from it, not from this section.
+
+Provenance, recorded once: M5 arose from a seven-document adversarial
+review loop (external deep dive → verification against the tree →
+convergence → refinement → empirical correction → freeze request →
+final precision). Every code claim in the chain was checked against the
+tree; two live probes established the bookmark facts (both testid
+buttons coexist on a bookmarked post; the bookmark click is a no-op when
+already bookmarked — the destructive fallback in `click_bookmark` is
+code-real, live-dormant, and fixed in commit 1).
+
+**Architectural decision (retires an old recommendation):** approval
+grants are intentionally ephemeral. Durable safety state belongs to the
+EffectLedger, not to persisted confirmation tokens. The earlier P2 item
+"persist and prune confirmation tokens" is obsolete — it solved the
+wrong problem.
+
+The change rule is part of the freeze: revise the design only when
+implementation, fault injection, or live evidence falsifies an
+invariant or assumption.
+
 ## Phase plan
 
 | Phase | Scope | Status |
@@ -100,7 +125,7 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 | **v0.2 M4b** | reply_multi_image (shared media-compose harness) | **LIVE-VERIFIED** + runtime tests |
 | **v0.2 M4c** | quote_multi_image (shared harness, quote hook) | **LIVE-VERIFIED** (quote 2102520857155522777) |
 
-## Capabilities (19)
+## Capabilities (20)
 
 | Capability | Tier | Status | Notes |
 |-----------|------|--------|-------|
@@ -244,6 +269,19 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
   refactor commit); reply_multi_image on it with the target-first hook; 10
   runtime tests; live-verified (reply 2102493233989529629, thread-target
   verified, media_count 2 after the verifier fix below).
+- [x] ~~Bookmark mutation-as-probe (latent invariant-8 violation, found by
+  the review chain 2026-09-23)~~ — FIXED in pre-M5 commit 1. The pre-fix
+  click_bookmark used the removeBookmark click as a fallback probe: on an
+  already-bookmarked post it would REMOVE the bookmark and report
+  already_bookmarked. Live-probed status at discovery: code-real,
+  live-DORMANT (both buttons coexist when bookmarked; primary click is a
+  no-op) — retry-safe by DOM accident, never by code guarantee. Banked DOM
+  facts (2026-09-23, fixture post): bookmark/removeBookmark COEXIST in the
+  bookmarked state; the bookmark click is idempotent-when-bookmarked. Fix:
+  state-read-first branching (not_bookmarked→click; bookmarked→
+  already_satisfied zero-mutation; unknown→honest failure zero-mutation),
+  mutual exclusion with the new click_remove_bookmark mirror, broker-level
+  four-state tests over both topologies (tests/test_bookmark_semantics.py).
 - [x] ~~M4c quote_multi_image~~ — LIVE-VERIFIED 2026-09-23 (quote 2102520857155522777:
   posted_and_target_verified, media_count 2/2, blob-count gates exact through
   the quote composer, dual attachment honest; ran after the budget window
@@ -271,6 +309,25 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-23 (n): Pre-M5 commit 1 — bookmark made semantic and
+  state-preserving. click_bookmark reads state first and never touches
+  removeBookmark (the mutation-as-probe defect is gone); click_remove_bookmark
+  added as its mirror (compensation metadata now names a real method). 7
+  broker-level tests: the four observable rows across both DOM topologies,
+  the swap-topology regression, the selector-churn-proof replay property
+  (pre=bookmarked → post=bookmarked, zero mutations), and mutual exclusion.
+  Suite 279.
+- 2026-09-23 (m): M5 design FROZEN and recorded (docs/M5_DESIGN.md; baseline
+  7d081b9). Twelve invariants, unified approval-spend rule (fenced: durable
+  EFFECT_RESERVED is the authoritative spend event — the ledger fact dominates
+  the transient object; non-fenced: the gateway's process-local CAS), four-axis
+  EffectPolicy (risk / authority / ReplaySemantics / durability; UNKNOWN =
+  conservative), ApprovalGrant/EffectAttempt as separate state machines with an
+  orthogonal claim lock, authorization-epoch kill revocation, effect-knowledge
+  states (COMMIT_ATTEMPTED demoted to diagnostic event), enforcement-grade
+  RecoveryGuard, journal/ledger split, T1-T14 acceptance tests, seven-step
+  build order. Negative guarantees recorded to prevent claim inflation.
+  Sequence from here: bookmark semantic fix → metadata chore → M5 layers.
 - 2026-09-23 (l): STABILIZATION BATCH complete. New home pushed (46-commit history,
   verified secret-free: sweep + full-blob scan of tracked tool-state; remote's
   wizard stub replaced). C1 CI foundation: offline stub of the Super-Browser SDK

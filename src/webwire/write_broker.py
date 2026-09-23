@@ -47,36 +47,46 @@ class WriteBroker:
         """Kill-switch check before any mutation."""
         return self._kill.guard()
 
-    async def click_bookmark(self, post_url: str) -> ActionResult:
-        """Click the bookmark button on the post at post_url.
+    # Post-navigation settle for bookmark-state reads (measured: the state
+    # probe is reliable after hydration; a fixed 4s window has held across
+    # live use — 2026-09-23). Class attribute so tests can shrink it.
+    _BOOKMARK_SETTLE_S = 4.0
 
-        Navigates to the post, finds the bookmark button (data-testid='bookmark'),
-        clicks it. Returns ok=True if the click succeeded.
+    async def click_bookmark(self, post_url: str) -> ActionResult:
+        """SET the bookmarked state (semantic, state-preserving — invariant 8).
+
+        Reads the current state FIRST and branches:
+          - not_bookmarked → click [data-testid='bookmark']
+          - bookmarked     → already_satisfied, ZERO mutation
+          - unknown        → fail honestly, ZERO mutation
+
+        This method MUST NEVER click removeBookmark. The pre-2026-09-23
+        implementation used the removeBookmark click as a fallback probe —
+        a mutation-as-probe that would REMOVE the bookmark on an
+        already-bookmarked post and report success ("already_bookmarked").
+        On today's DOM the fallback was unreachable (both buttons coexist
+        when bookmarked; the primary click is a no-op), so the defect was
+        latent — but retry-unsafe by construction, and re-armable by any
+        return of selector-swapping. Live-probed 2026-09-23; fixed same day.
         """
         if (r := self._guard()) is not None:
             return r
-        import asyncio
-        # Navigate to the post.
-        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
-        if not nav.ok:
-            return nav
-        await asyncio.sleep(4)  # hydrate
-        # Find and click the bookmark button.
+        state_r = await self.read_bookmark_state(post_url)
+        state = (state_r.data or {}).get("bookmark_state", "unknown") if state_r.ok else "unknown"
+        if state == "bookmarked":
+            return ok_result(data={"bookmarked": True, "result": "already_satisfied"})
+        if state != "not_bookmarked":
+            return soft_failure(
+                f"click_bookmark: unresolved bookmark state {state!r} at {post_url!r} "
+                "— refusing to mutate on an unknown state.",
+                failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+            )
         try:
-            # X's bookmark button: data-testid='bookmark' (when not bookmarked).
-            # After clicking, it becomes data-testid='removeBookmark'.
             click_result = await self._sb.click(
                 "[data-testid='bookmark']",
                 description="bookmark button",
             )
             if not click_result.ok:
-                # Maybe already bookmarked (button is 'removeBookmark').
-                already = await self._sb.click(
-                    "[data-testid='removeBookmark']",
-                    description="remove-bookmark button (already bookmarked)",
-                )
-                if already.ok:
-                    return ok_result(data={"bookmarked": True, "note": "already_bookmarked"})
                 return soft_failure(
                     f"Could not find bookmark button at {post_url!r}. "
                     f"DOM churn or post unavailable.",
@@ -89,15 +99,53 @@ class WriteBroker:
                 failure_category=FailureCategory.UNKNOWN,
             )
 
+    async def click_remove_bookmark(self, post_url: str) -> ActionResult:
+        """CLEAR the bookmarked state — the mirror of click_bookmark.
+
+        MUST NEVER click the bookmark button. State-read first:
+          - bookmarked     → click [data-testid='removeBookmark']
+          - not_bookmarked → already_satisfied, ZERO mutation
+          - unknown        → fail honestly, ZERO mutation
+        """
+        if (r := self._guard()) is not None:
+            return r
+        state_r = await self.read_bookmark_state(post_url)
+        state = (state_r.data or {}).get("bookmark_state", "unknown") if state_r.ok else "unknown"
+        if state == "not_bookmarked":
+            return ok_result(data={"bookmarked": False, "result": "already_satisfied"})
+        if state != "bookmarked":
+            return soft_failure(
+                f"click_remove_bookmark: unresolved bookmark state {state!r} "
+                f"at {post_url!r} — refusing to mutate on an unknown state.",
+                failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+            )
+        try:
+            click_result = await self._sb.click(
+                "[data-testid='removeBookmark']",
+                description="remove-bookmark button",
+            )
+            if not click_result.ok:
+                return soft_failure(
+                    f"Could not find remove-bookmark button at {post_url!r}.",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            return ok_result(data={"bookmarked": False})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(
+                f"click_remove_bookmark error: {exc!r}",
+                failure_category=FailureCategory.UNKNOWN,
+            )
+
     async def read_bookmark_state(self, post_url: str) -> ActionResult:
-        """Read-only check: is the post currently bookmarked? Used by verify()."""
+        """Read-only check: is the post currently bookmarked? Used by verify()
+        and by both semantic click methods' state-first branching."""
         if (r := self._guard()) is not None:
             return r
         import asyncio
         nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
         if not nav.ok:
             return nav
-        await asyncio.sleep(4)
+        await asyncio.sleep(self._BOOKMARK_SETTLE_S)
         # Check which bookmark button variant is present.
         # Reuse the CDP evaluate path to check button state.
         cdp = self._sb._controller._cdp

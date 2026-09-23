@@ -3,7 +3,7 @@
 ```text
 Status:   FROZEN FOR IMPLEMENTATION — REVISED BY IMPLEMENTATION EVIDENCE
 Baseline: 7d081b9
-Revision: layer-3 maintainer/Codex close-out, 2026-09-23
+Revision: layer-3 maintainer/Codex close-out, 2026-09-24
 Change rule: revise only when implementation, fault injection, live evidence,
 or an independently verified review finding falsifies an invariant or assumption.
 ```
@@ -33,10 +33,14 @@ ways that are now part of the contract:
 - approval validity, current authorization epoch, and kill state are checked at
   the final authority transition rather than trusted from an earlier sample;
 - direct authorization-epoch changes are fenced with final mint/consume;
+- final approval liveness/binding validation and `ACTIVE -> SPENT` are one
+  grant-lock transition (`spend_if_live`); no gateway-clock call may sit between
+  final approval validation and spend;
 - approval validity and permit TTL use distinct process-local clock domains;
 - grant and permit TTL defaults use monotonic elapsed time, not wall-clock time;
-- permit TTL starts at actual permit mint and is sampled again at the actual
-  consume transition after any blocking policy/epoch/kill validation;
+- permit time is sampled in the final mint critical section after reservation
+  work and before atomic approval spend, and permit expiry is sampled again at
+  the actual consume transition after any blocking policy/epoch/kill validation;
 - external hot-file kill state is re-observed at final mint/consume boundaries,
   without claiming impossible cross-process atomicity for a non-cooperating file
   writer;
@@ -117,6 +121,10 @@ M5 introduces one architecture around those facts:
   windows without claiming atomicity across the final filesystem observation and
   the following in-process transition. A stronger guarantee requires a
   cooperating cross-process locking/protocol mechanism.
+- **No simultaneous cross-clock snapshot claim.** Grant expiry and permit TTL
+  intentionally use independent injectable monotonic clock domains. The gateway
+  orders their final observations safely but never compares or claims atomic
+  simultaneity between the two clock values.
 
 ---
 
@@ -216,6 +224,10 @@ Properties:
 - clean precommit failure may release the claim and keep approval `ACTIVE`;
 - once approval has been spent, the claim is never released back into reusable
   approval;
+- `spend_if_live()` refreshes grant expiry, verifies intent/actor/policy/epoch,
+  and performs `ACTIVE → SPENT` under one grant lock; the CommitGateway uses this
+  operation at final mint rather than composing `validate_live()` and `spend()`
+  around unrelated work;
 - public binding/lifecycle fields are sealed against accidental direct
   mutation; lifecycle methods own transitions;
 - persistence of approval authority is intentionally out of scope.
@@ -224,8 +236,9 @@ Properties:
 is `time.monotonic()`, so wall-clock rollback/forward correction cannot extend
 or prematurely expire a process-local approval. Tests and future runtimes may
 inject a grant clock independent from the gateway permit clock; the two clock
-values must never be compared directly. UTC wall time remains appropriate for
-ledger/audit timestamps, not authority TTL enforcement.
+values must never be compared directly. Final spend samples the grant clock
+inside `spend_if_live()` at the state transition. UTC wall time remains
+appropriate for ledger/audit timestamps, not authority TTL enforcement.
 
 ### 5.2 EffectAttempt
 
@@ -344,20 +357,21 @@ prune old expired permits
 → fsync ledger (+ new directory entry where platform supports it)
 → mark attempt RESERVED
 → enter authorization-epoch fence
+→ read gateway/permit clock for final mint timestamp
 → callback-free re-observe current kill state
-→ revalidate grant liveness + fenced current authorization epoch
-→ if still valid: spend grant
-→ read gateway clock at actual mint
-→ mint one permit with full TTL
+→ atomically refresh grant-clock expiry + validate intent/actor/policy/fenced epoch
+  + transition ACTIVE -> SPENT under the grant lock
+→ mint one permit with the sampled permit timestamp/TTL
 ```
 
-The second grant validation is intentional: durable I/O can block long enough
-for approval expiry or epoch revocation to become relevant before authority is
-exposed. The final kill refresh similarly catches external hot-file activation
-that occurred during the blocking work; it does not execute listener callbacks
-inside the authority fence.
+The final `spend_if_live()` is intentional: durable I/O and the gateway clock
+read can consume elapsed time, so an earlier successful `validate_live()` is not
+trusted to remain current. The grant samples its own independent monotonic clock
+inside the same lock that performs `ACTIVE -> SPENT`. The final kill refresh
+similarly catches external hot-file activation that occurred during blocking
+work; it does not execute listener callbacks inside the authority fence.
 
-If post-reservation grant/epoch/kill validation fails:
+If final grant/epoch/kill validation fails:
 
 ```text
 no permit exists
@@ -387,10 +401,10 @@ prune old expired permits
 → validate grant/snapshot/policy/epoch
 → reject missing/unpersistable target lineage
 → enter authorization-epoch fence
+→ read gateway/permit clock for final mint timestamp
 → callback-free re-observe current kill state
-→ revalidate grant/epoch immediately before mint
-→ spend grant
-→ read gateway clock at actual mint
+→ atomically refresh grant-clock expiry + validate bindings/fenced epoch
+  + transition ACTIVE -> SPENT under the grant lock
 → mint one permit
 ```
 
@@ -404,20 +418,24 @@ proven replay safety, not a fictitious missing ledger fact.
 
 ### 6.4 Permit clock domain
 
-`EffectPermit.issued_at` and `expires_at` use the gateway's permit clock and are
-computed **at actual mint**. The production default is `time.monotonic()` because
-the permit is a process-local elapsed-time capability:
+`EffectPermit.issued_at` and `expires_at` use the gateway's permit clock. The
+permit timestamp is sampled in the final mint critical section **after**
+reservation/pruning work and **before** atomic approval spend:
 
 ```text
 mint_now = gateway_monotonic_clock()
+atomic grant spend_if_live() using the grant's own monotonic clock
 issued_at = mint_now
 expires_at = mint_now + permit_ttl
 ```
 
-Reservation fsync latency and expired-permit cleanup do not consume a newly
-returned permit's TTL. System wall-clock correction cannot extend or prematurely
-expire the permit. Injected clocks remain supported for deterministic tests and
-special runtimes.
+This ordering prevents slow reservation/pruning work from consuming the returned
+permit's TTL while also ensuring that no potentially blocking gateway-clock call
+can occur after final approval validation but before spend. The grant and permit
+clocks are independent authority domains: their numeric values are never
+compared and M5 does not claim they are sampled simultaneously. System wall-clock
+correction cannot extend or prematurely expire either process-local authority.
+Injected clocks remain supported for deterministic tests and special runtimes.
 
 Permit validity is also sampled at the **actual consume transition**. An early
 expiry check is only a fast path; policy/epoch/kill validation can block, so the
@@ -485,14 +503,15 @@ stronger cross-process linearizability claim.
    succeeds.
 7. Before any reservation or permit mint, target lineage is non-empty and
    representable by the durable ledger schema.
-8. Approval liveness, current authorization epoch, and current kill state are
-   revalidated at the final mint boundary; direct epoch changes are fenced with
-   that authority transition.
+8. At final mint, the gateway samples permit time, refreshes current kill state,
+   and then atomically revalidates approval liveness/bindings and spends the
+   grant under the fenced current authorization epoch. No unrelated call may
+   separate the final approval validation from `ACTIVE -> SPENT`.
 9. A reservation failure cannot become generic clean precommit release.
 10. A durable fenced reservation whose authority becomes invalid before permit
     exposure closes `NO_EFFECT`; close failure remains unresolved.
-11. Permit TTL starts at actual permit mint and is sampled again at the actual
-    consume transition after blocking authority checks.
+11. Permit TTL is based on the final mint-sequence timestamp and is sampled again
+    at the actual consume transition after blocking authority checks.
 12. Permit validation/consumption is atomic under the gateway protocol lock;
     policy identity, actor, target, intent, effect scope, epoch, kill state, and
     TTL must all still be valid at that boundary.
@@ -647,14 +666,15 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 8. REQUIRED reservation start is latched before durable I/O.
 9. Once REQUIRED reservation I/O begins, generic clean release is forbidden.
 10. No REQUIRED mutation authority is minted unless durable reservation succeeds.
-11. Approval/epoch/kill validity is checked again at the final mint boundary;
-    direct epoch changes are fenced with authority creation.
+11. Final approval expiry/binding/epoch validation and `ACTIVE -> SPENT` are one
+    grant-lock operation after the final permit-clock sample and kill refresh;
+    stale approval validation cannot authorize a permit.
 12. A now-invalid fenced pre-permit reservation is closed `NO_EFFECT`, or remains
     unresolved if closure cannot be persisted.
 13. Grant and permit TTLs are process-local elapsed-time authority: production
-    defaults are monotonic, permit TTL begins at actual mint, permit expiry is
-    sampled again at actual consume, and grant/permit clock values are never
-    compared across domains.
+    defaults are monotonic, permit time is sampled in the final mint sequence,
+    permit expiry is sampled again at actual consume, and grant/permit clock
+    values are never compared across domains or claimed simultaneous.
 14. Durable unresolved reservation/unknown state blocks automatic semantic
     replay once RecoveryGuard is integrated.
 15. Explicit unknown outcomes are never blindly retried.
@@ -691,7 +711,7 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 | T13 | Clean precommit failure before reservation start | Claim released; grant may remain `ACTIVE`; bounded retry budget advances |
 | T14 | REQUIRED reservation durably established | Post-reservation crash cannot reclaim ephemeral approval; unresolved effect recoverable |
 | T15 | Caller mutates `WriteIntent` while REQUIRED fsync blocks | Reservation and permit remain bound to one validated immutable snapshot |
-| T16 | REQUIRED reservation/pruning consumes more than permit TTL | Returned permit still receives full TTL from actual mint time |
+| T16 | REQUIRED reservation/pruning consumes more than permit TTL | Returned permit still receives full TTL from the final mint-sequence permit timestamp |
 | T17 | Approval expires or epoch changes after REQUIRED reservation but before permit mint | No permit; durable `RESERVED -> NO_EFFECT`; attempt terminalized without approval reuse |
 | T18 | T17 close append fails | No permit; raw `RESERVED` remains unresolved/fail-closed |
 | T19 | System wall clock moves while process-local authority is live | Grant/permit TTL enforcement is unaffected because production defaults use monotonic clocks; ledger timestamps remain UTC wall time |
@@ -699,6 +719,7 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 | T21 | Permit expires while consume waits behind policy/epoch work | Fresh boundary-time clock denies consumption and closes the unused permit `NO_EFFECT` |
 | T22 | External hot file appears during REQUIRED reservation or blocked consume | Final callback-free re-observation denies mint/consume; fenced pre-permit reservation closes `NO_EFFECT` |
 | T23 | BEST_EFFORT grant and intent both carry empty target type or id | Gateway denies `target_missing` before permit mint; grant remains unspent, attempt PREPARING, and no ledger row exists |
+| T24 | Grant expires during the final gateway/permit-clock read after earlier validation | Atomic `spend_if_live` refresh denies `expired`; no permit; grant is `EXPIRED`; fenced reservation closes `RESERVED -> NO_EFFECT` and attempt terminalizes `NO_EFFECT` |
 
 Additional mandatory regressions include:
 
@@ -729,13 +750,16 @@ Additional mandatory regressions include:
 - terminal evidence is strict JSON and persistence failure stays retryable
   without restoring execution authority;
 - grant/attempt public lifecycle fields reject direct mutation;
+- final grant expiry/binding validation and spend are one lifecycle operation;
+- grant expiry induced during the final gateway-clock read is denied before
+  permit mint and closes a fenced reservation `NO_EFFECT`;
 - `SAFE_*` policy assignments require concrete broker-level replay evidence;
 - unimplemented or unproven mutation families remain `UNKNOWN` / `REQUIRED`;
 - caller-owned intent mutation during blocked reservation cannot alter durable or
   permit lineage;
 - missing target type/id is denied before either REQUIRED reservation or
   BEST_EFFORT permit mint;
-- permit TTL begins after slow reservation work;
+- permit time is sampled only after slow reservation/pruning work;
 - grant expiry during reservation uses the grant clock, not the gateway clock;
 - default grant/permit authority clocks are monotonic while ledger timestamps
   remain UTC wall-clock provenance;
@@ -749,6 +773,8 @@ Additional mandatory regressions include:
 - External hot-file kill activation is final-boundary re-observed but is not a
   strict cross-process atomic transition; a stronger guarantee requires a
   cooperating cross-process protocol.
+- Grant and permit clocks are independent elapsed-time domains; M5 orders final
+  observations safely but does not claim a simultaneous cross-clock snapshot.
 - live browser behavior belongs to layer-5 capability migration.
 - end-to-end restart denial belongs to layer-6 RecoveryGuard integration.
 - future reconciliation needs its own evidence-bearing terminal resolution

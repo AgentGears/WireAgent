@@ -19,6 +19,7 @@ from webwire.safety.effect_policy import (
     DurabilityPolicy,
 )
 from webwire.safety.execution_models import (
+    ApprovalGrant,
     ApprovalGrantStore,
     AttemptState,
     AuthorizationEpoch,
@@ -35,7 +36,7 @@ def _claimed_bookmark(
     target_type: str,
     target_id: str,
     epoch: AuthorizationEpoch,
-) -> tuple[WriteIntent, object, EffectAttempt]:
+) -> tuple[WriteIntent, ApprovalGrant, EffectAttempt]:
     risk, compensation = DEFAULT_REGISTRY.require("bookmark")
     policy = DEFAULT_EFFECT_POLICIES.require("bookmark")
     assert policy.durability is DurabilityPolicy.BEST_EFFORT

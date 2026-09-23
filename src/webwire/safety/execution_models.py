@@ -13,9 +13,11 @@ EffectAttempt (one per execution try)
     RESERVED  -> NO_EFFECT | EFFECT_CONFIRMED | EFFECT_UNKNOWN
     unfenced effects may skip RESERVED entirely.
 
-Approval bindings and attempt lineage are sealed after construction. Human-
-approved identity, policy/actor/target bindings, validity bounds, grant ids,
-attempt ids, and effect ids are not mutable lifecycle state.
+All public model fields are read-only after construction. Bindings and lineage
+are immutable, while lifecycle state can change only through the transition
+methods in this module. The implementation is an engineering boundary against
+accidental state-machine bypass, not a security sandbox against hostile Python
+that deliberately uses reflection or ``object.__setattr__``.
 
 Each EffectAttempt owns one stable ``effect_id`` before it reaches the Commit
 Gateway. That durable lineage identity survives an ambiguous reservation write:
@@ -71,7 +73,7 @@ __all__ = [
 DEFAULT_GRANT_TTL_S = 300.0
 DEFAULT_MAX_PRECOMMIT_ATTEMPTS = 3
 
-_GRANT_SEALED_FIELDS = frozenset(
+_GRANT_PUBLIC_FIELDS = frozenset(
     {
         "intent_hash",
         "actor_id",
@@ -84,10 +86,15 @@ _GRANT_SEALED_FIELDS = frozenset(
         "issued_at",
         "expires_at",
         "max_precommit_attempts",
+        "state",
+        "claimed_by",
+        "precommit_attempts",
         "clock",
     }
 )
-_ATTEMPT_SEALED_FIELDS = frozenset({"grant_id", "attempt_id", "effect_id"})
+_ATTEMPT_PUBLIC_FIELDS = frozenset(
+    {"grant_id", "attempt_id", "effect_id", "state", "reservation_started"}
+)
 
 
 class GrantState(StrEnum):
@@ -119,7 +126,7 @@ class GrantClaimDenied(ApprovalGrantError):
 
 
 class GrantStateError(ApprovalGrantError):
-    """An illegal transition or mutation of sealed authority was attempted."""
+    """An illegal transition or direct mutation of model state was attempted."""
 
 
 class AuthorizationEpoch:
@@ -148,7 +155,7 @@ class AuthorizationEpoch:
 
 @dataclass
 class ApprovalGrant:
-    """One human approval with sealed bindings and an atomic claim lock."""
+    """One human approval with sealed fields and an atomic claim lock."""
 
     intent_hash: str
     actor_id: str
@@ -177,8 +184,10 @@ class ApprovalGrant:
     )
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in _GRANT_SEALED_FIELDS and name in self.__dict__:
-            raise GrantStateError(f"approval binding {name!r} is immutable after issue")
+        if name in _GRANT_PUBLIC_FIELDS and name in self.__dict__:
+            raise GrantStateError(
+                f"approval field {name!r} is read-only; use lifecycle methods"
+            )
         object.__setattr__(self, name, value)
 
     def is_expired(self, now: Optional[float] = None) -> bool:
@@ -187,7 +196,7 @@ class ApprovalGrant:
 
     def _refresh_state(self, now: Optional[float] = None) -> None:
         if self.state is GrantState.ACTIVE and self.is_expired(now):
-            self.state = GrantState.EXPIRED
+            object.__setattr__(self, "state", GrantState.EXPIRED)
 
     def validate_live(
         self,
@@ -208,7 +217,7 @@ class ApprovalGrant:
             if self.state is GrantState.REVOKED:
                 raise GrantClaimDenied("revoked")
             if authorization_epoch != self.authorization_epoch:
-                self.state = GrantState.REVOKED
+                object.__setattr__(self, "state", GrantState.REVOKED)
                 raise GrantClaimDenied(
                     "epoch_mismatch",
                     f"grant epoch {self.authorization_epoch} != current {authorization_epoch}",
@@ -253,7 +262,7 @@ class ApprovalGrant:
                     f"{self.precommit_attempts} precommit attempts used of "
                     f"{self.max_precommit_attempts}",
                 )
-            self.claimed_by = attempt_id
+            object.__setattr__(self, "claimed_by", attempt_id)
 
     @contextmanager
     def claim_fence(self, attempt_id: str) -> Iterator[None]:
@@ -278,8 +287,8 @@ class ApprovalGrant:
                     f"release_claim called by {attempt_id!r} but claim is held by "
                     f"{self.claimed_by!r}"
                 )
-            self.claimed_by = None
-            self.precommit_attempts += 1
+            object.__setattr__(self, "claimed_by", None)
+            object.__setattr__(self, "precommit_attempts", self.precommit_attempts + 1)
 
     def spend(self) -> None:
         """ACTIVE -> SPENT. Terminal and irrevocable."""
@@ -288,7 +297,7 @@ class ApprovalGrant:
                 raise GrantStateError(
                     f"spend() requires ACTIVE, got {self.state.value}"
                 )
-            self.state = GrantState.SPENT
+            object.__setattr__(self, "state", GrantState.SPENT)
 
     def revoke(self) -> None:
         """ACTIVE -> REVOKED. Terminal."""
@@ -297,12 +306,12 @@ class ApprovalGrant:
                 raise GrantStateError(
                     f"revoke() requires ACTIVE, got {self.state.value}"
                 )
-            self.state = GrantState.REVOKED
+            object.__setattr__(self, "state", GrantState.REVOKED)
 
 
 @dataclass
 class EffectAttempt:
-    """One execution try with sealed grant/attempt/effect lineage."""
+    """One execution try with sealed fields and method-owned transitions."""
 
     grant_id: str
     attempt_id: str = field(default_factory=lambda: secrets.token_urlsafe(12))
@@ -311,8 +320,10 @@ class EffectAttempt:
     reservation_started: bool = False
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in _ATTEMPT_SEALED_FIELDS and name in self.__dict__:
-            raise GrantStateError(f"attempt lineage {name!r} is immutable")
+        if name in _ATTEMPT_PUBLIC_FIELDS and name in self.__dict__:
+            raise GrantStateError(
+                f"attempt field {name!r} is read-only; use lifecycle methods"
+            )
         object.__setattr__(self, name, value)
 
     def _require(self, expected: AttemptState) -> None:
@@ -342,7 +353,7 @@ class EffectAttempt:
             raise GrantStateError(
                 "begin_reservation requires this attempt to hold the grant claim"
             )
-        self.reservation_started = True
+        object.__setattr__(self, "reservation_started", True)
 
     def mark_no_effect(self, grant: ApprovalGrant) -> None:
         """Clean precommit NO_EFFECT: release claim and preserve approval.
@@ -358,7 +369,7 @@ class EffectAttempt:
                 "clean NO_EFFECT is forbidden after reservation I/O has started"
             )
         grant.release_claim(self.attempt_id)
-        self.state = AttemptState.NO_EFFECT
+        object.__setattr__(self, "state", AttemptState.NO_EFFECT)
 
     def mark_no_effect_after_authority(self) -> None:
         """Terminalize proven no-effect after approval authority was spent.
@@ -371,7 +382,7 @@ class EffectAttempt:
                 f"attempt {self.attempt_id!r}: post-authority NO_EFFECT requires "
                 f"preparing/reserved, got {self.state.value}"
             )
-        self.state = AttemptState.NO_EFFECT
+        object.__setattr__(self, "state", AttemptState.NO_EFFECT)
 
     def mark_reserved(self, grant: ApprovalGrant) -> None:
         """Record that the durable reservation exists; does not spend grant."""
@@ -385,19 +396,19 @@ class EffectAttempt:
             raise GrantStateError(
                 "mark_reserved requires this attempt to hold the grant claim"
             )
-        self.state = AttemptState.RESERVED
+        object.__setattr__(self, "state", AttemptState.RESERVED)
 
     def mark_effect_confirmed(self) -> None:
         """External evidence establishes the effect."""
         if self.state not in (AttemptState.RESERVED, AttemptState.PREPARING):
             self._require(AttemptState.RESERVED)
-        self.state = AttemptState.EFFECT_CONFIRMED
+        object.__setattr__(self, "state", AttemptState.EFFECT_CONFIRMED)
 
     def mark_effect_unknown(self) -> None:
         """The effect may have happened; reconciliation is required."""
         if self.state not in (AttemptState.RESERVED, AttemptState.PREPARING):
             self._require(AttemptState.RESERVED)
-        self.state = AttemptState.EFFECT_UNKNOWN
+        object.__setattr__(self, "state", AttemptState.EFFECT_UNKNOWN)
 
 
 class ApprovalGrantStore:

@@ -8,9 +8,9 @@ T13 — clean precommit failure preserves approval:
     attempt may claim the same approval.
 
 T14 — reservation consumes approval:
-    claim → RESERVED → (gateway spends after the durable append, simulated
-    here as the two documented calls) → the same approval cannot be
-    reclaimed; a new claim attempt is denied on a SPENT grant.
+    claim → reservation I/O begins → RESERVED → (gateway spends after the
+    durable append, simulated here as the documented calls) → the same approval
+    cannot be reclaimed; a new claim attempt is denied on a SPENT grant.
 
 Plus the T10/T11 prerequisites (actor / intent binding denials), the
 epoch rule (spec 7), expiry, the attempt budget (spec 5.3), and every
@@ -77,7 +77,7 @@ def test_T13_clean_precommit_failure_preserves_approval(store: ApprovalGrantStor
     a1 = EffectAttempt(grant_id=grant_id)
     grant.claim(a1.attempt_id, **_claim_args())
 
-    # Preparation fails with PROVEN no external effect.
+    # Preparation fails with PROVEN no external effect, before reservation I/O.
     a1.mark_no_effect(grant)
 
     assert a1.state is AttemptState.NO_EFFECT
@@ -109,6 +109,43 @@ def test_attempt_budget_exhausts_but_grant_stays_active(store: ApprovalGrantStor
     assert exc.value.reason == "attempts_exhausted"
 
 
+def test_reservation_started_cannot_use_clean_no_effect_release(
+    store: ApprovalGrantStore,
+) -> None:
+    """Once reservation I/O may have written bytes, generic clean failure no
+    longer owns closure. The claim stays held and retry budget is untouched."""
+    grant_id = _mint(store)
+    grant = store.get(grant_id)
+    attempt = EffectAttempt(grant_id=grant_id)
+    grant.claim(attempt.attempt_id, **_claim_args())
+
+    attempt.begin_reservation(grant)
+    with pytest.raises(GrantStateError, match="reservation I/O"):
+        attempt.mark_no_effect(grant)
+
+    assert attempt.state is AttemptState.PREPARING
+    assert attempt.reservation_started is True
+    assert grant.state is GrantState.ACTIVE
+    assert grant.claimed_by == attempt.attempt_id
+    assert grant.precommit_attempts == 0
+
+
+def test_begin_reservation_is_idempotent_for_same_preparing_attempt(
+    store: ApprovalGrantStore,
+) -> None:
+    grant_id = _mint(store)
+    grant = store.get(grant_id)
+    attempt = EffectAttempt(grant_id=grant_id)
+    grant.claim(attempt.attempt_id, **_claim_args())
+
+    attempt.begin_reservation(grant)
+    attempt.begin_reservation(grant)
+
+    assert attempt.reservation_started is True
+    assert attempt.state is AttemptState.PREPARING
+    assert grant.claimed_by == attempt.attempt_id
+
+
 # ---------------------------------------------------------------------------
 # T14 — reservation consumes approval
 # ---------------------------------------------------------------------------
@@ -120,8 +157,10 @@ def test_T14_reservation_consumes_approval(store: ApprovalGrantStore) -> None:
     attempt = EffectAttempt(grant_id=grant_id)
     grant.claim(attempt.attempt_id, **_claim_args())
 
-    # The gateway's documented two-step, composed here (spec 6.1): the
-    # durable append happens between these calls in layer 3.
+    # The gateway's documented protocol, composed here (spec 6.1):
+    # begin_reservation happens before the durable append; mark_reserved after
+    # the append/fsync; spend immediately after, under the same claim fence.
+    attempt.begin_reservation(grant)
     attempt.mark_reserved(grant)
     grant.spend()
 
@@ -147,18 +186,28 @@ def test_spent_grant_is_irrevocably_terminal(store: ApprovalGrantStore) -> None:
         grant.revoke()
 
 
+def test_mark_reserved_requires_reservation_start(store: ApprovalGrantStore) -> None:
+    grant_id = _mint(store)
+    grant = store.get(grant_id)
+    attempt = EffectAttempt(grant_id=grant_id)
+    grant.claim(attempt.attempt_id, **_claim_args())
+
+    with pytest.raises(GrantStateError, match="begin_reservation"):
+        attempt.mark_reserved(grant)
+    assert attempt.state is AttemptState.PREPARING
+
+
 def test_mark_reserved_does_not_spend_by_itself(store: ApprovalGrantStore) -> None:
-    """Ordering contract: the attempt reaching RESERVED does NOT spend the
-    grant — the gateway does, after the fsync. (A crash between the two is
-    exactly the window where the ledger fact must dominate; the grant dying
-    with the process is the other half of that rule.)"""
+    """Ordering contract: reaching RESERVED does NOT spend the grant — the
+    gateway does immediately after the fsync. The claim remains held across
+    the complete protocol."""
     grant_id = _mint(store)
     grant = store.get(grant_id)
     a = EffectAttempt(grant_id=grant_id)
     grant.claim(a.attempt_id, **_claim_args())
+    a.begin_reservation(grant)
     a.mark_reserved(grant)
     assert grant.state is GrantState.ACTIVE
-    # The claim is still held — the gateway completes under it.
     assert grant.claimed_by == a.attempt_id
 
 
@@ -287,9 +336,10 @@ def test_attempt_transitions_enforced(store: ApprovalGrantStore) -> None:
     a = EffectAttempt(grant_id=grant_id)
     grant.claim(a.attempt_id, **_claim_args())
 
+    a.begin_reservation(grant)
     a.mark_reserved(grant)
     with pytest.raises(GrantStateError):
-        a.mark_no_effect(grant), "RESERVED cannot go to NO_EFFECT"
+        a.mark_no_effect(grant), "RESERVED cannot use clean NO_EFFECT"
     with pytest.raises(GrantStateError):
         a.mark_reserved(grant)
 
@@ -387,7 +437,7 @@ def test_wrong_grant_rejected_on_transitions(store: ApprovalGrantStore) -> None:
     with pytest.raises(GrantStateError):
         a1.mark_no_effect(g2)
     with pytest.raises(GrantStateError):
-        a1.mark_reserved(g2)
+        a1.begin_reservation(g2)
     assert g2.claimed_by is None, "the other approval was untouched"
     assert g1.claimed_by == a1.attempt_id
     assert a1.state is AttemptState.PREPARING

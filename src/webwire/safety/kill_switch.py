@@ -88,6 +88,11 @@ class KillSwitch:
         Caller must hold ``_state_lock``.
         """
         for listener in tuple(self._trip_listeners):
+            # A trusted callback can re-enter and reset the switch. If that
+            # happens, stop delivering callbacks for the trip that no longer
+            # exists; a future trip starts a fresh notification cycle.
+            if not self._active_unlocked():
+                break
             if (
                 listener in self._notified_listeners
                 or listener in self._listeners_in_progress

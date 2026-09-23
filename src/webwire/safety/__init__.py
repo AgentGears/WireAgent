@@ -1,6 +1,24 @@
-"""Safety subsystem — kill switch (Phase 0a) + write-safety kernel (Phase 0b)."""
+"""Safety subsystem — kill switch, write kernel, and M5 effect controls."""
 
 from webwire.safety.dedupe import DedupeStore
+from webwire.safety.effect_ledger import (
+    EffectLedger,
+    EffectLedgerCorruptError,
+    EffectLedgerError,
+    EffectLedgerRecord,
+    EffectState,
+    RecoveryProjection,
+)
+from webwire.safety.effect_policy import (
+    DEFAULT_EFFECT_POLICIES,
+    DurabilityPolicy,
+    EffectPolicy,
+    EffectPolicyRegistry,
+    EffectVerb,
+    ReplaySemantics,
+    UncertaintyPolicy,
+    derive_durability,
+)
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import (
     Amplification,
@@ -39,4 +57,18 @@ __all__ = [
     "Visibility",
     "Reversibility",
     "Amplification",
+    "EffectPolicy",
+    "EffectPolicyRegistry",
+    "DEFAULT_EFFECT_POLICIES",
+    "EffectVerb",
+    "ReplaySemantics",
+    "DurabilityPolicy",
+    "UncertaintyPolicy",
+    "derive_durability",
+    "EffectLedger",
+    "EffectLedgerRecord",
+    "EffectLedgerError",
+    "EffectLedgerCorruptError",
+    "EffectState",
+    "RecoveryProjection",
 ]

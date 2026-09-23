@@ -10,10 +10,11 @@ Per the Phase 0a design (Point 3 decision):
 - Tripping does NOT call ``sb.stop()``. The browser is left intact for
   debugging. Kill switch = refuse new Agent-WebWire actions.
 
-M5 layer 3 adds trip listeners.  The Commit Gateway binds the authorization
+M5 layer 3 adds trip listeners. The Commit Gateway binds the authorization
 epoch to this hook so a trip revokes already-minted execution authority even
-if the operator later resets the kill switch.  Hot-file trips are detected on
-the next ``tripped()`` observation and notify once per effective trip.
+if the operator later resets the kill switch. Hot-file trips are detected on
+the next ``tripped()`` observation. Notification is tracked per listener, so a
+listener registered while a trip is already active is notified immediately.
 """
 
 from __future__ import annotations
@@ -31,25 +32,13 @@ __all__ = ["KillSwitch"]
 
 
 class KillSwitch:
-    """Tri-state kill switch with hot-file + in-process flag + boot env var.
-
-    The switch is *tripped* (set) by any of:
-    - creating the hot file at ``config.kill_path()``;
-    - calling :meth:`trip` programmatically (tests, CLI, future control plane);
-    - setting the configured env var before boot (boot-time default only).
-
-    It is *cleared* by:
-    - removing the hot file AND calling :meth:`reset` (both mechanisms must be
-      clear, otherwise the switch stays tripped).
-    """
+    """Tri-state kill switch with hot-file + in-process flag + boot env var."""
 
     def __init__(self, config: Optional[WebWireConfig] = None) -> None:
         self._config = config or WebWireConfig()
         self._flag: bool = False
         self._trip_listeners: list[Callable[[], object]] = []
-        self._trip_notified: bool = False
-        # Boot-time default from env. Only consulted once at construction;
-        # the env var is not the active kill mechanism.
+        self._notified_listeners: list[Callable[[], object]] = []
         env_var = self._config.kill_env_var
         if env_var and os.environ.get(env_var, "").lower() in ("1", "true", "yes"):
             self._flag = True
@@ -61,23 +50,23 @@ class KillSwitch:
     # -- trip listeners ------------------------------------------------------
 
     def add_trip_listener(self, listener: Callable[[], object]) -> None:
-        """Invoke ``listener`` once per effective trip transition.
+        """Invoke ``listener`` once for the current trip and once per future trip.
 
-        M5 uses this to bump the authorization epoch.  Duplicate registration
-        is ignored.  If the switch is already tripped, registration observes
-        that state immediately so authority minted before binding cannot escape
-        revocation.
+        If the switch is already active when a new listener is registered, that
+        listener is notified immediately even if earlier listeners were already
+        notified. This is required for authorization-epoch revocation when a
+        CommitGateway is constructed during an existing trip.
         """
         if listener not in self._trip_listeners:
             self._trip_listeners.append(listener)
         self.tripped()
 
-    def _notify_trip_once(self) -> None:
-        if self._trip_notified:
-            return
-        self._trip_notified = True
+    def _notify_active_listeners(self) -> None:
         for listener in tuple(self._trip_listeners):
+            if listener in self._notified_listeners:
+                continue
             listener()
+            self._notified_listeners.append(listener)
 
     # -- query ---------------------------------------------------------------
 
@@ -89,14 +78,12 @@ class KillSwitch:
             try:
                 active = self._config.kill_path().exists()
             except OSError:
-                # If we can't even stat the state dir, fail closed (tripped).
                 active = True
 
         if active:
-            self._notify_trip_once()
+            self._notify_active_listeners()
         else:
-            # A subsequent trip is a new revocation event.
-            self._trip_notified = False
+            self._notified_listeners.clear()
         return active
 
     def state(self) -> dict:
@@ -113,8 +100,7 @@ class KillSwitch:
     # -- mutations -----------------------------------------------------------
 
     def trip(self) -> None:
-        """Trip the in-process flag. Also touches the hot file so external
-        observers (and a restarted process) see the trip."""
+        """Trip the flag and touch the hot file; notify each listener once."""
         self._flag = True
         path = self._config.kill_path()
         try:
@@ -122,17 +108,11 @@ class KillSwitch:
             path.touch()
         except OSError as exc:
             logger.warning("Could not write kill hot file %s: %r", path, exc)
-        self._notify_trip_once()
+        self._notify_active_listeners()
         logger.warning("KillSwitch tripped")
 
     def reset(self) -> None:
-        """Clear the in-process flag and remove the hot file.
-
-        Note: if the hot file was created externally and cannot be removed
-        (permissions), ``tripped()`` will remain True. That is intentional —
-        fail closed.  Reset never undoes a trip notification; authorization
-        epochs only move forward.
-        """
+        """Clear the flag and hot file; authorization epochs never move back."""
         self._flag = False
         path = self._config.kill_path()
         try:
@@ -140,20 +120,13 @@ class KillSwitch:
                 path.unlink()
         except OSError as exc:
             logger.warning("Could not remove kill hot file %s: %r", path, exc)
-        # Refresh the transition latch. If removal failed, tripped() leaves it
-        # notified; if clear, a future trip may notify again.
         self.tripped()
         logger.info("KillSwitch reset")
 
     # -- guard helper --------------------------------------------------------
 
     def guard(self) -> Optional[ActionResult]:
-        """Return a kill-switched ActionResult if tripped, else None.
-
-        Used at dispatcher top and broker entry:
-            if (r := kill_switch.guard()) is not None:
-                return r
-        """
+        """Return a kill-switched ActionResult if tripped, else None."""
         if self.tripped():
             return kill_switched()
         return None

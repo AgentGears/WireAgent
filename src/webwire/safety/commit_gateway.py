@@ -6,17 +6,6 @@ scoped broker authority objects; those land in layer 4. The gateway establishes
 the transaction boundary and produces a permit that layer 4 will consume at the
 actual broker mutation boundary.
 
-Protocol:
-  claimed ApprovalGrant + PREPARING EffectAttempt
-      -> validate current EffectPolicy and all grant bindings
-      -> final kill-switch check
-      -> REQUIRED: append durable RESERVED + fsync
-      -> mark RESERVED (fenced only)
-      -> spend ApprovalGrant
-      -> mint bound, expiring, single-use EffectPermit
-      -> consume_permit() immediately before the mutation
-      -> record_effect_confirmed() OR record_effect_unknown()
-
 A crash after a fenced reservation and before a terminal record leaves raw
 RESERVED evidence; EffectLedger recovery projects it as EFFECT_UNKNOWN. No
 exactly-once claim is made.
@@ -77,12 +66,22 @@ class GatewayStateError(RuntimeError):
 
 
 @dataclass
-class EffectPermit:
-    """Single-use authority descended from one human ApprovalGrant.
+class _PermitUse:
+    """Private mutable use state; the authority payload itself is immutable."""
 
-    The permit is process-local and ephemeral. For a fenced effect the durable
-    authority fact is the RESERVED ledger record; the permit merely carries the
-    exact bindings layer 4 must re-check at the mutation boundary.
+    consumed: bool = False
+    consumed_effect: Optional[EffectVerb] = None
+    consumed_at: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class EffectPermit:
+    """Immutable, process-local authority descended from one ApprovalGrant.
+
+    Binding fields cannot be changed after mint. The CommitGateway also accepts
+    only the exact permit object it issued, so a reconstructed/copy permit cannot
+    reset single-use state or alter authority. Deliberately hostile same-process
+    Python remains outside the M5 threat model.
     """
 
     grant_id: str
@@ -101,9 +100,19 @@ class EffectPermit:
     issued_at: float
     expires_at: float
     permit_id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
-    consumed: bool = False
-    consumed_effect: Optional[EffectVerb] = None
-    consumed_at: Optional[float] = None
+    _use: _PermitUse = field(default_factory=_PermitUse, repr=False, compare=False)
+
+    @property
+    def consumed(self) -> bool:
+        return self._use.consumed
+
+    @property
+    def consumed_effect(self) -> Optional[EffectVerb]:
+        return self._use.consumed_effect
+
+    @property
+    def consumed_at(self) -> Optional[float]:
+        return self._use.consumed_at
 
 
 class CommitGateway:
@@ -111,7 +120,7 @@ class CommitGateway:
 
     Layer 3 owns authorization, durable reservation, spend ordering, permit
     validation/consumption, and terminal effect-knowledge recording. It does
-    not own browser methods; layer 4 will adapt a consumed permit to a scoped
+    not own browser methods; layer 4 adapts a consumed permit to a scoped
     authority surface.
     """
 
@@ -131,9 +140,9 @@ class CommitGateway:
         self._policies = policies
         self._clock = clock
         self._permit_ttl = permit_ttl_seconds
-        # Frozen invariant 11: a kill activation revokes outstanding authority,
-        # not merely while the switch remains visibly tripped. KillSwitch emits
-        # one listener notification per effective trip, including hot-file trips.
+        self._issued_permits: dict[str, EffectPermit] = {}
+        # Frozen invariant 11: activation revokes outstanding execution
+        # authority, including after the visible kill flag is later reset.
         self._kill.add_trip_listener(self._epoch.bump)
 
     @property
@@ -159,6 +168,11 @@ class CommitGateway:
     def _check_kill(self) -> None:
         if self._kill.tripped():
             raise GatewayDenied("kill_switch")
+
+    def _require_issued_permit(self, permit: EffectPermit) -> None:
+        canonical = self._issued_permits.get(permit.permit_id)
+        if canonical is None or canonical is not permit:
+            raise GatewayDenied("permit_unknown")
 
     @staticmethod
     def _validate_grant_identity(
@@ -201,13 +215,12 @@ class CommitGateway:
         attempt: EffectAttempt,
         intent: WriteIntent,
     ) -> EffectPermit:
-        """Grant commit authority and return a single-use permit.
+        """Grant commit authority and mint one exact single-use permit.
 
         REQUIRED effects are fenced first. If the durable append fails, no
-        permit exists and the grant is not spent (T1 fail-closed prerequisite).
-        For fenced effects the durable RESERVED fact is the authoritative spend
-        point; ``grant.spend()`` follows immediately in the same synchronous
-        critical section.
+        permit exists and the grant is not spent. For fenced effects, the
+        durable RESERVED fact is the authoritative spend point; ``spend()``
+        follows immediately in the same synchronous critical section.
         """
 
         policy = self._policy_for(intent)
@@ -242,7 +255,7 @@ class CommitGateway:
 
         grant.spend()
 
-        return EffectPermit(
+        permit = EffectPermit(
             grant_id=grant.grant_id,
             attempt_id=attempt.attempt_id,
             effect_id=effect_id,
@@ -259,6 +272,8 @@ class CommitGateway:
             issued_at=now,
             expires_at=now + self._permit_ttl,
         )
+        self._issued_permits[permit.permit_id] = permit
+        return permit
 
     def consume_permit(
         self,
@@ -271,8 +286,9 @@ class CommitGateway:
         target_id: str,
         policy_binding: str,
     ) -> None:
-        """Validate and consume a permit immediately before external mutation."""
+        """Validate and consume a gateway-issued permit before mutation."""
 
+        self._require_issued_permit(permit)
         self._check_kill()
         now = self._clock()
         if permit.consumed:
@@ -296,12 +312,12 @@ class CommitGateway:
         if target_type != permit.target_type or target_id != permit.target_id:
             raise GatewayDenied("target_mismatch")
 
-        permit.consumed = True
-        permit.consumed_effect = effect
-        permit.consumed_at = now
+        permit._use.consumed = True
+        permit._use.consumed_effect = effect
+        permit._use.consumed_at = now
 
-    @staticmethod
-    def _validate_outcome_objects(permit: EffectPermit, attempt: EffectAttempt) -> None:
+    def _validate_outcome_objects(self, permit: EffectPermit, attempt: EffectAttempt) -> None:
+        self._require_issued_permit(permit)
         if permit.attempt_id != attempt.attempt_id:
             raise GatewayStateError("permit/attempt mismatch")
         if not permit.consumed:
@@ -365,12 +381,10 @@ class CommitGateway:
     ) -> None:
         """Persist uncertainty before making the in-memory attempt terminal.
 
-        This ordering matters when the ledger is temporarily unavailable: a
-        failed append leaves the attempt in RESERVED/PREPARING, so the caller
-        may retry *outcome persistence* with the already-consumed permit. It
-        does not restore execution authority: the grant is SPENT and the permit
-        remains consumed. For fenced effects, the prior RESERVED record remains
-        an unresolved restart blocker throughout.
+        A failed append leaves the attempt in RESERVED/PREPARING so the caller
+        may retry outcome persistence with the already-consumed permit. It never
+        restores execution authority: the grant remains SPENT and the permit
+        remains consumed.
         """
 
         self._validate_outcome_objects(permit, attempt)

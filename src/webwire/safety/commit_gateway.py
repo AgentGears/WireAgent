@@ -147,7 +147,12 @@ class CommitGateway:
         gateway protocol lock
           -> kill execution fence
           -> policy registry fence
-          -> approval-grant claim fence
+          -> approval-grant claim fence (authorize path)
+          -> authorization-epoch fence at the final authority transition
+
+    Permit consumption uses protocol -> kill -> policy -> epoch. Direct epoch
+    bumps therefore linearize either before the final check or after authority
+    has crossed; a sampled epoch value is never trusted across that transition.
 
     Kill-listener draining happens before the protocol lock. This avoids a
     callback lock inversion while ``execution_fence`` closes the race between
@@ -411,53 +416,62 @@ class CommitGateway:
 
                             # Durable I/O and opportunistic expiry closure can
                             # consume elapsed time. Approval validity is checked
-                            # again in the grant's own monotonic clock domain;
-                            # permit TTL starts later from the gateway clock.
-                            mint_epoch = self._epoch.current
-                            try:
-                                grant.validate_live(
-                                    intent_hash=snapshot.intent_hash,
-                                    actor_id=snapshot.actor_id,
-                                    policy_binding=binding,
-                                    authorization_epoch=mint_epoch,
-                                )
-                            except GrantClaimDenied as exc:
-                                if fenced and attempt.state is AttemptState.RESERVED:
-                                    self._close_reserved_before_permit(
-                                        grant=grant,
-                                        attempt=attempt,
-                                        snapshot=snapshot,
+                            # again in the grant's own monotonic clock domain.
+                            # The epoch fence makes direct revocation atomic with
+                            # spend + permit mint; the slow fsync above remains
+                            # outside the fence so a bump during I/O is observed.
+                            grant_error: Optional[GrantClaimDenied] = None
+                            with self._epoch.fence() as mint_epoch:
+                                try:
+                                    grant.validate_live(
+                                        intent_hash=snapshot.intent_hash,
+                                        actor_id=snapshot.actor_id,
                                         policy_binding=binding,
-                                        reason=f"{exc.reason}_before_permit",
+                                        authorization_epoch=mint_epoch,
                                     )
+                                except GrantClaimDenied as exc:
+                                    grant_error = exc
                                 else:
-                                    # BEST_EFFORT has no durable precommit fact;
-                                    # no permit was minted, so NO_EFFECT is proven.
-                                    attempt.mark_no_effect_after_authority()
-                                raise GatewayDenied(exc.reason, str(exc)) from exc
+                                    mint_now = self._clock()
+                                    grant.spend()
+                                    permit = EffectPermit(
+                                        grant_id=grant.grant_id,
+                                        attempt_id=attempt.attempt_id,
+                                        effect_id=effect_id,
+                                        semantic_key=semantic_key,
+                                        intent_hash=snapshot.intent_hash,
+                                        actor_id=snapshot.actor_id,
+                                        action_type=snapshot.action_type,
+                                        target_type=snapshot.target_type,
+                                        target_id=snapshot.target_id,
+                                        policy_binding=binding,
+                                        authorization_epoch=mint_epoch,
+                                        allowed_effects=policy.allowed_effects,
+                                        fenced=fenced,
+                                        issued_at=mint_now,
+                                        expires_at=mint_now + self._permit_ttl,
+                                    )
+                                    self._issued_permits[permit.permit_id] = permit
+                                    self._issued_attempts[permit.permit_id] = attempt
+                                    return permit
 
-                            mint_now = self._clock()
-                            grant.spend()
-                            permit = EffectPermit(
-                                grant_id=grant.grant_id,
-                                attempt_id=attempt.attempt_id,
-                                effect_id=effect_id,
-                                semantic_key=semantic_key,
-                                intent_hash=snapshot.intent_hash,
-                                actor_id=snapshot.actor_id,
-                                action_type=snapshot.action_type,
-                                target_type=snapshot.target_type,
-                                target_id=snapshot.target_id,
-                                policy_binding=binding,
-                                authorization_epoch=mint_epoch,
-                                allowed_effects=policy.allowed_effects,
-                                fenced=fenced,
-                                issued_at=mint_now,
-                                expires_at=mint_now + self._permit_ttl,
-                            )
-                            self._issued_permits[permit.permit_id] = permit
-                            self._issued_attempts[permit.permit_id] = attempt
-                            return permit
+                            assert grant_error is not None
+                            if fenced and attempt.state is AttemptState.RESERVED:
+                                self._close_reserved_before_permit(
+                                    grant=grant,
+                                    attempt=attempt,
+                                    snapshot=snapshot,
+                                    policy_binding=binding,
+                                    reason=f"{grant_error.reason}_before_permit",
+                                )
+                            else:
+                                # BEST_EFFORT has no durable precommit fact;
+                                # no permit was minted, so NO_EFFECT is proven.
+                                attempt.mark_no_effect_after_authority()
+                            raise GatewayDenied(
+                                grant_error.reason,
+                                str(grant_error),
+                            ) from grant_error
                 except GrantClaimDenied as exc:
                     raise GatewayDenied(exc.reason, str(exc)) from exc
                 except KeyError as exc:
@@ -486,35 +500,42 @@ class CommitGateway:
                 if now >= permit.expires_at:
                     self._close_expired_unconsumed(permit)
                     raise GatewayDenied("permit_expired")
-                if permit.authorization_epoch != self._epoch.current:
-                    raise GatewayDenied("epoch_mismatch")
 
                 try:
                     policy_fence = self._policies.policy_fence(permit.action_type)
                     with policy_fence as current_policy:
-                        current_binding = self._current_policy_binding(
-                            permit.action_type
-                        )
-                        assert current_binding == current_policy.binding_hash()
-                        if current_binding != permit.policy_binding:
-                            raise GatewayDenied(
-                                "policy_mismatch",
-                                "registered policy changed after permit mint",
+                        # Hold direct epoch revocation stable across the exact
+                        # authority crossing. A bump either happens before this
+                        # check (deny) or after permit consumption (boundary won).
+                        with self._epoch.fence() as current_epoch:
+                            if permit.authorization_epoch != current_epoch:
+                                raise GatewayDenied("epoch_mismatch")
+                            current_binding = self._current_policy_binding(
+                                permit.action_type
                             )
-                        if policy_binding != permit.policy_binding:
-                            raise GatewayDenied("policy_mismatch")
-                        if effect not in permit.allowed_effects:
-                            raise GatewayDenied("effect_not_allowed", effect.value)
-                        if intent_hash != permit.intent_hash:
-                            raise GatewayDenied("intent_mismatch")
-                        if actor_id != permit.actor_id:
-                            raise GatewayDenied("actor_mismatch")
-                        if target_type != permit.target_type or target_id != permit.target_id:
-                            raise GatewayDenied("target_mismatch")
+                            assert current_binding == current_policy.binding_hash()
+                            if current_binding != permit.policy_binding:
+                                raise GatewayDenied(
+                                    "policy_mismatch",
+                                    "registered policy changed after permit mint",
+                                )
+                            if policy_binding != permit.policy_binding:
+                                raise GatewayDenied("policy_mismatch")
+                            if effect not in permit.allowed_effects:
+                                raise GatewayDenied("effect_not_allowed", effect.value)
+                            if intent_hash != permit.intent_hash:
+                                raise GatewayDenied("intent_mismatch")
+                            if actor_id != permit.actor_id:
+                                raise GatewayDenied("actor_mismatch")
+                            if (
+                                target_type != permit.target_type
+                                or target_id != permit.target_id
+                            ):
+                                raise GatewayDenied("target_mismatch")
 
-                        permit._use.consumed = True
-                        permit._use.consumed_effect = effect
-                        permit._use.consumed_at = now
+                            permit._use.consumed = True
+                            permit._use.consumed_effect = effect
+                            permit._use.consumed_at = now
                 except KeyError as exc:
                     raise GatewayDenied("policy_missing", str(exc)) from exc
 

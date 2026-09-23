@@ -134,7 +134,7 @@ class EffectLedgerRecord:
         self.validate()
 
     def validate(self) -> None:
-        required_strings = {
+        required_strings: dict[str, Optional[str]] = {
             "effect_id": self.effect_id,
             "semantic_key": self.semantic_key,
             "action_type": self.action_type,

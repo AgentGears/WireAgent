@@ -149,6 +149,18 @@ class AuthorizationEpoch:
         with self._lock:
             return self._current
 
+    @contextmanager
+    def fence(self) -> Iterator[int]:
+        """Hold the current epoch stable across one authority transition.
+
+        A direct ``bump()`` either linearizes before this fence is acquired or
+        after it is released. Callers must use this around the final transition
+        that mints or consumes execution authority; sampling ``current`` alone
+        is not sufficient under concurrency.
+        """
+        with self._lock:
+            yield self._current
+
     def bump(self) -> int:
         """Advance the epoch and return the new value."""
         with self._lock:

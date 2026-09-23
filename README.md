@@ -3,7 +3,7 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.3 (M1–M4c + delete_post; M5 design frozen).** 20 capabilities — 7 read, 13 write — every
+**Status: v0.3 (M1–M4c + delete_post live path; M5 layer-3 reviewed candidate).** 20 capabilities — 7 read, 13 write — every
 live-verified capability proven against the real site, with a write-safety
 kernel that gates every mutation behind token-bound human confirmation.
 
@@ -122,4 +122,4 @@ is bounded by what the DOM exposes (X hides per-image identity and quoted
 targets). Sessions are cookie-persistence only. The journal is the audit
 record, not a guarantee of side-effect freedom. See `docs/STATE.md` — the
 living project state — for current capability status, known gaps, and the
-invariant list (15 architecture invariants).
+invariant list (20 architecture invariants).

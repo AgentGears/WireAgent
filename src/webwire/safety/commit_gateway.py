@@ -427,20 +427,23 @@ class CommitGateway:
                                 attempt.mark_reserved(grant)
 
                             # Durable I/O and opportunistic expiry closure can
-                            # consume elapsed time. The callback-free kill
-                            # refresh catches external hot-file activation that
-                            # cannot participate in the Python execution fence.
-                            # Grant validity is checked after that potentially
-                            # blocking filesystem observation, immediately before
-                            # spend/mint, under the direct epoch fence.
+                            # consume elapsed time. The gateway permit clock is
+                            # sampled before the final approval transition so a
+                            # slow/injected clock cannot create an unchecked gap
+                            # between approval liveness validation and spend.
+                            # After that clock read, re-observe external hot-file
+                            # state and atomically revalidate+spend the grant in
+                            # its own monotonic clock domain under the direct
+                            # authorization-epoch fence.
                             grant_error: Optional[GrantClaimDenied] = None
                             kill_blocked_at_mint = False
                             with self._epoch.fence() as mint_epoch:
+                                mint_now = self._clock()
                                 if self._kill.execution_blocked_now():
                                     kill_blocked_at_mint = True
                                 else:
                                     try:
-                                        grant.validate_live(
+                                        grant.spend_if_live(
                                             intent_hash=snapshot.intent_hash,
                                             actor_id=snapshot.actor_id,
                                             policy_binding=binding,
@@ -449,8 +452,6 @@ class CommitGateway:
                                     except GrantClaimDenied as exc:
                                         grant_error = exc
                                     else:
-                                        mint_now = self._clock()
-                                        grant.spend()
                                         permit = EffectPermit(
                                             grant_id=grant.grant_id,
                                             attempt_id=attempt.attempt_id,

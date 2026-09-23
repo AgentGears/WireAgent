@@ -79,8 +79,17 @@ def test_default_policy_table_matches_m5_assignments() -> None:
     assert delete.replay_semantics == ReplaySemantics.SAFE_TARGET_DELETE
     assert delete.durability == DurabilityPolicy.REQUIRED
 
-    assert DEFAULT_EFFECT_POLICIES.require("like").durability == DurabilityPolicy.BEST_EFFORT
-    assert DEFAULT_EFFECT_POLICIES.require("bookmark").durability == DurabilityPolicy.BEST_EFFORT
+    bookmark = DEFAULT_EFFECT_POLICIES.require("bookmark")
+    assert bookmark.replay_semantics is ReplaySemantics.SAFE_STATE_SET
+    assert bookmark.durability is DurabilityPolicy.BEST_EFFORT
+
+    # Like/unlike are intentionally conservative until their concrete broker
+    # methods gain state-first, selector-coexistence regressions. A high-level
+    # capability pre-read is not enough evidence for a broker-level SAFE claim.
+    for action in ("like", "unlike"):
+        engagement = DEFAULT_EFFECT_POLICIES.require(action)
+        assert engagement.replay_semantics is ReplaySemantics.UNKNOWN
+        assert engagement.durability is DurabilityPolicy.REQUIRED
 
     for action in ("follow", "unfollow", "repost", "unrepost"):
         future = DEFAULT_EFFECT_POLICIES.require(action)

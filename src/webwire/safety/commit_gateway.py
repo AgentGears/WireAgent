@@ -494,13 +494,14 @@ class CommitGateway:
             with self._kill.execution_fence() as blocked:
                 self._deny_if_killed(blocked)
                 self._require_issued_permit(permit)
-                now = self._clock()
+                fast_now = self._clock()
                 if permit.consumed:
                     raise GatewayDenied("permit_reused")
-                if now >= permit.expires_at:
+                if fast_now >= permit.expires_at:
                     self._close_expired_unconsumed(permit)
                     raise GatewayDenied("permit_expired")
 
+                expired_at_boundary = False
                 try:
                     policy_fence = self._policies.policy_fence(permit.action_type)
                     with policy_fence as current_policy:
@@ -533,11 +534,23 @@ class CommitGateway:
                             ):
                                 raise GatewayDenied("target_mismatch")
 
-                            permit._use.consumed = True
-                            permit._use.consumed_effect = effect
-                            permit._use.consumed_at = now
+                            # Policy/epoch fences may block. TTL is elapsed-time
+                            # authority, so it must be sampled at the exact
+                            # consume transition rather than trusted from the
+                            # earlier fast-path check.
+                            boundary_now = self._clock()
+                            if boundary_now >= permit.expires_at:
+                                expired_at_boundary = True
+                            else:
+                                permit._use.consumed = True
+                                permit._use.consumed_effect = effect
+                                permit._use.consumed_at = boundary_now
                 except KeyError as exc:
                     raise GatewayDenied("policy_missing", str(exc)) from exc
+
+                if expired_at_boundary:
+                    self._close_expired_unconsumed(permit)
+                    raise GatewayDenied("permit_expired")
 
     def _validate_outcome_objects(
         self,

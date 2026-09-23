@@ -119,13 +119,11 @@ class EffectPermit:
 class CommitGateway:
     """The one M5 commit-authority boundary.
 
-    A single re-entrant protocol lock serializes lifecycle transitions that
-    touch grants, attempts, permits, and the permit registry. The project is
-    async-capable and browser work may be initiated concurrently; logical
-    single-use checks are therefore not enough. The lock makes permit
-    consumption a true process-local compare-and-set and also prevents two
-    concurrent calls from reserving/spending the same grant or racing terminal
-    outcome records.
+    A re-entrant protocol lock serializes grant/attempt/permit transitions.
+    Authorization and permit consumption additionally hold the KillSwitch
+    execution fence, so programmatic trip activation and authority crossing
+    share one process-local linearization order. This closes both duplicate-use
+    concurrency and the stale-kill-check race.
     """
 
     def __init__(
@@ -168,8 +166,9 @@ class CommitGateway:
         policy.validate()
         return policy.binding_hash()
 
-    def _check_kill(self) -> None:
-        if self._kill.tripped():
+    @staticmethod
+    def _deny_if_killed(tripped: bool) -> None:
+        if tripped:
             raise GatewayDenied("kill_switch")
 
     def _require_issued_permit(self, permit: EffectPermit) -> None:
@@ -238,58 +237,59 @@ class CommitGateway:
         """Grant commit authority and mint one exact single-use permit."""
 
         with self._protocol_lock:
-            policy = self._policy_for(intent)
-            binding = policy.binding_hash()
-            epoch = self._epoch.current
-            self._validate_grant_identity(grant, attempt, intent, binding, epoch)
-            self._check_kill()
+            with self._kill.execution_fence() as tripped:
+                self._deny_if_killed(tripped)
+                policy = self._policy_for(intent)
+                binding = policy.binding_hash()
+                epoch = self._epoch.current
+                self._validate_grant_identity(grant, attempt, intent, binding, epoch)
 
-            now = self._clock()
-            self._prune_expired_unconsumed(now)
-            effect_id = secrets.token_urlsafe(16)
-            semantic_key = intent.dedupe_key()
-            fenced = policy.durability is DurabilityPolicy.REQUIRED
+                now = self._clock()
+                self._prune_expired_unconsumed(now)
+                effect_id = secrets.token_urlsafe(16)
+                semantic_key = intent.dedupe_key()
+                fenced = policy.durability is DurabilityPolicy.REQUIRED
 
-            if fenced:
-                record = EffectLedgerRecord(
+                if fenced:
+                    record = EffectLedgerRecord(
+                        effect_id=effect_id,
+                        semantic_key=semantic_key,
+                        state=EffectState.RESERVED,
+                        action_type=intent.action_type,
+                        intent_hash=intent.intent_hash(),
+                        policy_binding=binding,
+                        actor_id=intent.actor_identity,
+                        target_type=intent.target_type,
+                        target_id=intent.target_id,
+                        details={"attempt_id": attempt.attempt_id, "grant_id": grant.grant_id},
+                    )
+                    try:
+                        self._ledger.append_durable(record)
+                    except EffectLedgerError as exc:
+                        raise GatewayDenied("reservation_failed", str(exc)) from exc
+                    attempt.mark_reserved(grant)
+
+                grant.spend()
+
+                permit = EffectPermit(
+                    grant_id=grant.grant_id,
+                    attempt_id=attempt.attempt_id,
                     effect_id=effect_id,
                     semantic_key=semantic_key,
-                    state=EffectState.RESERVED,
-                    action_type=intent.action_type,
                     intent_hash=intent.intent_hash(),
-                    policy_binding=binding,
-                    actor_id=intent.actor_identity,
+                    actor_id=intent.actor_identity or "",
+                    action_type=intent.action_type,
                     target_type=intent.target_type,
                     target_id=intent.target_id,
-                    details={"attempt_id": attempt.attempt_id, "grant_id": grant.grant_id},
+                    policy_binding=binding,
+                    authorization_epoch=epoch,
+                    allowed_effects=policy.allowed_effects,
+                    fenced=fenced,
+                    issued_at=now,
+                    expires_at=now + self._permit_ttl,
                 )
-                try:
-                    self._ledger.append_durable(record)
-                except EffectLedgerError as exc:
-                    raise GatewayDenied("reservation_failed", str(exc)) from exc
-                attempt.mark_reserved(grant)
-
-            grant.spend()
-
-            permit = EffectPermit(
-                grant_id=grant.grant_id,
-                attempt_id=attempt.attempt_id,
-                effect_id=effect_id,
-                semantic_key=semantic_key,
-                intent_hash=intent.intent_hash(),
-                actor_id=intent.actor_identity or "",
-                action_type=intent.action_type,
-                target_type=intent.target_type,
-                target_id=intent.target_id,
-                policy_binding=binding,
-                authorization_epoch=epoch,
-                allowed_effects=policy.allowed_effects,
-                fenced=fenced,
-                issued_at=now,
-                expires_at=now + self._permit_ttl,
-            )
-            self._issued_permits[permit.permit_id] = permit
-            return permit
+                self._issued_permits[permit.permit_id] = permit
+                return permit
 
     def consume_permit(
         self,
@@ -304,40 +304,44 @@ class CommitGateway:
     ) -> None:
         """Atomically validate and consume a gateway-issued permit.
 
-        The validation-to-consumed transition is one critical section. Exactly
-        one concurrent caller can cross it; all later callers see
-        ``permit_reused`` before any external mutation is authorized.
+        Validation, kill/epoch observation, and the consumed transition share
+        both the gateway protocol lock and KillSwitch execution fence. Exactly
+        one concurrent consumer can cross, and an in-process kill trip cannot
+        activate between the final kill check and the boundary transition.
         """
 
         with self._protocol_lock:
-            self._require_issued_permit(permit)
-            self._check_kill()
-            now = self._clock()
-            if permit.consumed:
-                raise GatewayDenied("permit_reused")
-            if now >= permit.expires_at:
-                self._issued_permits.pop(permit.permit_id, None)
-                raise GatewayDenied("permit_expired")
-            if permit.authorization_epoch != self._epoch.current:
-                raise GatewayDenied("epoch_mismatch")
+            with self._kill.execution_fence() as tripped:
+                self._deny_if_killed(tripped)
+                self._require_issued_permit(permit)
+                now = self._clock()
+                if permit.consumed:
+                    raise GatewayDenied("permit_reused")
+                if now >= permit.expires_at:
+                    self._issued_permits.pop(permit.permit_id, None)
+                    raise GatewayDenied("permit_expired")
+                if permit.authorization_epoch != self._epoch.current:
+                    raise GatewayDenied("epoch_mismatch")
 
-            current_binding = self._current_policy_binding(permit.action_type)
-            if current_binding != permit.policy_binding:
-                raise GatewayDenied("policy_mismatch", "registered policy changed after permit mint")
-            if policy_binding != permit.policy_binding:
-                raise GatewayDenied("policy_mismatch")
-            if effect not in permit.allowed_effects:
-                raise GatewayDenied("effect_not_allowed", effect.value)
-            if intent_hash != permit.intent_hash:
-                raise GatewayDenied("intent_mismatch")
-            if actor_id != permit.actor_id:
-                raise GatewayDenied("actor_mismatch")
-            if target_type != permit.target_type or target_id != permit.target_id:
-                raise GatewayDenied("target_mismatch")
+                current_binding = self._current_policy_binding(permit.action_type)
+                if current_binding != permit.policy_binding:
+                    raise GatewayDenied(
+                        "policy_mismatch", "registered policy changed after permit mint"
+                    )
+                if policy_binding != permit.policy_binding:
+                    raise GatewayDenied("policy_mismatch")
+                if effect not in permit.allowed_effects:
+                    raise GatewayDenied("effect_not_allowed", effect.value)
+                if intent_hash != permit.intent_hash:
+                    raise GatewayDenied("intent_mismatch")
+                if actor_id != permit.actor_id:
+                    raise GatewayDenied("actor_mismatch")
+                if target_type != permit.target_type or target_id != permit.target_id:
+                    raise GatewayDenied("target_mismatch")
 
-            permit._use.consumed = True
-            permit._use.consumed_effect = effect
-            permit._use.consumed_at = now
+                permit._use.consumed = True
+                permit._use.consumed_effect = effect
+                permit._use.consumed_at = now
 
     def _validate_outcome_objects(self, permit: EffectPermit, attempt: EffectAttempt) -> None:
         self._require_issued_permit(permit)

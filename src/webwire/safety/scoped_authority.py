@@ -4,6 +4,11 @@ This module is the process-local least-authority adapter between Layer 3's
 CommitGateway/EffectPermit and the legacy concrete WriteBroker. It does not wire
 the live WriteKernel; capability migration remains Layer 5.
 
+Scoped objects retain only exact bound operations, never the concrete broker
+object itself. Effect authorities also do not expose outcome-recording APIs:
+verification and durable terminal truth remain CommitGateway orchestration owned
+by Layer 5.
+
 Threat model: same-process engineering boundary against accidental overreach,
 not a hostile-Python sandbox. Untrusted code still requires process/OS isolation
 and no raw browser handle.
@@ -12,6 +17,7 @@ and no raw browser handle.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +56,12 @@ __all__ = [
     "DeletePostAuthority",
     "SubmitContentAuthority",
 ]
+
+_AsyncNoArg = Callable[[], Awaitable[ActionResult]]
+_AsyncOneStr = Callable[[str], Awaitable[ActionResult]]
+_AsyncTwoStr = Callable[[str, str], Awaitable[ActionResult]]
+_CommitGate = Callable[[], Optional[ActionResult]]
+_EffectInvocation = Callable[[_CommitGate], Awaitable[ActionResult]]
 
 
 class ScopedAuthorityDenied(RuntimeError):
@@ -103,6 +115,24 @@ class _IntentBinding:
         if not isinstance(target_id, str) or not target_id:
             raise ScopedAuthorityDenied("target_missing", "target_id must be non-empty")
 
+        post_target_actions = {
+            "bookmark",
+            "remove_bookmark",
+            "like",
+            "unlike",
+            "reply",
+            "quote",
+            "delete_post",
+        }
+        if (
+            frozen.action_type in post_target_actions
+            and (target_type != "post" or not target_id.isdigit())
+        ):
+            raise ScopedAuthorityDenied(
+                "target_invalid",
+                f"{frozen.action_type} requires a numeric post target",
+            )
+
         post_url_raw = payload.get("post_url", "")
         if post_url_raw is None:
             post_url_raw = ""
@@ -124,6 +154,8 @@ class _IntentBinding:
                 "target_mismatch",
                 f"payload target {target_post_id!r} != intent target {target_id!r}",
             )
+        if frozen.action_type in post_target_actions and target_post_id != target_id:
+            raise ScopedAuthorityDenied("target_mismatch")
 
         if post_url and target_post_id:
             match = re.search(r"/status/(\d+)", post_url)
@@ -206,13 +238,17 @@ _EFFECT_BY_ACTION: dict[str, EffectVerb] = {
 
 class _PreparationBase:
     __slots__ = (
-        "__write_broker",
         "__grant",
         "__attempt",
         "__binding",
         "__policies",
         "__gateway",
         "__next_media_index",
+        "__read_composer",
+        "__verify_attachment",
+        "__count_attachments",
+        "__attach_media",
+        "__close_composer",
     )
 
     def __init__(
@@ -225,13 +261,17 @@ class _PreparationBase:
         policies: EffectPolicyRegistry,
         gateway: CommitGateway,
     ) -> None:
-        self.__write_broker = write_broker
         self.__grant = grant
         self.__attempt = attempt
         self.__binding = binding
         self.__policies = policies
         self.__gateway = gateway
         self.__next_media_index = 0
+        self.__read_composer: _AsyncNoArg = write_broker.read_composer_text
+        self.__verify_attachment: _AsyncNoArg = write_broker.verify_attachment_ready
+        self.__count_attachments: _AsyncNoArg = write_broker.count_attachments
+        self.__attach_media: _AsyncOneStr = write_broker.attach_media
+        self.__close_composer: _AsyncNoArg = write_broker.close_composer
 
     @property
     def action_type(self) -> str:
@@ -241,12 +281,14 @@ class _PreparationBase:
     def intent_hash(self) -> str:
         return self.__binding.intent_hash
 
-    def _broker(self) -> Any:
-        """Internal only; not part of the public authority contract."""
-        return self.__write_broker
+    def _expected_text(self) -> str:
+        return self.__binding.normalized_text
 
-    def _binding(self) -> _IntentBinding:
-        return self.__binding
+    def _expected_post_url(self) -> str:
+        return self.__binding.post_url
+
+    def _expected_target_post_id(self) -> str:
+        return self.__binding.target_post_id
 
     def _require_live(self, verb: PreparationVerb) -> None:
         grant = self.__grant
@@ -288,13 +330,13 @@ class _PreparationBase:
             raise ScopedAuthorityDenied(exc.reason, str(exc)) from exc
 
     async def read_composer_text(self) -> ActionResult:
-        return await self.__write_broker.read_composer_text()
+        return await self.__read_composer()
 
     async def verify_attachment_ready(self) -> ActionResult:
-        return await self.__write_broker.verify_attachment_ready()
+        return await self.__verify_attachment()
 
     async def count_attachments(self) -> ActionResult:
-        return await self.__write_broker.count_attachments()
+        return await self.__count_attachments()
 
     async def attach_media(self, image_path: str) -> ActionResult:
         self._require_live(PreparationVerb.ATTACH_MEDIA)
@@ -315,94 +357,113 @@ class _PreparationBase:
                 "media_changed_after_approval",
                 f"media index {expected.index} digest changed",
             )
-        result = await self.__write_broker.attach_media(expected.source_path)
+        result = await self.__attach_media(expected.source_path)
         if result.ok:
             self.__next_media_index += 1
         return result
 
     async def close_composer(self) -> ActionResult:
         """Reducing cleanup remains available even when approval was revoked."""
-        return await self.__write_broker.close_composer()
+        return await self.__close_composer()
 
 
 class PostPreparationAuthority(_PreparationBase):
+    __slots__ = ("__fill_composer",)
+
+    def __init__(self, *, write_broker: Any, **kwargs: Any) -> None:
+        super().__init__(write_broker=write_broker, **kwargs)
+        self.__fill_composer: _AsyncOneStr = write_broker.fill_composer
+
     async def fill_composer(self, text: str) -> ActionResult:
         if self.action_type != "post":
             raise ScopedAuthorityDenied("action_mismatch")
         self._require_live(PreparationVerb.OPEN_COMPOSER)
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        expected = self._binding().normalized_text
+        expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "composer text differs")
-        return await self._broker().fill_composer(expected)
+        return await self.__fill_composer(expected)
 
 
 class ReplyPreparationAuthority(_PreparationBase):
-    async def open_reply_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
+    __slots__ = ("__open_reply", "__fill_reply")
+
+    def __init__(self, *, write_broker: Any, **kwargs: Any) -> None:
+        super().__init__(write_broker=write_broker, **kwargs)
+        self.__open_reply: _AsyncTwoStr = write_broker.open_reply_on_target
+        self.__fill_reply: _AsyncOneStr = write_broker.fill_reply_composer
+
+    async def open_reply_on_target(
+        self, post_url: str, target_post_id: str
+    ) -> ActionResult:
         if self.action_type != "reply":
             raise ScopedAuthorityDenied("action_mismatch")
         self._require_live(PreparationVerb.OPEN_COMPOSER)
-        binding = self._binding()
-        if post_url != binding.post_url or target_post_id != binding.target_post_id:
+        if (
+            post_url != self._expected_post_url()
+            or target_post_id != self._expected_target_post_id()
+        ):
             raise ScopedAuthorityDenied("target_mismatch")
-        return await self._broker().open_reply_on_target(
-            binding.post_url, binding.target_post_id
+        return await self.__open_reply(
+            self._expected_post_url(), self._expected_target_post_id()
         )
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        expected = self._binding().normalized_text
+        expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "reply text differs")
-        return await self._broker().fill_reply_composer(expected)
+        return await self.__fill_reply(expected)
 
 
 class QuotePreparationAuthority(_PreparationBase):
-    async def open_quote_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
+    __slots__ = ("__open_quote", "__fill_quote")
+
+    def __init__(self, *, write_broker: Any, **kwargs: Any) -> None:
+        super().__init__(write_broker=write_broker, **kwargs)
+        self.__open_quote: _AsyncTwoStr = write_broker.open_quote_on_target
+        self.__fill_quote: _AsyncOneStr = write_broker.fill_quote_composer
+
+    async def open_quote_on_target(
+        self, post_url: str, target_post_id: str
+    ) -> ActionResult:
         if self.action_type != "quote":
             raise ScopedAuthorityDenied("action_mismatch")
         self._require_live(PreparationVerb.OPEN_COMPOSER)
-        binding = self._binding()
-        if post_url != binding.post_url or target_post_id != binding.target_post_id:
+        if (
+            post_url != self._expected_post_url()
+            or target_post_id != self._expected_target_post_id()
+        ):
             raise ScopedAuthorityDenied("target_mismatch")
-        return await self._broker().open_quote_on_target(
-            binding.post_url, binding.target_post_id
+        return await self.__open_quote(
+            self._expected_post_url(), self._expected_target_post_id()
         )
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        expected = self._binding().normalized_text
+        expected = self._expected_text()
         if text != expected:
             raise ScopedAuthorityDenied("payload_mismatch", "quote text differs")
-        return await self._broker().fill_quote_composer(expected)
+        return await self.__fill_quote(expected)
 
 
 class _EffectAuthorityBase:
-    __slots__ = (
-        "__write_broker",
-        "__gateway",
-        "__permit",
-        "__attempt",
-        "__binding",
-        "__effect",
-    )
+    __slots__ = ("__gateway", "__permit", "__binding", "__effect", "__invoke")
 
     def __init__(
         self,
         *,
-        write_broker: Any,
         gateway: CommitGateway,
         permit: EffectPermit,
-        attempt: EffectAttempt,
         binding: _IntentBinding,
         effect: EffectVerb,
+        invoke: _EffectInvocation,
     ) -> None:
-        self.__write_broker = write_broker
         self.__gateway = gateway
         self.__permit = permit
-        self.__attempt = attempt
         self.__binding = binding
         self.__effect = effect
+        self.__invoke = invoke
 
     @property
     def effect(self) -> EffectVerb:
@@ -411,12 +472,6 @@ class _EffectAuthorityBase:
     @property
     def consumed(self) -> bool:
         return self.__permit.consumed
-
-    def _broker(self) -> Any:
-        return self.__write_broker
-
-    def _binding(self) -> _IntentBinding:
-        return self.__binding
 
     def _commit_gate(self) -> Optional[ActionResult]:
         """Consume exact permit at the concrete broker's final mutation seam."""
@@ -438,70 +493,42 @@ class _EffectAuthorityBase:
             )
         return None
 
-    def record_confirmed(self, *, evidence: Optional[dict[str, Any]] = None) -> None:
-        self.__gateway.record_effect_confirmed(
-            self.__permit,
-            self.__attempt,
-            evidence=evidence,
-        )
-
-    def record_unknown(self, *, evidence: Optional[dict[str, Any]] = None) -> None:
-        self.__gateway.record_effect_unknown(
-            self.__permit,
-            self.__attempt,
-            evidence=evidence,
-        )
+    async def _invoke_exact(self) -> ActionResult:
+        return await self.__invoke(self._commit_gate)
 
 
 class SetBookmarkAuthority(_EffectAuthorityBase):
     async def apply(self) -> ActionResult:
-        return await self._broker().click_bookmark(
-            self._binding().post_url,
-            _commit_gate=self._commit_gate,
-        )
+        return await self._invoke_exact()
 
 
 class ClearBookmarkAuthority(_EffectAuthorityBase):
     async def apply(self) -> ActionResult:
-        return await self._broker().click_remove_bookmark(
-            self._binding().post_url,
-            _commit_gate=self._commit_gate,
-        )
+        return await self._invoke_exact()
 
 
 class SetLikeAuthority(_EffectAuthorityBase):
     async def apply(self) -> ActionResult:
-        return await self._broker().click_like(
-            self._binding().post_url,
-            _commit_gate=self._commit_gate,
-        )
+        return await self._invoke_exact()
 
 
 class ClearLikeAuthority(_EffectAuthorityBase):
     async def apply(self) -> ActionResult:
-        return await self._broker().click_unlike(
-            self._binding().post_url,
-            _commit_gate=self._commit_gate,
-        )
+        return await self._invoke_exact()
 
 
 class SubmitContentAuthority(_EffectAuthorityBase):
     async def submit(self) -> ActionResult:
-        return await self._broker().click_submit(_commit_gate=self._commit_gate)
+        return await self._invoke_exact()
 
 
 class DeletePostAuthority(_EffectAuthorityBase):
     async def delete(self) -> ActionResult:
-        binding = self._binding()
-        return await self._broker().delete_post(
-            binding.post_url,
-            binding.target_post_id,
-            _commit_gate=self._commit_gate,
-        )
+        return await self._invoke_exact()
 
 
 class ScopedAuthorityBroker:
-    """Factory that never returns its concrete WriteBroker."""
+    """Factory that never returns a caller-visible concrete broker."""
 
     __slots__ = ("__write_broker", "__gateway", "__policies")
 
@@ -537,9 +564,7 @@ class ScopedAuthorityBroker:
         except KeyError as exc:
             raise ScopedAuthorityDenied("policy_missing", str(exc)) from exc
         if not policy.preparation_effects:
-            raise ScopedAuthorityDenied(
-                "preparation_not_allowed", binding.action_type
-            )
+            raise ScopedAuthorityDenied("preparation_not_allowed", binding.action_type)
 
         if attempt.grant_id != grant.grant_id:
             raise ScopedAuthorityDenied("grant_mismatch")
@@ -561,20 +586,20 @@ class ScopedAuthorityBroker:
         except GrantClaimDenied as exc:
             raise ScopedAuthorityDenied(exc.reason, str(exc)) from exc
 
-        kwargs = dict(
-            write_broker=self.__write_broker,
-            grant=grant,
-            attempt=attempt,
-            binding=binding,
-            policies=self.__policies,
-            gateway=self.__gateway,
-        )
+        common: dict[str, Any] = {
+            "write_broker": self.__write_broker,
+            "grant": grant,
+            "attempt": attempt,
+            "binding": binding,
+            "policies": self.__policies,
+            "gateway": self.__gateway,
+        }
         if binding.action_type == "post":
-            return PostPreparationAuthority(**kwargs)
+            return PostPreparationAuthority(**common)
         if binding.action_type == "reply":
-            return ReplyPreparationAuthority(**kwargs)
+            return ReplyPreparationAuthority(**common)
         if binding.action_type == "quote":
-            return QuotePreparationAuthority(**kwargs)
+            return QuotePreparationAuthority(**common)
         raise ScopedAuthorityDenied("preparation_not_supported", binding.action_type)
 
     def authorize(
@@ -608,23 +633,46 @@ class ScopedAuthorityBroker:
                 f"{sorted(effect.value for effect in permit.allowed_effects)!r}",
             )
 
-        kwargs = dict(
-            write_broker=self.__write_broker,
+        broker = self.__write_broker
+        cls: type[_EffectAuthorityBase]
+        invoke: _EffectInvocation
+        if expected is EffectVerb.SET_BOOKMARK:
+            async def invoke(gate: _CommitGate) -> ActionResult:
+                return await broker.click_bookmark(binding.post_url, _commit_gate=gate)
+            cls = SetBookmarkAuthority
+        elif expected is EffectVerb.CLEAR_BOOKMARK:
+            async def invoke(gate: _CommitGate) -> ActionResult:
+                return await broker.click_remove_bookmark(
+                    binding.post_url, _commit_gate=gate
+                )
+            cls = ClearBookmarkAuthority
+        elif expected is EffectVerb.SET_LIKE:
+            async def invoke(gate: _CommitGate) -> ActionResult:
+                return await broker.click_like(binding.post_url, _commit_gate=gate)
+            cls = SetLikeAuthority
+        elif expected is EffectVerb.CLEAR_LIKE:
+            async def invoke(gate: _CommitGate) -> ActionResult:
+                return await broker.click_unlike(binding.post_url, _commit_gate=gate)
+            cls = ClearLikeAuthority
+        elif expected is EffectVerb.SUBMIT_CONTENT:
+            async def invoke(gate: _CommitGate) -> ActionResult:
+                return await broker.click_submit(_commit_gate=gate)
+            cls = SubmitContentAuthority
+        elif expected is EffectVerb.DELETE_POST:
+            async def invoke(gate: _CommitGate) -> ActionResult:
+                return await broker.delete_post(
+                    binding.post_url,
+                    binding.target_post_id,
+                    _commit_gate=gate,
+                )
+            cls = DeletePostAuthority
+        else:
+            raise ScopedAuthorityDenied("effect_not_implemented", expected.value)
+
+        return cls(
             gateway=self.__gateway,
             permit=permit,
-            attempt=attempt,
             binding=binding,
             effect=expected,
+            invoke=invoke,
         )
-        cls_by_effect: dict[EffectVerb, type[_EffectAuthorityBase]] = {
-            EffectVerb.SET_BOOKMARK: SetBookmarkAuthority,
-            EffectVerb.CLEAR_BOOKMARK: ClearBookmarkAuthority,
-            EffectVerb.SET_LIKE: SetLikeAuthority,
-            EffectVerb.CLEAR_LIKE: ClearLikeAuthority,
-            EffectVerb.SUBMIT_CONTENT: SubmitContentAuthority,
-            EffectVerb.DELETE_POST: DeletePostAuthority,
-        }
-        cls = cls_by_effect.get(expected)
-        if cls is None:
-            raise ScopedAuthorityDenied("effect_not_implemented", expected.value)
-        return cls(**kwargs)

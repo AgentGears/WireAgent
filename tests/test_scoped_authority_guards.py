@@ -22,6 +22,7 @@ from webwire.safety.execution_models import (
     AttemptState,
     AuthorizationEpoch,
     EffectAttempt,
+    GrantState,
 )
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import WriteIntent
@@ -56,10 +57,7 @@ def _bookmark_intent() -> WriteIntent:
         risk_meta=risk,
         compensation=comp,
         actor_identity="@actor",
-        payload={
-            "post_url": "https://x.com/u/status/123",
-            "post_id": "123",
-        },
+        payload={"post_url": "https://x.com/u/status/123", "post_id": "123"},
     )
 
 
@@ -69,12 +67,7 @@ def _registry() -> EffectPolicyRegistry:
     return reg
 
 
-def _runtime(
-    tmp_path: Path,
-    *,
-    policies: EffectPolicyRegistry | None = None,
-    clock=None,  # type: ignore[no-untyped-def]
-):
+def _runtime(tmp_path: Path, *, policies: EffectPolicyRegistry | None = None):  # type: ignore[no-untyped-def]
     intent = _bookmark_intent()
     reg = policies or _registry()
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
@@ -86,8 +79,7 @@ def _runtime(
         kill_switch=kill,
         authorization_epoch=epoch,
         policies=reg,
-        clock=clock if clock is not None else __import__("time").monotonic,
-        permit_ttl_seconds=1.0 if clock is not None else 60.0,
+        permit_ttl_seconds=60.0,
     )
     broker = _EffectBroker()
     scoped = ScopedAuthorityBroker(broker, gateway, policies=reg)
@@ -115,9 +107,11 @@ def _runtime(
 def _bookmark_receipt(tmp_path: Path):  # type: ignore[no-untyped-def]
     runtime = _runtime(tmp_path)
     intent, _, _, _, _, _, scoped, _, grant, attempt = runtime
-    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+    receipt = scoped.scope_effect(grant=grant, attempt=attempt, intent=intent)
     assert isinstance(receipt, AuthorizedEffect)
     assert isinstance(receipt.authority, SetBookmarkAuthority)
+    assert receipt.permit is None
+    assert grant.state is GrantState.ACTIVE
     return runtime, receipt
 
 
@@ -125,14 +119,13 @@ def test_scoped_and_gateway_must_share_exact_policy_registry(tmp_path: Path) -> 
     intent, reg, _, _, _, gateway, _, broker, _, _ = _runtime(tmp_path)
     other = EffectPolicyRegistry()
     other.register(reg.require(intent.action_type))
-
     with pytest.raises(ScopedAuthorityDenied, match="policy_registry_mismatch"):
         ScopedAuthorityBroker(broker, gateway, policies=other)
 
 
-async def test_kill_trip_then_reset_still_blocks_minted_authority(tmp_path: Path) -> None:
+async def test_kill_trip_then_reset_blocks_before_permit_mint(tmp_path: Path) -> None:
     runtime, receipt = _bookmark_receipt(tmp_path)
-    _, _, _, kill, _, _, _, broker, _, _ = runtime
+    _, _, ledger, kill, _, _, _, broker, grant, attempt = runtime
 
     kill.trip()
     kill.reset()
@@ -140,12 +133,15 @@ async def test_kill_trip_then_reset_still_blocks_minted_authority(tmp_path: Path
 
     assert not result.ok
     assert broker.events == []
-    assert receipt.permit.consumed is False
+    assert receipt.permit is None
+    assert grant.state in {GrantState.ACTIVE, GrantState.REVOKED}
+    assert attempt.state is AttemptState.PREPARING
+    assert ledger.read_records() == []
 
 
-async def test_policy_drift_after_mint_blocks_browser_mutation(tmp_path: Path) -> None:
+async def test_policy_drift_after_scope_blocks_before_browser_mutation(tmp_path: Path) -> None:
     runtime, receipt = _bookmark_receipt(tmp_path)
-    _, reg, _, _, _, _, _, broker, _, _ = runtime
+    _, reg, ledger, _, _, _, _, broker, grant, attempt = runtime
     base = reg.require("bookmark")
     reg.register(
         EffectPolicy.derive(
@@ -160,23 +156,10 @@ async def test_policy_drift_after_mint_blocks_browser_mutation(tmp_path: Path) -
 
     assert not result.ok
     assert broker.events == []
-    assert receipt.permit.consumed is False
-
-
-async def test_expired_permit_blocks_browser_mutation_and_closes_attempt(tmp_path: Path) -> None:
-    now = [0.0]
-    runtime = _runtime(tmp_path, clock=lambda: now[0])
-    intent, _, _, _, _, _, scoped, broker, grant, attempt = runtime
-    receipt = scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
-    assert isinstance(receipt.authority, SetBookmarkAuthority)
-
-    now[0] = 2.0
-    result = await receipt.authority.apply()
-
-    assert not result.ok
-    assert broker.events == []
-    assert attempt.state is AttemptState.NO_EFFECT
-    assert receipt.permit.consumed is False
+    assert receipt.permit is None
+    assert grant.state is GrantState.ACTIVE
+    assert attempt.state is AttemptState.PREPARING
+    assert ledger.read_records() == []
 
 
 async def test_consumed_permit_cannot_mutate_twice(tmp_path: Path) -> None:
@@ -189,10 +172,10 @@ async def test_consumed_permit_cannot_mutate_twice(tmp_path: Path) -> None:
     assert first.ok
     assert not second.ok
     assert broker.events == [("bookmark", "https://x.com/u/status/123")]
-    assert receipt.permit.consumed is True
+    assert receipt.permit is not None and receipt.permit.consumed
 
 
-def test_policy_broadening_is_denied_before_gateway_mint(tmp_path: Path) -> None:
+def test_policy_broadening_is_denied_before_effect_handle(tmp_path: Path) -> None:
     base = DEFAULT_EFFECT_POLICIES.require("bookmark")
     reg = EffectPolicyRegistry()
     reg.register(
@@ -207,7 +190,8 @@ def test_policy_broadening_is_denied_before_gateway_mint(tmp_path: Path) -> None
     intent, _, ledger, _, _, _, scoped, _, grant, attempt = runtime
 
     with pytest.raises(ScopedAuthorityDenied, match="effect_scope_not_exact"):
-        scoped.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+        scoped.scope_effect(grant=grant, attempt=attempt, intent=intent)
 
     assert ledger.read_records() == []
     assert attempt.state is AttemptState.PREPARING
+    assert grant.state is GrantState.ACTIVE

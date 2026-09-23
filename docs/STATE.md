@@ -17,7 +17,8 @@
 
 ## Current version
 
-**v0.3 (stabilized)** — 20 capabilities, 272 tests, CI-enforced (AgentGears/WireAgent).
+**v0.3 (stabilized; M5 design FROZEN)** — 20 capabilities, 272 tests, CI-enforced.
+Next: M5 per docs/M5_DESIGN.md (normative; baseline 7d081b9).
 Type- and lint-clean; all media writes share ONE harness; offline stub SDK powers CI.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
 Health capability-selector probes landed (history i).
@@ -71,6 +72,30 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
     memory layers fail open (missing/corrupt journal → empty stores, full
     budgets); the confirmation gate never depends on the journal. The journal
     is never rewritten — rotated whole at 10 MB / 31 days, 6 files retained.
+
+## M5 — Effect Transaction Boundary (design FROZEN)
+
+The full contract lives in **docs/M5_DESIGN.md** — normative and
+self-contained; build from it, not from this section.
+
+Provenance, recorded once: M5 arose from a seven-document adversarial
+review loop (external deep dive → verification against the tree →
+convergence → refinement → empirical correction → freeze request →
+final precision). Every code claim in the chain was checked against the
+tree; two live probes established the bookmark facts (both testid
+buttons coexist on a bookmarked post; the bookmark click is a no-op when
+already bookmarked — the destructive fallback in `click_bookmark` is
+code-real, live-dormant, and fixed in commit 1).
+
+**Architectural decision (retires an old recommendation):** approval
+grants are intentionally ephemeral. Durable safety state belongs to the
+EffectLedger, not to persisted confirmation tokens. The earlier P2 item
+"persist and prune confirmation tokens" is obsolete — it solved the
+wrong problem.
+
+The change rule is part of the freeze: revise the design only when
+implementation, fault injection, or live evidence falsifies an
+invariant or assumption.
 
 ## Phase plan
 
@@ -271,6 +296,17 @@ All P0/P1 review items + M4b landed and live-validated 2026-09-22. M4c
 
 ## History
 
+- 2026-09-23 (m): M5 design FROZEN and recorded (docs/M5_DESIGN.md; baseline
+  7d081b9). Twelve invariants, unified approval-spend rule (fenced: durable
+  EFFECT_RESERVED is the authoritative spend event — the ledger fact dominates
+  the transient object; non-fenced: the gateway's process-local CAS), four-axis
+  EffectPolicy (risk / authority / ReplaySemantics / durability; UNKNOWN =
+  conservative), ApprovalGrant/EffectAttempt as separate state machines with an
+  orthogonal claim lock, authorization-epoch kill revocation, effect-knowledge
+  states (COMMIT_ATTEMPTED demoted to diagnostic event), enforcement-grade
+  RecoveryGuard, journal/ledger split, T1-T14 acceptance tests, seven-step
+  build order. Negative guarantees recorded to prevent claim inflation.
+  Sequence from here: bookmark semantic fix → metadata chore → M5 layers.
 - 2026-09-23 (l): STABILIZATION BATCH complete. New home pushed (46-commit history,
   verified secret-free: sweep + full-blob scan of tracked tool-state; remote's
   wizard stub replaced). C1 CI foundation: offline stub of the Super-Browser SDK

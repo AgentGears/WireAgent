@@ -246,9 +246,9 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
             )
         )
 
-    # Bookmark directions are state-first in the concrete WriteBroker and have
-    # broker-level regressions covering selector coexistence and zero-mutation
-    # already-satisfied behavior, so SAFE_STATE_SET is evidence-backed here.
+    # Bookmark directions are state-first in the concrete broker and have
+    # broker-level regressions covering selector coexistence, directional-only
+    # clicks, and zero-mutation already-satisfied behavior.
     add("bookmark", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_BOOKMARK})
     add(
         "remove_bookmark",
@@ -256,11 +256,13 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
         {EffectVerb.CLEAR_BOOKMARK},
     )
 
-    # LikeCapability performs a high-level pre-state read, but the concrete
-    # click_like/click_unlike broker methods remain conservatively UNKNOWN until
-    # their Layer-4 exact-boundary/state-first behavior has dedicated evidence.
-    add("like", ReplaySemantics.UNKNOWN, {EffectVerb.SET_LIKE})
-    add("unlike", ReplaySemantics.UNKNOWN, {EffectVerb.CLEAR_LIKE})
+    # Layer-4 M5 broker regressions now prove the same semantic state-set
+    # contract for like/unlike at the concrete mutation boundary: real DOM state
+    # is read first, already-satisfied replay performs zero mutation and consumes
+    # no permit, and the exact directional click is reachable only after the
+    # private commit gate. That evidence is sufficient for SAFE_STATE_SET.
+    add("like", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_LIKE})
+    add("unlike", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.CLEAR_LIKE})
 
     # Future mutation families have no real broker implementation yet. Their
     # replay behavior is UNKNOWN until an implementation + regression proves a

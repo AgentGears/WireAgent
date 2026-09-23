@@ -125,7 +125,7 @@ invariant or assumption.
 | **v0.2 M4b** | reply_multi_image (shared media-compose harness) | **LIVE-VERIFIED** + runtime tests |
 | **v0.2 M4c** | quote_multi_image (shared harness, quote hook) | **LIVE-VERIFIED** (quote 2102520857155522777) |
 
-## Capabilities (19)
+## Capabilities (20)
 
 | Capability | Tier | Status | Notes |
 |-----------|------|--------|-------|

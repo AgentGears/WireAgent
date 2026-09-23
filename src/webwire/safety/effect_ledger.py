@@ -314,15 +314,65 @@ class EffectLedger:
                 )
             last_by_effect[record.effect_id] = record
 
+    @staticmethod
+    def _same_fact(
+        existing: EffectLedgerRecord,
+        proposed: EffectLedgerRecord,
+    ) -> bool:
+        """True only for an idempotent retry of the same durable fact.
+
+        Timestamp is intentionally excluded: a retry reconstructs the fact at a
+        later wall-clock time. Details are included so changed evidence is never
+        silently reported as persisted.
+        """
+        return (
+            existing.effect_id == proposed.effect_id
+            and existing.state is proposed.state
+            and all(
+                getattr(existing, name) == getattr(proposed, name)
+                for name in _LINEAGE_FIELDS
+            )
+            and existing.details == proposed.details
+        )
+
+    def _redurable_existing_fact(self) -> None:
+        """Re-establish durability after an ambiguous prior append failure."""
+        fd: Optional[int] = None
+        try:
+            fd = os.open(self._path, os.O_RDONLY)
+            os.fsync(fd)
+            # A failed first-append directory fsync can leave the row visible
+            # but the directory entry not yet crash-durable. Re-fsync the parent
+            # on every exact-fact retry; Windows deliberately no-ops here.
+            self._fsync_directory(self._path.parent)
+        except OSError as exc:
+            raise EffectLedgerError(
+                f"effect ledger re-durability fsync failed: {exc!r}"
+            ) from exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
     def append_durable(self, record: EffectLedgerRecord) -> None:
         """Validate, append, and fsync one canonical effect fact.
 
         Any history/creation/write/fsync failure raises EffectLedgerError. The
         caller must not perform a REQUIRED external effect after such a failure.
+        If an earlier append wrote this exact fact but reported an ambiguous
+        fsync failure, a retry re-fsyncs it without adding a duplicate row.
         """
         with self._lock:
             record.validate()
             existing = self.read_records()
+            for prior in reversed(existing):
+                if prior.effect_id == record.effect_id:
+                    if self._same_fact(prior, record):
+                        self._redurable_existing_fact()
+                        return
+                    break
             self._validate_history([*existing, record])
 
             payload = (record.to_jsonl() + "\n").encode("utf-8")

@@ -156,7 +156,7 @@ class EffectLedgerRecord:
     def from_dict(cls, raw: dict[str, Any]) -> "EffectLedgerRecord":
         try:
             state = EffectState(raw["state"])
-            details_raw = raw.get("details") or {}
+            details_raw = raw.get("details", {})
             if not isinstance(details_raw, dict):
                 raise ValueError("details must be an object when present")
             record = cls(

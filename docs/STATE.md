@@ -309,6 +309,27 @@ invariant or assumption.
 
 ## History
 
+- 2026-09-23 (p): M5 LAYER 2 (PR #3): ApprovalGrant / EffectAttempt models
+  per frozen spec sections 5-7. Grants: ACTIVE → SPENT | EXPIRED | REVOKED
+  (terminal, one-directional), orthogonal CAS claim (claimed_by; NOT a state),
+  bindings validated on every claim (intent_hash / actor / policy_binding /
+  authorization_epoch — the T10/T11 prerequisites), bounded precommit attempts
+  (default 3; exhaustion stops automation but never consumes the approval),
+  lazy EXPIRED demotion, epoch mismatch REVOKES. Attempts: PREPARING →
+  NO_EFFECT | RESERVED → EFFECT_CONFIRMED | EFFECT_UNKNOWN, unfenced effects
+  skip RESERVED; outcomes never release or spend — grant transitions stay
+  explicit gateway operations. The frozen spend rule ships as TWO calls the
+  gateway composes under the claim (mark_reserved; spend after the durable
+  fsync) — the ordering contract is documented at spend(). Store: ephemeral,
+  in-memory, zero persistence surface by design (test-locked); grants carry
+  the store's injected clock for deterministic expiry. T13 and T14 run
+  end-to-end at model level. Codex review resolved: P1 policy_binding was
+  stored but never compared — now a required claim argument, mismatch denies
+  (approval under P1 cannot execute under P2, per the spec's own binding
+  rule); P2 grant-taking transitions verify grant identity (wrong-grant
+  mixup cannot release or reserve another approval). Suite 322 (301 + 21
+  lifecycle tests, count from the run). Gateway, authorities, RecoveryGuard
+  all absent — layer 3+ composes these.
 - 2026-09-23 (o): M5 LAYER 1 (PR #2, squash c15c3ce): EffectPolicy + durable
   EffectLedger primitives per the frozen build order. Four-axis policy with
   derivation locks (UNKNOWN/non-idempotent/residual-effect → REQUIRED;

@@ -269,8 +269,6 @@ class CommitGateway:
         snapshot: _IntentSnapshot,
         policy_binding: str,
         authorization_epoch: int,
-        *,
-        now: float,
     ) -> None:
         if attempt.grant_id != grant.grant_id:
             raise GatewayDenied("grant_mismatch")
@@ -290,12 +288,13 @@ class CommitGateway:
         if not snapshot.actor_id or snapshot.actor_id != grant.actor_id:
             raise GatewayDenied("actor_mismatch")
         try:
+            # ApprovalGrant owns its own clock domain. Do not compare its
+            # expires_at against the gateway's permit clock.
             grant.validate_live(
                 intent_hash=snapshot.intent_hash,
                 actor_id=snapshot.actor_id,
                 policy_binding=policy_binding,
                 authorization_epoch=authorization_epoch,
-                now=now,
             )
         except GrantClaimDenied as exc:
             raise GatewayDenied(exc.reason, str(exc)) from exc
@@ -376,7 +375,6 @@ class CommitGateway:
                                 snapshot,
                                 binding,
                                 epoch,
-                                now=self._clock(),
                             )
 
                             effect_id = attempt.effect_id
@@ -412,9 +410,9 @@ class CommitGateway:
                                 attempt.mark_reserved(grant)
 
                             # Durable I/O and opportunistic expiry closure can
-                            # consume wall-clock time. Approval/epoch validity is
-                            # checked again at the actual authority-mint point.
-                            mint_now = self._clock()
+                            # consume wall-clock time. Approval validity is
+                            # checked again in the grant's own clock domain;
+                            # permit TTL starts later from the gateway clock.
                             mint_epoch = self._epoch.current
                             try:
                                 grant.validate_live(
@@ -422,7 +420,6 @@ class CommitGateway:
                                     actor_id=snapshot.actor_id,
                                     policy_binding=binding,
                                     authorization_epoch=mint_epoch,
-                                    now=mint_now,
                                 )
                             except GrantClaimDenied as exc:
                                 if fenced and attempt.state is AttemptState.RESERVED:
@@ -433,8 +430,13 @@ class CommitGateway:
                                         policy_binding=binding,
                                         reason=f"{exc.reason}_before_permit",
                                     )
+                                else:
+                                    # BEST_EFFORT has no durable precommit fact;
+                                    # no permit was minted, so NO_EFFECT is proven.
+                                    attempt.mark_no_effect_after_authority()
                                 raise GatewayDenied(exc.reason, str(exc)) from exc
 
+                            mint_now = self._clock()
                             grant.spend()
                             permit = EffectPermit(
                                 grant_id=grant.grant_id,

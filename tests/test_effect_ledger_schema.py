@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from webwire.safety.effect_ledger import (
 )
 
 
-def _record(state: EffectState) -> EffectLedgerRecord:
+def _record(state: EffectState, *, details: dict | None = None) -> EffectLedgerRecord:
     return EffectLedgerRecord(
         effect_id="fx-schema",
         semantic_key="@actor|post|post|123|schema",
@@ -27,6 +28,7 @@ def _record(state: EffectState) -> EffectLedgerRecord:
         actor_id="@actor",
         target_type="post",
         target_id="123",
+        details=details or {},
     )
 
 
@@ -90,6 +92,44 @@ def test_from_dict_allows_missing_details_as_empty_object() -> None:
     raw.pop("details")
     parsed = EffectLedgerRecord.from_dict(raw)
     assert parsed.details == {}
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {1: "numeric key"},
+        {"bad": object()},
+        {"bad": ("tuple",)},
+        {"bad": {"nested": object()}},
+        {"bad": float("nan")},
+        {"bad": float("inf")},
+        {"bad": -float("inf")},
+    ],
+)
+def test_details_reject_values_json_would_coerce_or_encode_nonportably(
+    details: dict,
+) -> None:
+    with pytest.raises(ValueError, match="details"):
+        _record(EffectState.RESERVED, details=details)
+
+
+def test_details_allow_nested_strict_json_values() -> None:
+    record = _record(
+        EffectState.RESERVED,
+        details={
+            "proof": {
+                "ok": True,
+                "count": 2,
+                "ratio": 0.5,
+                "optional": None,
+                "items": ["a", 1, False, {"nested": "yes"}],
+            }
+        },
+    )
+    encoded = record.to_jsonl()
+    parsed = EffectLedgerRecord.from_dict(json.loads(encoded))
+    assert parsed.details == record.details
+    assert math.isfinite(parsed.details["proof"]["ratio"])
 
 
 @pytest.mark.parametrize("bad", [None, "", 123, True])

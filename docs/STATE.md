@@ -17,7 +17,7 @@
 
 ## Current version
 
-**v0.3 (stabilized; M5 design FROZEN)** — 20 capabilities, 272 tests, CI-enforced.
+**v0.3 (stabilized; M5 design FROZEN)** — 20 capabilities, 279 tests, CI-enforced.
 Next: M5 per docs/M5_DESIGN.md (normative; baseline 7d081b9).
 Type- and lint-clean; all media writes share ONE harness; offline stub SDK powers CI.
 README rewritten to v0.2 truth; pyproject 0.0.1 → 0.2.0.
@@ -269,6 +269,19 @@ invariant or assumption.
   refactor commit); reply_multi_image on it with the target-first hook; 10
   runtime tests; live-verified (reply 2102493233989529629, thread-target
   verified, media_count 2 after the verifier fix below).
+- [x] ~~Bookmark mutation-as-probe (latent invariant-8 violation, found by
+  the review chain 2026-09-23)~~ — FIXED in pre-M5 commit 1. The pre-fix
+  click_bookmark used the removeBookmark click as a fallback probe: on an
+  already-bookmarked post it would REMOVE the bookmark and report
+  already_bookmarked. Live-probed status at discovery: code-real,
+  live-DORMANT (both buttons coexist when bookmarked; primary click is a
+  no-op) — retry-safe by DOM accident, never by code guarantee. Banked DOM
+  facts (2026-09-23, fixture post): bookmark/removeBookmark COEXIST in the
+  bookmarked state; the bookmark click is idempotent-when-bookmarked. Fix:
+  state-read-first branching (not_bookmarked→click; bookmarked→
+  already_satisfied zero-mutation; unknown→honest failure zero-mutation),
+  mutual exclusion with the new click_remove_bookmark mirror, broker-level
+  four-state tests over both topologies (tests/test_bookmark_semantics.py).
 - [x] ~~M4c quote_multi_image~~ — LIVE-VERIFIED 2026-09-23 (quote 2102520857155522777:
   posted_and_target_verified, media_count 2/2, blob-count gates exact through
   the quote composer, dual attachment honest; ran after the budget window
@@ -296,6 +309,14 @@ invariant or assumption.
 
 ## History
 
+- 2026-09-23 (n): Pre-M5 commit 1 — bookmark made semantic and
+  state-preserving. click_bookmark reads state first and never touches
+  removeBookmark (the mutation-as-probe defect is gone); click_remove_bookmark
+  added as its mirror (compensation metadata now names a real method). 7
+  broker-level tests: the four observable rows across both DOM topologies,
+  the swap-topology regression, the selector-churn-proof replay property
+  (pre=bookmarked → post=bookmarked, zero mutations), and mutual exclusion.
+  Suite 279.
 - 2026-09-23 (m): M5 design FROZEN and recorded (docs/M5_DESIGN.md; baseline
   7d081b9). Twelve invariants, unified approval-spend rule (fenced: durable
   EFFECT_RESERVED is the authoritative spend event — the ledger fact dominates

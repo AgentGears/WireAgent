@@ -70,7 +70,7 @@ def test_registry_rejects_durability_downgrade() -> None:
         reg.register(bad)
 
 
-def test_default_policy_table_matches_frozen_m5_assignments() -> None:
+def test_default_policy_table_matches_m5_assignments() -> None:
     assert DEFAULT_EFFECT_POLICIES.require("post").durability == DurabilityPolicy.REQUIRED
     assert DEFAULT_EFFECT_POLICIES.require("reply").durability == DurabilityPolicy.REQUIRED
     assert DEFAULT_EFFECT_POLICIES.require("quote").durability == DurabilityPolicy.REQUIRED
@@ -81,6 +81,11 @@ def test_default_policy_table_matches_frozen_m5_assignments() -> None:
 
     assert DEFAULT_EFFECT_POLICIES.require("like").durability == DurabilityPolicy.BEST_EFFORT
     assert DEFAULT_EFFECT_POLICIES.require("bookmark").durability == DurabilityPolicy.BEST_EFFORT
+
+    for action in ("follow", "unfollow", "repost", "unrepost"):
+        future = DEFAULT_EFFECT_POLICIES.require(action)
+        assert future.replay_semantics is ReplaySemantics.UNKNOWN
+        assert future.durability is DurabilityPolicy.REQUIRED
 
 
 def test_every_existing_risk_action_has_an_effect_policy() -> None:
@@ -110,15 +115,14 @@ def test_policy_binding_is_stable_and_sensitive_to_authority() -> None:
     assert p1.binding_hash() != broader.binding_hash()
 
 
-# ---------------------------------------------------------------------------
-# Codex review regression (PR #2, 2026-09-23): no per-action uncertainty axis
-# ---------------------------------------------------------------------------
-
 def test_no_per_action_uncertainty_policy_exists() -> None:
-    """Frozen invariant 9 makes unknown-outcome handling GLOBAL. The axis that
-    once lived here carried a safe-to-retry value that any registered policy
-    could have used to exempt itself from that guarantee; it is removed, and
-    this lock keeps it removed."""
+    """Uncertainty behavior is not an action-author controlled escape hatch.
+
+    Explicit EFFECT_UNKNOWN is globally reconciliation-required. A crash with
+    no BEST_EFFORT durable fact may be replayed only because replay semantics
+    are registry-controlled and implementation-tested; no separate
+    ``uncertainty_policy`` can weaken that contract.
+    """
     from pathlib import Path as _Path
 
     import webwire.safety.effect_policy as ep

@@ -15,6 +15,7 @@ Source of truth: docs/M5_DESIGN.md §§10-12.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from dataclasses import asdict, dataclass, field
@@ -86,6 +87,31 @@ _LINEAGE_FIELDS = (
 )
 
 
+def _validate_json_value(value: Any, path: str) -> None:
+    """Reject evidence that JSON would coerce, truncate, or encode non-portably."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain only finite JSON numbers")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"{path} keys must be strings, got {type(key).__name__}"
+                )
+            _validate_json_value(item, f"{path}.{key}")
+        return
+    raise ValueError(
+        f"{path} contains non-JSON value of type {type(value).__name__}"
+    )
+
+
 @dataclass(frozen=True)
 class EffectLedgerRecord:
     """One append-only effect-state fact."""
@@ -123,7 +149,7 @@ class EffectLedgerRecord:
                     f"string, got {type(value).__name__}"
                 )
 
-        optional_strings = {
+        optional_strings: dict[str, Optional[str]] = {
             "actor_id": self.actor_id,
             "target_type": self.target_type,
             "target_id": self.target_id,
@@ -145,12 +171,18 @@ class EffectLedgerRecord:
                 "effect ledger record field 'details' must be a dict, "
                 f"got {type(self.details).__name__}"
             )
+        _validate_json_value(self.details, "details")
 
     def to_jsonl(self) -> str:
         self.validate()
         payload = asdict(self)
         payload["state"] = self.state.value
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "EffectLedgerRecord":
@@ -339,7 +371,9 @@ class EffectLedger:
         """Re-establish durability after an ambiguous prior append failure."""
         fd: Optional[int] = None
         try:
-            fd = os.open(self._path, os.O_RDONLY)
+            # Use a writable descriptor so the fsync/_commit contract is valid
+            # on Windows as well as POSIX. The ledger is created owner-writable.
+            fd = os.open(self._path, os.O_RDWR)
             os.fsync(fd)
             # A failed first-append directory fsync can leave the row visible
             # but the directory entry not yet crash-durable. Re-fsync the parent

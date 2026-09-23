@@ -1,9 +1,9 @@
 """M5 effect policy — independent risk, authority, replay, and durability axes.
 
 This module is the normative policy primitive for the M5 Effect Transaction
-Boundary.  It deliberately does not execute browser mutations; it describes
-what an action is allowed to do. Handling of uncertain outcomes is
-global by frozen invariant 9, never a per-action policy.
+Boundary. It deliberately does not execute browser mutations; it describes
+what an action is allowed to do. Handling of uncertain outcomes is global by
+frozen invariant 9, never a per-action policy.
 
 Source of truth: docs/M5_DESIGN.md §4.
 """
@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 from webwire.safety.models import RiskTier
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
@@ -46,6 +48,7 @@ class DurabilityPolicy(StrEnum):
     REQUIRED = "required"
     BEST_EFFORT = "best_effort"
 
+
 # No per-action uncertainty policy exists, deliberately (Codex review,
 # PR #2, 2026-09-23): docs/M5_DESIGN.md invariant 9 makes unknown-outcome
 # handling GLOBAL — an uncertain effect is never automatically retried;
@@ -54,7 +57,7 @@ class DurabilityPolicy(StrEnum):
 
 
 class EffectVerb(StrEnum):
-    """Semantic authority verbs.  These are not generic DOM primitives."""
+    """Semantic authority verbs. These are not generic DOM primitives."""
 
     SET_BOOKMARK = "set_bookmark"
     CLEAR_BOOKMARK = "clear_bookmark"
@@ -75,16 +78,7 @@ def derive_durability(
     risk_tier: RiskTier,
     replay_semantics: ReplaySemantics,
 ) -> DurabilityPolicy:
-    """Derive fencing from risk *and* replay semantics.
-
-    Frozen M5 rules:
-    - UNKNOWN is conservative: treat it like a non-idempotent create.
-    - content-irreversible and public-amplifying actions are consequential
-      enough to require durable fencing even when replay itself is safe.
-    - non-idempotent/residual-effect replay always requires fencing.
-    - only established safe state-set/target-delete actions below those risk
-      tiers may be BEST_EFFORT.
-    """
+    """Derive fencing from risk *and* replay semantics."""
 
     if risk_tier in {
         RiskTier.PUBLIC_AMPLIFYING_REVERSIBLE,
@@ -165,26 +159,46 @@ class EffectPolicy:
 
 
 class EffectPolicyRegistry:
-    """Authoritative action_type -> EffectPolicy map."""
+    """Authoritative, thread-safe action_type -> EffectPolicy map.
+
+    ``policy_fence()`` is the mutation-boundary synchronization primitive.
+    Registration and a gateway's final policy check share the same RLock, so a
+    P1→P2 update cannot linearize between binding validation and permit use.
+    """
 
     def __init__(self) -> None:
         self._entries: dict[str, EffectPolicy] = {}
+        self._lock = threading.RLock()
 
     def register(self, policy: EffectPolicy) -> None:
         policy.validate()
-        self._entries[policy.action_type] = policy
+        with self._lock:
+            self._entries[policy.action_type] = policy
 
     def get(self, action_type: str) -> Optional[EffectPolicy]:
-        return self._entries.get(action_type)
+        with self._lock:
+            return self._entries.get(action_type)
 
     def require(self, action_type: str) -> EffectPolicy:
-        policy = self.get(action_type)
-        if policy is None:
-            raise KeyError(f"action_type {action_type!r} has no effect policy")
-        return policy
+        with self._lock:
+            policy = self._entries.get(action_type)
+            if policy is None:
+                raise KeyError(f"action_type {action_type!r} has no effect policy")
+            return policy
 
     def known_actions(self) -> list[str]:
-        return sorted(self._entries)
+        with self._lock:
+            return sorted(self._entries)
+
+    @contextmanager
+    def policy_fence(self, action_type: str) -> Iterator[EffectPolicy]:
+        """Hold registry identity stable across one authority transition."""
+        with self._lock:
+            policy = self._entries.get(action_type)
+            if policy is None:
+                raise KeyError(f"action_type {action_type!r} has no effect policy")
+            policy.validate()
+            yield policy
 
 
 def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPolicyRegistry:

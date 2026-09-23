@@ -309,6 +309,24 @@ invariant or assumption.
 
 ## History
 
+- 2026-09-23 (o): M5 LAYER 1 (PR #2, squash c15c3ce): EffectPolicy + durable
+  EffectLedger primitives per the frozen build order. Four-axis policy with
+  derivation locks (UNKNOWN/non-idempotent/residual-effect → REQUIRED;
+  public-amplifying and content-irreversible → REQUIRED regardless of replay
+  safety); default table from risk-registry truth; binding_hash for grant/
+  permit lineage. Ledger at .webwire/effects.ndjson: fsync-backed durable
+  appends that PROPAGATE failure, fail-closed corruption, unresolved RESERVED
+  projects as EFFECT_UNKNOWN without rewriting evidence, state-directory
+  ancestry persisted on creation (win32 honestly lacks a dir-fsync primitive).
+  Implemented externally (branch m5-layer1-effect-policy-ledger); Codex review
+  resolved here: P1 win32 dir-open was already fixed at head by the
+  implementer (review anchored on commit 1 of 3) + regression lock; P2
+  str()-coerced identities → genuine-string validation + __post_init__;
+  P3 per-action SAFE_TO_RETRY uncertainty axis REMOVED (contradicted frozen
+  invariant 9 — uncertainty handling is global). Suite 301 (297 + four review
+  regressions). Recording note: the branch's STATE entry for this layer
+  silently failed to apply (anchor mismatch, unasserted) — this entry was
+  added on main after the merge; the PR body's '302' was a miscount.
 - 2026-09-23 (n): Pre-M5 commit 1 — bookmark made semantic and
   state-preserving. click_bookmark reads state first and never touches
   removeBookmark (the mutation-as-probe defect is gone); click_remove_bookmark

@@ -88,7 +88,6 @@ class KillSwitch:
         try:
             return self._config.kill_path().exists()
         except OSError:
-            # If state cannot be observed reliably, fail closed.
             return True
 
     def _sync_trip_generation_unlocked(self) -> bool:
@@ -111,11 +110,11 @@ class KillSwitch:
             for delivered, critical in zip(
                 self._listener_generations,
                 self._listener_critical,
+                strict=True,
             )
         )
 
     def _start_delivery_unlocked(self) -> bool:
-        """Claim ownership of the notification drain. Caller holds state lock."""
         if self._notifying or not self._has_pending_listener_events_unlocked():
             return False
         self._notifying = True
@@ -129,20 +128,16 @@ class KillSwitch:
         *,
         critical: bool = False,
     ) -> None:
-        """Register for the current active trip (if any) and all future trips.
-
-        ``critical=True`` means undelivered generations block
-        :meth:`execution_fence`. CommitGateway uses this for authorization-epoch
-        revocation. Generic/diagnostic listeners remain non-critical so their
-        failure cannot indefinitely block execution after revocation succeeds.
-        """
+        """Register for the current active trip (if any) and all future trips."""
         with self._state_lock:
             active = self._sync_trip_generation_unlocked()
             try:
                 index = self._trip_listeners.index(listener)
             except ValueError:
                 self._trip_listeners.append(listener)
-                delivered = self._trip_generation - 1 if active else self._trip_generation
+                delivered = (
+                    self._trip_generation - 1 if active else self._trip_generation
+                )
                 self._listener_generations.append(delivered)
                 self._listener_critical.append(critical)
             else:
@@ -161,7 +156,10 @@ class KillSwitch:
         candidate: Optional[tuple[int, int, Callable[[], object]]] = None
         for index, listener in enumerate(tuple(self._trip_listeners)):
             delivered = self._listener_generations[index]
-            if delivered >= self._trip_generation or index in self._listeners_in_progress:
+            if (
+                delivered >= self._trip_generation
+                or index in self._listeners_in_progress
+            ):
                 continue
             target_generation = delivered + 1
             if (index, target_generation) in attempted:
@@ -171,14 +169,7 @@ class KillSwitch:
         return candidate
 
     def _drain_pending_listener_events(self) -> None:
-        """Deliver owed trip events with *no* arbitrary callback under state lock.
-
-        The caller must have set ``_notifying=True`` through
-        :meth:`_start_delivery_unlocked`. Re-entrant API calls may create newer
-        generations or append listeners; the outer drain observes them on its
-        next locked selection pass. A failed event is attempted only once in this
-        drain and remains owed for a later external observation.
-        """
+        """Deliver owed trip events without arbitrary callback under state lock."""
         attempted: list[tuple[int, int]] = []
         try:
             while True:
@@ -212,7 +203,7 @@ class KillSwitch:
     def _observe_and_drain(self) -> bool:
         """Observe state, publish generations, and drain callbacks outside lock."""
         with self._state_lock:
-            active = self._sync_trip_generation_unlocked()
+            self._sync_trip_generation_unlocked()
             should_drain = self._start_delivery_unlocked()
         if should_drain:
             self._drain_pending_listener_events()
@@ -227,22 +218,14 @@ class KillSwitch:
 
     @contextmanager
     def execution_fence(self) -> Iterator[bool]:
-        """Hold kill state stable across one in-process authority boundary.
-
-        Listener callbacks are deliberately *not* invoked here because the
-        caller may already hold the CommitGateway protocol lock. Critical
-        pending generations instead make the fence fail closed. CommitGateway
-        performs a listener-draining preflight before acquiring its protocol
-        lock, while this fence closes the race between that preflight and the
-        authority transition.
-        """
+        """Hold kill state stable across one in-process authority boundary."""
         with self._state_lock:
             active = self._sync_trip_generation_unlocked()
             blocked = active or self._has_pending_critical_events_unlocked()
             yield blocked
 
     def state(self) -> dict:
-        """Diagnostic snapshot of both mechanisms. For health/journal."""
+        """Diagnostic snapshot of both mechanisms."""
         self._observe_and_drain()
         with self._state_lock:
             path = self._config.kill_path()

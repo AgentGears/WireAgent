@@ -3,7 +3,7 @@
 ```text
 Status:   FROZEN FOR IMPLEMENTATION — REVISED BY IMPLEMENTATION EVIDENCE
 Baseline: 7d081b9
-Revision: layer-3 independent-review close-out, 2026-09-23
+Revision: layer-3 maintainer/Codex close-out, 2026-09-23
 Change rule: revise only when implementation, fault injection, live evidence,
 or an independently verified review finding falsifies an invariant or assumption.
 ```
@@ -28,14 +28,24 @@ ways that are now part of the contract:
 - durable evidence is strict JSON and is never silently coerced;
 - the mutable legacy `WriteIntent` is never re-read across a blocking commit
   sequence: the gateway captures one immutable private snapshot;
-- approval/epoch validity is rechecked after REQUIRED durability and before
-  authority exposure;
+- target lineage must be non-empty and persistable before any reservation or
+  execution authority can be created;
+- approval validity, current authorization epoch, and kill state are checked at
+  the final authority transition rather than trusted from an earlier sample;
+- direct authorization-epoch changes are fenced with final mint/consume;
 - approval validity and permit TTL use distinct process-local clock domains;
 - grant and permit TTL defaults use monotonic elapsed time, not wall-clock time;
-- permit TTL starts at actual permit mint, not at transaction entry;
-- if a durable fenced reservation exists but approval becomes invalid before
-  permit exposure, the reservation is closed `NO_EFFECT` before denial; failure
-  to close remains unresolved/fail-closed.
+- permit TTL starts at actual permit mint and is sampled again at the actual
+  consume transition after any blocking policy/epoch/kill validation;
+- external hot-file kill state is re-observed at final mint/consume boundaries,
+  without claiming impossible cross-process atomicity for a non-cooperating file
+  writer;
+- if a durable fenced reservation exists but approval becomes invalid or kill
+  blocks before permit exposure, the reservation is closed `NO_EFFECT` before
+  denial; failure to close remains unresolved/fail-closed;
+- `SAFE_*` replay semantics remain evidence claims: bookmark/remove-bookmark are
+  broker-regression-backed, while like/unlike remain `UNKNOWN`/`REQUIRED` until
+  their concrete broker surface proves state-preserving replay safety.
 
 ---
 
@@ -99,6 +109,14 @@ M5 introduces one architecture around those facts:
 - **No cross-process ledger-writer coordination in the current runtime.** M5
   layer 3 is a single-process design. A future multi-process deployment needs
   OS/file/database coordination stronger than the current process-local lock.
+- **No strict cross-process linearization for an external kill-file writer.**
+  In-process `KillSwitch.trip()` participates in the state lock and has a strict
+  process-local ordering with authority crossing. A separate process that merely
+  creates `.webwire/kill` cannot share that Python lock. The gateway therefore
+  re-observes the file at the final mint/consume boundary, closing long stale
+  windows without claiming atomicity across the final filesystem observation and
+  the following in-process transition. A stronger guarantee requires a
+  cooperating cross-process locking/protocol mechanism.
 
 ---
 
@@ -161,14 +179,19 @@ Rules:
 |---|---|---|
 | post / reply / quote (+ media variants) | `NON_IDEMPOTENT_CREATE` | `REQUIRED` |
 | delete_post | `SAFE_TARGET_DELETE` | `REQUIRED` (consequential) |
-| like / unlike | `SAFE_STATE_SET` | `BEST_EFFORT` |
+| like / unlike | `UNKNOWN` | `REQUIRED` until broker-level state-set semantics are proven |
 | bookmark / remove_bookmark | `SAFE_STATE_SET` | `BEST_EFFORT` |
 | follow / unfollow | `UNKNOWN` | `REQUIRED` until implemented and proven |
 | repost / unrepost | `UNKNOWN` | `REQUIRED` until implemented and proven |
 
-The bookmark classification depends on the directional broker contract: already
-bookmarked must be an already-satisfied no-op, never a fallback click on
-`removeBookmark`.
+The bookmark classification is a positive broker-level claim: both directional
+methods read semantic state first, already-satisfied is a zero-mutation result,
+and concrete regressions cover selector/state topology. Like/unlike are kept
+conservative even though `LikeCapability.execute()` performs a high-level
+pre-state read: the concrete broker methods remain selector-first and do not yet
+have equivalent broker-level state-preserving/coexistence regressions. Until
+that evidence exists, their replay semantics are `UNKNOWN`, not inferred safe
+from today's DOM behavior.
 
 ---
 
@@ -242,10 +265,10 @@ that no durable reservation exists merely because the append call raised.
 3. **Ambiguous reservation failure before permit mint:** no mutation authority
    was minted, but reservation bytes may exist. Claim remains held; same attempt
    and `effect_id` must retry/reconcile.
-4. **Durable reservation, then approval/epoch invalid before permit mint:** no
-   permit has been exposed, so no external mutation crossed the gateway. Append
-   durable `NO_EFFECT` and terminalize without releasing the claim back into
-   reusable approval. If that close fails, keep `RESERVED` unresolved.
+4. **Durable reservation, then approval/epoch/kill invalid before permit mint:**
+   no permit has been exposed, so no external mutation crossed the gateway.
+   Append durable `NO_EFFECT` and terminalize without releasing the claim back
+   into reusable approval. If that close fails, keep `RESERVED` unresolved.
 
 `COMMIT_ATTEMPTED`, `submit_call_started`, and `submit_call_returned` may be
 useful diagnostics but are not canonical safety states.
@@ -257,8 +280,8 @@ useful diagnostics but are not canonical safety states.
 > An ApprovalGrant is reusable only after clean, proven precommit `NO_EFFECT`.
 > It becomes irrevocably spent when the gateway grants authority capable of the
 > approved external effect. REQUIRED authority is exposed only after durable
-> reservation and a final liveness/epoch check; BEST_EFFORT authority is spent
-> at process-local permit mint.
+> reservation and a final liveness/epoch/kill check; BEST_EFFORT authority is
+> spent at process-local permit mint.
 
 ### 6.1 One immutable intent snapshot
 
@@ -277,16 +300,37 @@ Concurrent mutation of the caller-owned object after snapshot capture cannot
 change the authority being minted. A torn or changed snapshot still has to match
 the already-approved grant bindings before authority proceeds.
 
+Before any durability branch, the gateway also requires `target_type` and
+`target_id` to be genuine non-empty strings. This is an authority/lineage
+validity check, not action-specific semantic validation: Layer 3 proves that a
+permit's target can later be represented by the durable EffectLedger schema;
+Layers 4–5 remain responsible for whether a particular target is a valid X post,
+user, or other action-specific object.
+
 ### 6.2 REQUIRED protocol
 
-Lock order:
+Lock order for authorization:
 
 ```text
 gateway protocol lock
   → kill execution fence
     → policy registry fence
       → grant claim fence
+        → authorization-epoch fence at final mint
 ```
+
+Permit consumption uses:
+
+```text
+gateway protocol lock
+  → kill execution fence
+    → policy registry fence
+      → authorization-epoch fence at final consume
+```
+
+Slow REQUIRED ledger I/O remains outside the authorization-epoch fence so a
+direct `AuthorizationEpoch.bump()` can proceed while fsync is blocked and then
+be observed before authority is minted.
 
 Protocol:
 
@@ -294,11 +338,14 @@ Protocol:
 prune old expired permits
 → capture immutable intent snapshot
 → validate current grant/snapshot/policy/epoch
+→ reject missing/unpersistable target lineage
 → latch reservation_started
 → append exact RESERVED fact
 → fsync ledger (+ new directory entry where platform supports it)
 → mark attempt RESERVED
-→ revalidate grant liveness + current authorization epoch
+→ enter authorization-epoch fence
+→ callback-free re-observe current kill state
+→ revalidate grant liveness + fenced current authorization epoch
 → if still valid: spend grant
 → read gateway clock at actual mint
 → mint one permit with full TTL
@@ -306,15 +353,17 @@ prune old expired permits
 
 The second grant validation is intentional: durable I/O can block long enough
 for approval expiry or epoch revocation to become relevant before authority is
-exposed.
+exposed. The final kill refresh similarly catches external hot-file activation
+that occurred during the blocking work; it does not execute listener callbacks
+inside the authority fence.
 
-If post-reservation revalidation fails:
+If post-reservation grant/epoch/kill validation fails:
 
 ```text
 no permit exists
 → append RESERVED -> NO_EFFECT
 → terminalize attempt without restoring approval claim
-→ deny original expiry/revocation reason
+→ deny the relevant expiry/revocation/kill reason
 ```
 
 If the `NO_EFFECT` append itself fails, surface `prepermit_close_failed`, mint no
@@ -336,6 +385,9 @@ If the original reservation append reports failure:
 prune old expired permits
 → capture immutable intent snapshot
 → validate grant/snapshot/policy/epoch
+→ reject missing/unpersistable target lineage
+→ enter authorization-epoch fence
+→ callback-free re-observe current kill state
 → revalidate grant/epoch immediately before mint
 → spend grant
 → read gateway clock at actual mint
@@ -367,6 +419,13 @@ returned permit's TTL. System wall-clock correction cannot extend or prematurely
 expire the permit. Injected clocks remain supported for deterministic tests and
 special runtimes.
 
+Permit validity is also sampled at the **actual consume transition**. An early
+expiry check is only a fast path; policy/epoch/kill validation can block, so the
+gateway reads its monotonic clock again after those checks and immediately
+before setting the single-use consumed state. A permit that expires while
+waiting is closed `NO_EFFECT` as unused authority rather than crossing on a
+stale timestamp.
+
 ### 6.5 Spend is not reversed by permit expiry
 
 Permit expiry proves only that the particular permit never crossed the mutation
@@ -395,13 +454,23 @@ Listener callbacks execute **outside** the kill-state lock. Re-entrant listeners
 are tracked per listener/generation; reset+retrip cannot cause an old callback
 to satisfy a newer generation.
 
-The current epoch is checked both before REQUIRED durability and again before
-permit mint. Thus a direct epoch change during reservation I/O cannot produce a
-permit under stale authority.
+`AuthorizationEpoch` has its own process-local fence. Slow reservation I/O does
+not hold it; the gateway acquires it around final spend/mint and final permit
+consumption. A direct `bump()` therefore either occurs before the final epoch
+check and denies stale authority, or after the authority transition has already
+won. The gateway does not trust an epoch value sampled earlier in the protocol.
 
-External hot-file creation cannot share the Python lock; it retains
-check-at-observation semantics. Once observed, generation and critical
-revocation rules apply.
+Programmatic `KillSwitch.trip()` shares the kill-state lock with
+`execution_fence()`, giving the in-process active-state transition a strict
+process-local ordering with authority crossing. External hot-file creation is
+different: a non-cooperating process cannot participate in that Python lock.
+The gateway therefore performs a callback-free current-state refresh immediately
+before final permit mint and consume. If the file appeared during slow
+reservation/policy work, authority is denied; the observed generation remains
+owed to critical listeners and normal later observation drains it. There is
+still an unavoidable filesystem-observation-to-transition micro-window unless
+external writers adopt a cooperating cross-process protocol, so M5 makes no
+stronger cross-process linearizability claim.
 
 ---
 
@@ -414,15 +483,19 @@ revocation rules apply.
 5. REQUIRED reservation I/O is latched before the ledger call.
 6. No REQUIRED mutation authority is minted until reservation durability
    succeeds.
-7. Approval liveness and authorization epoch are revalidated after REQUIRED
-   durability and before permit mint.
-8. A reservation failure cannot become generic clean precommit release.
-9. A durable fenced reservation whose approval becomes invalid before permit
-   exposure closes `NO_EFFECT`; close failure remains unresolved.
-10. Permit TTL starts at actual permit mint in the gateway clock domain.
-11. Permit validation/consumption is atomic under the gateway protocol lock.
-12. Kill state/pending critical revocation, epoch, policy identity, actor,
-    target, intent, and effect scope are checked at the authority boundary.
+7. Before any reservation or permit mint, target lineage is non-empty and
+   representable by the durable ledger schema.
+8. Approval liveness, current authorization epoch, and current kill state are
+   revalidated at the final mint boundary; direct epoch changes are fenced with
+   that authority transition.
+9. A reservation failure cannot become generic clean precommit release.
+10. A durable fenced reservation whose authority becomes invalid before permit
+    exposure closes `NO_EFFECT`; close failure remains unresolved.
+11. Permit TTL starts at actual permit mint and is sampled again at the actual
+    consume transition after blocking authority checks.
+12. Permit validation/consumption is atomic under the gateway protocol lock;
+    policy identity, actor, target, intent, effect scope, epoch, kill state, and
+    TTL must all still be valid at that boundary.
 13. The gateway accepts only the exact permit object it issued and retains the
     exact canonical attempt object for terminal lifecycle mutation.
 14. Durable outcome append precedes in-memory terminalization/eviction.
@@ -479,9 +552,11 @@ restart without rewriting evidence.
 ### 10.2 Record schema
 
 Durable identity fields are genuine non-empty strings; optional lineage fields
-are either `None` or non-empty strings. Evidence is strict portable JSON:
-strings, booleans, integers, finite floats, null, lists, and string-keyed objects.
-Unsupported Python values are rejected rather than stringified.
+are either `None` or non-empty strings. Gateway execution authority uses
+non-empty target type/id so a consumed permit can always be represented by the
+terminal ledger schema. Evidence is strict portable JSON: strings, booleans,
+integers, finite floats, null, lists, and string-keyed objects. Unsupported
+Python values are rejected rather than stringified.
 
 Gateway-owned evidence fields (`attempt_id`, `grant_id`, `permit_id`, `effect`)
 cannot be overwritten by caller evidence.
@@ -567,16 +642,19 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 4. Clean proven precommit failure can preserve human approval.
 5. Only one attempt owns an approval claim at a time.
 6. One attempt owns one stable effect identity.
-7. One immutable intent snapshot owns one commit sequence's authority lineage.
+7. One immutable intent snapshot owns one commit sequence's authority lineage,
+   including a non-empty persistable target binding.
 8. REQUIRED reservation start is latched before durable I/O.
 9. Once REQUIRED reservation I/O begins, generic clean release is forbidden.
 10. No REQUIRED mutation authority is minted unless durable reservation succeeds.
-11. Approval/epoch validity is checked again after durability and before mint.
+11. Approval/epoch/kill validity is checked again at the final mint boundary;
+    direct epoch changes are fenced with authority creation.
 12. A now-invalid fenced pre-permit reservation is closed `NO_EFFECT`, or remains
     unresolved if closure cannot be persisted.
 13. Grant and permit TTLs are process-local elapsed-time authority: production
-    defaults are monotonic, permit TTL begins at actual mint, and grant/permit
-    clock values are never compared across domains.
+    defaults are monotonic, permit TTL begins at actual mint, permit expiry is
+    sampled again at actual consume, and grant/permit clock values are never
+    compared across domains.
 14. Durable unresolved reservation/unknown state blocks automatic semantic
     replay once RecoveryGuard is integrated.
 15. Explicit unknown outcomes are never blindly retried.
@@ -584,8 +662,9 @@ after concrete capabilities and RecoveryGuard have moved to M5.
     safety.
 17. Risk, authority, replay semantics, and durability are independent policy
     dimensions.
-18. Kill activation invalidates old authority; pending critical revocation is
-    fail-closed.
+18. In-process kill activation invalidates old authority with strict
+    process-local ordering; external hot-file kills are re-observed at final
+    authority boundaries and make no unsupported cross-process atomicity claim.
 19. Ledger history is monotonic and lineage-immutable; contradictory history
     fails closed.
 20. Verification and reconciliation report evidence rather than inferred
@@ -616,6 +695,10 @@ after concrete capabilities and RecoveryGuard have moved to M5.
 | T17 | Approval expires or epoch changes after REQUIRED reservation but before permit mint | No permit; durable `RESERVED -> NO_EFFECT`; attempt terminalized without approval reuse |
 | T18 | T17 close append fails | No permit; raw `RESERVED` remains unresolved/fail-closed |
 | T19 | System wall clock moves while process-local authority is live | Grant/permit TTL enforcement is unaffected because production defaults use monotonic clocks; ledger timestamps remain UTC wall time |
+| T20 | Direct authorization epoch bumps while final mint/consume is competing | Epoch fence gives one process-local ordering: stale authority is denied if bump wins; otherwise authority crossing wins first |
+| T21 | Permit expires while consume waits behind policy/epoch work | Fresh boundary-time clock denies consumption and closes the unused permit `NO_EFFECT` |
+| T22 | External hot file appears during REQUIRED reservation or blocked consume | Final callback-free re-observation denies mint/consume; fenced pre-permit reservation closes `NO_EFFECT` |
+| T23 | BEST_EFFORT grant and intent both carry empty target type or id | Gateway denies `target_missing` before permit mint; grant remains unspent, attempt PREPARING, and no ledger row exists |
 
 Additional mandatory regressions include:
 
@@ -623,12 +706,17 @@ Additional mandatory regressions include:
 - concurrent permit consumers -> exactly one successful consumption;
 - competing confirmed/unknown writers -> exactly one terminal fact;
 - live policy registration cannot interleave inside final permit consumption;
-- kill activation and authority crossing have one process-local linearization;
+- in-process kill activation and authority crossing have one process-local
+  linearization;
+- external hot-file creation during slow reservation/consume is re-observed at
+  the final boundary and blocks authority;
 - reset listener cannot suppress critical revocation;
 - re-entrant kill listeners do not recursively duplicate delivery;
 - reset+retrip creates distinct listener generations;
 - callbacks execute outside kill-state lock;
+- direct authorization-epoch bump cannot race past final mint/consume;
 - fenced unused expiry persists `NO_EFFECT` before eviction;
+- permit expiry while blocked on authority checks is re-evaluated at consume;
 - outcome APIs require canonical attempt object;
 - caller evidence cannot forge reserved correlation keys;
 - corrupt tail / malformed schema / changed lineage / illegal transitions fail
@@ -641,9 +729,12 @@ Additional mandatory regressions include:
 - terminal evidence is strict JSON and persistence failure stays retryable
   without restoring execution authority;
 - grant/attempt public lifecycle fields reject direct mutation;
-- unimplemented future mutation families remain `UNKNOWN` / `REQUIRED`;
+- `SAFE_*` policy assignments require concrete broker-level replay evidence;
+- unimplemented or unproven mutation families remain `UNKNOWN` / `REQUIRED`;
 - caller-owned intent mutation during blocked reservation cannot alter durable or
   permit lineage;
+- missing target type/id is denied before either REQUIRED reservation or
+  BEST_EFFORT permit mint;
 - permit TTL begins after slow reservation work;
 - grant expiry during reservation uses the grant clock, not the gateway clock;
 - default grant/permit authority clocks are monotonic while ledger timestamps
@@ -655,6 +746,9 @@ Additional mandatory regressions include:
 
 - Windows durability behavior is code/test-modeled but not yet verified by a
   Windows CI runner.
+- External hot-file kill activation is final-boundary re-observed but is not a
+  strict cross-process atomic transition; a stronger guarantee requires a
+  cooperating cross-process protocol.
 - live browser behavior belongs to layer-5 capability migration.
 - end-to-end restart denial belongs to layer-6 RecoveryGuard integration.
 - future reconciliation needs its own evidence-bearing terminal resolution

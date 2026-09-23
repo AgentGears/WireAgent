@@ -16,7 +16,12 @@ from webwire.safety.effect_policy import (
     EffectPolicyRegistry,
     EffectVerb,
 )
-from webwire.safety.execution_models import ApprovalGrantStore, AuthorizationEpoch, EffectAttempt
+from webwire.safety.execution_models import (
+    ApprovalGrantStore,
+    AttemptState,
+    AuthorizationEpoch,
+    EffectAttempt,
+)
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import WriteIntent
 from webwire.safety.risk_registry import DEFAULT_REGISTRY
@@ -300,8 +305,6 @@ def test_failing_kill_listener_cannot_suppress_epoch_listener(tmp_path: Path) ->
         authorization_epoch=epoch,
     )
 
-    # trip() itself must not propagate the listener failure, and the later
-    # gateway listener must still revoke the authorization epoch.
     kill.trip()
     assert epoch.current == 1
     assert calls == 1
@@ -340,7 +343,7 @@ def test_terminal_evidence_cannot_override_gateway_owned_fields(
             evidence={reserved_key: "forged"},
         )
 
-    assert attempt.state is EffectState.RESERVED or attempt.state.value == "reserved"
+    assert attempt.state is AttemptState.RESERVED
     assert permit.permit_id in gateway._issued_permits
     assert [record.state for record in ledger.read_records()] == [EffectState.RESERVED]
 

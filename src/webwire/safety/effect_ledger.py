@@ -108,19 +108,43 @@ class EffectLedgerRecord:
         self.validate()
 
     def validate(self) -> None:
-        required = {
+        required_strings = {
             "effect_id": self.effect_id,
             "semantic_key": self.semantic_key,
             "action_type": self.action_type,
             "intent_hash": self.intent_hash,
             "policy_binding": self.policy_binding,
+            "timestamp": self.timestamp,
         }
-        for name, value in required.items():
+        for name, value in required_strings.items():
             if not isinstance(value, str) or not value:
                 raise ValueError(
                     f"effect ledger record field {name!r} must be a non-empty "
                     f"string, got {type(value).__name__}"
                 )
+
+        optional_strings = {
+            "actor_id": self.actor_id,
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+        }
+        for name, value in optional_strings.items():
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(
+                    f"effect ledger record field {name!r} must be None or a "
+                    f"non-empty string, got {type(value).__name__}"
+                )
+
+        if not isinstance(self.state, EffectState):
+            raise ValueError(
+                "effect ledger record field 'state' must be an EffectState, "
+                f"got {type(self.state).__name__}"
+            )
+        if not isinstance(self.details, dict):
+            raise ValueError(
+                "effect ledger record field 'details' must be a dict, "
+                f"got {type(self.details).__name__}"
+            )
 
     def to_jsonl(self) -> str:
         self.validate()

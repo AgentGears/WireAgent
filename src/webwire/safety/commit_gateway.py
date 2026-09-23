@@ -14,6 +14,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -64,6 +65,36 @@ class GatewayDenied(RuntimeError):
 
 class GatewayStateError(RuntimeError):
     """Gateway/outcome API was called with an inconsistent lifecycle object."""
+
+
+@dataclass(frozen=True)
+class _IntentSnapshot:
+    """Private immutable authority view captured from a mutable WriteIntent.
+
+    ``WriteIntent`` predates M5 and remains mutable for the legacy write path.
+    The gateway must never validate one version and later re-read another. A
+    private deep-copied intent is reduced immediately to the exact immutable
+    strings used by approval, reservation, and permit lineage.
+    """
+
+    action_type: str
+    target_type: str
+    target_id: str
+    actor_id: str
+    semantic_key: str
+    intent_hash: str
+
+    @classmethod
+    def capture(cls, intent: WriteIntent) -> "_IntentSnapshot":
+        frozen = deepcopy(intent)
+        return cls(
+            action_type=frozen.action_type,
+            target_type=frozen.target_type,
+            target_id=frozen.target_id,
+            actor_id=frozen.actor_identity or "",
+            semantic_key=frozen.dedupe_key(),
+            intent_hash=frozen.intent_hash(),
+        )
 
 
 @dataclass
@@ -235,9 +266,11 @@ class CommitGateway:
     def _validate_grant_identity(
         grant: ApprovalGrant,
         attempt: EffectAttempt,
-        intent: WriteIntent,
+        snapshot: _IntentSnapshot,
         policy_binding: str,
         authorization_epoch: int,
+        *,
+        now: float,
     ) -> None:
         if attempt.grant_id != grant.grant_id:
             raise GatewayDenied("grant_mismatch")
@@ -247,22 +280,65 @@ class CommitGateway:
             raise GatewayDenied("attempt_not_preparing", attempt.state.value)
         if grant.state is not GrantState.ACTIVE:
             raise GatewayDenied("grant_not_active", grant.state.value)
-        if grant.action_type != intent.action_type:
+        if grant.action_type != snapshot.action_type:
             raise GatewayDenied("action_mismatch")
-        if grant.target_type != intent.target_type or grant.target_id != intent.target_id:
+        if (
+            grant.target_type != snapshot.target_type
+            or grant.target_id != snapshot.target_id
+        ):
             raise GatewayDenied("target_mismatch")
-        actor = intent.actor_identity
-        if not actor or actor != grant.actor_id:
+        if not snapshot.actor_id or snapshot.actor_id != grant.actor_id:
             raise GatewayDenied("actor_mismatch")
         try:
             grant.validate_live(
-                intent_hash=intent.intent_hash(),
-                actor_id=actor,
+                intent_hash=snapshot.intent_hash,
+                actor_id=snapshot.actor_id,
                 policy_binding=policy_binding,
                 authorization_epoch=authorization_epoch,
+                now=now,
             )
         except GrantClaimDenied as exc:
             raise GatewayDenied(exc.reason, str(exc)) from exc
+
+    def _close_reserved_before_permit(
+        self,
+        *,
+        grant: ApprovalGrant,
+        attempt: EffectAttempt,
+        snapshot: _IntentSnapshot,
+        policy_binding: str,
+        reason: str,
+    ) -> None:
+        """Close a durable reservation when authority becomes invalid pre-mint.
+
+        At this point the reservation is known durable and no EffectPermit has
+        been exposed, so the gateway can prove that no external mutation crossed
+        its boundary. The grant may already be EXPIRED/REVOKED, therefore the
+        attempt terminalizes without releasing the claim back into reusable
+        approval.
+        """
+        try:
+            self._ledger.append_durable(
+                EffectLedgerRecord(
+                    effect_id=attempt.effect_id,
+                    semantic_key=snapshot.semantic_key,
+                    state=EffectState.NO_EFFECT,
+                    action_type=snapshot.action_type,
+                    intent_hash=snapshot.intent_hash,
+                    policy_binding=policy_binding,
+                    actor_id=snapshot.actor_id,
+                    target_type=snapshot.target_type,
+                    target_id=snapshot.target_id,
+                    details={
+                        "attempt_id": attempt.attempt_id,
+                        "grant_id": grant.grant_id,
+                        "reason": reason,
+                    },
+                )
+            )
+        except EffectLedgerError as exc:
+            raise GatewayDenied("prepermit_close_failed", str(exc)) from exc
+        attempt.mark_no_effect_after_authority()
 
     def authorize_commit(
         self,
@@ -277,15 +353,19 @@ class CommitGateway:
         reservation write becomes ambiguous (for example, bytes were written
         before fsync reported failure), retrying this same attempt targets the
         same ledger fact rather than manufacturing a second reservation.
+
+        ``WriteIntent`` itself is mutable legacy state. The gateway captures one
+        private immutable snapshot after housekeeping and never re-reads the
+        caller-owned object during validation, reservation, or permit minting.
         """
         self._preflight_kill_notifications()
         with self._protocol_lock:
             with self._kill.execution_fence() as blocked:
                 self._deny_if_killed(blocked)
-                now = self._clock()
-                self._prune_expired_unconsumed(now)
+                self._prune_expired_unconsumed(self._clock())
+                snapshot = _IntentSnapshot.capture(intent)
                 try:
-                    policy_fence = self._policies.policy_fence(intent.action_type)
+                    policy_fence = self._policies.policy_fence(snapshot.action_type)
                     with policy_fence as policy:
                         binding = policy.binding_hash()
                         epoch = self._epoch.current
@@ -293,13 +373,14 @@ class CommitGateway:
                             self._validate_grant_identity(
                                 grant,
                                 attempt,
-                                intent,
+                                snapshot,
                                 binding,
                                 epoch,
+                                now=self._clock(),
                             )
 
                             effect_id = attempt.effect_id
-                            semantic_key = intent.dedupe_key()
+                            semantic_key = snapshot.semantic_key
                             fenced = policy.durability is DurabilityPolicy.REQUIRED
 
                             if fenced:
@@ -310,12 +391,12 @@ class CommitGateway:
                                     effect_id=effect_id,
                                     semantic_key=semantic_key,
                                     state=EffectState.RESERVED,
-                                    action_type=intent.action_type,
-                                    intent_hash=intent.intent_hash(),
+                                    action_type=snapshot.action_type,
+                                    intent_hash=snapshot.intent_hash,
                                     policy_binding=binding,
-                                    actor_id=intent.actor_identity,
-                                    target_type=intent.target_type,
-                                    target_id=intent.target_id,
+                                    actor_id=snapshot.actor_id,
+                                    target_type=snapshot.target_type,
+                                    target_id=snapshot.target_id,
                                     details={
                                         "attempt_id": attempt.attempt_id,
                                         "grant_id": grant.grant_id,
@@ -330,23 +411,47 @@ class CommitGateway:
                                     ) from exc
                                 attempt.mark_reserved(grant)
 
+                            # Durable I/O and opportunistic expiry closure can
+                            # consume wall-clock time. Approval/epoch validity is
+                            # checked again at the actual authority-mint point.
+                            mint_now = self._clock()
+                            mint_epoch = self._epoch.current
+                            try:
+                                grant.validate_live(
+                                    intent_hash=snapshot.intent_hash,
+                                    actor_id=snapshot.actor_id,
+                                    policy_binding=binding,
+                                    authorization_epoch=mint_epoch,
+                                    now=mint_now,
+                                )
+                            except GrantClaimDenied as exc:
+                                if fenced and attempt.state is AttemptState.RESERVED:
+                                    self._close_reserved_before_permit(
+                                        grant=grant,
+                                        attempt=attempt,
+                                        snapshot=snapshot,
+                                        policy_binding=binding,
+                                        reason=f"{exc.reason}_before_permit",
+                                    )
+                                raise GatewayDenied(exc.reason, str(exc)) from exc
+
                             grant.spend()
                             permit = EffectPermit(
                                 grant_id=grant.grant_id,
                                 attempt_id=attempt.attempt_id,
                                 effect_id=effect_id,
                                 semantic_key=semantic_key,
-                                intent_hash=intent.intent_hash(),
-                                actor_id=intent.actor_identity or "",
-                                action_type=intent.action_type,
-                                target_type=intent.target_type,
-                                target_id=intent.target_id,
+                                intent_hash=snapshot.intent_hash,
+                                actor_id=snapshot.actor_id,
+                                action_type=snapshot.action_type,
+                                target_type=snapshot.target_type,
+                                target_id=snapshot.target_id,
                                 policy_binding=binding,
-                                authorization_epoch=epoch,
+                                authorization_epoch=mint_epoch,
                                 allowed_effects=policy.allowed_effects,
                                 fenced=fenced,
-                                issued_at=now,
-                                expires_at=now + self._permit_ttl,
+                                issued_at=mint_now,
+                                expires_at=mint_now + self._permit_ttl,
                             )
                             self._issued_permits[permit.permit_id] = permit
                             self._issued_attempts[permit.permit_id] = attempt

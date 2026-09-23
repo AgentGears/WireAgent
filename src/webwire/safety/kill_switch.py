@@ -177,6 +177,10 @@ class KillSwitch:
                     self._sync_trip_generation_unlocked()
                     candidate = self._select_pending_event_unlocked(attempted)
                     if candidate is None:
+                        # Publish idleness atomically with the no-work decision.
+                        # Any producer that queues work after this lock release
+                        # sees ``_notifying == False`` and starts the next drain.
+                        self._notifying = False
                         return
                     index, target_generation, listener = candidate
                     attempted.append((index, target_generation))
@@ -196,9 +200,13 @@ class KillSwitch:
                             current = self._listener_generations[index]
                             if current < target_generation:
                                 self._listener_generations[index] = target_generation
-        finally:
+        except BaseException:
+            # Normal shutdown clears the latch inside the same critical section
+            # that proved there was no eligible work. This exceptional path is
+            # only a fail-safe for unexpected internal/BaseException exits.
             with self._state_lock:
                 self._notifying = False
+            raise
 
     def _observe_and_drain(self) -> bool:
         """Observe state, publish generations, and drain callbacks outside lock."""

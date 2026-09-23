@@ -13,8 +13,9 @@ Per the Phase 0a design (Point 3 decision):
 M5 layer 3 adds trip listeners. The Commit Gateway binds the authorization
 epoch to this hook so a trip revokes already-minted execution authority even
 if the operator later resets the kill switch. Hot-file trips are detected on
-the next ``tripped()`` observation. Notification is tracked per listener, so a
-listener registered while a trip is already active is notified immediately.
+the next ``tripped()`` observation. Listener delivery is tied to a monotonically
+increasing trip generation, so re-entrant reset/retrip cannot make a callback
+from one activation count as notification for a later activation.
 
 Programmatic trip/reset and M5 authority crossing share the state lock exposed
 by :meth:`execution_fence`. This gives them a process-local linearization point:
@@ -49,10 +50,16 @@ class KillSwitch:
         self._flag: bool = False
         self._trip_listeners: list[Callable[[], object]] = []
         self._notified_listeners: list[Callable[[], object]] = []
-        # Re-entrant listener callbacks may call tripped()/trip()/add_listener()
-        # while this RLock is held. Track callbacks currently executing so the
-        # nested refresh skips them instead of recursively invoking them again.
         self._listeners_in_progress: list[Callable[[], object]] = []
+        # ``_last_active`` + ``_trip_generation`` identify distinct observed
+        # inactive -> active transitions. The generation is the once-per-trip
+        # identity; a callback may reset and retrip while the RLock is re-entered.
+        self._last_active = False
+        self._trip_generation = 0
+        # Nested refreshes during a callback update active/generation state but
+        # never start a second notification traversal. The outer traversal drains
+        # all pending listeners for the newest generation after the callback exits.
+        self._notifying = False
         env_var = self._config.kill_env_var
         if env_var and os.environ.get(env_var, "").lower() in ("1", "true", "yes"):
             self._flag = True
@@ -64,63 +71,11 @@ class KillSwitch:
     # -- trip listeners ------------------------------------------------------
 
     def add_trip_listener(self, listener: Callable[[], object]) -> None:
-        """Invoke ``listener`` once for the current trip and once per future trip.
-
-        If the switch is already active when a new listener is registered, that
-        listener is notified immediately even if earlier listeners were already
-        notified. This is required for authorization-epoch revocation when a
-        CommitGateway is constructed during an existing trip.
-        """
+        """Invoke ``listener`` once for the current trip and once per future trip."""
         with self._state_lock:
             if listener not in self._trip_listeners:
                 self._trip_listeners.append(listener)
             self._refresh_trip_unlocked()
-
-    def _notify_active_listeners_unlocked(self) -> None:
-        """Notify each listener at most once per active trip.
-
-        A callback is marked in-progress *before* invocation so a re-entrant
-        call to ``tripped()``, ``trip()``, or ``add_trip_listener()`` cannot
-        invoke the same callback recursively through the RLock. Successful
-        listeners become notified for the current active trip. Failed listeners
-        are removed from the in-progress marker and remain unnotified so a later
-        observation can retry them. One failure never blocks later listeners.
-        Caller must hold ``_state_lock``.
-        """
-        for listener in tuple(self._trip_listeners):
-            # A trusted callback can re-enter and reset the switch. If that
-            # happens, stop delivering callbacks for the trip that no longer
-            # exists; a future trip starts a fresh notification cycle.
-            if not self._active_unlocked():
-                break
-            if (
-                listener in self._notified_listeners
-                or listener in self._listeners_in_progress
-            ):
-                continue
-
-            self._listeners_in_progress.append(listener)
-            succeeded = False
-            try:
-                listener()
-                succeeded = True
-            except Exception:
-                logger.exception("KillSwitch trip listener failed: %r", listener)
-            finally:
-                # Remove only this invocation's marker. The list form avoids
-                # imposing hashability requirements on arbitrary callables.
-                if listener in self._listeners_in_progress:
-                    self._listeners_in_progress.remove(listener)
-
-            # A callback is allowed to re-enter the switch and even reset it.
-            # Only mark it notified when the trip is still active afterwards;
-            # otherwise the next future trip must be able to notify it again.
-            if (
-                succeeded
-                and self._active_unlocked()
-                and listener not in self._notified_listeners
-            ):
-                self._notified_listeners.append(listener)
 
     def _active_unlocked(self) -> bool:
         if self._flag:
@@ -131,13 +86,100 @@ class KillSwitch:
             # If state cannot be observed reliably, fail closed.
             return True
 
-    def _refresh_trip_unlocked(self) -> bool:
-        """Refresh active state/listeners. Caller must hold ``_state_lock``."""
+    def _sync_trip_generation_unlocked(self) -> bool:
+        """Observe active state and advance generation on a fresh activation."""
         active = self._active_unlocked()
-        if active:
-            self._notify_active_listeners_unlocked()
-        else:
+        if active and not self._last_active:
+            self._trip_generation += 1
             self._notified_listeners.clear()
+        elif not active and self._last_active:
+            self._notified_listeners.clear()
+        self._last_active = active
+        return active
+
+    def _notify_active_listeners_unlocked(self) -> None:
+        """Drain pending callbacks for the current trip generation.
+
+        Only the outermost notification traversal invokes callbacks. Re-entrant
+        ``tripped()``, ``trip()``, ``reset()``, or ``add_trip_listener()`` calls
+        may update active/generation state, but they cannot recursively invoke a
+        callback. If a callback resets and retrips, its successful invocation is
+        credited only to the generation captured before it ran; the traversal
+        then restarts and delivers the callback again for the new generation.
+        Failed callbacks remain unnotified and retry on a later observation.
+        Caller must hold ``_state_lock``.
+        """
+        if self._notifying:
+            return
+
+        self._notifying = True
+        try:
+            while True:
+                if not self._sync_trip_generation_unlocked():
+                    return
+                generation = self._trip_generation
+                pending = [
+                    listener
+                    for listener in tuple(self._trip_listeners)
+                    if listener not in self._notified_listeners
+                    and listener not in self._listeners_in_progress
+                ]
+                if not pending:
+                    return
+
+                generation_changed = False
+                made_progress = False
+                for listener in pending:
+                    if not self._sync_trip_generation_unlocked():
+                        return
+                    if self._trip_generation != generation:
+                        generation_changed = True
+                        break
+                    if (
+                        listener in self._notified_listeners
+                        or listener in self._listeners_in_progress
+                    ):
+                        continue
+
+                    self._listeners_in_progress.append(listener)
+                    succeeded = False
+                    try:
+                        listener()
+                        succeeded = True
+                    except Exception:
+                        logger.exception("KillSwitch trip listener failed: %r", listener)
+                    finally:
+                        if listener in self._listeners_in_progress:
+                            self._listeners_in_progress.remove(listener)
+
+                    active = self._sync_trip_generation_unlocked()
+                    if active and self._trip_generation == generation and succeeded:
+                        if listener not in self._notified_listeners:
+                            self._notified_listeners.append(listener)
+                        made_progress = True
+                    elif self._trip_generation != generation:
+                        # The callback reset then retripped. Do not credit its old
+                        # invocation to the new generation; restart from the top.
+                        generation_changed = True
+                        break
+                    elif not active:
+                        return
+                    # On failure, leave it pending but do not spin in this same
+                    # traversal. Later tripped()/trip() observation performs retry.
+
+                if generation_changed:
+                    continue
+                if not made_progress:
+                    return
+        finally:
+            self._notifying = False
+
+    def _refresh_trip_unlocked(self) -> bool:
+        """Refresh active generation and listeners. Caller holds ``_state_lock``."""
+        active = self._sync_trip_generation_unlocked()
+        if active and not self._notifying:
+            self._notify_active_listeners_unlocked()
+            active = self._sync_trip_generation_unlocked()
         return active
 
     # -- query ---------------------------------------------------------------
@@ -149,15 +191,7 @@ class KillSwitch:
 
     @contextmanager
     def execution_fence(self) -> Iterator[bool]:
-        """Hold kill state stable across one in-process authority boundary.
-
-        The yielded boolean is the current trip state. While the context is
-        held, :meth:`trip` and :meth:`reset` cannot interleave with the caller.
-        This is the synchronization primitive used by M5's CommitGateway for
-        authorization and permit consumption. It deliberately cannot serialize
-        an external process creating the hot file; that source remains governed
-        by boundary-time observation.
-        """
+        """Hold kill state stable across one in-process authority boundary."""
         with self._state_lock:
             yield self._refresh_trip_unlocked()
 
@@ -181,13 +215,7 @@ class KillSwitch:
     # -- mutations -----------------------------------------------------------
 
     def trip(self) -> None:
-        """Atomically activate the in-process trip and notify listeners.
-
-        The state lock is also held by CommitGateway authority boundaries. A
-        concurrent boundary therefore linearizes wholly before or wholly after
-        this activation; it cannot pass a stale kill/epoch check and then cross
-        after the trip becomes active.
-        """
+        """Atomically activate the in-process trip and notify this generation."""
         with self._state_lock:
             self._flag = True
             path = self._config.kill_path()
@@ -196,7 +224,7 @@ class KillSwitch:
                 path.touch()
             except OSError as exc:
                 logger.warning("Could not write kill hot file %s: %r", path, exc)
-            self._notify_active_listeners_unlocked()
+            self._refresh_trip_unlocked()
         logger.warning("KillSwitch tripped")
 
     def reset(self) -> None:

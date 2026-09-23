@@ -94,6 +94,30 @@ def test_retry_same_terminal_fact_redurables_without_duplicate(
     ]
 
 
+def test_exact_fact_redurability_uses_writable_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = EffectLedger(path=tmp_path / "effects.ndjson")
+    reservation = _record(EffectState.RESERVED)
+    ledger.append_durable(reservation)
+
+    real_open = os.open
+    seen_flags: list[int] = []
+
+    def tracking_open(path, flags, *args):  # type: ignore[no-untyped-def]
+        if Path(path) == ledger.path:
+            seen_flags.append(flags)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    ledger.append_durable(reservation)
+
+    assert seen_flags
+    assert seen_flags[-1] & os.O_RDWR == os.O_RDWR
+    assert len(ledger.read_records()) == 1
+
+
 def test_retry_with_changed_evidence_is_not_silently_accepted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

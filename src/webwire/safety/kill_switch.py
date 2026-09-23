@@ -49,6 +49,10 @@ class KillSwitch:
         self._flag: bool = False
         self._trip_listeners: list[Callable[[], object]] = []
         self._notified_listeners: list[Callable[[], object]] = []
+        # Re-entrant listener callbacks may call tripped()/trip()/add_listener()
+        # while this RLock is held. Track callbacks currently executing so the
+        # nested refresh skips them instead of recursively invoking them again.
+        self._listeners_in_progress: list[Callable[[], object]] = []
         env_var = self._config.kill_env_var
         if env_var and os.environ.get(env_var, "").lower() in ("1", "true", "yes"):
             self._flag = True
@@ -73,21 +77,45 @@ class KillSwitch:
             self._refresh_trip_unlocked()
 
     def _notify_active_listeners_unlocked(self) -> None:
-        """Notify every unnotified listener; one failure cannot block the rest.
+        """Notify each listener at most once per active trip.
 
-        Failed listeners remain unnotified so a later observation of the same
-        active trip retries them. Successful listeners are marked exactly once
-        for that trip. Caller must hold ``_state_lock``.
+        A callback is marked in-progress *before* invocation so a re-entrant
+        call to ``tripped()``, ``trip()``, or ``add_trip_listener()`` cannot
+        invoke the same callback recursively through the RLock. Successful
+        listeners become notified for the current active trip. Failed listeners
+        are removed from the in-progress marker and remain unnotified so a later
+        observation can retry them. One failure never blocks later listeners.
+        Caller must hold ``_state_lock``.
         """
         for listener in tuple(self._trip_listeners):
-            if listener in self._notified_listeners:
+            if (
+                listener in self._notified_listeners
+                or listener in self._listeners_in_progress
+            ):
                 continue
+
+            self._listeners_in_progress.append(listener)
+            succeeded = False
             try:
                 listener()
+                succeeded = True
             except Exception:
                 logger.exception("KillSwitch trip listener failed: %r", listener)
-                continue
-            self._notified_listeners.append(listener)
+            finally:
+                # Remove only this invocation's marker. The list form avoids
+                # imposing hashability requirements on arbitrary callables.
+                if listener in self._listeners_in_progress:
+                    self._listeners_in_progress.remove(listener)
+
+            # A callback is allowed to re-enter the switch and even reset it.
+            # Only mark it notified when the trip is still active afterwards;
+            # otherwise the next future trip must be able to notify it again.
+            if (
+                succeeded
+                and self._active_unlocked()
+                and listener not in self._notified_listeners
+            ):
+                self._notified_listeners.append(listener)
 
     def _active_unlocked(self) -> bool:
         if self._flag:

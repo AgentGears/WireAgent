@@ -20,7 +20,7 @@
 ## Current version
 
 **v0.3 stabilized live path + M5 layer-3 candidate** — 20 live/implemented
-capabilities; **458 tests** on the reviewed M5 branch; CI-enforced on Python
+capabilities; **467 tests** on the reviewed M5 branch; CI-enforced on Python
 3.11/3.12; Ruff clean; mypy clean across 51 source files.
 
 M5 status:
@@ -54,8 +54,10 @@ RecoveryGuard onto M5.
    them.** Registry tier-gates; WRITE registration is allowed but current live
    routing remains through the WriteKernel pipeline until M5 layer 5.
 4. **Kill switch is checked at dispatcher top AND mutation boundaries.** Kill
-   dominates unsupported resolution. M5 additionally linearizes process-local
-   trip activation with commit authority and generation-based epoch revocation.
+   dominates unsupported resolution. M5 strictly linearizes in-process trip
+   activation with commit authority and generation-based epoch revocation.
+   External hot-file activation is re-observed at final mint/consume boundaries
+   but is not falsely claimed to be a cross-process atomic transition.
 5. **Persistence is a convenience, not an auth authority source.**
    `load_session` success means only cookies loaded. `whoami` is the real auth
    gate. Never save a logged-out jar over a known-good file.
@@ -64,13 +66,18 @@ RecoveryGuard onto M5.
 7. **Verify resolved values, not just ok=True.** This has caught real production
    bugs repeatedly; it remains project law.
 8. **Writes are semantic, not toggle-based.** `click_like()` ≠ `click_unlike()`;
-   bookmark/remove-bookmark are directional state-setting operations.
+   bookmark/remove-bookmark are directional state-setting operations. A
+   replay-safety policy claim is made only when the concrete broker behavior is
+   regression-proven; like/unlike therefore remain M5 `UNKNOWN`/`REQUIRED` for
+   now even though the higher-level capability performs a pre-state read.
 9. **Compensation reverses only THIS invocation's delta.** Pre-existing state →
    `already_satisfied` no-op, no compensation.
 10. **Public content writes require frozen intent.** Legacy path binds normalized
     text/media into the confirmation token. M5 additionally captures one private
     immutable intent snapshot for the full commit sequence and never re-reads
     the caller-owned mutable `WriteIntent` across blocking reservation I/O.
+    Commit authority also requires non-empty target type/id so the lineage is
+    representable by the durable EffectLedger schema.
 11. **Composer DOM read-back before submit.** The last pre-submit assertion
     proves what the browser is about to submit.
 12. **Final kill switch before irreversible submit.** "Hand on the button."
@@ -90,12 +97,14 @@ RecoveryGuard onto M5.
 17. **One M5 attempt owns one stable effect identity.** Ambiguous fsync retry
     targets the same fact; REQUIRED reservation start is latched before I/O and
     forbids generic clean release afterward.
-18. **Approval, intent, and permit time are distinct authority concepts.** Grant
-    expiry and permit TTL are process-local elapsed-time authority and default to
-    monotonic clocks; permit TTL begins at actual mint. Grant and gateway clock
-    values are never compared directly. Approval/epoch validity is rechecked
-    after REQUIRED durability before authority is exposed. Durable ledger
-    timestamps remain UTC wall-clock provenance.
+18. **Approval, intent, epoch, and permit time are distinct authority concepts.**
+    Grant expiry and permit TTL are process-local elapsed-time authority and
+    default to monotonic clocks; permit TTL begins at actual mint and is sampled
+    again at the actual consume transition after blocking policy/epoch/kill
+    checks. Grant and gateway clock values are never compared directly. Direct
+    authorization-epoch changes are fenced with final mint/consume; approval,
+    epoch, and kill validity are rechecked at final authority boundaries.
+    Durable ledger timestamps remain UTC wall-clock provenance.
 19. **Never blindly replay explicit uncertainty.** Durable `RESERVED` or
     `EFFECT_UNKNOWN` requires reconciliation once RecoveryGuard is integrated.
 20. **Same-process least authority is not a hostile-code sandbox.** Untrusted
@@ -114,25 +123,38 @@ an independently verified review finding falsifies an assumption.
 Key current layer-3 facts:
 
 - `EffectPolicy` separates impact, semantic authority, replay semantics, and
-  durability.
+  durability. `SAFE_*` is positive evidence, not a convenience label:
+  bookmark/remove-bookmark are `SAFE_STATE_SET`/BEST_EFFORT; like/unlike remain
+  `UNKNOWN`/REQUIRED until concrete broker-level replay safety is proven.
 - `ApprovalGrant` is intentionally ephemeral; durable safety state belongs to
   the EffectLedger, not persisted confirmation tokens.
 - `EffectAttempt` owns stable `attempt_id`, stable `effect_id`, and the monotonic
   `reservation_started` latch.
-- `CommitGateway` holds protocol → kill fence → policy fence → grant claim fence
-  through authority creation.
-- REQUIRED: snapshot → validate → latch → durable `RESERVED` → revalidate
-  grant/epoch → spend → mint.
-- BEST_EFFORT: only proven replay-safe semantics may omit precommit reservation.
-- process-local approval/permit TTL defaults use `time.monotonic()`; ledger
-  timestamps remain UTC wall time.
+- `CommitGateway` authorization lock order is protocol → kill fence → policy
+  fence → grant claim fence, with the authorization-epoch fence held only at the
+  final authority transition. Permit consumption uses protocol → kill → policy
+  → epoch.
+- Every permit target is validated as non-empty/persistable before either a
+  REQUIRED reservation or a BEST_EFFORT permit can be created.
+- REQUIRED: snapshot → validate target/bindings → latch → durable `RESERVED` →
+  final callback-free kill refresh + fenced epoch/grant revalidation → spend →
+  mint.
+- BEST_EFFORT: only proven replay-safe semantics may omit precommit reservation;
+  final kill/epoch validity is still checked before spend/mint.
+- process-local approval/permit TTL defaults use `time.monotonic()`; permit TTL
+  begins at actual mint and is re-sampled immediately before consumption after
+  blocking authority checks. Ledger timestamps remain UTC wall time.
+- in-process `trip()` is process-local lock-linearized with authority crossing;
+  external hot-file creation is callback-free re-observed at final mint/consume
+  but cannot be made strictly cross-process atomic without a cooperating lock
+  protocol.
 - `EffectLedger` validates strict schema, immutable lineage, monotonic states,
   and same-path process-local writer serialization.
 - Exact same-fact retry re-fsyncs a visible-but-ambiguously-durable row instead
   of appending a duplicate.
-- If a durable fenced reservation exists but approval expires/revokes before
-  permit mint, the gateway records `NO_EFFECT`; if that close fails, the raw
-  `RESERVED` remains unresolved and no authority is minted.
+- If a durable fenced reservation exists but approval/epoch/kill becomes invalid
+  before permit mint, the gateway records `NO_EFFECT`; if that close fails, the
+  raw `RESERVED` remains unresolved and no authority is minted.
 - Layer 4+ remains required before this boundary governs concrete browser writes.
 
 ## Phase plan
@@ -164,7 +186,7 @@ Key current layer-3 facts:
 | **v0.2 M4c** | quote_multi_image | **LIVE-VERIFIED** |
 | **M5 L1** | EffectPolicy + durable EffectLedger | **DONE** |
 | **M5 L2** | ApprovalGrant + EffectAttempt | **DONE** |
-| **M5 L3** | CommitGateway + EffectPermit | **CANDIDATE — 458 green / independently reviewed** |
+| **M5 L3** | CommitGateway + EffectPermit | **CANDIDATE — 467 green / independently reviewed** |
 | **M5 L4** | scoped broker authorities | **NEXT** |
 | **M5 L5** | concrete capability migration | pending |
 | **M5 L6** | RecoveryGuard | pending |
@@ -213,19 +235,22 @@ Legacy live path:
 
 M5 layer-3 additions:
 
-- `EffectPolicy` replay/durability derivation;
+- `EffectPolicy` replay/durability derivation with evidence-backed SAFE claims;
 - `EffectLedger` at `.webwire/effects.ndjson`;
 - sealed `ApprovalGrant` / `EffectAttempt` lifecycle;
 - stable attempt-owned `effect_id`;
 - reservation-start latch;
 - process-local `CommitGateway` protocol lock;
 - generation-based critical kill revocation + authorization epoch;
+- direct authorization-epoch fence at final mint/consume;
+- callback-free external hot-file refresh at final authority boundaries;
 - policy fence across live-policy validation/consume;
 - exact-object `EffectPermit` and canonical-attempt lineage;
 - private immutable intent snapshot across blocking commit work;
-- mint-time permit TTL;
+- non-empty persistable target lineage before authority creation;
+- mint-time permit TTL + boundary-time consume expiry check;
 - monotonic default clocks for grant/permit authority TTLs;
-- post-durability grant/epoch revalidation;
+- post-durability grant/epoch/kill revalidation;
 - durable terminal outcomes before in-memory terminalization;
 - strict JSON evidence and reserved correlation-key protection;
 - per-path process-local ledger writer serialization;
@@ -281,8 +306,14 @@ M5 layer-3 additions:
   resolved states/events rather than overwrite.
 - [ ] **Cross-process EffectLedger writers** — unsupported by current
   single-process contract; would need stronger OS/database coordination.
+- [ ] **External kill-file cross-process atomicity** — final-boundary
+  re-observation closes long stale windows, but strict ordering with a separate
+  file writer requires a cooperating cross-process lock/protocol.
 - [ ] **Windows durability runner evidence** — implementation models Windows
   honestly, but CI currently runs Ubuntu only.
+- [ ] **Like/unlike BEST_EFFORT evidence** — M5 intentionally keeps these
+  `UNKNOWN`/`REQUIRED` until the concrete broker gets state-first/coexistence
+  regressions comparable to bookmark/remove-bookmark.
 - [x] ~~Bookmark mutation-as-probe~~ — fixed: directional state-read-first
   behavior; already-bookmarked is zero-mutation already-satisfied.
 - [x] ~~M4c quote_multi_image~~ — LIVE-VERIFIED 2026-09-23.
@@ -309,6 +340,24 @@ M5 layer-3 additions:
 
 ## History
 
+- 2026-09-23 (s): **M5 L3 MAINTAINER/CODEX CLOSE-OUT.** After the prior
+  `fb5620a` candidate, a fresh maintainer-first pass found and fixed: direct
+  authorization-epoch mint/consume races (epoch fence); unsupported
+  like/unlike SAFE/BEST_EFFORT classification (downgraded to
+  `UNKNOWN`/`REQUIRED` pending broker-level proof); stale permit expiry sampled
+  before blocking consume fences (fresh boundary-time monotonic check); and
+  external hot-file activation observed only at gateway entry (callback-free
+  final-boundary refresh, with cross-process atomicity explicitly not claimed).
+  Frozen runtime `3c5e845` passed **465 tests**, Ruff, and mypy on Python
+  3.11/3.12 (CI #104), then received an exact-head Codex review whose only new
+  finding was the already-known normative policy-table drift. Enumerating older
+  unresolved review threads surfaced one still-valid P2: an empty BEST_EFFORT
+  target could mint/consume authority but later fail EffectLedger terminal
+  persistence. Independently reproduced on the current runtime and fixed at the
+  gateway pre-mint boundary with `target_missing`; BEST_EFFORT bookmark
+  regressions cover empty target type and id. Final reviewed runtime
+  `28156253`: **467 tests**, Ruff clean, mypy clean over 51 source files,
+  Python 3.11/3.12 green (CI #107). Layer 4 scoped authorities remains next.
 - 2026-09-23 (r): **M5 L3 FINAL CLOCK-DOMAIN HARDENING.** Targeted final Codex
   review found one additional P2 after the 455-test candidate: process-local
   grant/permit authority TTLs defaulted to `time.time()`, so wall-clock rollback

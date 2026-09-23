@@ -13,7 +13,7 @@ Per the Phase 0a design (Point 3 decision):
 M5 layer 3 adds trip listeners. The Commit Gateway binds the authorization
 epoch to a *critical* listener so a trip revokes already-minted execution
 authority even if the operator later resets the kill switch. Hot-file trips are
-detected on the next observation.
+detected on observation and re-observed at final M5 authority transitions.
 
 Trip notification is event-based, not merely derived from the current boolean
 state. Each observed inactive -> active transition creates a monotonically
@@ -31,8 +31,10 @@ window.
 
 Programmatic trip/reset and M5 authority crossing still share the state lock for
 the active-state transition itself. External hot-file creation cannot participate
-in a Python lock, so it retains check-at-observation semantics; once observed it
-also creates a generation and the same critical-delivery fence applies.
+in a Python lock, so the gateway re-observes mechanisms immediately before its
+final mint/consume transition. That refresh publishes any new trip generation
+without invoking arbitrary callbacks under the fence; the active/pending state
+itself is sufficient to fail closed at that boundary.
 """
 
 from __future__ import annotations
@@ -231,6 +233,24 @@ class KillSwitch:
             active = self._sync_trip_generation_unlocked()
             blocked = active or self._has_pending_critical_events_unlocked()
             yield blocked
+
+    def execution_blocked_now(self) -> bool:
+        """Re-observe kill mechanisms without running callbacks.
+
+        This is safe to call while :meth:`execution_fence` is already held
+        because the state lock is re-entrant. It exists for the external hot-file
+        mechanism: an external process cannot participate in the Python lock, so
+        a long authority path must refresh immediately before mint/consume.
+
+        A newly observed trip publishes its generation and therefore creates any
+        critical delivery obligation, but callbacks are deliberately *not*
+        drained here. The active/pending state itself is enough to fail closed;
+        normal preflight observation will deliver listeners after the authority
+        fence is released.
+        """
+        with self._state_lock:
+            active = self._sync_trip_generation_unlocked()
+            return active or self._has_pending_critical_events_unlocked()
 
     def state(self) -> dict:
         """Diagnostic snapshot of both mechanisms."""

@@ -1,23 +1,23 @@
-"""M5-specific WriteBroker subclass with exact commit-gate seams.
+"""M5-specific WriteBroker subclass with exact scoped commit seams.
 
-Layer 4 deliberately leaves the legacy WriteBroker/live WriteKernel untouched.
-This subclass is the concrete broker that Layer 5 will place behind scoped
-authority objects. Effect-producing methods accept a private ``_commit_gate``
-keyword and invoke it immediately before the canonical mutating click.
+Layer 4 leaves the legacy WriteBroker/live WriteKernel untouched. Layer 5 will
+place this broker behind scoped authority objects. Canonical mutation methods
+fail closed unless a private commit gate is supplied, and submit additionally
+requires a scoped precommit payload check.
 
-The keyword is optional only so this class remains substitutable for the legacy
-WriteBroker at the Python type level. Omitting it always fails closed before the
-canonical effect; Layer 5 capabilities receive scoped authorities, not this
-object directly.
-
-Preparation/read methods are inherited unchanged. Capabilities must never receive
-this object directly once Layer 5 is wired; they receive scoped authorities.
+State-set engagement operations are target-scoped: both the state probe and the
+actual directional click resolve the article whose timestamp link owns the
+approved ``/status/<id>``. Navigating to a status page alone is not considered a
+target binding because a page can contain multiple articles.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+import re
+from collections.abc import Awaitable, Callable
 from typing import Optional
+from urllib.parse import urlparse
 
 from super_browser.results.types import FailureCategory
 
@@ -27,10 +27,14 @@ from webwire.write_broker import WriteBroker
 __all__ = ["M5WriteBroker"]
 
 CommitGate = Callable[[], Optional[ActionResult]]
+PrecommitCheck = Callable[[], Awaitable[Optional[ActionResult]]]
+
+_STATUS_HOSTS = frozenset({"x.com", "www.x.com", "twitter.com", "www.twitter.com"})
+_STATUS_PATH_RE = re.compile(r"/status/(\d+)(?:/|$)")
 
 
 class M5WriteBroker(WriteBroker):
-    """Concrete M5 mutation seam; every canonical effect requires a commit hook."""
+    """Concrete M5 mutation seam; every canonical effect requires authority."""
 
     @staticmethod
     def _cross_commit_gate(
@@ -46,13 +50,137 @@ class M5WriteBroker(WriteBroker):
             return denied
         return None
 
+    @staticmethod
+    def _status_id(post_url: str) -> Optional[str]:
+        parsed = urlparse(post_url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme.lower() != "https" or host not in _STATUS_HOSTS:
+            return None
+        match = _STATUS_PATH_RE.search(parsed.path)
+        return match.group(1) if match is not None else None
+
+    @staticmethod
+    def _target_article_prefix(post_id: str, marker: str) -> str:
+        """JS that resolves the article whose own timestamp link has post_id."""
+        # ``post_id`` is numeric by construction; repr keeps the JS literal safe.
+        target = repr(post_id)
+        return (
+            "(function(){"
+            f"/*{marker}:{post_id}*/"
+            f"var targetId={target};"
+            "var arts=document.querySelectorAll('article');"
+            "var art=null;"
+            "for(var ai=0;ai<arts.length&&!art;ai++){"
+            "var links=arts[ai].querySelectorAll('a[href]');"
+            "for(var li=0;li<links.length;li++){"
+            "var a=links[li];"
+            "if(!a.querySelector('time'))continue;"
+            "try{var u=new URL(a.href,location.href);"
+            "if(u.pathname.endsWith('/status/'+targetId)){art=arts[ai];break;}}"
+            "catch(e){}"
+            "}"
+            "}"
+            "if(!art)return 'target_missing';"
+        )
+
+    async def _target_state(
+        self,
+        post_url: str,
+        *,
+        set_testid: str,
+        clear_testid: str,
+        set_state: str,
+        clear_state: str,
+        data_key: str,
+        settle_seconds: float,
+    ) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        post_id = self._status_id(post_url)
+        if post_id is None:
+            return soft_failure(
+                f"invalid scoped status URL: {post_url!r}",
+                failure_category=FailureCategory.SECURITY,
+            )
+        nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+        if not nav.ok:
+            return nav
+        if settle_seconds > 0:
+            await asyncio.sleep(settle_seconds)
+
+        expr = (
+            self._target_article_prefix(post_id, f"m5-target-state-{data_key}")
+            + f"var clear=art.querySelector(\"[data-testid='{clear_testid}']\");"
+            + f"var set=art.querySelector(\"[data-testid='{set_testid}']\");"
+            + f"if(clear)return {clear_state!r};"
+            + f"if(set)return {set_state!r};"
+            + "return 'unknown';})()"
+        )
+        try:
+            result = await self._sb._controller._cdp.evaluate(expr)
+            if result.ok and result.data and "exceptionDetails" not in result.data:
+                state = result.data.get("result", {}).get("value") or "unknown"
+                return ok_result(data={data_key: state})
+            return ok_result(data={data_key: "unknown"})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"target state read error: {exc!r}")
+
+    async def _click_target_control(
+        self,
+        post_url: str,
+        *,
+        testid: str,
+        description: str,
+    ) -> ActionResult:
+        post_id = self._status_id(post_url)
+        if post_id is None:
+            return soft_failure(
+                f"invalid scoped status URL: {post_url!r}",
+                failure_category=FailureCategory.SECURITY,
+            )
+        expr = (
+            self._target_article_prefix(post_id, f"m5-target-click-{testid}")
+            + f"var b=art.querySelector(\"[data-testid='{testid}']\");"
+            + "if(!b)return 'control_missing';"
+            + "b.click();return 'clicked';})()"
+        )
+        try:
+            result = await self._sb._controller._cdp.evaluate(expr)
+            value = (
+                result.data.get("result", {}).get("value")
+                if result.ok and result.data
+                else None
+            )
+            if value != "clicked":
+                return soft_failure(
+                    f"Could not find {description} on approved target {post_id!r}.",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            return ok_result(data={"clicked": True, "post_id": post_id})
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(
+                f"target {description} click error: {exc!r}",
+                failure_category=FailureCategory.UNKNOWN,
+            )
+
+    async def read_bookmark_state(self, post_url: str) -> ActionResult:
+        return await self._target_state(
+            post_url,
+            set_testid="bookmark",
+            clear_testid="removeBookmark",
+            set_state="not_bookmarked",
+            clear_state="bookmarked",
+            data_key="bookmark_state",
+            settle_seconds=self._BOOKMARK_SETTLE_S,
+        )
+
     async def click_bookmark(
         self,
         post_url: str,
         *,
         _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
-        """State-first SET_BOOKMARK; consume authority only before the click."""
+        """State-first SET_BOOKMARK scoped to the approved status article."""
         if (r := self._guard()) is not None:
             return r
         state_r = await self.read_bookmark_state(post_url)
@@ -62,34 +190,22 @@ class M5WriteBroker(WriteBroker):
             else "unknown"
         )
         if state == "bookmarked":
-            return ok_result(
-                data={"bookmarked": True, "result": "already_satisfied"}
-            )
+            return ok_result(data={"bookmarked": True, "result": "already_satisfied"})
         if state != "not_bookmarked":
             return soft_failure(
-                f"click_bookmark: unresolved bookmark state {state!r} at "
-                f"{post_url!r} — refusing to mutate on an unknown state.",
+                f"click_bookmark: unresolved target bookmark state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
-        try:
-            click_result = await self._sb.click(
-                "[data-testid='bookmark']",
-                description="bookmark button",
-            )
-            if not click_result.ok:
-                return soft_failure(
-                    f"Could not find bookmark button at {post_url!r}. "
-                    "DOM churn or post unavailable.",
-                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
-                )
-            return ok_result(data={"bookmarked": True})
-        except Exception as exc:  # noqa: BLE001
-            return soft_failure(
-                f"click_bookmark error: {exc!r}",
-                failure_category=FailureCategory.UNKNOWN,
-            )
+        clicked = await self._click_target_control(
+            post_url,
+            testid="bookmark",
+            description="bookmark button",
+        )
+        if not clicked.ok:
+            return clicked
+        return ok_result(data={"bookmarked": True})
 
     async def click_remove_bookmark(
         self,
@@ -97,7 +213,7 @@ class M5WriteBroker(WriteBroker):
         *,
         _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
-        """State-first CLEAR_BOOKMARK; consume authority only before the click."""
+        """State-first CLEAR_BOOKMARK scoped to the approved status article."""
         if (r := self._guard()) is not None:
             return r
         state_r = await self.read_bookmark_state(post_url)
@@ -107,33 +223,33 @@ class M5WriteBroker(WriteBroker):
             else "unknown"
         )
         if state == "not_bookmarked":
-            return ok_result(
-                data={"bookmarked": False, "result": "already_satisfied"}
-            )
+            return ok_result(data={"bookmarked": False, "result": "already_satisfied"})
         if state != "bookmarked":
             return soft_failure(
-                f"click_remove_bookmark: unresolved bookmark state {state!r} at "
-                f"{post_url!r} — refusing to mutate on an unknown state.",
+                f"click_remove_bookmark: unresolved target bookmark state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
-        try:
-            click_result = await self._sb.click(
-                "[data-testid='removeBookmark']",
-                description="remove-bookmark button",
-            )
-            if not click_result.ok:
-                return soft_failure(
-                    f"Could not find remove-bookmark button at {post_url!r}.",
-                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
-                )
-            return ok_result(data={"bookmarked": False})
-        except Exception as exc:  # noqa: BLE001
-            return soft_failure(
-                f"click_remove_bookmark error: {exc!r}",
-                failure_category=FailureCategory.UNKNOWN,
-            )
+        clicked = await self._click_target_control(
+            post_url,
+            testid="removeBookmark",
+            description="remove-bookmark button",
+        )
+        if not clicked.ok:
+            return clicked
+        return ok_result(data={"bookmarked": False})
+
+    async def read_like_state(self, post_url: str) -> ActionResult:
+        return await self._target_state(
+            post_url,
+            set_testid="like",
+            clear_testid="unlike",
+            set_state="not_liked",
+            clear_state="liked",
+            data_key="like_state",
+            settle_seconds=4.0,
+        )
 
     async def click_like(
         self,
@@ -141,12 +257,7 @@ class M5WriteBroker(WriteBroker):
         *,
         _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
-        """Directional SET_LIKE with an exact pre-click commit boundary.
-
-        Layer 4 makes the M5 seam state-first so a known already-liked state does
-        not consume a permit. Replay policy nevertheless remains UNKNOWN until
-        this behavior has its own concrete regression evidence and review.
-        """
+        """Directional SET_LIKE scoped to the approved status article."""
         if (r := self._guard()) is not None:
             return r
         state_r = await self.read_like_state(post_url)
@@ -159,25 +270,19 @@ class M5WriteBroker(WriteBroker):
             return ok_result(data={"liked": True, "note": "already_liked"})
         if state != "not_liked":
             return soft_failure(
-                f"click_like: unresolved like state {state!r} at {post_url!r}; "
-                "refusing to mutate on an unknown state.",
+                f"click_like: unresolved target like state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
-        try:
-            click_result = await self._sb.click(
-                "[data-testid='like']",
-                description="like button",
-            )
-            if not click_result.ok:
-                return soft_failure(
-                    f"Could not find like button at {post_url!r}.",
-                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
-                )
-            return ok_result(data={"liked": True})
-        except Exception as exc:  # noqa: BLE001
-            return soft_failure(f"click_like error: {exc!r}")
+        clicked = await self._click_target_control(
+            post_url,
+            testid="like",
+            description="like button",
+        )
+        if not clicked.ok:
+            return clicked
+        return ok_result(data={"liked": True})
 
     async def click_unlike(
         self,
@@ -185,7 +290,7 @@ class M5WriteBroker(WriteBroker):
         *,
         _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
-        """Directional CLEAR_LIKE with an exact pre-click commit boundary."""
+        """Directional CLEAR_LIKE scoped to the approved status article."""
         if (r := self._guard()) is not None:
             return r
         state_r = await self.read_like_state(post_url)
@@ -195,37 +300,42 @@ class M5WriteBroker(WriteBroker):
             else "unknown"
         )
         if state == "not_liked":
-            return ok_result(
-                data={"liked": False, "note": "already_not_liked"}
-            )
+            return ok_result(data={"liked": False, "note": "already_not_liked"})
         if state != "liked":
             return soft_failure(
-                f"click_unlike: unresolved like state {state!r} at {post_url!r}; "
-                "refusing to mutate on an unknown state.",
+                f"click_unlike: unresolved target like state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
-        try:
-            click_result = await self._sb.click(
-                "[data-testid='unlike']",
-                description="unlike button (compensation)",
-            )
-            if not click_result.ok:
-                return soft_failure(
-                    f"Could not find unlike button at {post_url!r}.",
-                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
-                )
-            return ok_result(data={"liked": False, "unliked": True})
-        except Exception as exc:  # noqa: BLE001
-            return soft_failure(f"click_unlike error: {exc!r}")
+        clicked = await self._click_target_control(
+            post_url,
+            testid="unlike",
+            description="unlike button",
+        )
+        if not clicked.ok:
+            return clicked
+        return ok_result(data={"liked": False, "unliked": True})
 
     async def click_submit(
         self,
         *,
         _commit_gate: Optional[CommitGate] = None,
+        _precommit_check: Optional[PrecommitCheck] = None,
     ) -> ActionResult:
-        """Consume SUBMIT_CONTENT immediately before the tweet-button click."""
+        """Submit only after scoped payload proof, then consume at final click."""
+        if (r := self._guard()) is not None:
+            return r
+        if _precommit_check is None:
+            return soft_failure(
+                "M5 submit requires scoped payload verification",
+                failure_category=FailureCategory.SECURITY,
+            )
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        # Verification may await browser I/O. Re-check local kill state before
+        # the gateway performs its own final authority-boundary checks.
         if (r := self._guard()) is not None:
             return r
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
@@ -239,14 +349,7 @@ class M5WriteBroker(WriteBroker):
             return soft_failure(f"click_submit error: {exc!r}")
 
     async def close_composer(self) -> ActionResult:
-        """Abort cleanup is reducing authority and stays available under kill.
-
-        The legacy WriteBroker retains its historical guarded behavior until
-        Layer 5. The M5 broker deliberately permits only this cleanup override
-        after kill/revocation; it cannot publish content.
-        """
-        import asyncio
-
+        """Abort cleanup is reducing authority and remains available under kill."""
         try:
             cdp = self._sb._controller._cdp
             close_expr = (
@@ -268,7 +371,8 @@ class M5WriteBroker(WriteBroker):
             )
             await asyncio.sleep(1)
             await self._sb.navigate(
-                "https://x.com/home", wait_until="domcontentloaded"
+                "https://x.com/home",
+                wait_until="domcontentloaded",
             )
             await asyncio.sleep(2)
             return ok_result(data={"cleanup": state or "navigated_away"})
@@ -282,14 +386,14 @@ class M5WriteBroker(WriteBroker):
         *,
         _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
-        """Id-scoped delete with permit consumption at final confirmation.
-
-        Navigation, target/caret/menu staging and confirmation-control polling do
-        not consume the permit. The commit hook runs only after a confirmation
-        control is known to exist and the final broker kill check passes.
-        """
+        """Id-scoped delete with permit consumption at final confirmation."""
         if (r := self._guard()) is not None:
             return r
+        if self._status_id(post_url) != post_id:
+            return soft_failure(
+                "delete_post target URL/id mismatch",
+                failure_category=FailureCategory.SECURITY,
+            )
         try:
             nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
             if not nav.ok:
@@ -304,8 +408,7 @@ class M5WriteBroker(WriteBroker):
             )
             if not r1.ok:
                 return soft_failure(
-                    "delete_post: target post not found (deleted already, "
-                    "not yours, or URL invalid)",
+                    "delete_post: target post not found (deleted already, not yours, or URL invalid)",
                     failure_category=FailureCategory.SELECTOR_NOT_FOUND,
                 )
 
@@ -332,8 +435,7 @@ class M5WriteBroker(WriteBroker):
                     '"[role=\'menuitem\'],a,button");'
                     'for(var i=0;i<items.length;i++){'
                     'var t=(items[i].innerText||"").trim();'
-                    'if(t==="Delete"||t==="Delete post"||t==="删除"'
-                    '||t==="删除帖子"){'
+                    'if(t==="Delete"||t==="Delete post"||t==="删除"||t==="删除帖子"){' 
                     'items[i].click();return "delete_item_clicked:"+t;}}}'
                     'return null;})()'
                 ),

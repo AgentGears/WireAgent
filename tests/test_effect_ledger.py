@@ -66,8 +66,34 @@ def test_append_durable_calls_fsync(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     EffectLedger(WebWireConfig(state_dir=tmp_path)).append_durable(
         _record(EffectState.RESERVED)
     )
-    # File fsync + directory-entry fsync on first creation.
-    assert len(calls) >= 2
+    # File fsync always; POSIX also fsyncs the new file's directory entry.
+    assert len(calls) >= (1 if os.name == "nt" else 2)
+
+
+def test_new_state_directory_ancestry_is_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "new" / "state"
+    fsynced_dirs: list[Path] = []
+
+    def record_dir_fsync(path: Path) -> None:
+        fsynced_dirs.append(path)
+
+    monkeypatch.setattr(
+        EffectLedger,
+        "_fsync_directory",
+        staticmethod(record_dir_fsync),
+    )
+    EffectLedger(WebWireConfig(state_dir=state_dir)).append_durable(
+        _record(EffectState.RESERVED)
+    )
+
+    # The newly created state directory and the entries that name its ancestry
+    # are explicitly sent through the directory-durability hook.
+    assert state_dir in fsynced_dirs
+    assert state_dir.parent in fsynced_dirs
+    assert tmp_path in fsynced_dirs
 
 
 def test_append_durable_fsync_failure_raises_fail_closed(

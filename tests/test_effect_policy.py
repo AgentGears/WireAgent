@@ -97,16 +97,16 @@ def test_default_policy_table_matches_m5_assignments() -> None:
     assert bookmark.preparation_effects == frozenset()
     assert bookmark.allowed_effects == frozenset({EffectVerb.SET_BOOKMARK})
 
-    # Like/unlike are intentionally conservative until their concrete M5 broker
-    # state-first boundary behavior has its own reviewed evidence. A high-level
-    # capability pre-read is not enough evidence for a broker-level SAFE claim.
+    # Layer-4 concrete-broker regressions establish like/unlike as directional
+    # semantic state-sets: state-first, zero mutation when already satisfied,
+    # and exact commit gating immediately before the one directional click.
     for action, effect in (
         ("like", EffectVerb.SET_LIKE),
         ("unlike", EffectVerb.CLEAR_LIKE),
     ):
         engagement = DEFAULT_EFFECT_POLICIES.require(action)
-        assert engagement.replay_semantics is ReplaySemantics.UNKNOWN
-        assert engagement.durability is DurabilityPolicy.REQUIRED
+        assert engagement.replay_semantics is ReplaySemantics.SAFE_STATE_SET
+        assert engagement.durability is DurabilityPolicy.BEST_EFFORT
         assert engagement.preparation_effects == frozenset()
         assert engagement.allowed_effects == frozenset({effect})
 

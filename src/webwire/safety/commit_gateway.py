@@ -342,6 +342,8 @@ class CommitGateway:
                             self._issued_permits[permit.permit_id] = permit
                             self._issued_attempts[permit.permit_id] = attempt
                             return permit
+                except GrantClaimDenied as exc:
+                    raise GatewayDenied(exc.reason, str(exc)) from exc
                 except KeyError as exc:
                     raise GatewayDenied("policy_missing", str(exc)) from exc
 

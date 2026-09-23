@@ -8,7 +8,7 @@ ApprovalGrant (ephemeral, in-memory, never persisted)
     ACTIVE -> SPENT | EXPIRED | REVOKED            (terminal, one-directional)
     orthogonal claim lock: claimed_by = attempt_id (atomic CAS; NOT a state)
 
-EffectAttempt (one per execution try)
+EffectAttempt (one per execution try against a grant)
     PREPARING -> NO_EFFECT | RESERVED
     RESERVED  -> NO_EFFECT | EFFECT_CONFIRMED | EFFECT_UNKNOWN
     unfenced effects may skip RESERVED entirely.
@@ -42,7 +42,11 @@ grant's claim fence:
     attempt.begin_reservation(grant)
         -> durable EFFECT_RESERVED append + fsync
         -> attempt.mark_reserved(grant)
-        -> grant.spend()
+        -> grant.spend_if_live(...)
+
+The final spend operation revalidates approval liveness/bindings and performs
+ACTIVE -> SPENT under one grant lock. This prevents elapsed grant time from
+crossing expiry between a successful final validation and the spend transition.
 
 Grant/permit lifetime is elapsed-time authority, so default clocks are monotonic.
 Wall-clock UTC belongs to durable ledger timestamps, not process-local TTLs.
@@ -244,6 +248,32 @@ class ApprovalGrant:
             if policy_binding != self.policy_binding:
                 raise GrantClaimDenied("policy_mismatch")
 
+    def spend_if_live(
+        self,
+        *,
+        intent_hash: str,
+        actor_id: str,
+        policy_binding: str,
+        authorization_epoch: int,
+        now: Optional[float] = None,
+    ) -> None:
+        """Atomically revalidate live bindings and transition ACTIVE -> SPENT.
+
+        The liveness refresh and state transition share the grant lock, so no
+        separately sampled validation can become stale before approval is spent.
+        ``now`` is optional for deterministic tests; production callers normally
+        let the grant sample its own monotonic clock at the transition.
+        """
+        with self._lock:
+            self.validate_live(
+                intent_hash=intent_hash,
+                actor_id=actor_id,
+                policy_binding=policy_binding,
+                authorization_epoch=authorization_epoch,
+                now=now,
+            )
+            object.__setattr__(self, "state", GrantState.SPENT)
+
     def claim(
         self,
         attempt_id: str,
@@ -306,7 +336,12 @@ class ApprovalGrant:
             object.__setattr__(self, "precommit_attempts", self.precommit_attempts + 1)
 
     def spend(self) -> None:
-        """ACTIVE -> SPENT. Terminal and irrevocable."""
+        """ACTIVE -> SPENT. Terminal and irrevocable.
+
+        This low-level transition intentionally does not refresh liveness.
+        Commit-authority code must use ``spend_if_live()`` so expiry and binding
+        validation are atomic with the spend transition.
+        """
         with self._lock:
             if self.state is not GrantState.ACTIVE:
                 raise GrantStateError(

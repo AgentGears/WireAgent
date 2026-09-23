@@ -383,6 +383,8 @@ class CommitGateway:
         self._require_issued_permit(permit)
         if permit.attempt_id != attempt.attempt_id:
             raise GatewayStateError("permit/attempt mismatch")
+        if permit.grant_id != attempt.grant_id:
+            raise GatewayStateError("permit/attempt grant mismatch")
         if not permit.consumed:
             raise GatewayStateError("effect outcome cannot be recorded before permit consumption")
         expected = AttemptState.RESERVED if permit.fenced else AttemptState.PREPARING

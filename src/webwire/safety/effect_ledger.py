@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from webwire.config import WebWireConfig
 
@@ -114,9 +115,6 @@ class EffectLedgerRecord:
             "intent_hash": self.intent_hash,
             "policy_binding": self.policy_binding,
         }
-        # Identity fields must be genuine non-empty strings. str() coercion at
-        # the from_dict boundary would turn a corrupt null into "None" and let
-        # it hydrate as a semantic key.
         for name, value in required.items():
             if not isinstance(value, str) or not value:
                 raise ValueError(
@@ -169,7 +167,17 @@ class RecoveryProjection:
 
 
 class EffectLedger:
-    """Append-only fsync-backed safety ledger."""
+    """Append-only fsync-backed safety ledger.
+
+    All instances targeting the same normalized path share one process-local
+    re-entrant lock. That makes history-validation + append one critical section
+    even if the runtime constructs more than one ``EffectLedger`` object. M5 is
+    a single-process runtime; coordinating independent external writers is not a
+    property of this file format.
+    """
+
+    _path_locks_guard: ClassVar[Any] = threading.Lock()
+    _path_locks: ClassVar[dict[str, Any]] = {}
 
     def __init__(
         self,
@@ -179,6 +187,17 @@ class EffectLedger:
     ) -> None:
         cfg = config or WebWireConfig()
         self._path = path or cfg.effects_path()
+        self._lock = self._lock_for_path(self._path)
+
+    @classmethod
+    def _lock_for_path(cls, path: Path) -> Any:
+        key = str(path.resolve(strict=False))
+        with cls._path_locks_guard:
+            lock = cls._path_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                cls._path_locks[key] = lock
+            return lock
 
     @property
     def path(self) -> Path:
@@ -237,12 +256,7 @@ class EffectLedger:
 
     @staticmethod
     def _validate_history(records: list[EffectLedgerRecord]) -> None:
-        """Validate immutable lineage and the canonical per-effect state machine.
-
-        This runs both when reading durable state and before a local append. A
-        malformed or contradictory history is corruption: recovery must fail
-        closed rather than choose whichever record happened to be last.
-        """
+        """Validate immutable lineage and the canonical per-effect state machine."""
         first_by_effect: dict[str, EffectLedgerRecord] = {}
         last_by_effect: dict[str, EffectLedgerRecord] = {}
 
@@ -281,41 +295,42 @@ class EffectLedger:
 
         Any history/creation/write/fsync failure raises EffectLedgerError. The
         caller must not perform a REQUIRED external effect after such a failure.
-        Local preflight validation catches impossible transitions before bytes
-        are appended; read-time validation remains authoritative after restart.
         """
-        record.validate()
-        existing = self.read_records()
-        self._validate_history([*existing, record])
+        with self._lock:
+            record.validate()
+            existing = self.read_records()
+            self._validate_history([*existing, record])
 
-        payload = (record.to_jsonl() + "\n").encode("utf-8")
-        self._ensure_parent()
-        existed = self._path.exists()
-        fd: Optional[int] = None
-        try:
-            fd = os.open(
-                self._path,
-                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-                0o600,
-            )
-            self._write_all(fd, payload)
-            os.fsync(fd)
-        except OSError as exc:
-            raise EffectLedgerError(f"durable effect ledger append failed: {exc!r}") from exc
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-        if not existed:
+            payload = (record.to_jsonl() + "\n").encode("utf-8")
+            self._ensure_parent()
+            existed = self._path.exists()
+            fd: Optional[int] = None
             try:
-                self._fsync_directory(self._path.parent)
+                fd = os.open(
+                    self._path,
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    0o600,
+                )
+                self._write_all(fd, payload)
+                os.fsync(fd)
             except OSError as exc:
                 raise EffectLedgerError(
-                    f"effect ledger directory fsync failed: {exc!r}"
+                    f"durable effect ledger append failed: {exc!r}"
                 ) from exc
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+            if not existed:
+                try:
+                    self._fsync_directory(self._path.parent)
+                except OSError as exc:
+                    raise EffectLedgerError(
+                        f"effect ledger directory fsync failed: {exc!r}"
+                    ) from exc
 
     def read_records(self) -> list[EffectLedgerRecord]:
         """Read and validate all records in append order.
@@ -324,28 +339,30 @@ class EffectLedger:
         are not skipped. Losing or contradicting a safety fact could permit
         replay, so corruption fails closed.
         """
-
-        if not self._path.exists():
-            return []
-        try:
-            lines = self._path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            raise EffectLedgerError(f"effect ledger read failed: {exc!r}") from exc
-
-        records: list[EffectLedgerRecord] = []
-        for lineno, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
+        with self._lock:
+            if not self._path.exists():
+                return []
             try:
-                raw = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise EffectLedgerCorruptError(
-                    f"effect ledger line {lineno} is not valid JSON"
+                lines = self._path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                raise EffectLedgerError(
+                    f"effect ledger read failed: {exc!r}"
                 ) from exc
-            records.append(EffectLedgerRecord.from_dict(raw))
 
-        self._validate_history(records)
-        return records
+            records: list[EffectLedgerRecord] = []
+            for lineno, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise EffectLedgerCorruptError(
+                        f"effect ledger line {lineno} is not valid JSON"
+                    ) from exc
+                records.append(EffectLedgerRecord.from_dict(raw))
+
+            self._validate_history(records)
+            return records
 
     def recovery_projection(self) -> list[RecoveryProjection]:
         """Derive current per-effect recovery truth without rewriting evidence."""

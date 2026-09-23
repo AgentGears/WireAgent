@@ -34,6 +34,7 @@ from webwire.safety.models import (
 )
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
 from webwire.safety.scoped_authority import (
+    AuthorizedEffect,
     ClearBookmarkAuthority,
     ClearLikeAuthority,
     DeletePostAuthority,
@@ -84,6 +85,7 @@ __all__ = [
     "EffectLedgerCorruptError",
     "EffectState",
     "RecoveryProjection",
+    "AuthorizedEffect",
     "ScopedAuthorityBroker",
     "ScopedAuthorityDenied",
     "PostPreparationAuthority",

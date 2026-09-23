@@ -10,12 +10,14 @@ import pytest
 from webwire.config import WebWireConfig
 from webwire.safety.commit_gateway import (
     CommitGateway,
+    EffectPermit,
     GatewayDenied,
     GatewayStateError,
 )
 from webwire.safety.effect_ledger import EffectLedger, EffectState
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectVerb
 from webwire.safety.execution_models import (
+    ApprovalGrant,
     ApprovalGrantStore,
     AttemptState,
     AuthorizationEpoch,
@@ -43,7 +45,7 @@ def _intent() -> WriteIntent:
 def _claimed(
     intent: WriteIntent,
     epoch: AuthorizationEpoch,
-) -> tuple[object, EffectAttempt]:
+) -> tuple[ApprovalGrant, EffectAttempt]:
     policy = DEFAULT_EFFECT_POLICIES.require(intent.action_type)
     store = ApprovalGrantStore()
     grant = store.mint(
@@ -68,9 +70,9 @@ def _claimed(
 
 def _consume(
     gateway: CommitGateway,
-    permit,
+    permit: EffectPermit,
     intent: WriteIntent,
-) -> None:  # type: ignore[no-untyped-def]
+) -> None:
     gateway.consume_permit(
         permit,
         effect=EffectVerb.SUBMIT_CONTENT,
@@ -110,7 +112,7 @@ def test_written_then_fsync_failed_reservation_retries_same_effect_fact(
     monkeypatch.setattr(os, "fsync", fail_once)
 
     with pytest.raises(GatewayDenied, match="reservation_failed"):
-        gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)  # type: ignore[arg-type]
+        gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
 
     # The bytes can already be visible even though durability was reported as
     # failed. No permit was minted, and the approval remains claimed/ACTIVE.
@@ -119,12 +121,12 @@ def test_written_then_fsync_failed_reservation_retries_same_effect_fact(
     assert first[0].state is EffectState.RESERVED
     assert first[0].effect_id == attempt.effect_id
     assert attempt.state is AttemptState.PREPARING
-    assert grant.state is GrantState.ACTIVE  # type: ignore[union-attr]
-    assert grant.claimed_by == attempt.attempt_id  # type: ignore[union-attr]
+    assert grant.state is GrantState.ACTIVE
+    assert grant.claimed_by == attempt.attempt_id
 
     # Same attempt retries the SAME effect fact. EffectLedger re-fsyncs that
     # fact instead of appending a second reservation with a fresh effect id.
-    permit = gateway.authorize_commit(  # type: ignore[arg-type]
+    permit = gateway.authorize_commit(
         grant=grant,
         attempt=attempt,
         intent=intent,
@@ -133,7 +135,7 @@ def test_written_then_fsync_failed_reservation_retries_same_effect_fact(
     assert len(records) == 1
     assert records[0].effect_id == attempt.effect_id == permit.effect_id
     assert attempt.state is AttemptState.RESERVED
-    assert grant.state is GrantState.SPENT  # type: ignore[union-attr]
+    assert grant.state is GrantState.SPENT
 
     _consume(gateway, permit, intent)
     gateway.record_effect_confirmed(
@@ -162,7 +164,7 @@ def test_invalid_terminal_evidence_fails_without_losing_retryable_outcome(
     )
     intent = _intent()
     grant, attempt = _claimed(intent, epoch)
-    permit = gateway.authorize_commit(  # type: ignore[arg-type]
+    permit = gateway.authorize_commit(
         grant=grant,
         attempt=attempt,
         intent=intent,
@@ -202,7 +204,7 @@ def test_mutated_attempt_effect_identity_is_rejected_at_outcome_boundary(
     )
     intent = _intent()
     grant, attempt = _claimed(intent, epoch)
-    permit = gateway.authorize_commit(  # type: ignore[arg-type]
+    permit = gateway.authorize_commit(
         grant=grant,
         attempt=attempt,
         intent=intent,

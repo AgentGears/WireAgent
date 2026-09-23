@@ -2,8 +2,13 @@
 
 Layer 4 deliberately leaves the legacy WriteBroker/live WriteKernel untouched.
 This subclass is the concrete broker that Layer 5 will place behind scoped
-authority objects. Effect-producing methods require a private ``_commit_gate``
+authority objects. Effect-producing methods accept a private ``_commit_gate``
 keyword and invoke it immediately before the canonical mutating click.
+
+The keyword is optional only so this class remains substitutable for the legacy
+WriteBroker at the Python type level. Omitting it always fails closed before the
+canonical effect; Layer 5 capabilities receive scoped authorities, not this
+object directly.
 
 Preparation/read methods are inherited unchanged. Capabilities must never receive
 this object directly once Layer 5 is wired; they receive scoped authorities.
@@ -28,7 +33,14 @@ class M5WriteBroker(WriteBroker):
     """Concrete M5 mutation seam; every canonical effect requires a commit hook."""
 
     @staticmethod
-    def _cross_commit_gate(commit_gate: CommitGate) -> Optional[ActionResult]:
+    def _cross_commit_gate(
+        commit_gate: Optional[CommitGate],
+    ) -> Optional[ActionResult]:
+        if commit_gate is None:
+            return soft_failure(
+                "M5 canonical effect requires scoped commit authority",
+                failure_category=FailureCategory.SECURITY,
+            )
         denied = commit_gate()
         if denied is not None:
             return denied
@@ -38,7 +50,7 @@ class M5WriteBroker(WriteBroker):
         self,
         post_url: str,
         *,
-        _commit_gate: CommitGate,
+        _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
         """State-first SET_BOOKMARK; consume authority only before the click."""
         if (r := self._guard()) is not None:
@@ -83,7 +95,7 @@ class M5WriteBroker(WriteBroker):
         self,
         post_url: str,
         *,
-        _commit_gate: CommitGate,
+        _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
         """State-first CLEAR_BOOKMARK; consume authority only before the click."""
         if (r := self._guard()) is not None:
@@ -127,7 +139,7 @@ class M5WriteBroker(WriteBroker):
         self,
         post_url: str,
         *,
-        _commit_gate: CommitGate,
+        _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
         """Directional SET_LIKE with an exact pre-click commit boundary.
 
@@ -171,7 +183,7 @@ class M5WriteBroker(WriteBroker):
         self,
         post_url: str,
         *,
-        _commit_gate: CommitGate,
+        _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
         """Directional CLEAR_LIKE with an exact pre-click commit boundary."""
         if (r := self._guard()) is not None:
@@ -208,7 +220,11 @@ class M5WriteBroker(WriteBroker):
         except Exception as exc:  # noqa: BLE001
             return soft_failure(f"click_unlike error: {exc!r}")
 
-    async def click_submit(self, *, _commit_gate: CommitGate) -> ActionResult:
+    async def click_submit(
+        self,
+        *,
+        _commit_gate: Optional[CommitGate] = None,
+    ) -> ActionResult:
         """Consume SUBMIT_CONTENT immediately before the tweet-button click."""
         if (r := self._guard()) is not None:
             return r
@@ -264,7 +280,7 @@ class M5WriteBroker(WriteBroker):
         post_url: str,
         post_id: str,
         *,
-        _commit_gate: CommitGate,
+        _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
         """Id-scoped delete with permit consumption at final confirmation.
 
@@ -331,8 +347,6 @@ class M5WriteBroker(WriteBroker):
                     failure_category=FailureCategory.SELECTOR_NOT_FOUND,
                 )
 
-            # Poll readiness WITHOUT clicking. This is the Layer-4 split from
-            # the legacy method, whose stage-4 poll both observed and clicked.
             ready_expr = (
                 '(function(){'
                 'var b=document.querySelector('
@@ -355,8 +369,6 @@ class M5WriteBroker(WriteBroker):
                     failure_category=FailureCategory.SELECTOR_NOT_FOUND,
                 )
 
-            # Hand on the button: broker kill check, then gateway permit consume,
-            # then exactly one final confirmation click.
             if (r := self._guard()) is not None:
                 await self._dismiss_delete_dialog()
                 return r

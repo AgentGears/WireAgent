@@ -116,13 +116,7 @@ class EffectPermit:
 
 
 class CommitGateway:
-    """The one M5 commit-authority boundary.
-
-    Layer 3 owns authorization, durable reservation, spend ordering, permit
-    validation/consumption, and terminal effect-knowledge recording. It does
-    not own browser methods; layer 4 adapts a consumed permit to a scoped
-    authority surface.
-    """
+    """The one M5 commit-authority boundary."""
 
     def __init__(
         self,
@@ -141,8 +135,6 @@ class CommitGateway:
         self._clock = clock
         self._permit_ttl = permit_ttl_seconds
         self._issued_permits: dict[str, EffectPermit] = {}
-        # Frozen invariant 11: activation revokes outstanding execution
-        # authority, including after the visible kill flag is later reset.
         self._kill.add_trip_listener(self._epoch.bump)
 
     @property
@@ -171,8 +163,25 @@ class CommitGateway:
 
     def _require_issued_permit(self, permit: EffectPermit) -> None:
         canonical = self._issued_permits.get(permit.permit_id)
-        if canonical is None or canonical is not permit:
+        if canonical is None:
+            # Terminal permits are evicted from the registry. Their exact
+            # process-local handle still carries consumed=True, preserving the
+            # useful single-use denial reason without retaining the object.
+            if permit.consumed:
+                raise GatewayDenied("permit_reused")
             raise GatewayDenied("permit_unknown")
+        if canonical is not permit:
+            raise GatewayDenied("permit_unknown")
+
+    def _prune_expired_unconsumed(self, now: float) -> None:
+        """Bound permit retention without dropping consumed unresolved effects."""
+        expired = [
+            permit_id
+            for permit_id, permit in self._issued_permits.items()
+            if not permit.consumed and now >= permit.expires_at
+        ]
+        for permit_id in expired:
+            self._issued_permits.pop(permit_id, None)
 
     @staticmethod
     def _validate_grant_identity(
@@ -215,13 +224,7 @@ class CommitGateway:
         attempt: EffectAttempt,
         intent: WriteIntent,
     ) -> EffectPermit:
-        """Grant commit authority and mint one exact single-use permit.
-
-        REQUIRED effects are fenced first. If the durable append fails, no
-        permit exists and the grant is not spent. For fenced effects, the
-        durable RESERVED fact is the authoritative spend point; ``spend()``
-        follows immediately in the same synchronous critical section.
-        """
+        """Grant commit authority and mint one exact single-use permit."""
 
         policy = self._policy_for(intent)
         binding = policy.binding_hash()
@@ -230,6 +233,7 @@ class CommitGateway:
         self._check_kill()
 
         now = self._clock()
+        self._prune_expired_unconsumed(now)
         effect_id = secrets.token_urlsafe(16)
         semantic_key = intent.dedupe_key()
         fenced = policy.durability is DurabilityPolicy.REQUIRED
@@ -294,6 +298,7 @@ class CommitGateway:
         if permit.consumed:
             raise GatewayDenied("permit_reused")
         if now >= permit.expires_at:
+            self._issued_permits.pop(permit.permit_id, None)
             raise GatewayDenied("permit_expired")
         if permit.authorization_epoch != self._epoch.current:
             raise GatewayDenied("epoch_mismatch")
@@ -360,17 +365,23 @@ class CommitGateway:
         *,
         evidence: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Record evidence-established success."""
+        """Durably record every known confirmed effect, fenced or not.
+
+        BEST_EFFORT waives the pre-mutation reservation; it does not waive the
+        terminal confirmation record. A transient append failure leaves the
+        in-memory attempt pre-terminal and the consumed permit resident so only
+        outcome persistence—not external execution—can be retried.
+        """
 
         self._validate_outcome_objects(permit, attempt)
-        if permit.fenced:
-            try:
-                self._ledger.append_durable(
-                    self._terminal_record(permit, EffectState.EFFECT_CONFIRMED, evidence)
-                )
-            except EffectLedgerError as exc:
-                raise GatewayStateError(f"could not persist confirmed outcome: {exc}") from exc
+        try:
+            self._ledger.append_durable(
+                self._terminal_record(permit, EffectState.EFFECT_CONFIRMED, evidence)
+            )
+        except EffectLedgerError as exc:
+            raise GatewayStateError(f"could not persist confirmed outcome: {exc}") from exc
         attempt.mark_effect_confirmed()
+        self._issued_permits.pop(permit.permit_id, None)
 
     def record_effect_unknown(
         self,
@@ -379,13 +390,7 @@ class CommitGateway:
         *,
         evidence: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Persist uncertainty before making the in-memory attempt terminal.
-
-        A failed append leaves the attempt in RESERVED/PREPARING so the caller
-        may retry outcome persistence with the already-consumed permit. It never
-        restores execution authority: the grant remains SPENT and the permit
-        remains consumed.
-        """
+        """Persist uncertainty before making the in-memory attempt terminal."""
 
         self._validate_outcome_objects(permit, attempt)
         try:
@@ -395,3 +400,4 @@ class CommitGateway:
         except EffectLedgerError as exc:
             raise GatewayStateError(f"could not persist unknown outcome: {exc}") from exc
         attempt.mark_effect_unknown()
+        self._issued_permits.pop(permit.permit_id, None)

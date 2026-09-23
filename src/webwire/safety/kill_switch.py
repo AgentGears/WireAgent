@@ -11,23 +11,28 @@ Per the Phase 0a design (Point 3 decision):
   debugging. Kill switch = refuse new Agent-WebWire actions.
 
 M5 layer 3 adds trip listeners. The Commit Gateway binds the authorization
-epoch to this hook so a trip revokes already-minted execution authority even
-if the operator later resets the kill switch. Hot-file trips are detected on
-the next ``tripped()`` observation.
+epoch to a *critical* listener so a trip revokes already-minted execution
+authority even if the operator later resets the kill switch. Hot-file trips are
+detected on the next observation.
 
 Trip notification is event-based, not merely derived from the current boolean
 state. Each observed inactive -> active transition creates a monotonically
-increasing trip generation. Every listener that was registered for that
-generation retains an obligation to receive it exactly once, even if an earlier
-listener resets or retrips the switch while callbacks are being delivered.
-Failed callbacks remain owed and are retried only on a later observation.
+increasing trip generation. Every listener registered for that generation keeps
+an obligation to receive it exactly once, even if an earlier listener resets or
+retrips the switch while callbacks are being delivered. Failed callbacks remain
+owed and are retried only on a later observation.
 
-Programmatic trip/reset and M5 authority crossing share the state lock exposed
-by :meth:`execution_fence`. This gives them a process-local linearization point:
-either an authority boundary completes before trip activation, or the trip
-activates (and listeners bump the epoch) before the authority check. External
-hot-file creation cannot participate in a Python lock, so it retains the
-existing check-at-observation semantics.
+Callbacks execute outside the kill-state lock. This prevents arbitrary listener
+code from creating a cross-thread lock-order inversion with the CommitGateway.
+Critical listener obligations are fail-closed: :meth:`execution_fence` denies
+remote authority while any critical trip generation remains undelivered. Thus
+moving callbacks out of the lock does not create a reset-before-revocation
+window.
+
+Programmatic trip/reset and M5 authority crossing still share the state lock for
+the active-state transition itself. External hot-file creation cannot participate
+in a Python lock, so it retains check-at-observation semantics; once observed it
+also creates a generation and the same critical-delivery fence applies.
 """
 
 from __future__ import annotations
@@ -47,49 +52,35 @@ __all__ = ["KillSwitch"]
 
 
 class KillSwitch:
-    """Tri-state kill switch with hot-file + in-process flag + boot env var."""
+    """Hot-file + in-process kill state with generation-based notifications."""
 
     def __init__(self, config: Optional[WebWireConfig] = None) -> None:
         self._config = config or WebWireConfig()
         self._state_lock = threading.RLock()
         self._flag: bool = False
+
+        # These arrays are index-aligned. A listener's generation value is the
+        # latest trip generation successfully delivered to it. There is no
+        # listener-removal API, so indices remain stable for process lifetime.
         self._trip_listeners: list[Callable[[], object]] = []
-        # Aligned with ``_trip_listeners``. Entry i is the latest trip
-        # generation successfully delivered to listener i. This is the small
-        # process-local event ledger that prevents reset/retrip from erasing a
-        # revocation event before all registered listeners observe it.
         self._listener_generations: list[int] = []
-        self._listeners_in_progress: list[Callable[[], object]] = []
+        self._listener_critical: list[bool] = []
+        self._listeners_in_progress: set[int] = set()
+
         self._last_active = False
         self._trip_generation = 0
-        # Nested refreshes during callbacks update active/generation state but
-        # never recurse into another delivery traversal. The outer traversal
-        # drains all outstanding generation obligations after the callback exits.
         self._notifying = False
+
         env_var = self._config.kill_env_var
         if env_var and os.environ.get(env_var, "").lower() in ("1", "true", "yes"):
             self._flag = True
             logger.warning(
                 "KillSwitch tripped at boot via env var %s=%r",
-                env_var, os.environ.get(env_var),
+                env_var,
+                os.environ.get(env_var),
             )
 
-    # -- trip listeners ------------------------------------------------------
-
-    def add_trip_listener(self, listener: Callable[[], object]) -> None:
-        """Register for the current active trip (if any) and all future trips.
-
-        A listener added while the switch is active owes the current generation
-        and is notified immediately. A listener added while inactive begins at
-        the current generation and therefore does not receive historical trips.
-        """
-        with self._state_lock:
-            active = self._sync_trip_generation_unlocked()
-            if listener not in self._trip_listeners:
-                self._trip_listeners.append(listener)
-                delivered = self._trip_generation - 1 if active else self._trip_generation
-                self._listener_generations.append(delivered)
-            self._refresh_trip_unlocked()
+    # -- state / generation --------------------------------------------------
 
     def _active_unlocked(self) -> bool:
         if self._flag:
@@ -114,54 +105,92 @@ class KillSwitch:
             for delivered in self._listener_generations
         )
 
-    def _notify_pending_listeners_unlocked(self) -> None:
-        """Deliver all currently owed trip-generation events without recursion.
+    def _has_pending_critical_events_unlocked(self) -> bool:
+        return any(
+            critical and delivered < self._trip_generation
+            for delivered, critical in zip(
+                self._listener_generations,
+                self._listener_critical,
+            )
+        )
 
-        Delivery is independent of the switch's *current* active state: once a
-        generation has existed, its safety side effects (especially authorization
-        epoch revocation) remain owed even if another callback resets the switch.
-
-        Only the outermost traversal invokes callbacks. Re-entrant ``tripped()``,
-        ``trip()``, ``reset()``, or ``add_trip_listener()`` calls may update the
-        active state and create newer generations, but those nested calls cannot
-        recursively invoke listeners. A successful callback advances exactly one
-        owed generation. A failed callback remains behind and is retried on a
-        later external observation, never repeatedly in the same traversal.
-        Caller must hold ``_state_lock``.
-        """
-        if self._notifying:
-            return
-
+    def _start_delivery_unlocked(self) -> bool:
+        """Claim ownership of the notification drain. Caller holds state lock."""
+        if self._notifying or not self._has_pending_listener_events_unlocked():
+            return False
         self._notifying = True
+        return True
+
+    # -- trip listeners ------------------------------------------------------
+
+    def add_trip_listener(
+        self,
+        listener: Callable[[], object],
+        *,
+        critical: bool = False,
+    ) -> None:
+        """Register for the current active trip (if any) and all future trips.
+
+        ``critical=True`` means undelivered generations block
+        :meth:`execution_fence`. CommitGateway uses this for authorization-epoch
+        revocation. Generic/diagnostic listeners remain non-critical so their
+        failure cannot indefinitely block execution after revocation succeeds.
+        """
+        with self._state_lock:
+            active = self._sync_trip_generation_unlocked()
+            try:
+                index = self._trip_listeners.index(listener)
+            except ValueError:
+                self._trip_listeners.append(listener)
+                delivered = self._trip_generation - 1 if active else self._trip_generation
+                self._listener_generations.append(delivered)
+                self._listener_critical.append(critical)
+            else:
+                if critical:
+                    self._listener_critical[index] = True
+            should_drain = self._start_delivery_unlocked()
+
+        if should_drain:
+            self._drain_pending_listener_events()
+
+    def _select_pending_event_unlocked(
+        self,
+        attempted: list[tuple[int, int]],
+    ) -> Optional[tuple[int, int, Callable[[], object]]]:
+        """Select the oldest undelivered listener-generation obligation."""
+        candidate: Optional[tuple[int, int, Callable[[], object]]] = None
+        for index, listener in enumerate(tuple(self._trip_listeners)):
+            delivered = self._listener_generations[index]
+            if delivered >= self._trip_generation or index in self._listeners_in_progress:
+                continue
+            target_generation = delivered + 1
+            if (index, target_generation) in attempted:
+                continue
+            if candidate is None or target_generation < candidate[1]:
+                candidate = (index, target_generation, listener)
+        return candidate
+
+    def _drain_pending_listener_events(self) -> None:
+        """Deliver owed trip events with *no* arbitrary callback under state lock.
+
+        The caller must have set ``_notifying=True`` through
+        :meth:`_start_delivery_unlocked`. Re-entrant API calls may create newer
+        generations or append listeners; the outer drain observes them on its
+        next locked selection pass. A failed event is attempted only once in this
+        drain and remains owed for a later external observation.
+        """
         attempted: list[tuple[int, int]] = []
         try:
             while True:
-                self._sync_trip_generation_unlocked()
+                with self._state_lock:
+                    self._sync_trip_generation_unlocked()
+                    candidate = self._select_pending_event_unlocked(attempted)
+                    if candidate is None:
+                        return
+                    index, target_generation, listener = candidate
+                    attempted.append((index, target_generation))
+                    self._listeners_in_progress.add(index)
 
-                candidate_index: Optional[int] = None
-                candidate_generation: Optional[int] = None
-                for index, listener in enumerate(tuple(self._trip_listeners)):
-                    delivered = self._listener_generations[index]
-                    if delivered >= self._trip_generation:
-                        continue
-                    if listener in self._listeners_in_progress:
-                        continue
-                    target_generation = delivered + 1
-                    if (index, target_generation) in attempted:
-                        continue
-                    if (
-                        candidate_generation is None
-                        or target_generation < candidate_generation
-                    ):
-                        candidate_index = index
-                        candidate_generation = target_generation
-
-                if candidate_index is None or candidate_generation is None:
-                    return
-
-                listener = self._trip_listeners[candidate_index]
-                attempted.append((candidate_index, candidate_generation))
-                self._listeners_in_progress.append(listener)
                 succeeded = False
                 try:
                     listener()
@@ -169,48 +198,55 @@ class KillSwitch:
                 except Exception:
                     logger.exception("KillSwitch trip listener failed: %r", listener)
                 finally:
-                    if listener in self._listeners_in_progress:
-                        self._listeners_in_progress.remove(listener)
-
-                # Re-entry may have changed active state or created a newer trip
-                # generation. Capture that before crediting the event we just
-                # delivered. The old generation remains valid historical work.
-                self._sync_trip_generation_unlocked()
-                if succeeded:
-                    # Listener ordering is stable because there is no removal API.
-                    # Dynamic registration appends and cannot shift this index.
-                    current = self._listener_generations[candidate_index]
-                    if current < candidate_generation:
-                        self._listener_generations[candidate_index] = candidate_generation
+                    with self._state_lock:
+                        self._listeners_in_progress.discard(index)
+                        self._sync_trip_generation_unlocked()
+                        if succeeded:
+                            current = self._listener_generations[index]
+                            if current < target_generation:
+                                self._listener_generations[index] = target_generation
         finally:
-            self._notifying = False
+            with self._state_lock:
+                self._notifying = False
 
-    def _refresh_trip_unlocked(self) -> bool:
-        """Refresh active state and drain pending trip events. Caller holds lock."""
-        active = self._sync_trip_generation_unlocked()
-        if not self._notifying and self._has_pending_listener_events_unlocked():
-            self._notify_pending_listeners_unlocked()
+    def _observe_and_drain(self) -> bool:
+        """Observe state, publish generations, and drain callbacks outside lock."""
+        with self._state_lock:
             active = self._sync_trip_generation_unlocked()
-        return active
+            should_drain = self._start_delivery_unlocked()
+        if should_drain:
+            self._drain_pending_listener_events()
+        with self._state_lock:
+            return self._sync_trip_generation_unlocked()
 
     # -- query ---------------------------------------------------------------
 
     def tripped(self) -> bool:
-        """True if the switch is currently tripped (flag OR hot file)."""
-        with self._state_lock:
-            return self._refresh_trip_unlocked()
+        """True if currently tripped; also advances pending listener delivery."""
+        return self._observe_and_drain()
 
     @contextmanager
     def execution_fence(self) -> Iterator[bool]:
-        """Hold kill state stable across one in-process authority boundary."""
+        """Hold kill state stable across one in-process authority boundary.
+
+        Listener callbacks are deliberately *not* invoked here because the
+        caller may already hold the CommitGateway protocol lock. Critical
+        pending generations instead make the fence fail closed. CommitGateway
+        performs a listener-draining preflight before acquiring its protocol
+        lock, while this fence closes the race between that preflight and the
+        authority transition.
+        """
         with self._state_lock:
-            yield self._refresh_trip_unlocked()
+            active = self._sync_trip_generation_unlocked()
+            blocked = active or self._has_pending_critical_events_unlocked()
+            yield blocked
 
     def state(self) -> dict:
         """Diagnostic snapshot of both mechanisms. For health/journal."""
+        self._observe_and_drain()
         with self._state_lock:
             path = self._config.kill_path()
-            active = self._refresh_trip_unlocked()
+            active = self._sync_trip_generation_unlocked()
             try:
                 hot_file_exists = path.exists() if path.parent.exists() else None
             except OSError:
@@ -221,12 +257,14 @@ class KillSwitch:
                 "hot_file": str(path),
                 "hot_file_exists": hot_file_exists,
                 "env_var": self._config.kill_env_var,
+                "trip_generation": self._trip_generation,
+                "critical_revocation_pending": self._has_pending_critical_events_unlocked(),
             }
 
     # -- mutations -----------------------------------------------------------
 
     def trip(self) -> None:
-        """Atomically activate the in-process trip and publish its generation."""
+        """Activate the in-process trip, publish its generation, then notify."""
         with self._state_lock:
             self._flag = True
             path = self._config.kill_path()
@@ -235,7 +273,11 @@ class KillSwitch:
                 path.touch()
             except OSError as exc:
                 logger.warning("Could not write kill hot file %s: %r", path, exc)
-            self._refresh_trip_unlocked()
+            self._sync_trip_generation_unlocked()
+            should_drain = self._start_delivery_unlocked()
+
+        if should_drain:
+            self._drain_pending_listener_events()
         logger.warning("KillSwitch tripped")
 
     def reset(self) -> None:
@@ -248,7 +290,11 @@ class KillSwitch:
                     path.unlink()
             except OSError as exc:
                 logger.warning("Could not remove kill hot file %s: %r", path, exc)
-            self._refresh_trip_unlocked()
+            self._sync_trip_generation_unlocked()
+            should_drain = self._start_delivery_unlocked()
+
+        if should_drain:
+            self._drain_pending_listener_events()
         logger.info("KillSwitch reset")
 
     # -- guard helper --------------------------------------------------------

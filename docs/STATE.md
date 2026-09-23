@@ -20,7 +20,7 @@
 ## Current version
 
 **v0.3 stabilized live path + M5 layer-3 candidate** — 20 live/implemented
-capabilities; **455 tests** on the reviewed M5 branch; CI-enforced on Python
+capabilities; **458 tests** on the reviewed M5 branch; CI-enforced on Python
 3.11/3.12; Ruff clean; mypy clean across 51 source files.
 
 M5 status:
@@ -91,9 +91,11 @@ RecoveryGuard onto M5.
     targets the same fact; REQUIRED reservation start is latched before I/O and
     forbids generic clean release afterward.
 18. **Approval, intent, and permit time are distinct authority concepts.** Grant
-    expiry uses the grant clock; permit TTL uses the gateway clock and begins at
-    actual mint. Approval/epoch validity is rechecked after REQUIRED durability
-    before authority is exposed.
+    expiry and permit TTL are process-local elapsed-time authority and default to
+    monotonic clocks; permit TTL begins at actual mint. Grant and gateway clock
+    values are never compared directly. Approval/epoch validity is rechecked
+    after REQUIRED durability before authority is exposed. Durable ledger
+    timestamps remain UTC wall-clock provenance.
 19. **Never blindly replay explicit uncertainty.** Durable `RESERVED` or
     `EFFECT_UNKNOWN` requires reconciliation once RecoveryGuard is integrated.
 20. **Same-process least authority is not a hostile-code sandbox.** Untrusted
@@ -122,6 +124,8 @@ Key current layer-3 facts:
 - REQUIRED: snapshot → validate → latch → durable `RESERVED` → revalidate
   grant/epoch → spend → mint.
 - BEST_EFFORT: only proven replay-safe semantics may omit precommit reservation.
+- process-local approval/permit TTL defaults use `time.monotonic()`; ledger
+  timestamps remain UTC wall time.
 - `EffectLedger` validates strict schema, immutable lineage, monotonic states,
   and same-path process-local writer serialization.
 - Exact same-fact retry re-fsyncs a visible-but-ambiguously-durable row instead
@@ -160,7 +164,7 @@ Key current layer-3 facts:
 | **v0.2 M4c** | quote_multi_image | **LIVE-VERIFIED** |
 | **M5 L1** | EffectPolicy + durable EffectLedger | **DONE** |
 | **M5 L2** | ApprovalGrant + EffectAttempt | **DONE** |
-| **M5 L3** | CommitGateway + EffectPermit | **CANDIDATE — 455 green / independently reviewed** |
+| **M5 L3** | CommitGateway + EffectPermit | **CANDIDATE — 458 green / independently reviewed** |
 | **M5 L4** | scoped broker authorities | **NEXT** |
 | **M5 L5** | concrete capability migration | pending |
 | **M5 L6** | RecoveryGuard | pending |
@@ -220,6 +224,7 @@ M5 layer-3 additions:
 - exact-object `EffectPermit` and canonical-attempt lineage;
 - private immutable intent snapshot across blocking commit work;
 - mint-time permit TTL;
+- monotonic default clocks for grant/permit authority TTLs;
 - post-durability grant/epoch revalidation;
 - durable terminal outcomes before in-memory terminalization;
 - strict JSON evidence and reserved correlation-key protection;
@@ -304,6 +309,18 @@ M5 layer-3 additions:
 
 ## History
 
+- 2026-09-23 (r): **M5 L3 FINAL CLOCK-DOMAIN HARDENING.** Targeted final Codex
+  review found one additional P2 after the 455-test candidate: process-local
+  grant/permit authority TTLs defaulted to `time.time()`, so wall-clock rollback
+  could extend authority and a forward correction could expire it early.
+  Independently verified and fixed: `ApprovalGrant`, `ApprovalGrantStore`, and
+  `CommitGateway` now default to `time.monotonic()` for elapsed-time authority;
+  injected clocks remain supported. `EffectLedgerRecord.timestamp` remains UTC
+  wall-clock provenance. Regression `test_m5_monotonic_authority_clock.py`
+  locks grant/store/gateway clock defaults plus ledger timestamp separation.
+  Runtime `165527ce`: **458 tests**, Ruff clean, mypy clean over 51 source files,
+  Python 3.11/3.12 green (CI #90). Normative design updated with monotonic-clock
+  invariant and T19 acceptance case. Layer 4 scoped authorities remains next.
 - 2026-09-23 (q): **M5 LAYER 3 REVIEWED CANDIDATE (PR #4).** CommitGateway /
   EffectPermit implemented and subjected to the repository's maintainer-first
   exhaustive review procedure. Frozen maintainer first pass found and fixed:

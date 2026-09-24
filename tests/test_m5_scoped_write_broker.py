@@ -68,6 +68,12 @@ class _CDP:
         if "data-wireagent-quote-item" in expr and "item.click()" in expr:
             self.events.append("click_bound_quote")
             return ok_result(data={"result": {"value": "clicked"}})
+        # Media binding is a more specific expression than context binding and
+        # must be classified first because both contain data-wireagent-context.
+        if "data-wireagent-approved-media" in expr and "found.length" in expr:
+            assert "[data-testid='attachments']" in expr
+            self.events.append("bind_new_media")
+            return ok_result(data={"result": {"value": "bound"}})
         if "data-wireagent-context" in expr and "found.length" in expr:
             self.events.append("bind_new_context")
             return ok_result(data={"result": {"value": "bound"}})
@@ -80,10 +86,6 @@ class _CDP:
         if "data-wireagent-media-baseline" in expr:
             self.events.append("baseline_media")
             return ok_result(data={"result": {"value": "baselined"}})
-        if "data-wireagent-approved-media" in expr and "found.length" in expr:
-            assert "[data-testid='attachments']" in expr
-            self.events.append("bind_new_media")
-            return ok_result(data={"result": {"value": "bound"}})
         if "data-wireagent-submit-button" in expr and "candidates.length" in expr:
             assert "data-wireagent-context-kind" in expr
             assert "data-wireagent-context-target" in expr
@@ -167,7 +169,7 @@ async def test_approved_upload_is_bound_to_exact_new_preview(
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("webwire.m5_scoped_write_broker.asyncio.sleep", _no_sleep)
     broker, sb = _broker(tmp_path)
-    broker._m5_context_token = "ctx"  # test the broker provenance seam directly
+    broker._m5_context_token = "ctx"
     broker._m5_context_kind = "post"
     broker._m5_context_target = "none"
     result = await broker.attach_media(str(tmp_path / "approved.png"))

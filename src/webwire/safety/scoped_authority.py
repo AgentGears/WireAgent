@@ -703,6 +703,8 @@ class _EffectAuthorityBase:
         "__invoke",
         "__holder",
         "__tracker",
+        "__state_lock",
+        "__invocation_in_flight",
     )
 
     def __init__(
@@ -727,6 +729,8 @@ class _EffectAuthorityBase:
         self.__invoke = invoke
         self.__holder = holder
         self.__tracker = tracker
+        self.__state_lock = threading.RLock()
+        self.__invocation_in_flight = False
 
     @property
     def effect(self) -> EffectVerb:
@@ -767,14 +771,32 @@ class _EffectAuthorityBase:
         return None
 
     async def _invoke_exact(self) -> ActionResult:
+        with self.__state_lock:
+            with self.__holder._lock:
+                if self.__holder.permit is not None:
+                    return soft_failure(
+                        "scoped effect authority is exhausted after commit authorization",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+            if self.__invocation_in_flight:
+                return soft_failure(
+                    "scoped effect authority invocation already in flight",
+                    failure_category=FailureCategory.SECURITY,
+                )
+            self.__invocation_in_flight = True
+
         tracker = self.__tracker
-        if tracker is not None:
-            tracker.begin_effect(self.__binding)
+        tracker_started = False
         try:
+            if tracker is not None:
+                tracker.begin_effect(self.__binding)
+                tracker_started = True
             return await self.__invoke(self._commit_gate)
         finally:
-            if tracker is not None:
+            if tracker is not None and tracker_started:
                 tracker.finish_effect()
+            with self.__state_lock:
+                self.__invocation_in_flight = False
 
 
 class SetBookmarkAuthority(_EffectAuthorityBase):

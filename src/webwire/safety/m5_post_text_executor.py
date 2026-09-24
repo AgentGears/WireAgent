@@ -196,12 +196,16 @@ class M5PostTextExecutor:
 
         permit = receipt.permit
         if permit is None:
-            if not session.attempt.reservation_started:
-                await self._abort_precommit(
-                    session,
-                    preparation,
-                    reason="submit_failed_before_commit_authority",
-                )
+            # Even an ambiguous reservation failure must release transient
+            # browser/composer ownership. Only the *effect attempt* remains
+            # unresolved; UI cleanup does not prove or rewrite ledger truth.
+            try:
+                await preparation.close_composer()
+            finally:
+                if not session.attempt.reservation_started:
+                    session.resolve_no_external_effect(
+                        reason="submit_failed_before_commit_authority"
+                    )
             return self._execution(submit_result, session, None)
 
         if not permit.consumed:
@@ -311,12 +315,13 @@ class M5PostTextExecutor:
     ) -> M5PostTextExecution:
         permit = receipt.permit
         if permit is None:
-            if not session.attempt.reservation_started:
-                await self._abort_precommit(
-                    session,
-                    preparation,
-                    reason="submit_interrupted_before_commit_authority",
-                )
+            try:
+                await preparation.close_composer()
+            finally:
+                if not session.attempt.reservation_started:
+                    session.resolve_no_external_effect(
+                        reason="submit_interrupted_before_commit_authority"
+                    )
             result = hard_failure(
                 f"post submit interrupted before commit authority: {type(exc).__name__}",
                 failure_category=FailureCategory.UNKNOWN,

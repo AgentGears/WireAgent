@@ -8,6 +8,8 @@ lease required by Layer 4's transient DOM ownership contract.
 
 from __future__ import annotations
 
+from typing import Any
+
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectPolicyRegistry
@@ -19,7 +21,7 @@ _REQUIRED_SCOPED_AUTHORITY_VERSION = 3
 
 
 def build_live_scoped_authority_broker(
-    write_broker: M5LeasedWriteBroker,
+    write_broker: Any,
     commit_gateway: CommitGateway,
     *,
     policies: EffectPolicyRegistry = DEFAULT_EFFECT_POLICIES,

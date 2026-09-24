@@ -9,7 +9,8 @@ M5 write attempts share one ``SuperBrowser`` instance:
 - target-click -> transient-context binding cannot interleave with another M5
   writer;
 - focus -> keyboard typing and upload -> preview binding stay inside the lease;
-- one-step engagement/delete cannot navigate over an owned content context.
+- one-step engagement/delete cannot navigate over an owned content context;
+- delete menu and confirmation controls are causally bound to the approved target.
 
 This is still an engineering boundary, not a hostile-code sandbox. Layer 5 must
 ensure legacy/read paths do not concurrently navigate the same browser while an
@@ -99,7 +100,17 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
         async with self._m5_write_state.lock:
             if (blocked := self._claim_content_owner()) is not None:
                 return blocked
-            result = await operation()
+            try:
+                result = await operation()
+            except BaseException:
+                # If no context was ever bound, retaining ownership would wedge
+                # every later M5 writer without protecting any browser state.
+                # Once a context exists, retain the lease fail-closed so an
+                # orphaned composer cannot be adopted by another write attempt.
+                if self._m5_context_token is None:
+                    self._clear_context()
+                    self._release_content_owner()
+                raise
             if not result.ok or self._m5_context_token is None:
                 self._clear_context()
                 self._release_content_owner()
@@ -160,6 +171,106 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             "if(form)inputs=form.querySelectorAll(\"input[type='file']\");}"
             "if(inputs.length!==1)return inputs.length?'ambiguous':'missing';"
             "inputs[0].setAttribute('data-wireagent-media-input',token);return 'bound';})()"
+        )
+
+    @staticmethod
+    def _baseline_delete_menus_js(baseline: str) -> str:
+        mark = json.dumps(baseline)
+        return (
+            "(function(){"
+            "function vis(e){return !!(e&&e.isConnected&&e.getClientRects().length);}"
+            f"var mark={mark};"
+            "var menus=document.querySelectorAll(\"[data-testid='Dropdown'],[role='menu']\");"
+            "for(var i=0;i<menus.length;i++)if(vis(menus[i]))"
+            "menus[i].setAttribute('data-wireagent-delete-menu-baseline',mark);"
+            "return 'baselined';})()"
+        )
+
+    @staticmethod
+    def _bind_new_delete_menu_js(baseline: str, token: str) -> str:
+        base = json.dumps(baseline)
+        mark = json.dumps(token)
+        return (
+            "(function(){"
+            "function vis(e){return !!(e&&e.isConnected&&e.getClientRects().length);}"
+            f"var base={base},mark={mark};"
+            "var menus=document.querySelectorAll(\"[data-testid='Dropdown'],[role='menu']\");"
+            "var found=[];"
+            "for(var m=0;m<menus.length;m++){var menu=menus[m];if(!vis(menu))continue;"
+            "if(menu.getAttribute('data-wireagent-delete-menu-baseline')===base)continue;"
+            "var items=menu.querySelectorAll(\"[role='menuitem'],a,button\");"
+            "for(var i=0;i<items.length;i++){var t=(items[i].innerText||'').trim();"
+            "if(t==='Delete'||t==='Delete post'||t==='删除'||t==='删除帖子')"
+            "{found.push([menu,items[i]]);break;}}}"
+            "if(found.length!==1)return found.length?'ambiguous':'missing';"
+            "found[0][0].setAttribute('data-wireagent-delete-menu',mark);"
+            "found[0][1].setAttribute('data-wireagent-delete-item',mark);"
+            "return 'bound';})()"
+        )
+
+    @staticmethod
+    def _click_bound_delete_item_js(token: str) -> str:
+        mark = json.dumps(token)
+        return (
+            "(function(){"
+            f"var mark={mark};"
+            "var menu=document.querySelector('[data-wireagent-delete-menu=\"'+mark+'\"]');"
+            "var item=document.querySelector('[data-wireagent-delete-item=\"'+mark+'\"]');"
+            "if(!menu||!item||!menu.contains(item)||!item.isConnected)return 'stale';"
+            "item.removeAttribute('data-wireagent-delete-item');item.click();return 'clicked';})()"
+        )
+
+    @staticmethod
+    def _baseline_delete_confirms_js(baseline: str) -> str:
+        mark = json.dumps(baseline)
+        return (
+            "(function(){"
+            "function vis(e){return !!(e&&e.isConnected&&e.getClientRects().length);}"
+            f"var mark={mark};"
+            "var bs=document.querySelectorAll(\"[data-testid='confirmationSheetConfirm']\");"
+            "for(var i=0;i<bs.length;i++)if(vis(bs[i]))"
+            "bs[i].setAttribute('data-wireagent-delete-confirm-baseline',mark);"
+            "var dialogs=document.querySelectorAll(\"[role='dialog']\");"
+            "for(var d=0;d<dialogs.length;d++){if(!vis(dialogs[d]))continue;"
+            "var buttons=dialogs[d].querySelectorAll('button');"
+            "for(var j=0;j<buttons.length;j++){if(vis(buttons[j])&&"
+            "(buttons[j].innerText||'').trim()==='Delete')"
+            "buttons[j].setAttribute('data-wireagent-delete-confirm-baseline',mark);}}"
+            "return 'baselined';})()"
+        )
+
+    @staticmethod
+    def _bind_new_delete_confirm_js(baseline: str, token: str) -> str:
+        base = json.dumps(baseline)
+        mark = json.dumps(token)
+        return (
+            "(function(){"
+            "function vis(e){return !!(e&&e.isConnected&&e.getClientRects().length);}"
+            f"var base={base},mark={mark};var found=[];"
+            "var primary=document.querySelectorAll(\"[data-testid='confirmationSheetConfirm']\");"
+            "for(var i=0;i<primary.length;i++){var b=primary[i];if(!vis(b))continue;"
+            "if(b.getAttribute('data-wireagent-delete-confirm-baseline')===base)continue;"
+            "found.push(b);}"
+            "if(found.length===0){var dialogs=document.querySelectorAll(\"[role='dialog']\");"
+            "for(var d=0;d<dialogs.length;d++){if(!vis(dialogs[d]))continue;"
+            "var buttons=dialogs[d].querySelectorAll('button');"
+            "for(var j=0;j<buttons.length;j++){var b=buttons[j];"
+            "if(!vis(b)||(b.innerText||'').trim()!=='Delete')continue;"
+            "if(b.getAttribute('data-wireagent-delete-confirm-baseline')===base)continue;"
+            "found.push(b);}}}"
+            "if(found.length!==1)return found.length?'ambiguous':'missing';"
+            "found[0].setAttribute('data-wireagent-delete-confirm',mark);return 'bound';})()"
+        )
+
+    @staticmethod
+    def _click_bound_delete_confirm_js(token: str) -> str:
+        mark = json.dumps(token)
+        return (
+            "(function(){"
+            f"var mark={mark};"
+            "var b=document.querySelector('[data-wireagent-delete-confirm=\"'+mark+'\"]');"
+            "if(!b||!b.isConnected||!b.getClientRects().length)return 'stale';"
+            "b.removeAttribute('data-wireagent-delete-confirm');b.click();return 'clicked';})()"
         )
 
     async def fill_composer(self, text: str) -> ActionResult:
@@ -289,6 +400,110 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             )
         )
 
+    async def _delete_scoped(
+        self,
+        post_url: str,
+        post_id: str,
+        commit_gate: Optional[CommitGate],
+    ) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        if self._status_id(post_url) != post_id:
+            return soft_failure(
+                "delete_post target URL/id mismatch",
+                failure_category=FailureCategory.SECURITY,
+            )
+        try:
+            nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
+            if not nav.ok:
+                return nav
+
+            found = await self._delete_poll(
+                lambda: self._delete_eval(self._delete_article_js(post_id, 'return "found";')),
+                want_true=True,
+                label="target article",
+            )
+            if not found.ok:
+                return soft_failure(
+                    "delete_post: target post not found",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+
+            cdp = self._sb._controller._cdp
+            menu_baseline = secrets.token_hex(16)
+            await cdp.evaluate(self._baseline_delete_menus_js(menu_baseline))
+            caret = await self._delete_eval(
+                self._delete_article_js(
+                    post_id,
+                    'var c=art.querySelector("[data-testid=\'caret\']");'
+                    'if(!c)return null;c.click();return "caret_clicked";',
+                )
+            )
+            if not (caret.ok and caret.data):
+                return soft_failure(
+                    "delete_post: caret button not found on target article",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+
+            menu_token = secrets.token_hex(16)
+            menu = await self._delete_poll(
+                lambda: self._delete_eval(
+                    self._bind_new_delete_menu_js(menu_baseline, menu_token)
+                ),
+                want_true=True,
+                label="target-triggered delete menu",
+            )
+            if not menu.ok:
+                return soft_failure(
+                    "delete_post: no unique target-triggered Delete menu",
+                    failure_category=FailureCategory.SECURITY,
+                )
+
+            confirm_baseline = secrets.token_hex(16)
+            await cdp.evaluate(self._baseline_delete_confirms_js(confirm_baseline))
+            clicked_item = await self._delete_eval(self._click_bound_delete_item_js(menu_token))
+            if not (clicked_item.ok and clicked_item.data):
+                return soft_failure(
+                    "delete_post: bound Delete menu item became stale",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+
+            confirm_token = secrets.token_hex(16)
+            confirm = await self._delete_poll(
+                lambda: self._delete_eval(
+                    self._bind_new_delete_confirm_js(confirm_baseline, confirm_token)
+                ),
+                want_true=True,
+                label="target-triggered delete confirmation",
+            )
+            if not confirm.ok:
+                await self._dismiss_delete_dialog()
+                return soft_failure(
+                    "delete_post: no unique target-triggered confirmation",
+                    failure_category=FailureCategory.SECURITY,
+                )
+
+            if (r := self._guard()) is not None:
+                await self._dismiss_delete_dialog()
+                return r
+            if (denied := self._cross_commit_gate(commit_gate)) is not None:
+                await self._dismiss_delete_dialog()
+                return denied
+
+            clicked_confirm = await self._delete_eval(
+                self._click_bound_delete_confirm_js(confirm_token)
+            )
+            if not (clicked_confirm.ok and clicked_confirm.data):
+                await self._dismiss_delete_dialog()
+                return soft_failure(
+                    "delete_post: bound confirmation changed after authority crossing",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            return ok_result(data={"deleted": True, "post_id": post_id})
+        except Exception as exc:  # noqa: BLE001
+            await self._dismiss_delete_dialog()
+            return soft_failure(f"delete_post error: {exc!r}")
+
     async def delete_post(
         self,
         post_url: str,
@@ -297,7 +512,5 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
         _commit_gate: Optional[CommitGate] = None,
     ) -> ActionResult:
         return await self._one_shot(
-            lambda: super(M5LeasedWriteBroker, self).delete_post(
-                post_url, post_id, _commit_gate=_commit_gate
-            )
+            lambda: self._delete_scoped(post_url, post_id, _commit_gate)
         )

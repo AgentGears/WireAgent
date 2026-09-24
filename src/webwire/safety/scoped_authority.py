@@ -19,9 +19,10 @@ and no raw browser handle.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -217,9 +218,7 @@ class _IntentBinding:
                 raise ScopedAuthorityDenied("payload_invalid", "manifest path is invalid")
             if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
                 raise ScopedAuthorityDenied("payload_invalid", "manifest digest is invalid")
-            media.append(
-                _MediaBinding(expected_index, source_path, digest.lower())
-            )
+            media.append(_MediaBinding(expected_index, source_path, digest.lower()))
 
         return cls(
             action_type=frozen.action_type,
@@ -245,8 +244,11 @@ class _PreparationTracker:
     text_filled: bool = False
     media_attached: int = 0
     sealed: bool = False
+    in_flight: bool = False
+    revision: int = 0
+    _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
-    def require_binding(self, binding: _IntentBinding) -> None:
+    def _require_binding_unlocked(self, binding: _IntentBinding) -> None:
         if (
             self.intent_hash != binding.intent_hash
             or self.action_type != binding.action_type
@@ -255,18 +257,88 @@ class _PreparationTracker:
         ):
             raise ScopedAuthorityDenied("preparation_binding_mismatch")
 
-    def ready(self, binding: _IntentBinding) -> bool:
-        self.require_binding(binding)
-        return (
-            self.composer_opened
-            and self.text_filled
-            and self.media_attached == self.expected_media
-        )
+    def require_binding(self, binding: _IntentBinding) -> None:
+        with self._lock:
+            self._require_binding_unlocked(binding)
 
-    def reset(self) -> None:
-        self.composer_opened = False
-        self.text_filled = False
-        self.media_attached = 0
+    def is_sealed(self) -> bool:
+        with self._lock:
+            return self.sealed
+
+    def ready(self, binding: _IntentBinding) -> bool:
+        with self._lock:
+            self._require_binding_unlocked(binding)
+            return (
+                not self.in_flight
+                and self.composer_opened
+                and self.text_filled
+                and self.media_attached == self.expected_media
+            )
+
+    def ready_and_sealed(self, binding: _IntentBinding) -> bool:
+        with self._lock:
+            self._require_binding_unlocked(binding)
+            return (
+                self.sealed
+                and not self.in_flight
+                and self.composer_opened
+                and self.text_filled
+                and self.media_attached == self.expected_media
+            )
+
+    def seal(self, binding: _IntentBinding) -> None:
+        with self._lock:
+            self._require_binding_unlocked(binding)
+            if self.sealed:
+                raise ScopedAuthorityDenied("preparation_sealed")
+            if (
+                self.in_flight
+                or not self.composer_opened
+                or not self.text_filled
+                or self.media_attached != self.expected_media
+            ):
+                raise ScopedAuthorityDenied("preparation_incomplete")
+            self.sealed = True
+
+    def begin(self, binding: _IntentBinding) -> int:
+        with self._lock:
+            self._require_binding_unlocked(binding)
+            if self.sealed:
+                raise ScopedAuthorityDenied("preparation_sealed")
+            if self.in_flight:
+                raise ScopedAuthorityDenied("preparation_in_flight")
+            self.in_flight = True
+            return self.revision
+
+    def finish(
+        self,
+        revision: int,
+        *,
+        succeeded: bool,
+        composer_opened: bool = False,
+        text_filled: bool = False,
+        media_delta: int = 0,
+    ) -> bool:
+        with self._lock:
+            valid = self.in_flight and self.revision == revision and not self.sealed
+            if valid and succeeded:
+                if composer_opened:
+                    self.composer_opened = True
+                if text_filled:
+                    self.text_filled = True
+                self.media_attached += media_delta
+            self.in_flight = False
+            return valid
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self.revision += 1
+            self.composer_opened = False
+            self.text_filled = False
+            self.media_attached = 0
+            # Deliberately leave in_flight unchanged. A concurrent cleanup
+            # invalidates the running operation, and new staging remains blocked
+            # until that operation returns and clears its latch via finish().
 
 
 _EFFECT_BY_ACTION: dict[str, EffectVerb] = {
@@ -335,6 +407,9 @@ class _PreparationBase:
     def _tracker(self) -> _PreparationTracker:
         return self.__tracker
 
+    def _binding(self) -> _IntentBinding:
+        return self.__binding
+
     def _expected_text(self) -> str:
         return self.__binding.normalized_text
 
@@ -346,7 +421,7 @@ class _PreparationBase:
 
     def _require_live(self, verb: PreparationVerb) -> None:
         tracker = self.__tracker
-        if tracker.sealed:
+        if tracker.is_sealed():
             raise ScopedAuthorityDenied("preparation_sealed")
         grant = self.__grant
         attempt = self.__attempt
@@ -409,16 +484,19 @@ class _PreparationBase:
         if digest != expected.sha256:
             raise ScopedAuthorityDenied("media_changed_after_approval")
         self._require_live(PreparationVerb.ATTACH_MEDIA)
-        result = await self.__attach_media(expected.source_path)
-        if result.ok:
-            tracker.media_attached += 1
+        revision = tracker.begin(self.__binding)
+        try:
+            result = await self.__attach_media(expected.source_path)
+        except BaseException:
+            tracker.finish(revision, succeeded=False)
+            raise
+        tracker.finish(revision, succeeded=result.ok, media_delta=1)
         return result
 
     async def close_composer(self) -> ActionResult:
-        result = await self.__close_composer()
-        if result.ok:
-            self.__tracker.reset()
-        return result
+        tracker = self.__tracker
+        tracker.invalidate()
+        return await self.__close_composer()
 
 
 class PostPreparationAuthority(_PreparationBase):
@@ -436,10 +514,18 @@ class PostPreparationAuthority(_PreparationBase):
             raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        result = await self.__fill_composer(self._expected_text())
-        if result.ok:
-            tracker.composer_opened = True
-            tracker.text_filled = True
+        revision = tracker.begin(self._binding())
+        try:
+            result = await self.__fill_composer(self._expected_text())
+        except BaseException:
+            tracker.finish(revision, succeeded=False)
+            raise
+        tracker.finish(
+            revision,
+            succeeded=result.ok,
+            composer_opened=True,
+            text_filled=True,
+        )
         return result
 
 
@@ -458,9 +544,15 @@ class ReplyPreparationAuthority(_PreparationBase):
             raise ScopedAuthorityDenied("preparation_order")
         if post_url != self._expected_post_url() or target_post_id != self._expected_target_post_id():
             raise ScopedAuthorityDenied("target_mismatch")
-        result = await self.__open_reply(self._expected_post_url(), self._expected_target_post_id())
-        if result.ok:
-            tracker.composer_opened = True
+        revision = tracker.begin(self._binding())
+        try:
+            result = await self.__open_reply(
+                self._expected_post_url(), self._expected_target_post_id()
+            )
+        except BaseException:
+            tracker.finish(revision, succeeded=False)
+            raise
+        tracker.finish(revision, succeeded=result.ok, composer_opened=True)
         return result
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
@@ -470,9 +562,13 @@ class ReplyPreparationAuthority(_PreparationBase):
             raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        result = await self.__fill_reply(self._expected_text())
-        if result.ok:
-            tracker.text_filled = True
+        revision = tracker.begin(self._binding())
+        try:
+            result = await self.__fill_reply(self._expected_text())
+        except BaseException:
+            tracker.finish(revision, succeeded=False)
+            raise
+        tracker.finish(revision, succeeded=result.ok, text_filled=True)
         return result
 
 
@@ -491,9 +587,15 @@ class QuotePreparationAuthority(_PreparationBase):
             raise ScopedAuthorityDenied("preparation_order")
         if post_url != self._expected_post_url() or target_post_id != self._expected_target_post_id():
             raise ScopedAuthorityDenied("target_mismatch")
-        result = await self.__open_quote(self._expected_post_url(), self._expected_target_post_id())
-        if result.ok:
-            tracker.composer_opened = True
+        revision = tracker.begin(self._binding())
+        try:
+            result = await self.__open_quote(
+                self._expected_post_url(), self._expected_target_post_id()
+            )
+        except BaseException:
+            tracker.finish(revision, succeeded=False)
+            raise
+        tracker.finish(revision, succeeded=result.ok, composer_opened=True)
         return result
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
@@ -503,9 +605,13 @@ class QuotePreparationAuthority(_PreparationBase):
             raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        result = await self.__fill_quote(self._expected_text())
-        if result.ok:
-            tracker.text_filled = True
+        revision = tracker.begin(self._binding())
+        try:
+            result = await self.__fill_quote(self._expected_text())
+        except BaseException:
+            tracker.finish(revision, succeeded=False)
+            raise
+        tracker.finish(revision, succeeded=result.ok, text_filled=True)
         return result
 
 
@@ -739,7 +845,7 @@ class ScopedAuthorityBroker:
             self.__preparations[attempt.attempt_id] = tracker
         else:
             tracker.require_binding(binding)
-            if tracker.sealed:
+            if tracker.is_sealed():
                 raise ScopedAuthorityDenied("preparation_sealed")
 
         common: dict[str, Any] = {
@@ -779,9 +885,9 @@ class ScopedAuthorityBroker:
         tracker: Optional[_PreparationTracker] = None
         if binding.action_type in _CONTENT_ACTIONS:
             tracker = self.__preparations.get(attempt.attempt_id)
-            if tracker is None or not tracker.ready(binding):
+            if tracker is None:
                 raise ScopedAuthorityDenied("preparation_incomplete")
-            tracker.sealed = True
+            tracker.seal(binding)
 
         broker = self.__write_broker
         holder = _PermitHolder()
@@ -808,7 +914,7 @@ class ScopedAuthorityBroker:
             assert tracker is not None
 
             async def precommit_check() -> Optional[ActionResult]:
-                if not tracker.ready(binding) or not tracker.sealed:
+                if not tracker.ready_and_sealed(binding):
                     return soft_failure(
                         "approved preparation state is not sealed/complete",
                         failure_category=FailureCategory.SECURITY,

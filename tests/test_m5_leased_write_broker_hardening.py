@@ -14,8 +14,16 @@ from webwire.safety.kill_switch import KillSwitch
 
 
 class _DeleteCDP:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        ambiguous_menu: bool = False,
+        ambiguous_confirm: bool = False,
+    ) -> None:
         self.events = events
+        self.ambiguous_menu = ambiguous_menu
+        self.ambiguous_confirm = ambiguous_confirm
 
     async def evaluate(self, expr: str) -> ActionResult:
         if "data-wireagent-delete-menu-baseline" in expr and "baselined" in expr:
@@ -26,7 +34,7 @@ class _DeleteCDP:
             value = "caret_clicked"
         elif "data-wireagent-delete-menu" in expr and "found.length" in expr:
             self.events.append("bind_menu")
-            value = "bound"
+            value = "ambiguous" if self.ambiguous_menu else "bound"
         elif "data-wireagent-delete-confirm-baseline" in expr and "baselined" in expr:
             self.events.append("baseline_confirm")
             value = "baselined"
@@ -35,7 +43,7 @@ class _DeleteCDP:
             value = "clicked"
         elif "data-wireagent-delete-confirm" in expr and "found.length" in expr:
             self.events.append("bind_confirm")
-            value = "bound"
+            value = "ambiguous" if self.ambiguous_confirm else "bound"
         elif "data-wireagent-delete-confirm" in expr and "b.click()" in expr:
             self.events.append("click_bound_confirm")
             value = "clicked"
@@ -48,23 +56,49 @@ class _DeleteCDP:
 
 
 class _Controller:
-    def __init__(self, events: list[str]) -> None:
-        self._cdp = _DeleteCDP(events)
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        ambiguous_menu: bool = False,
+        ambiguous_confirm: bool = False,
+    ) -> None:
+        self._cdp = _DeleteCDP(
+            events,
+            ambiguous_menu=ambiguous_menu,
+            ambiguous_confirm=ambiguous_confirm,
+        )
 
 
 class _SB:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        ambiguous_menu: bool = False,
+        ambiguous_confirm: bool = False,
+    ) -> None:
         self.events: list[str] = []
-        self._controller = _Controller(self.events)
+        self._controller = _Controller(
+            self.events,
+            ambiguous_menu=ambiguous_menu,
+            ambiguous_confirm=ambiguous_confirm,
+        )
 
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> ActionResult:
         self.events.append(f"navigate:{url}")
         return ok_result(data={"url": url})
 
 
-
-def _broker(tmp_path: Path) -> tuple[M5LeasedWriteBroker, _SB]:
-    sb = _SB()
+def _broker(
+    tmp_path: Path,
+    *,
+    ambiguous_menu: bool = False,
+    ambiguous_confirm: bool = False,
+) -> tuple[M5LeasedWriteBroker, _SB]:
+    sb = _SB(
+        ambiguous_menu=ambiguous_menu,
+        ambiguous_confirm=ambiguous_confirm,
+    )
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     broker = M5LeasedWriteBroker(sb, KillSwitch(cfg))  # type: ignore[arg-type]
     broker._DELETE_POLL_INTERVAL_S = 0.0
@@ -97,6 +131,46 @@ async def test_delete_binds_new_menu_and_confirm_before_commit(tmp_path: Path) -
         "gate",
         "click_bound_confirm",
     ]
+
+
+async def test_ambiguous_delete_menu_fails_before_commit(tmp_path: Path) -> None:
+    broker, sb = _broker(tmp_path, ambiguous_menu=True)
+    gate_called = False
+
+    def gate() -> None:
+        nonlocal gate_called
+        gate_called = True
+        return None
+
+    result = await broker.delete_post(
+        "https://x.com/u/status/123",
+        "123",
+        _commit_gate=gate,
+    )
+    assert not result.ok
+    assert not gate_called
+    assert "baseline_confirm" not in sb.events
+    assert "click_bound_confirm" not in sb.events
+
+
+async def test_ambiguous_delete_confirmation_fails_before_commit(tmp_path: Path) -> None:
+    broker, sb = _broker(tmp_path, ambiguous_confirm=True)
+    gate_called = False
+
+    def gate() -> None:
+        nonlocal gate_called
+        gate_called = True
+        return None
+
+    result = await broker.delete_post(
+        "https://x.com/u/status/123",
+        "123",
+        _commit_gate=gate,
+    )
+    assert not result.ok
+    assert not gate_called
+    assert "bind_confirm" in sb.events
+    assert "click_bound_confirm" not in sb.events
 
 
 def test_delete_binding_js_excludes_preexisting_transients() -> None:

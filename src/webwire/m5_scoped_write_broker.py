@@ -328,12 +328,16 @@ class M5ScopedWriteBroker(M5WriteBroker):
         return ok_result(data={"focused": True})
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
         context = self._require_context()
         if context is None or context[1] != "reply":
             return soft_failure("reply composer context is not bound", failure_category=FailureCategory.SECURITY)
         focused = await self._focus_bound_textarea()
         if not focused.ok:
             return focused
+        if (r := self._guard()) is not None:
+            return r
         try:
             await self._sb._page.engine_page.backend_page.keyboard.type(text, delay=10)
             await asyncio.sleep(0.25)
@@ -342,12 +346,16 @@ class M5ScopedWriteBroker(M5WriteBroker):
             return soft_failure(f"fill_reply_composer error: {exc!r}")
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
         context = self._require_context()
         if context is None or context[1] != "quote":
             return soft_failure("quote composer context is not bound", failure_category=FailureCategory.SECURITY)
         focused = await self._focus_bound_textarea()
         if not focused.ok:
             return focused
+        if (r := self._guard()) is not None:
+            return r
         try:
             await self._sb._page.engine_page.backend_page.keyboard.type(text, delay=10)
             await asyncio.sleep(0.25)

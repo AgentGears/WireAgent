@@ -68,11 +68,20 @@ class _M5Broker:
 
 
 class _EvidenceReader:
+    def __init__(
+        self,
+        *,
+        bookmark_state: str = "bookmarked",
+        like_state: str = "liked",
+    ) -> None:
+        self.bookmark_state = bookmark_state
+        self.like_state = like_state
+
     async def read_bookmark_state(self, post_url: str) -> ActionResult:
-        return ok_result(data={"bookmark_state": "bookmarked", "url": post_url})
+        return ok_result(data={"bookmark_state": self.bookmark_state, "url": post_url})
 
     async def read_like_state(self, post_url: str) -> ActionResult:
-        return ok_result(data={"like_state": "liked", "url": post_url})
+        return ok_result(data={"like_state": self.like_state, "url": post_url})
 
 
 class _OriginalCapability:
@@ -133,6 +142,8 @@ def _stack(
     *,
     action: str,
     fail_after_gate: bool = False,
+    bookmark_state: str = "bookmarked",
+    like_state: str = "liked",
 ) -> tuple[
     WriteKernel,
     M5EngagementCapabilityAdapter,
@@ -161,7 +172,13 @@ def _stack(
         commit_gateway=gateway,
         policies=DEFAULT_EFFECT_POLICIES,
     )
-    executor = M5EffectExecutor(runtime=runtime, evidence_reader=_EvidenceReader())
+    executor = M5EffectExecutor(
+        runtime=runtime,
+        evidence_reader=_EvidenceReader(
+            bookmark_state=bookmark_state,
+            like_state=like_state,
+        ),
+    )
     capability = _OriginalCapability(action=action)
     adapter = M5EngagementCapabilityAdapter(capability, executor)
     dedupe = DedupeStore(ttl_seconds=3600)
@@ -245,8 +262,37 @@ async def test_unknown_post_authority_failure_marks_public_side_effect_for_dedup
     assert result.data["trace"]["execute_ok"] is False
     assert result.data["trace"]["verify_ok"] is False
     assert result.data["trace"]["dedupe_recorded"] is True
+    assert result.data["data"]["reconciliation_required"] is True
     assert capability.execute_calls == 0
     assert capability.verify_calls == 0
+    assert adapter._execution.get() is None
+    assert [record.state for record in ledger.read_records()] == [
+        EffectState.RESERVED,
+        EffectState.EFFECT_UNKNOWN,
+    ]
+    intent = capability.compose({"post_id": "123"}, "@actor")
+    assert dedupe.check(intent.dedupe_key()) is False
+
+
+async def test_successful_click_with_unknown_readback_is_denied_and_deduped(
+    tmp_path: Path,
+) -> None:
+    kernel, adapter, capability, ledger, dedupe = _stack(
+        tmp_path,
+        action="like",
+        like_state="unknown",
+    )
+
+    result = await _confirm_and_execute(kernel, adapter)
+
+    assert result.data["policy"]["verdict"] == PolicyVerdict.DENY.value
+    assert result.data["trace"]["execute_ok"] is False
+    assert result.data["trace"]["verify_ok"] is False
+    assert result.data["trace"]["dedupe_recorded"] is True
+    assert result.data["data"]["m5_effect_state"] == AttemptState.EFFECT_UNKNOWN.value
+    assert result.data["data"]["public_side_effect"] is True
+    assert result.data["data"]["reconciliation_required"] is True
+    assert adapter._execution.get() is None
     assert [record.state for record in ledger.read_records()] == [
         EffectState.RESERVED,
         EffectState.EFFECT_UNKNOWN,

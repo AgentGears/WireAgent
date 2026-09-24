@@ -517,7 +517,10 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
 
             cdp = self._sb._controller._cdp
             menu_baseline = secrets.token_hex(16)
-            await cdp.evaluate(self._baseline_delete_menus_js(menu_baseline))
+            menu_baseline_result = await cdp.evaluate(self._baseline_delete_menus_js(menu_baseline))
+            menu_baselined = self._require_baselined(menu_baseline_result, "existing delete menus")
+            if not menu_baselined.ok:
+                return menu_baselined
             caret = await self._delete_eval(
                 self._delete_article_js(
                     post_id,
@@ -540,7 +543,15 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
                 return menu
 
             confirm_baseline = secrets.token_hex(16)
-            await cdp.evaluate(self._baseline_delete_confirms_js(confirm_baseline))
+            confirm_baseline_result = await cdp.evaluate(
+                self._baseline_delete_confirms_js(confirm_baseline)
+            )
+            confirm_baselined = self._require_baselined(
+                confirm_baseline_result, "existing delete confirmations"
+            )
+            if not confirm_baselined.ok:
+                await self._dismiss_delete_dialog()
+                return confirm_baselined
             clicked_item = await self._delete_eval(self._click_bound_delete_item_js(menu_token))
             if not (clicked_item.ok and clicked_item.data):
                 return soft_failure(

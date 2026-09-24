@@ -1,434 +1,429 @@
 # M5 Layer 4 — Scoped Authorities
 
-**Status:** maintainer first-pass design frozen for implementation  
+**Status:** implementation contract aligned to the maintainer-reviewed runtime  
 **Base:** Layer 3 squash `f8ffdeb`  
-**Codex:** not consulted for this design pass
+**Scope:** least execution authority; live capability migration remains Layer 5
 
-This document resolves the Layer-4 question deliberately left open by
-`docs/M5_DESIGN.md`: how a single-use `EffectPermit` coexists with slow,
-reversible composer preparation while preventing capabilities from receiving the
-full `WriteBroker` mutation surface.
+Layer 4 answers one question left open by `docs/M5_DESIGN.md`: how a capability
+can prepare a browser interaction and execute one approved semantic effect
+without ever receiving the full mutation broker.
 
-The goal of Layer 4 is **least execution authority**, not live-path migration.
-Layer 5 will wire concrete capabilities through these objects.
-
----
-
-## 1. Forcing function
-
-Today the legacy `WriteKernel` constructs one concrete `WriteBroker` and passes
-that whole object to every write capability for execute/verify. `ports.py`
-contains useful Protocol shapes, but structural typing alone is not runtime
-authority: a capability holding the concrete object can still call every method
-on it.
-
-Layer 4 must make the executable object itself narrower.
-
-Required shape:
-
-```text
-approved frozen intent
-        |
-        +--> PreparationAuthority   # bounded staging only
-        |
-        +--> CommitGateway -> EffectPermit
-                     |
-                     +--> EffectAuthority  # one canonical effect only
-```
-
-A capability must not receive raw `WriteBroker`, raw browser primitives, or an
-authority for the inverse effect merely because the concrete broker implements
-them.
+The implemented answer is **delayed authority mint + provenance-bound staging +
+per-browser M5 write ownership**. An effect handle is not an `EffectPermit`.
+The permit is minted and consumed only when the concrete broker has reached the
+last safe point immediately before the canonical mutating click.
 
 ---
 
-## 2. Maintainer first-pass findings
+## 1. Threat model and non-goals
 
-### L4-F1 / P1 — preparation and commit effects are conflated
+Layer 4 is a same-process least-authority engineering boundary against accidental
+or ordinary capability overreach. It is not a sandbox for hostile Python.
+Reflection or deliberate access to private implementation state remains outside
+the guarantee; untrusted plugins require process/OS isolation and no raw browser
+handle.
 
-Current `EffectPolicy.allowed_effects` puts these in one set for content actions:
+Layer 4 does **not**:
 
-- `OPEN_COMPOSER`
-- `FILL_COMPOSER`
-- `ATTACH_MEDIA`
-- `SUBMIT_CONTENT`
-
-But `EffectPermit` is intentionally single-use. One permit cannot correctly
-serve all four sequential operations:
-
-- minting before slow composer/media work starts its TTL too early;
-- consuming on an early staging operation leaves no fresh one-shot authority for
-  submit;
-- reusing one consumed permit across staging and submit violates Layer 3.
-
-**Resolution:** split policy vocabulary into:
-
-- `PreparationVerb`: bounded staging operations that cannot publish the
-  canonical effect;
-- `EffectVerb`: permit-consumable canonical external effects.
-
-For post/reply/quote the canonical permit effect is only `SUBMIT_CONTENT`.
-Preparation policy is bound into the policy hash, but preparation does not
-consume an `EffectPermit`.
-
-This is not a claim that staging has zero observable remote behavior. Media
-upload, draft state, and composer interaction can touch the service. M5's durable
-at-most-once/reconciliation contract applies to the **canonical semantic effect**;
-staging is separately constrained by active approval, exact intent binding,
-kill checks in the concrete broker, and cleanup. Layer 4 does not claim durable
-exactly-once staging.
-
-### L4-F2 / P1 — method-only scoping still permits argument smuggling
-
-A wrapper exposing only `click_bookmark(post_url)` is insufficient if the caller
-can supply a URL unrelated to the approved target while the gateway validates
-the permit's original `target_id`.
-
-The same problem exists for:
-
-- post/reply/quote text;
-- reply/quote target URL + target id;
-- delete target URL + id;
-- media source paths.
-
-**Resolution:** every scoped object owns one private deep-copied approved intent
-binding. Mutating browser arguments are derived from or checked against that
-binding. Canonical effect methods take no caller-selected target/payload
-arguments. Preparation methods either take no argument or reject anything that
-does not exactly match the frozen approved value.
-
-### L4-F3 / P1 — consuming at authority-method entry is still too early
-
-Several semantic broker methods perform staging before the actual mutation:
-
-- bookmark reads current state before clicking;
-- like navigates/hydrates before clicking;
-- delete navigates, opens menus, waits for the confirmation sheet, then clicks
-  confirm;
-- content staging can take far longer than a permit TTL.
-
-If an authority consumes the permit before delegating to those methods, the
-Commit Gateway is not the exact mutation boundary and may create false
-uncertainty.
-
-**Resolution:** the concrete broker mutation method accepts a private commit
-hook supplied only by the scoped effect authority. The broker invokes that hook
-**immediately before the actual mutating click/confirm**, after all preparatory
-state checks. The hook calls `CommitGateway.consume_permit(...)`.
-
-Legacy callers omit the hook, preserving Layer-4 non-migration behavior. Layer 5
-removes raw-broker exposure from live capability execution.
-
-### L4-F4 / P1 — inverse authority must not ride along with a concrete broker
-
-`WriteBroker` implements both bookmark/remove-bookmark and like/unlike. Granting
-one direction must not expose the other direction.
-
-**Resolution:** one effect authority represents exactly one `EffectVerb`.
-Examples:
-
-```text
-SetBookmarkAuthority       -> SET_BOOKMARK only
-ClearBookmarkAuthority     -> CLEAR_BOOKMARK only
-SetLikeAuthority           -> SET_LIKE only
-ClearLikeAuthority         -> CLEAR_LIKE only
-DeletePostAuthority        -> DELETE_POST only
-SubmitContentAuthority     -> SUBMIT_CONTENT only
-```
-
-The factory rejects a permit whose effect set is not exactly the expected
-singleton for the requested action binding.
-
-### L4-F5 / P1 — preparation must not exist without live human approval
-
-A staging wrapper created from `WriteIntent` alone could be used before the
-human approval gate.
-
-**Resolution:** preparation authority creation requires:
-
-- exact `ApprovalGrant`;
-- exact claimed `EffectAttempt`;
-- grant still `ACTIVE`;
-- attempt still `PREPARING`;
-- claim held by that attempt;
-- current policy binding;
-- current authorization epoch;
-- exact intent/actor binding.
-
-Every mutating preparation operation revalidates those conditions before
-calling the concrete broker. Once `authorize_commit()` spends the grant, the
-preparation authority becomes unusable automatically.
-
-### L4-F6 / P2 — permit payload binding must survive caller mutation
-
-`WriteIntent` remains a mutable legacy dataclass. Its `intent_hash()` covers the
-payload, but a scoped wrapper cannot retain the caller-owned object and re-read
-it later.
-
-**Resolution:** authority construction deep-copies once, computes the binding
-from that copy, extracts immutable typed values, and never re-reads the original
-intent. Effect authority construction additionally requires exact equality with
-permit action/actor/target/intent hash/policy binding.
-
-### L4-F7 / P2 — abort cleanup must remain possible when authority is revoked
-
-`close_composer()` is a reducing/cleanup operation, but the current concrete
-broker applies the same kill guard as effect-producing mutations. A trip during
-media preparation can therefore block cleanup and leave a partial composer open.
-
-**Resolution:** cleanup authority is one-way state reduction and is allowed even
-when normal preparation liveness has failed. `WriteBroker.close_composer()` must
-not be blocked by the mutation kill guard. It still exposes no submit or other
-external effect.
-
-### L4-F8 / P2 — outcome lifecycle must remain gateway-owned
-
-Layer 4 must not invent a second effect state machine. Scoped effect authority
-may consume the permit at the concrete boundary, but durable
-`EFFECT_CONFIRMED` / `EFFECT_UNKNOWN` recording continues through
-`CommitGateway` with the canonical attempt object. Layer 5 owns orchestration of
-verification and which terminal outcome is justified by evidence.
+- migrate the legacy `WriteKernel`, Dispatcher, or capabilities;
+- add RecoveryGuard;
+- retire the invocation journal's legacy role;
+- claim distributed exactly-once delivery;
+- make browser staging durable or exactly-once;
+- provide cross-process browser serialization.
 
 ---
 
-## 3. Policy model after Layer 4
+## 2. Authority model
+
+Policy separates bounded staging from the one canonical external effect:
 
 ```text
 EffectPolicy
 ├── risk_tier
 ├── preparation_effects: frozenset[PreparationVerb]
-├── allowed_effects: frozenset[EffectVerb]      # permit-consumable only
+├── allowed_effects: frozenset[EffectVerb]
 ├── replay_semantics
 ├── durability
-└── binding_hash()                              # includes both authority sets
+└── binding_hash()  # includes both preparation and canonical effect surfaces
 ```
 
-Initial content policy:
+`PreparationVerb` currently contains:
+
+- `OPEN_COMPOSER`
+- `FILL_COMPOSER`
+- `ATTACH_MEDIA`
+
+`EffectVerb` contains the permit-consumable semantic effects such as
+`SET_BOOKMARK`, `CLEAR_LIKE`, `SUBMIT_CONTENT`, and `DELETE_POST`.
+
+For post/reply/quote:
 
 ```text
-post / reply / quote
-  preparation_effects = {
-      OPEN_COMPOSER,
-      FILL_COMPOSER,
-      ATTACH_MEDIA,
-  }
-  allowed_effects = {SUBMIT_CONTENT}
+preparation_effects = {OPEN_COMPOSER, FILL_COMPOSER, ATTACH_MEDIA}
+allowed_effects     = {SUBMIT_CONTENT}
 ```
 
-Bookmark, like, delete and future one-step semantic mutations have no
-preparation verbs unless evidence later requires them.
+Layer 4 requires the canonical `allowed_effects` set to be exactly the expected
+singleton before it creates an effect handle. A broadened policy does not become
+a broader runtime object.
 
-`EffectPermit.allowed_effects` therefore remains a set for Layer-3 compatibility,
-but Layer-4 effect-authority construction requires the set to be a singleton.
-A broader permit is rejected rather than translated into a broader authority.
+Replay classification remains evidence-based:
+
+- bookmark/remove-bookmark: `SAFE_STATE_SET` → `BEST_EFFORT`;
+- like/unlike: `UNKNOWN` → `REQUIRED` despite directional DOM idempotence,
+  because replay may still have residual public-engagement effects;
+- follow/unfollow/repost/unrepost: `UNKNOWN` → `REQUIRED` until implemented
+  evidence proves a stronger contract;
+- content create: `NON_IDEMPOTENT_CREATE` → `REQUIRED`;
+- delete: target-delete semantics, but risk still requires fencing.
 
 ---
 
-## 4. Scoped authority broker
+## 3. Runtime shape
 
-Layer 4 introduces a process-local adapter around the concrete broker:
+The supported live path is:
 
 ```text
-ScopedAuthorityBroker(
-    write_broker,
-    commit_gateway,
-    authorization_epoch,
-    effect_policies,
-)
-
-prepare(grant, attempt, intent)
-  -> ContentPreparationAuthority
-
-authorize(permit, attempt, intent)
-  -> SetBookmarkAuthority
-   | ClearBookmarkAuthority
-   | SetLikeAuthority
-   | ClearLikeAuthority
-   | DeletePostAuthority
-   | SubmitContentAuthority
+real SuperBrowser facade
+        |
+        v
+WireAgent live-facade proxy
+        |
+        v
+M5LeasedWriteBroker (contract v3)
+        |
+        v
+ScopedAuthorityBroker
+        |
+        +--> PreparationAuthority        # ACTIVE claimed approval only
+        |
+        +--> AuthorizedEffect receipt
+                  |
+                  +--> narrow EffectAuthority  # capability-facing
+                  |
+                  +--> exact permit lineage    # trusted orchestrator only;
+                                                 # None until commit seam
 ```
 
-It never returns the underlying `WriteBroker`.
+The supported construction API is in `webwire.safety.m5_authority_factory`:
 
-Same-process Python reflection can still reach private implementation state if
-code is actively hostile. Layer 4 is least-authority engineering against normal
-capability code, not a sandbox. Untrusted plugins still require process/OS
-isolation and no raw browser handle.
+- `build_live_m5_write_broker(super_browser, kill_switch)`;
+- `build_live_scoped_authority_broker(write_broker, commit_gateway, ...)`.
+
+The first function wraps the external SDK facade in one WireAgent-owned,
+attribute-capable proxy per exact facade identity. Browser-lease state therefore
+does not depend on the third-party SDK accepting arbitrary attributes. Repeated
+live construction for the same facade shares the same proxy and lease state.
+
+The second function accepts only the factory-built `M5LeasedWriteBroker`
+contract v3. Direct/provenance-only brokers are rejected for the supported live
+path. The generic `ScopedAuthorityBroker` remains available for isolated adapter
+and unit-test doubles; Layer 5 must use the live factory.
+
+---
+
+## 4. Frozen intent and target binding
+
+`WriteIntent` remains mutable legacy state, so Layer 4 deep-copies it once and
+reduces it to an immutable typed binding. The binding owns:
+
+- action type;
+- target type and target id;
+- actor identity;
+- intent hash;
+- policy binding;
+- approved status URL / target post id;
+- approved normalized text;
+- ordered media path + SHA-256 manifest.
+
+Targeted post actions require an HTTPS `x.com`/`twitter.com` status URL whose
+numeric `/status/<id>` equals the approved target id. Mutating method arguments
+are derived from or checked against this frozen binding; capability code cannot
+select a different target after approval.
+
+Navigation is not itself target authority. Engagement state reads and clicks
+resolve the article that directly owns the approved post's timestamp link and
+operate only inside that article. Nested quoted-post timestamps cannot make the
+outer article authoritative.
 
 ---
 
 ## 5. Preparation authority
 
-`ContentPreparationAuthority` is bound to one active approval claim and one
-frozen intent. Its public mutation surface is limited to staging operations
-required by the current content family.
+Preparation authority requires the exact ACTIVE approval, exact claimed attempt,
+current policy binding, current authorization epoch, and frozen intent/actor
+binding.
 
-Expected operations include bounded equivalents of:
+The logical content sequence is bounded:
 
-- open/fill plain composer from approved text;
-- open/fill approved reply target;
-- open/fill approved quote target;
-- attach only approved canonical media paths, in approved order;
-- read composer text;
-- verify attachment readiness;
-- count attachments;
-- cleanup/close composer.
+```text
+post:          fill/open approved composer -> approved media -> seal
+reply/quote:   open approved target context -> fill text -> approved media -> seal
+```
 
-It exposes **no submit method**.
+Media operations require the approved order/path and recompute the approved
+SHA-256 before upload.
 
-Media staging validates the frozen manifest path/order and rechecks the approved
-SHA-256 before delegating upload. A caller cannot swap a path while retaining the
-approved permit hash.
+### 5.1 Async staging ownership
 
-Preparation authority becomes invalid for new staging when the grant is no
-longer ACTIVE, the claim is lost, policy identity changes, or authorization
-epoch changes. Cleanup remains allowed because it only reduces staged state.
+Preparation is a state machine, not a collection of independent coroutine
+calls. Each attempt tracker has:
+
+- a lock;
+- one active staging token;
+- a monotonically increasing generation;
+- cleanup/effect in-flight latches;
+- sealed state.
+
+Only one staging operation can own the token at a time. Cleanup may invalidate
+an in-flight operation by advancing the generation, but it does not free that
+operation's token until the coroutine actually returns. A stale completion can
+therefore never make the preparation ready again after cleanup.
+
+Once a content effect handle is created, the tracker is sealed. No further
+staging is accepted. Cleanup remains a reducing operation and may still be used
+to abandon browser draft state.
+
+Layer 5 must terminalize/release a **proved precommit NO_EFFECT** when a sealed
+content flow is deliberately abandoned before any permit exists; otherwise the
+approval can remain safely but unnecessarily claimed.
 
 ---
 
-## 6. Effect authority and exact commit hook
+## 6. Browser-side provenance and the write lease
 
-Effect authority owns:
+`M5WriteBroker` provides the base exact mutation seams.
+`M5ScopedWriteBroker` adds browser-DOM provenance for content staging.
+`M5LeasedWriteBroker` adds per-browser transient ownership and is the only
+supported live broker contract.
 
-- exact `EffectPermit` object;
-- exact canonical `EffectAttempt` object;
-- frozen intent binding;
-- one expected `EffectVerb`;
-- gateway reference;
-- private concrete-broker reference.
+### 6.1 Provenance binding
 
-The public semantic method is parameterless with respect to approved target and
-payload. Example:
+Content staging does not trust page-global selectors. It binds generated opaque
+markers to the exact transient DOM objects created by the approved flow:
+
+- baseline existing composer contexts before target-triggering clicks;
+- bind exactly one new approved reply/quote/plain composer;
+- scope textarea typing to that bound context;
+- scope file input to the bound context/form;
+- baseline existing media previews, then bind exactly one new approved preview;
+- at submit, prove context kind/target, exact text, exact media count, approved
+  media markers/readiness, and one submit control;
+- bind that submit control before the commit gate and revalidate/click the same
+  marked control after the gate.
+
+Ambiguity, a missing baseline, stale context, multiple new candidates, or a
+changed bound control fails closed.
+
+Delete uses the same provenance principle: baseline pre-existing menus and
+confirmation controls, trigger the approved target's caret, bind exactly one new
+Delete menu/item, bind exactly one new confirmation, then cross authority and
+click the same marked confirmation.
+
+### 6.2 Per-browser lease
+
+Every `M5LeasedWriteBroker` sharing the same supported live facade proxy shares
+one `_BrowserWriteState`:
+
+- one asyncio operation lock serializes M5 browser operations;
+- one content owner token persists for the lifetime of a bound composer;
+- other M5 one-shot effects are denied while content owns the browser;
+- failed content starts release ownership only when no content provenance was
+  established;
+- cleanup releases the owner when cleanup succeeds;
+- once submit crosses commit authority, the broker releases content ownership
+  after that boundary operation returns, even if the final browser click becomes
+  `UNKNOWN`.
+
+This lease is process-local and applies only to M5 writers constructed from the
+same exact facade identity. Layer 5 must not concurrently route legacy/read
+navigation through the same browser while an M5 lease is active.
+
+---
+
+## 7. Delayed effect authority
+
+Creating an effect authority does **not** mint an `EffectPermit` and does not
+spend approval.
+
+```text
+scope_effect(...)
+    -> AuthorizedEffect(
+           authority=<narrow semantic handle>,
+           attempt=<canonical attempt>,
+           permit=None,
+       )
+```
+
+The capability-facing authority exposes only one semantic method:
 
 ```text
 SetBookmarkAuthority.apply()
-  -> broker.click_bookmark(bound_post_url, _commit_gate=consume_exact_permit)
-
+ClearBookmarkAuthority.apply()
+SetLikeAuthority.apply()
+ClearLikeAuthority.apply()
 SubmitContentAuthority.submit()
-  -> broker.click_submit(_commit_gate=consume_exact_permit)
-
 DeletePostAuthority.delete()
-  -> broker.delete_post(bound_url, bound_id,
-                        _commit_gate=consume_exact_permit)
 ```
 
-The concrete broker calls `_commit_gate` only immediately before the actual
-mutation. The hook consumes the permit with the frozen intent hash, actor,
-target, policy binding, and exact effect verb.
+It has no caller-selected target/payload parameters, no generic click/fill
+primitive, no raw broker/browser reference, and no outcome-recording API.
 
-If the gateway denies the hook, the broker must not click.
+The trusted orchestrator retains `AuthorizedEffect`; after the final mutation
+boundary is attempted, `receipt.permit` exposes the exact canonical permit for
+Layer-5 outcome recording through `CommitGateway`.
 
-If the process crashes after permit consumption and before an outcome record,
-Layer 3's durable reservation/unknown semantics remain authoritative. Layer 4
-adds no exactly-once claim.
-
----
-
-## 7. Required concrete-broker seams
-
-Layer 4 may add an optional private keyword-only commit hook to the existing
-semantic methods. Legacy callers that omit it retain current behavior until
-Layer 5 migration.
-
-Required exact hook points:
-
-- bookmark/remove-bookmark: after state-first no-op/unknown resolution,
-  immediately before the directional click;
-- like/unlike: immediately before the directional click; if implementation is
-  made state-first as part of this seam, replay policy is **not** automatically
-  upgraded without separate broker-level evidence;
-- submit: after final broker kill guard, immediately before tweet-button click;
-- delete: first poll until confirmation control exists without clicking, then
-  run the hook, then perform one confirmation click. Do not consume authority
-  before menu/navigation staging.
+Effect invocation itself is single-use/in-flight guarded. A second concurrent
+invocation is rejected; once a permit exists the authority cannot be reused.
 
 ---
 
-## 8. Layer boundary
+## 8. Exact commit boundary
 
-Layer 4 **does not**:
+The concrete broker performs all safe staging/probing first. Its private commit
+hook then performs, synchronously:
 
-- route `WriteKernel` through M5;
-- change dispatcher live behavior;
-- migrate capabilities;
-- add RecoveryGuard;
-- make the invocation journal audit-only;
-- claim cross-process isolation;
-- claim exactly-once effects.
+```text
+CommitGateway.authorize_commit(...)
+    -> [REQUIRED only: durable RESERVED]
+    -> atomic approval spend
+    -> exact EffectPermit
+CommitGateway.consume_permit(...)
+    -> final policy/epoch/kill/TTL/binding checks
+    -> single-use authority crossing
+```
 
-Those remain Layers 5–7.
+Only after the hook succeeds may the canonical mutating click execute.
 
----
+Consequences:
 
-## 9. Acceptance tests
+- already-satisfied bookmark/like state-set: no permit, no spend, no mutation;
+- target missing / unresolved state: no permit, no spend;
+- delete navigation/menu/confirmation staging failure: no permit, no spend;
+- content payload/provenance failure: no permit, no spend;
+- submit/delete/engagement permit TTL starts at the final mutation seam rather
+  than at slow staging/probe entry.
 
-Layer 4 is not complete until adversarial tests prove at least:
+If the bound control changes **after** authority crosses but before the click can
+be proven, the result is `UNKNOWN`, never a fallback click on another control.
 
-1. bookmark authority cannot call clear-bookmark, like, delete, or submit;
-2. clear-bookmark authority cannot set bookmark;
-3. like/unlike directions are independent authorities;
-4. delete authority cannot change target URL/id after construction;
-5. content submit authority has no composer/media preparation methods;
-6. preparation authority has no submit/delete/engagement methods;
-7. preparation creation fails without the exact active claimed grant;
-8. preparation revalidation fails after grant expiry/revocation/spend;
-9. policy-binding drift invalidates preparation;
-10. caller mutation after authority construction does not alter target/text/media;
-11. media path substitution is rejected before upload;
-12. media order cannot be rearranged by the caller;
-13. media digest change is rejected before upload;
-14. effect authority rejects permit/frozen-intent mismatch;
-15. effect authority rejects a non-singleton/broadened permit effect set;
-16. target A permit cannot navigate/mutate target B through authority arguments;
-17. gateway permit is unconsumed during bookmark state probe and consumed only at
-    the actual click hook;
-18. gateway permit is unconsumed during delete navigation/menu staging and
-    consumed only immediately before confirmation click;
-19. expired/revoked/killed/policy-stale permit denial prevents the broker click;
-20. permit reuse remains rejected;
-21. submit permit receives its full Layer-3 TTL until the final submit boundary;
-22. cleanup remains callable after kill/revocation and cannot publish content;
-23. scoped objects expose no public raw `WriteBroker`, raw browser, or generic
-    click/fill primitive;
-24. existing legacy live-path tests remain unchanged/green because Layer 5 has
-    not migrated execution yet.
+### 8.1 Known Layer-3 follow-up: issued but denied before consumption
+
+There is one conservative lifecycle debt outside Layer 4's least-authority
+correctness. If `authorize_commit()` successfully issues a fenced permit and a
+concurrent kill/epoch/policy/binding change makes `consume_permit()` deny before
+`consumed=True`, the private gate returns failure and the broker does not click.
+The canonical effect is therefore known absent, but current Layer 3 retains the
+unused permit/reservation until expiry/pruning closes it to `NO_EFFECT`.
+
+This cannot produce an unauthorized effect. A crash before that expiry can,
+however, recover the raw `RESERVED` as `EFFECT_UNKNOWN`, causing conservative
+unnecessary reconciliation. The correct fix belongs to `CommitGateway`: add an
+explicit gateway-owned issued-but-unconsumed `NO_EFFECT` closure. Do not make
+Layer 4 mutate ledger/attempt truth directly. This follow-up must land before
+Layer-5 production migration.
 
 ---
 
-## 10. Implementation order
+## 9. Outcome ownership
 
-1. Split preparation verbs from permit-consumable effect verbs in EffectPolicy;
-   update binding tests and normative M5 text.
-2. Add exact private commit-hook seams to concrete broker mutations with no
-   behavior change when the hook is absent.
-3. Implement frozen intent binding + `ScopedAuthorityBroker`.
-4. Implement `ContentPreparationAuthority`.
-5. Implement exact effect-authority classes.
-6. Add adversarial Layer-4 tests.
-7. Run full pytest/Ruff/mypy on Python 3.11/3.12 CI.
-8. Complete exhaustive maintainer first-pass review of the implementation and
-   freeze its findings in the PR.
-9. Only then request independent Codex review.
+Layer 4 does not declare effect truth.
+
+After the boundary, Layer 5 uses the exact permit and canonical attempt retained
+by `AuthorizedEffect` to call:
+
+- `CommitGateway.record_effect_confirmed(...)`, or
+- `CommitGateway.record_effect_unknown(...)`
+
+based on evidence and verification.
+
+A crash after a fenced permit crosses authority and before terminal outcome
+persistence remains Layer 3's `RESERVED -> EFFECT_UNKNOWN` recovery case. No
+exactly-once claim is made.
+
+---
+
+## 10. Acceptance contract
+
+Layer 4 tests must prove at least:
+
+1. live factory rejects a broker weaker than v3 and rejects directly constructed
+   live brokers that bypass the WireAgent facade proxy;
+2. a slotted/non-extensible SDK facade can be used without WireAgent attributes;
+3. repeated live broker construction for one exact SDK facade shares one lease;
+4. each effect authority exposes one direction/effect only;
+5. raw broker/browser/generic mutation methods are absent from capability-facing
+   authority;
+6. caller mutation after scope construction cannot alter frozen target/text/media;
+7. target-A authority cannot act on a decoy/first article B;
+8. nested quoted-post timestamps cannot authorize the outer article;
+9. already-satisfied state-set is zero gate / zero permit / zero mutation;
+10. state probe/delete staging/content proof happens before permit mint;
+11. permit mint/consume occurs immediately before the exact bound mutating
+    control;
+12. missing/changed/ambiguous target or provenance fails before the gate;
+13. broadened policy effect sets are rejected;
+14. preparation requires exact ACTIVE claimed approval and current policy/epoch;
+15. preparation obeys context -> text -> media order and approved media digest;
+16. overlapping async staging is serialized by an owned token;
+17. cleanup invalidates stale staging completion without releasing its token
+    early;
+18. preparation is sealed before content effect use;
+19. cleanup cannot race an active effect invocation and effect cannot start
+    during cleanup;
+20. effect invocation is single-use and concurrent duplicate invocation is
+    rejected;
+21. policy/kill drift before final mint denies without browser mutation;
+22. submit proves exact bound context/text/media/button before crossing;
+23. delete proves target-triggered menu/confirmation provenance before crossing;
+24. browser lease blocks another M5 writer while a content context is owned;
+25. failed staging with established provenance retains the lease until cleanup;
+26. baseline/provenance failures fail closed before target-triggering action;
+27. legacy WriteKernel/Dispatcher/capability behavior remains unchanged because
+    live migration is not part of Layer 4.
 
 ---
 
 ## 11. Frozen Layer-4 invariants
 
-1. Capabilities do not need the concrete mutation broker to express an approved
-   semantic effect.
-2. Preparation and canonical commit authority are distinct.
-3. Preparation requires an ACTIVE, exact, claimed human approval.
-4. Permit mint spends approval; spent approval disables further preparation.
-5. Policy binding covers both staging and canonical effect authority.
-6. One effect authority exposes exactly one permit-consumable `EffectVerb`.
-7. Effect target/payload arguments are frozen from the approved intent, not
-   selected by the capability at execution time.
-8. Permit consumption happens at the concrete mutation seam, not at wrapper
-   construction or method entry.
-9. A denied commit hook cannot fall through to the browser click.
-10. Cleanup is reducing authority and remains available when normal preparation
-    authority is revoked.
-11. Layer 4 does not own effect truth; durable terminal outcomes remain the
-    CommitGateway/EffectLedger state machine.
-12. Same-process scoped authority is an engineering boundary, not hostile-code
-    isolation.
+1. Preparation authority and canonical commit authority are distinct.
+2. Preparation requires one exact ACTIVE claimed approval.
+3. Policy identity binds both staging and canonical effect surfaces.
+4. Browser target/payload values are frozen from approved intent.
+5. Capability-facing effect authority exposes exactly one canonical effect.
+6. Effect-handle construction does not mint a permit or spend approval.
+7. Slow navigation, state probing, delete staging, and content preparation occur
+   before permit mint.
+8. Permit mint and consumption occur only inside the concrete broker's final
+   commit hook.
+9. A denied commit hook cannot fall through to a canonical browser mutation.
+10. Browser mutations after authority crossing use the same bound target/control
+    that was proven before crossing; no page-global fallback is allowed.
+11. Content DOM staging is provenance-bound and ambiguity fails closed.
+12. One M5 browser facade has one process-local write lease in the supported live
+    construction path.
+13. Preparation/effect concurrency is token/latch controlled; stale async
+    completion cannot restore authority.
+14. Cleanup is reducing authority and remains available when new preparation is
+    no longer authorized.
+15. Layer 4 does not own effect truth; durable terminal outcome remains gateway /
+    ledger authority.
+16. Same-process least authority is not hostile-code isolation.
+
+---
+
+## 12. Layer-5 obligations
+
+Before production migration, Layer 5 must:
+
+- use `build_live_m5_write_broker()` and `build_live_scoped_authority_broker()`;
+- pass only preparation/effect authority objects to capabilities, never raw M5
+  broker/browser handles;
+- terminalize clean precommit abandonment so claimed approvals are not stranded;
+- apply the precommit retry budget by creating/releasing attempts deliberately,
+  not by retrying one failed attempt forever;
+- record confirmed/unknown outcomes synchronously from the exact receipt permit;
+- coordinate read/verification navigation with the M5 browser lease;
+- land the Layer-3 issued-but-unconsumed `NO_EFFECT` closure described in §8.1
+  before production migration.

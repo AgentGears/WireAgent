@@ -8,8 +8,7 @@ lease required by Layer 4's transient DOM ownership contract.
 
 from __future__ import annotations
 
-from typing import Any
-
+from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectPolicyRegistry
 from webwire.safety.scoped_authority import ScopedAuthorityBroker, ScopedAuthorityDenied
@@ -20,22 +19,21 @@ _REQUIRED_SCOPED_AUTHORITY_VERSION = 3
 
 
 def build_live_scoped_authority_broker(
-    write_broker: Any,
+    write_broker: M5LeasedWriteBroker,
     commit_gateway: CommitGateway,
     *,
     policies: EffectPolicyRegistry = DEFAULT_EFFECT_POLICIES,
 ) -> ScopedAuthorityBroker:
-    """Build the only supported live Layer-5 scoped-authority adapter.
-
-    Version 3 is the first broker contract that carries the per-SuperBrowser M5
-    write lease plus single active content-context ownership. Older M5 broker
-    seams are deliberately rejected for live migration.
-    """
+    """Build the only supported live Layer-5 scoped-authority adapter."""
     version = getattr(write_broker, "scoped_authority_version", 0)
-    if not isinstance(version, int) or version < _REQUIRED_SCOPED_AUTHORITY_VERSION:
+    if (
+        not isinstance(write_broker, M5LeasedWriteBroker)
+        or not isinstance(version, int)
+        or version < _REQUIRED_SCOPED_AUTHORITY_VERSION
+    ):
         raise ScopedAuthorityDenied(
             "broker_contract_mismatch",
-            "live M5 execution requires scoped_authority_version >= 3",
+            "live M5 execution requires M5LeasedWriteBroker contract version >= 3",
         )
     return ScopedAuthorityBroker(
         write_broker,

@@ -235,7 +235,7 @@ async def test_kill_denied_consume_is_closed_no_effect_by_runtime(
         EffectState.NO_EFFECT,
     ]
     assert ledger.recovery_projection()[0].unresolved is False
-    with pytest.raises(M5ExecutionStateError, match="ACTIVE approval"):
+    with pytest.raises(M5ExecutionStateError, match="commit authority was issued"):
         session.retry_clean_precommit()
 
 

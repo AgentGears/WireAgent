@@ -23,6 +23,7 @@ import asyncio
 import json
 import secrets
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
@@ -103,10 +104,6 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             try:
                 result = await operation()
             except BaseException:
-                # If no context was ever bound, retaining ownership would wedge
-                # every later M5 writer without protecting any browser state.
-                # Once a context exists, retain the lease fail-closed so an
-                # orphaned composer cannot be adopted by another write attempt.
                 if self._m5_context_token is None:
                     self._clear_context()
                     self._release_content_owner()
@@ -272,6 +269,24 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             "if(!b||!b.isConnected||!b.getClientRects().length)return 'stale';"
             "b.removeAttribute('data-wireagent-delete-confirm');b.click();return 'clicked';})()"
         )
+
+    async def _poll_delete_binding(self, expr: str, *, label: str) -> ActionResult:
+        deadline = time.monotonic() + self._DELETE_STAGE_TIMEOUT_S
+        while True:
+            result = await self._delete_eval(expr)
+            if result.ok and result.data == "bound":
+                return result
+            if result.ok and result.data == "ambiguous":
+                return soft_failure(
+                    f"delete binding ambiguous: {label}",
+                    failure_category=FailureCategory.SECURITY,
+                )
+            if time.monotonic() >= deadline:
+                return soft_failure(
+                    f"delete binding timeout: {label}",
+                    failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+                )
+            await asyncio.sleep(self._DELETE_POLL_INTERVAL_S)
 
     async def fill_composer(self, text: str) -> ActionResult:
         return await self._start_content(lambda: super(M5LeasedWriteBroker, self).fill_composer(text))
@@ -446,18 +461,12 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
                 )
 
             menu_token = secrets.token_hex(16)
-            menu = await self._delete_poll(
-                lambda: self._delete_eval(
-                    self._bind_new_delete_menu_js(menu_baseline, menu_token)
-                ),
-                want_true=True,
+            menu = await self._poll_delete_binding(
+                self._bind_new_delete_menu_js(menu_baseline, menu_token),
                 label="target-triggered delete menu",
             )
             if not menu.ok:
-                return soft_failure(
-                    "delete_post: no unique target-triggered Delete menu",
-                    failure_category=FailureCategory.SECURITY,
-                )
+                return menu
 
             confirm_baseline = secrets.token_hex(16)
             await cdp.evaluate(self._baseline_delete_confirms_js(confirm_baseline))
@@ -469,19 +478,13 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
                 )
 
             confirm_token = secrets.token_hex(16)
-            confirm = await self._delete_poll(
-                lambda: self._delete_eval(
-                    self._bind_new_delete_confirm_js(confirm_baseline, confirm_token)
-                ),
-                want_true=True,
+            confirm = await self._poll_delete_binding(
+                self._bind_new_delete_confirm_js(confirm_baseline, confirm_token),
                 label="target-triggered delete confirmation",
             )
             if not confirm.ok:
                 await self._dismiss_delete_dialog()
-                return soft_failure(
-                    "delete_post: no unique target-triggered confirmation",
-                    failure_category=FailureCategory.SECURITY,
-                )
+                return confirm
 
             if (r := self._guard()) is not None:
                 await self._dismiss_delete_dialog()

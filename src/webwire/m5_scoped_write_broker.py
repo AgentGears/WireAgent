@@ -1,15 +1,15 @@
 """Provenance-hardened M5 broker for scoped content authority.
 
-``M5WriteBroker`` owns the exact canonical mutation seams.  This subclass adds
+``M5WriteBroker`` owns the exact canonical mutation seams. This subclass adds
 browser-side provenance for reversible content staging so Layer 4 can prove that
 the final submit belongs to the approved composer context and to the previews
 created by approved uploads.
 
-The provenance markers are deliberately a same-process engineering mechanism,
-not a cryptographic statement about X's remote media object.  Local media bytes
-are SHA-256 checked by ``PreparationAuthority`` immediately before this broker is
-asked to upload them.  This broker then marks the exact new preview node produced
-by that upload and fails closed if X later replaces/re-renders that node.
+The provenance markers are a same-process engineering mechanism, not a
+cryptographic statement about X's remote media object. Local media bytes are
+SHA-256 checked by ``PreparationAuthority`` immediately before upload. This
+broker then marks the exact new preview node produced by that upload and fails
+closed if X later replaces or re-renders that node.
 """
 
 from __future__ import annotations
@@ -54,11 +54,11 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     @classmethod
     def _baseline_composers_js(cls, baseline: str) -> str:
-        b = json.dumps(baseline)
+        mark = json.dumps(baseline)
         return (
             "(function(){"
             + cls._visible_js()
-            + f"var mark={b};var tas=document.querySelectorAll(\"[data-testid='tweetTextarea_0']\");"
+            + f"var mark={mark};var tas=document.querySelectorAll(\"[data-testid='tweetTextarea_0']\");"
             "for(var i=0;i<tas.length;i++){var ta=tas[i];if(!vis(ta))continue;"
             + cls._composer_root_js("ta")
             + "if(root&&root!==document.body)root.setAttribute('data-wireagent-context-baseline',mark);}"
@@ -75,9 +75,9 @@ class M5ScopedWriteBroker(M5WriteBroker):
         target_id: str,
         expected_text: Optional[str] = None,
     ) -> str:
-        b = json.dumps(baseline)
+        base = json.dumps(baseline)
         token = json.dumps(context_token)
-        k = json.dumps(kind)
+        kind_js = json.dumps(kind)
         target = json.dumps(target_id)
         text_check = ""
         if expected_text is not None:
@@ -85,7 +85,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
         return (
             "(function(){"
             + cls._visible_js()
-            + f"var base={b},token={token},kind={k},target={target};"
+            + f"var base={base},token={token},kind={kind_js},target={target};"
             "var tas=document.querySelectorAll(\"[data-testid='tweetTextarea_0']\");var found=[];"
             "for(var i=0;i<tas.length;i++){var ta=tas[i];if(!vis(ta))continue;"
             + text_check
@@ -121,11 +121,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
         cdp = self._sb._controller._cdp
         for _ in range(8):
             result = await cdp.evaluate(expr)
-            value = (
-                result.data.get("result", {}).get("value")
-                if result.ok and result.data
-                else None
-            )
+            value = result.data.get("result", {}).get("value") if result.ok and result.data else None
             if value == "bound":
                 self._m5_context_token = context
                 self._m5_context_kind = kind
@@ -151,11 +147,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
     def _require_context(self) -> tuple[str, str, str] | None:
         if not self._m5_context_token or not self._m5_context_kind:
             return None
-        return (
-            self._m5_context_token,
-            self._m5_context_kind,
-            self._m5_context_target or "",
-        )
+        return (self._m5_context_token, self._m5_context_kind, self._m5_context_target or "")
 
     async def fill_composer(self, text: str) -> ActionResult:
         """Open/fill a plain-post composer and bind exactly that context."""
@@ -182,43 +174,34 @@ class M5ScopedWriteBroker(M5WriteBroker):
         )
 
     async def open_reply_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
-        """Open a reply composer from the direct-owning approved status article."""
         if (r := self._guard()) is not None:
             return r
         if self._status_id(post_url) != target_post_id:
             return soft_failure("reply target URL/id mismatch", failure_category=FailureCategory.SECURITY)
-        baseline = secrets.token_hex(16)
-        await self._baseline_composers(baseline)
         nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
         if not nav.ok:
             return nav
         await asyncio.sleep(0.5)
+        baseline = secrets.token_hex(16)
+        await self._baseline_composers(baseline)
         clicked = await self._sb._controller._cdp.evaluate(
             self._target_click_js(target_post_id, "reply", "m5-context-reply")
         )
-        value = (
-            clicked.data.get("result", {}).get("value")
-            if clicked.ok and clicked.data
-            else None
-        )
+        value = clicked.data.get("result", {}).get("value") if clicked.ok and clicked.data else None
         if value != "clicked":
             return soft_failure(
                 f"reply control unavailable on approved target {target_post_id!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
-        return await self._bind_new_context(
-            baseline=baseline,
-            kind="reply",
-            target_id=target_post_id,
-        )
+        return await self._bind_new_context(baseline=baseline, kind="reply", target_id=target_post_id)
 
     @staticmethod
     def _baseline_menus_js(token: str) -> str:
-        t = json.dumps(token)
+        token_js = json.dumps(token)
         return (
             "(function(){"
             + M5ScopedWriteBroker._visible_js()
-            + f"var token={t};var ms=document.querySelectorAll(\"[role='menu']\");"
+            + f"var token={token_js};var ms=document.querySelectorAll(\"[role='menu']\");"
             "for(var i=0;i<ms.length;i++)if(vis(ms[i]))"
             "ms[i].setAttribute('data-wireagent-menu-baseline',token);"
             "return 'baselined';})()"
@@ -226,12 +209,13 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     @staticmethod
     def _bind_quote_menu_js(baseline: str, token: str) -> str:
-        b = json.dumps(baseline)
-        t = json.dumps(token)
+        base = json.dumps(baseline)
+        token_js = json.dumps(token)
         return (
             "(function(){"
             + M5ScopedWriteBroker._visible_js()
-            + f"var base={b},token={t};var ms=document.querySelectorAll(\"[role='menu']\");var found=[];"
+            + f"var base={base},token={token_js};"
+            "var ms=document.querySelectorAll(\"[role='menu']\");var found=[];"
             "for(var m=0;m<ms.length;m++){var menu=ms[m];if(!vis(menu))continue;"
             "if(menu.getAttribute('data-wireagent-menu-baseline')===base)continue;"
             "var items=menu.querySelectorAll(\"[role='menuitem']\");"
@@ -244,37 +228,32 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     @staticmethod
     def _click_bound_quote_js(token: str) -> str:
-        t = json.dumps(token)
+        token_js = json.dumps(token)
         return (
             "(function(){"
-            f"var token={t};var menu=document.querySelector('[data-wireagent-quote-menu=\"'+token+'\"]');"
+            f"var token={token_js};var menu=document.querySelector('[data-wireagent-quote-menu=\"'+token+'\"]');"
             "var item=document.querySelector('[data-wireagent-quote-item=\"'+token+'\"]');"
             "if(!menu||!item||!menu.contains(item)||!item.isConnected)return 'stale';"
             "item.removeAttribute('data-wireagent-quote-item');item.click();return 'clicked';})()"
         )
 
     async def open_quote_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
-        """Open quote composer through the unique menu caused by approved target."""
         if (r := self._guard()) is not None:
             return r
         if self._status_id(post_url) != target_post_id:
             return soft_failure("quote target URL/id mismatch", failure_category=FailureCategory.SECURITY)
-        composer_baseline = secrets.token_hex(16)
-        menu_baseline = secrets.token_hex(16)
-        await self._baseline_composers(composer_baseline)
-        await self._sb._controller._cdp.evaluate(self._baseline_menus_js(menu_baseline))
         nav = await self._sb.navigate(post_url, wait_until="domcontentloaded")
         if not nav.ok:
             return nav
         await asyncio.sleep(0.5)
+        composer_baseline = secrets.token_hex(16)
+        menu_baseline = secrets.token_hex(16)
+        await self._baseline_composers(composer_baseline)
+        await self._sb._controller._cdp.evaluate(self._baseline_menus_js(menu_baseline))
         repost = await self._sb._controller._cdp.evaluate(
             self._target_click_js(target_post_id, "retweet", "m5-context-quote")
         )
-        repost_value = (
-            repost.data.get("result", {}).get("value")
-            if repost.ok and repost.data
-            else None
-        )
+        repost_value = repost.data.get("result", {}).get("value") if repost.ok and repost.data else None
         if repost_value != "clicked":
             return soft_failure(
                 f"repost control unavailable on approved target {target_post_id!r}",
@@ -284,24 +263,19 @@ class M5ScopedWriteBroker(M5WriteBroker):
         cdp = self._sb._controller._cdp
         for _ in range(8):
             bound = await cdp.evaluate(self._bind_quote_menu_js(menu_baseline, quote_token))
-            value = (
-                bound.data.get("result", {}).get("value")
-                if bound.ok and bound.data
-                else None
-            )
+            value = bound.data.get("result", {}).get("value") if bound.ok and bound.data else None
             if value == "bound":
                 break
             if value == "ambiguous":
                 return soft_failure("multiple new quote menus appeared", failure_category=FailureCategory.SECURITY)
             await asyncio.sleep(0.25)
         else:
-            return soft_failure("target-triggered Quote menu did not appear", failure_category=FailureCategory.SELECTOR_NOT_FOUND)
+            return soft_failure(
+                "target-triggered Quote menu did not appear",
+                failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+            )
         clicked = await cdp.evaluate(self._click_bound_quote_js(quote_token))
-        click_value = (
-            clicked.data.get("result", {}).get("value")
-            if clicked.ok and clicked.data
-            else None
-        )
+        click_value = clicked.data.get("result", {}).get("value") if clicked.ok and clicked.data else None
         if click_value != "clicked":
             return soft_failure("bound Quote menu item became stale", failure_category=FailureCategory.UNKNOWN)
         return await self._bind_new_context(
@@ -323,13 +297,12 @@ class M5ScopedWriteBroker(M5WriteBroker):
             "if(!ta)return 'missing';ta.focus();ta.click();return 'focused';})()"
         )
         result = await self._sb._controller._cdp.evaluate(expr)
-        value = (
-            result.data.get("result", {}).get("value")
-            if result.ok and result.data
-            else None
-        )
+        value = result.data.get("result", {}).get("value") if result.ok and result.data else None
         if value != "focused":
-            return soft_failure("approved composer textarea unavailable", failure_category=FailureCategory.SELECTOR_NOT_FOUND)
+            return soft_failure(
+                "approved composer textarea unavailable",
+                failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+            )
         return ok_result(data={"focused": True})
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
@@ -362,26 +335,29 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     @staticmethod
     def _mark_media_input_js(context_token: str, input_token: str) -> str:
-        c = json.dumps(context_token)
-        t = json.dumps(input_token)
+        context = json.dumps(context_token)
+        token = json.dumps(input_token)
         return (
             "(function(){"
-            f"var context={c},token={t};var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
+            f"var context={context},token={token};"
+            "var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
             "if(!root||!root.isConnected)return 'stale';"
             "var inputs=root.querySelectorAll(\"input[type='file']\");"
             "if(inputs.length===0){var form=root.closest('form')||root.querySelector('form');"
             "if(form)inputs=form.querySelectorAll(\"input[type='file']\");}"
+            "if(inputs.length===0)inputs=document.querySelectorAll(\"input[type='file']\");"
             "if(inputs.length!==1)return inputs.length?'ambiguous':'missing';"
             "inputs[0].setAttribute('data-wireagent-media-input',token);return 'bound';})()"
         )
 
     @staticmethod
     def _baseline_context_images_js(context_token: str, baseline: str) -> str:
-        c = json.dumps(context_token)
-        b = json.dumps(baseline)
+        context = json.dumps(context_token)
+        base = json.dumps(baseline)
         return (
             "(function(){"
-            f"var context={c},base={b};var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
+            f"var context={context},base={base};"
+            "var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
             "if(!root||!root.isConnected)return 'stale';var imgs=root.querySelectorAll('img');"
             "for(var i=0;i<imgs.length;i++)imgs[i].setAttribute('data-wireagent-media-baseline',base);"
             "return 'baselined';})()"
@@ -389,23 +365,24 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     @staticmethod
     def _bind_new_media_js(context_token: str, baseline: str, media_token: str) -> str:
-        c = json.dumps(context_token)
-        b = json.dumps(baseline)
-        m = json.dumps(media_token)
+        context = json.dumps(context_token)
+        base = json.dumps(baseline)
+        media = json.dumps(media_token)
         return (
             "(function(){"
-            f"var context={c},base={b},media={m};var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
+            f"var context={context},base={base},media={media};"
+            "var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
             "if(!root||!root.isConnected)return 'stale';var imgs=root.querySelectorAll('img');var found=[];"
             "for(var i=0;i<imgs.length;i++){var img=imgs[i];"
             "if(img.getAttribute('data-wireagent-media-baseline')===base)continue;"
             "if(img.getAttribute('data-wireagent-approved-media'))continue;"
-            "if(img.src&&img.src.indexOf('blob:')===0)found.push(img);}"
+            "var tray=img.closest(\"[data-testid='attachments']\");"
+            "if(tray||(img.src&&img.src.indexOf('blob:')===0))found.push(img);}"
             "if(found.length!==1)return found.length?'ambiguous':'missing';"
             "found[0].setAttribute('data-wireagent-approved-media',media);return 'bound';})()"
         )
 
     async def attach_media(self, image_path: str) -> ActionResult:
-        """Upload through the bound composer and mark the exact new preview node."""
         if (r := self._guard()) is not None:
             return r
         context = self._require_context()
@@ -416,33 +393,20 @@ class M5ScopedWriteBroker(M5WriteBroker):
         baseline = secrets.token_hex(16)
         cdp = self._sb._controller._cdp
         marked = await cdp.evaluate(self._mark_media_input_js(context_token, input_token))
-        marked_value = (
-            marked.data.get("result", {}).get("value")
-            if marked.ok and marked.data
-            else None
-        )
+        marked_value = marked.data.get("result", {}).get("value") if marked.ok and marked.data else None
         if marked_value != "bound":
             return soft_failure(
                 f"approved composer media input binding failed: {marked_value!r}",
                 failure_category=FailureCategory.SECURITY,
             )
         await cdp.evaluate(self._baseline_context_images_js(context_token, baseline))
-        upload = await self._sb.upload_file(
-            f"[data-wireagent-media-input='{input_token}']",
-            image_path,
-        )
+        upload = await self._sb.upload_file(f"[data-wireagent-media-input='{input_token}']", image_path)
         if not upload.ok:
             return upload
         media_token = secrets.token_hex(16)
         for _ in range(12):
-            bound = await cdp.evaluate(
-                self._bind_new_media_js(context_token, baseline, media_token)
-            )
-            value = (
-                bound.data.get("result", {}).get("value")
-                if bound.ok and bound.data
-                else None
-            )
+            bound = await cdp.evaluate(self._bind_new_media_js(context_token, baseline, media_token))
+            value = bound.data.get("result", {}).get("value") if bound.ok and bound.data else None
             if value == "bound":
                 return ok_result(data={"attached": True, "provenance_bound": True})
             if value == "ambiguous":
@@ -465,19 +429,21 @@ class M5ScopedWriteBroker(M5WriteBroker):
         submit_token: str,
     ) -> str:
         context = json.dumps(context_token)
-        k = json.dumps(kind)
+        kind_js = json.dumps(kind)
         target = json.dumps(target_id)
         text = json.dumps(expected_text)
         submit = json.dumps(submit_token)
-        action = (
-            "btn.removeAttribute('data-wireagent-submit-button');btn.click();return 'clicked';"
-            if click
-            else "btn.setAttribute('data-wireagent-submit-button',submit);return 'bound';"
-        )
+        if click:
+            action = (
+                "if(btn.getAttribute('data-wireagent-submit-button')!==submit)return 'submit_changed';"
+                "btn.removeAttribute('data-wireagent-submit-button');btn.click();return 'clicked';"
+            )
+        else:
+            action = "btn.setAttribute('data-wireagent-submit-button',submit);return 'bound';"
         return (
             "(function(){"
             + M5ScopedWriteBroker._visible_js()
-            + f"var context={context},kind={k},target={target},expected={text},"
+            + f"var context={context},kind={kind_js},target={target},expected={text},"
             f"expectedCount={expected_attachments},submit={submit};"
             "var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
             "if(!vis(root))return 'stale_context';"
@@ -488,7 +454,8 @@ class M5ScopedWriteBroker(M5WriteBroker):
             "var imgs=root.querySelectorAll('img');var candidates=[];"
             "for(var i=0;i<imgs.length;i++){var img=imgs[i];"
             "if(img.getAttribute('data-wireagent-context-preexisting')===context)continue;"
-            "if(img.src&&img.src.indexOf('blob:')===0)candidates.push(img);}"
+            "var tray=img.closest(\"[data-testid='attachments']\");"
+            "if(tray||(img.src&&img.src.indexOf('blob:')===0))candidates.push(img);}"
             "if(candidates.length!==expectedCount)return 'attachments_changed';"
             "for(var j=0;j<candidates.length;j++){"
             "if(!candidates[j].getAttribute('data-wireagent-approved-media'))return 'media_unapproved';"
@@ -508,7 +475,6 @@ class M5ScopedWriteBroker(M5WriteBroker):
         _expected_text: Optional[str] = None,
         _expected_attachments: Optional[int] = None,
     ) -> ActionResult:
-        """Prove context + exact approved previews, gate, then click same submit."""
         if (r := self._guard()) is not None:
             return r
         if _precommit_check is None or _expected_text is None or _expected_attachments is None:
@@ -533,11 +499,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
                 submit_token=submit_token,
             )
         )
-        value = (
-            bound.data.get("result", {}).get("value")
-            if bound.ok and bound.data
-            else None
-        )
+        value = bound.data.get("result", {}).get("value") if bound.ok and bound.data else None
         if value != "bound":
             return soft_failure(
                 f"scoped composer proof failed: {value!r}",
@@ -558,11 +520,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
                 submit_token=submit_token,
             )
         )
-        click_value = (
-            clicked.data.get("result", {}).get("value")
-            if clicked.ok and clicked.data
-            else None
-        )
+        click_value = clicked.data.get("result", {}).get("value") if clicked.ok and clicked.data else None
         if click_value != "clicked":
             return soft_failure(
                 f"scoped composer changed after authority crossing: {click_value!r}",

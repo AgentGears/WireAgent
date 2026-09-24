@@ -77,7 +77,7 @@ def test_live_factory_accepts_factory_built_leased_broker(tmp_path: Path) -> Non
 def test_slotted_sdk_facade_needs_no_wireagent_attributes(tmp_path: Path) -> None:
     sb = _SlottedSB()
     with pytest.raises(AttributeError):
-        setattr(sb, "_wireagent_m5_write_state", object())
+        object.__setattr__(sb, "_wireagent_m5_write_state", object())
 
     kill = _kill(tmp_path)
     broker = build_live_m5_write_broker(sb, kill)

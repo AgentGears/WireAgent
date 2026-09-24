@@ -72,6 +72,7 @@ select = ["E", "F", "W", "I", "B", "ASYNC"]
 # Irreducible single-line units (embedded CDP JS expressions, long enum-member
 # comment lines): wrapping them would obscure review, not help it.
 "src/webwire/write_broker.py" = ["E501"]
+"src/webwire/m5_write_broker.py" = ["E501"]
 "src/webwire/safety/models.py" = ["E501"]
 "src/webwire/capabilities/*_image.py" = ["E501"]
 "tests/test_broker.py" = ["E501"]

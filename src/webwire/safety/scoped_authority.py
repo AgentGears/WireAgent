@@ -227,7 +227,7 @@ class _IntentBinding:
 
 @dataclass
 class _PreparationTracker:
-    """Per-attempt staging state with explicit ownership of async mutations."""
+    """Per-attempt staging state with token-owned asynchronous mutations."""
 
     intent_hash: str
     action_type: str
@@ -253,6 +253,21 @@ class _PreparationTracker:
         ):
             raise ScopedAuthorityDenied("preparation_binding_mismatch")
 
+    def _begin_unlocked(self, binding: _IntentBinding) -> tuple[int, int]:
+        self._require_binding_unlocked(binding)
+        if self.sealed:
+            raise ScopedAuthorityDenied("preparation_sealed")
+        if self.effect_in_flight:
+            raise ScopedAuthorityDenied("effect_in_flight")
+        if self.cleanup_in_flight:
+            raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
+        if self._active_stage is not None:
+            raise ScopedAuthorityDenied("preparation_in_flight")
+        self._next_token += 1
+        token = self._next_token
+        self._active_stage = token
+        return token, self.generation
+
     def require_binding(self, binding: _IntentBinding) -> None:
         with self._lock:
             self._require_binding_unlocked(binding)
@@ -264,10 +279,6 @@ class _PreparationTracker:
     def cleanup_active(self) -> bool:
         with self._lock:
             return self.cleanup_in_flight
-
-    def stage_snapshot(self) -> tuple[bool, bool, int]:
-        with self._lock:
-            return self.composer_opened, self.text_filled, self.media_attached
 
     def ready(self, binding: _IntentBinding) -> bool:
         with self._lock:
@@ -310,21 +321,40 @@ class _PreparationTracker:
                 raise ScopedAuthorityDenied("preparation_incomplete")
             self.sealed = True
 
-    def begin_stage(self, binding: _IntentBinding) -> tuple[int, int]:
+    def begin_post_fill(self, binding: _IntentBinding) -> tuple[int, int]:
         with self._lock:
-            self._require_binding_unlocked(binding)
-            if self.sealed:
-                raise ScopedAuthorityDenied("preparation_sealed")
-            if self.effect_in_flight:
-                raise ScopedAuthorityDenied("effect_in_flight")
-            if self.cleanup_in_flight:
-                raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
-            if self._active_stage is not None:
-                raise ScopedAuthorityDenied("preparation_in_flight")
-            self._next_token += 1
-            token = self._next_token
-            self._active_stage = token
-            return token, self.generation
+            token, generation = self._begin_unlocked(binding)
+            if self.text_filled or self.media_attached:
+                self._active_stage = None
+                raise ScopedAuthorityDenied("preparation_order")
+            return token, generation
+
+    def begin_context_open(self, binding: _IntentBinding) -> tuple[int, int]:
+        with self._lock:
+            token, generation = self._begin_unlocked(binding)
+            if self.composer_opened or self.text_filled or self.media_attached:
+                self._active_stage = None
+                raise ScopedAuthorityDenied("preparation_order")
+            return token, generation
+
+    def begin_context_fill(self, binding: _IntentBinding) -> tuple[int, int]:
+        with self._lock:
+            token, generation = self._begin_unlocked(binding)
+            if not self.composer_opened or self.text_filled:
+                self._active_stage = None
+                raise ScopedAuthorityDenied("preparation_order")
+            return token, generation
+
+    def begin_attach(self, binding: _IntentBinding) -> tuple[int, int, int]:
+        with self._lock:
+            token, generation = self._begin_unlocked(binding)
+            if not self.text_filled:
+                self._active_stage = None
+                raise ScopedAuthorityDenied("preparation_order")
+            if self.media_attached >= self.expected_media:
+                self._active_stage = None
+                raise ScopedAuthorityDenied("media_not_approved")
+            return token, generation, self.media_attached
 
     def finish_stage(
         self,
@@ -337,7 +367,6 @@ class _PreparationTracker:
         media_delta: int = 0,
     ) -> bool:
         with self._lock:
-            # A stale completion never owns a newer operation's latch.
             if self._active_stage != token:
                 return False
             self._active_stage = None
@@ -525,24 +554,18 @@ class _PreparationBase:
 
     async def attach_media(self, image_path: str) -> ActionResult:
         self._require_live(PreparationVerb.ATTACH_MEDIA)
-        opened, text_filled, media_attached = self.__tracker.stage_snapshot()
-        del opened
-        if not text_filled:
-            raise ScopedAuthorityDenied("preparation_order")
-        if media_attached >= len(self.__binding.media):
-            raise ScopedAuthorityDenied("media_not_approved", image_path)
-        expected = self.__binding.media[media_attached]
-        if image_path != expected.source_path:
-            raise ScopedAuthorityDenied("media_order_mismatch")
+        token, generation, index = self.__tracker.begin_attach(self.__binding)
         try:
-            digest = file_sha256(Path(expected.source_path)).lower()
-        except OSError as exc:
-            raise ScopedAuthorityDenied("media_unreadable", str(exc)) from exc
-        if digest != expected.sha256:
-            raise ScopedAuthorityDenied("media_changed_after_approval")
-        self._require_live(PreparationVerb.ATTACH_MEDIA)
-        token, generation = self.__tracker.begin_stage(self.__binding)
-        try:
+            expected = self.__binding.media[index]
+            if image_path != expected.source_path:
+                raise ScopedAuthorityDenied("media_order_mismatch")
+            try:
+                digest = file_sha256(Path(expected.source_path)).lower()
+            except OSError as exc:
+                raise ScopedAuthorityDenied("media_unreadable", str(exc)) from exc
+            if digest != expected.sha256:
+                raise ScopedAuthorityDenied("media_changed_after_approval")
+            self._require_live(PreparationVerb.ATTACH_MEDIA)
             result = await self.__attach_media(expected.source_path)
         except BaseException:
             self.__tracker.finish_stage(token, generation, succeeded=False)
@@ -573,12 +596,9 @@ class PostPreparationAuthority(_PreparationBase):
     async def fill_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.OPEN_COMPOSER)
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        _, already_filled, media_attached = self._tracker().stage_snapshot()
-        if already_filled or media_attached:
-            raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        token, generation = self._tracker().begin_stage(self._binding())
+        token, generation = self._tracker().begin_post_fill(self._binding())
         try:
             result = await self.__fill_composer(self._expected_text())
         except BaseException:
@@ -604,12 +624,9 @@ class ReplyPreparationAuthority(_PreparationBase):
 
     async def open_reply_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
         self._require_live(PreparationVerb.OPEN_COMPOSER)
-        opened, filled, media = self._tracker().stage_snapshot()
-        if opened or filled or media:
-            raise ScopedAuthorityDenied("preparation_order")
         if post_url != self._expected_post_url() or target_post_id != self._expected_target_post_id():
             raise ScopedAuthorityDenied("target_mismatch")
-        token, generation = self._tracker().begin_stage(self._binding())
+        token, generation = self._tracker().begin_context_open(self._binding())
         try:
             result = await self.__open_reply(
                 self._expected_post_url(), self._expected_target_post_id()
@@ -624,12 +641,9 @@ class ReplyPreparationAuthority(_PreparationBase):
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        opened, filled, _ = self._tracker().stage_snapshot()
-        if not opened or filled:
-            raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        token, generation = self._tracker().begin_stage(self._binding())
+        token, generation = self._tracker().begin_context_fill(self._binding())
         try:
             result = await self.__fill_reply(self._expected_text())
         except BaseException:
@@ -649,12 +663,9 @@ class QuotePreparationAuthority(_PreparationBase):
 
     async def open_quote_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
         self._require_live(PreparationVerb.OPEN_COMPOSER)
-        opened, filled, media = self._tracker().stage_snapshot()
-        if opened or filled or media:
-            raise ScopedAuthorityDenied("preparation_order")
         if post_url != self._expected_post_url() or target_post_id != self._expected_target_post_id():
             raise ScopedAuthorityDenied("target_mismatch")
-        token, generation = self._tracker().begin_stage(self._binding())
+        token, generation = self._tracker().begin_context_open(self._binding())
         try:
             result = await self.__open_quote(
                 self._expected_post_url(), self._expected_target_post_id()
@@ -669,12 +680,9 @@ class QuotePreparationAuthority(_PreparationBase):
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        opened, filled, _ = self._tracker().stage_snapshot()
-        if not opened or filled:
-            raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        token, generation = self._tracker().begin_stage(self._binding())
+        token, generation = self._tracker().begin_context_fill(self._binding())
         try:
             result = await self.__fill_quote(self._expected_text())
         except BaseException:

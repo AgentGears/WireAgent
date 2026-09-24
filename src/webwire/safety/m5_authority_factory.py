@@ -11,6 +11,11 @@ or otherwise reject arbitrary attributes. WireAgent instead keeps one stable
 process-local proxy for each exact facade identity; the leased broker attaches
 its state to that owned proxy. Repeated construction for the same facade reuses
 the same proxy and therefore the same browser-write lease.
+
+The write broker and CommitGateway must also share the exact same KillSwitch
+instance. This makes the operator's in-process trip state one authority source
+for reversible staging and the final gateway transition rather than relying on
+two objects merely happening to point at the same hot-file path.
 """
 
 from __future__ import annotations
@@ -86,16 +91,19 @@ def build_live_scoped_authority_broker(
 
     version = getattr(write_broker, "scoped_authority_version", 0)
     browser_facade = getattr(write_broker, "_sb", None)
+    broker_kill = getattr(write_broker, "_kill", None)
+    gateway_kill = getattr(commit_gateway, "_kill", None)
     if (
         not isinstance(write_broker, M5LeasedWriteBroker)
         or not isinstance(version, int)
         or version < _REQUIRED_SCOPED_AUTHORITY_VERSION
         or not isinstance(browser_facade, _LeaseCompatibleBrowserFacade)
+        or broker_kill is not gateway_kill
     ):
         raise ScopedAuthorityDenied(
             "broker_contract_mismatch",
-            "live M5 execution requires the WireAgent live factory and "
-            "M5LeasedWriteBroker contract version >= 3",
+            "live M5 execution requires the WireAgent live factory, one shared "
+            "KillSwitch, and M5LeasedWriteBroker contract version >= 3",
         )
     return ScopedAuthorityBroker(
         write_broker,

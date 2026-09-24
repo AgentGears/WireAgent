@@ -1,8 +1,10 @@
 """M5-specific WriteBroker subclass with exact scoped commit seams.
 
 Layer 4 leaves the legacy WriteBroker/live WriteKernel untouched. Layer 5 will
-place this broker behind scoped authority objects. Canonical mutation methods
-fail closed unless a private commit gate is supplied.
+place this broker behind scoped authority objects. The Layer-4-supported
+mutation methods implemented here fail closed unless a private commit gate is
+supplied. Other inherited legacy WriteBroker verbs remain outside Layer 4 and
+must not be exposed as scoped authority.
 
 For M5, navigation is not target authority. Engagement controls are resolved
 inside the article that directly owns the approved timestamp link. Submit and
@@ -35,7 +37,7 @@ _STATUS_PATH_RE = re.compile(r"/status/(\d+)(?:/|$)")
 
 
 class M5WriteBroker(WriteBroker):
-    """Concrete M5 mutation seam; every canonical effect requires authority."""
+    """Concrete M5 mutation seams for the Layer-4-supported effect set."""
 
     @staticmethod
     def _cross_commit_gate(commit_gate: Optional[CommitGate]) -> Optional[ActionResult]:
@@ -193,6 +195,8 @@ class M5WriteBroker(WriteBroker):
                 f"click_bookmark: unresolved target bookmark state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
+        if (r := self._guard()) is not None:
+            return r
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
         clicked = await self._click_target_control(
@@ -223,6 +227,8 @@ class M5WriteBroker(WriteBroker):
                 f"click_remove_bookmark: unresolved target bookmark state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
+        if (r := self._guard()) is not None:
+            return r
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
         clicked = await self._click_target_control(
@@ -264,6 +270,8 @@ class M5WriteBroker(WriteBroker):
                 f"click_like: unresolved target like state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
+        if (r := self._guard()) is not None:
+            return r
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
         clicked = await self._click_target_control(
@@ -292,6 +300,8 @@ class M5WriteBroker(WriteBroker):
                 f"click_unlike: unresolved target like state {state!r}",
                 failure_category=FailureCategory.SELECTOR_NOT_FOUND,
             )
+        if (r := self._guard()) is not None:
+            return r
         if (denied := self._cross_commit_gate(_commit_gate)) is not None:
             return denied
         clicked = await self._click_target_control(

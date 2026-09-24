@@ -486,7 +486,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
             "if(!candidates[j].complete||candidates[j].naturalWidth<=0)return 'media_not_ready';}"
             "var btns=root.querySelectorAll(\"[data-testid='tweetButton']\");"
             "if(btns.length!==1||!vis(btns[0]))return 'submit_missing';var btn=btns[0];"
-            "if(btn.getAttribute('disabled'))return 'submit_disabled';"
+            "if(btn.disabled||btn.getAttribute('aria-disabled')==='true')return 'submit_disabled';"
             + action
             + "})()"
         )

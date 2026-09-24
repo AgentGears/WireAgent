@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from super_browser.results.types import FailureCategory
 
-from webwire.envelope import ActionResult, ok_result, soft_failure
+from webwire.envelope import ActionResult, hard_failure, ok_result, soft_failure
 from webwire.safety.execution_models import AttemptState
 from webwire.safety.m5_effect_executor import M5EffectExecution, M5EffectExecutor
 from webwire.safety.models import WriteIntent
@@ -58,15 +58,42 @@ class M5EngagementCapabilityAdapter:
         return await self._capability.preview(intent, broker)
 
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        """Execute through M5; ``broker`` is intentionally ignored."""
+        """Execute through M5; ``broker`` is intentionally ignored.
+
+        The legacy kernel decides its final policy verdict from ``execute_ok``.
+        Therefore an M5 ``EFFECT_UNKNOWN`` must be translated to an explicit
+        non-retryable failure even when the underlying click call returned
+        ``ok=True``. ``public_side_effect`` is retained so the transitional
+        journal-backed dedupe layer also blocks an in-process clean replay.
+        """
         del broker
         execution = await self._executor.execute(intent)
-        self._execution.set(execution)
         result = execution.result
+
         if execution.attempt_state is AttemptState.EFFECT_UNKNOWN:
+            self._execution.set(None)
             data = dict(result.data) if isinstance(result.data, dict) else {}
-            data["public_side_effect"] = True
-            result.data = data
+            data.update(
+                {
+                    "public_side_effect": True,
+                    "m5_effect_state": AttemptState.EFFECT_UNKNOWN.value,
+                    "reconciliation_required": True,
+                }
+            )
+            denied = hard_failure(
+                "M5 effect outcome is unknown; reconciliation is required",
+                failure_category=FailureCategory.UNKNOWN,
+            )
+            denied.data = data
+            return denied
+
+        if not result.ok:
+            # WriteKernel skips verify() after a failed execute; do not leave a
+            # stale ContextVar receipt that a later invocation could observe.
+            self._execution.set(None)
+            return result
+
+        self._execution.set(execution)
         return result
 
     async def verify(self, intent: WriteIntent, broker: Any) -> ActionResult:
@@ -96,7 +123,7 @@ class M5EngagementCapabilityAdapter:
                 }
             )
         if execution.attempt_state is AttemptState.EFFECT_UNKNOWN:
-            return soft_failure(
+            return hard_failure(
                 "M5 effect outcome is unknown; reconciliation is required",
                 failure_category=FailureCategory.UNKNOWN,
             )

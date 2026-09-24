@@ -97,16 +97,16 @@ def test_default_policy_table_matches_m5_assignments() -> None:
     assert bookmark.preparation_effects == frozenset()
     assert bookmark.allowed_effects == frozenset({EffectVerb.SET_BOOKMARK})
 
-    # Layer-4 concrete-broker regressions establish like/unlike as directional
-    # semantic state-sets: state-first, zero mutation when already satisfied,
-    # and exact commit gating immediately before the one directional click.
+    # Directional/state-first DOM behavior is necessary but not sufficient to
+    # prove replay safety for public engagement. A repeated like/unlike may have
+    # residual platform effects even when the final boolean state is unchanged.
     for action, effect in (
         ("like", EffectVerb.SET_LIKE),
         ("unlike", EffectVerb.CLEAR_LIKE),
     ):
         engagement = DEFAULT_EFFECT_POLICIES.require(action)
-        assert engagement.replay_semantics is ReplaySemantics.SAFE_STATE_SET
-        assert engagement.durability is DurabilityPolicy.BEST_EFFORT
+        assert engagement.replay_semantics is ReplaySemantics.UNKNOWN
+        assert engagement.durability is DurabilityPolicy.REQUIRED
         assert engagement.preparation_effects == frozenset()
         assert engagement.allowed_effects == frozenset({effect})
 

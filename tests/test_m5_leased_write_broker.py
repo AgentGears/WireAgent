@@ -98,7 +98,6 @@ def _brokers(tmp_path: Path) -> tuple[M5LeasedWriteBroker, M5LeasedWriteBroker, 
 async def test_active_content_owner_blocks_other_m5_writer(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setattr("webwire.write_broker.asyncio.sleep", _no_sleep, raising=False)
     monkeypatch.setattr("webwire.m5_scoped_write_broker.asyncio.sleep", _no_sleep)
     monkeypatch.setattr("webwire.m5_write_broker.asyncio.sleep", _no_sleep)
     first, second, sb = _brokers(tmp_path)

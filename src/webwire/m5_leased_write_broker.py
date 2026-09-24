@@ -225,23 +225,6 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
         return await self._verify_bound_text(text)
 
     @staticmethod
-    def _mark_media_input_js(context_token: str, input_token: str) -> str:
-        """Bind only an input causally inside the approved composer/form."""
-        context = json.dumps(context_token)
-        token = json.dumps(input_token)
-        return (
-            "(function(){"
-            f"var context={context},token={token};"
-            "var root=document.querySelector('[data-wireagent-context=\"'+context+'\"]');"
-            "if(!root||!root.isConnected)return 'stale';"
-            "var inputs=root.querySelectorAll(\"input[type='file']\");"
-            "if(inputs.length===0){var form=root.closest('form')||root.querySelector('form');"
-            "if(form)inputs=form.querySelectorAll(\"input[type='file']\");}"
-            "if(inputs.length!==1)return inputs.length?'ambiguous':'missing';"
-            "inputs[0].setAttribute('data-wireagent-media-input',token);return 'bound';})()"
-        )
-
-    @staticmethod
     def _baseline_delete_menus_js(baseline: str) -> str:
         mark = json.dumps(baseline)
         return (

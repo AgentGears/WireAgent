@@ -19,8 +19,8 @@ class _OldBroker:
     scoped_authority_version = 2
 
 
-class _CurrentBrokerMarker:
-    scoped_authority_version = M5LeasedWriteBroker.scoped_authority_version
+class _SB:
+    pass
 
 
 def _gateway(tmp_path: Path) -> CommitGateway:
@@ -38,10 +38,9 @@ def test_live_factory_rejects_provenance_only_broker(tmp_path: Path) -> None:
         build_live_scoped_authority_broker(_OldBroker(), _gateway(tmp_path))
 
 
-def test_live_factory_accepts_current_leased_contract(tmp_path: Path) -> None:
-    scoped = build_live_scoped_authority_broker(
-        _CurrentBrokerMarker(),
-        _gateway(tmp_path),
-    )
+def test_live_factory_accepts_actual_leased_broker(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    broker = M5LeasedWriteBroker(_SB(), KillSwitch(cfg))  # type: ignore[arg-type]
+    scoped = build_live_scoped_authority_broker(broker, _gateway(tmp_path))
     assert isinstance(scoped, ScopedAuthorityBroker)
     assert M5LeasedWriteBroker.scoped_authority_version >= 3

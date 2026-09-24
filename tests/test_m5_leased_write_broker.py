@@ -136,6 +136,27 @@ async def test_plain_post_rejects_nonempty_or_ambiguous_context_before_typing(
     assert first._m5_write_state.content_owner is None
 
 
+async def test_bound_staging_failure_retains_lease_until_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.m5_leased_write_broker.asyncio.sleep", _no_sleep)
+    first, second, sb = _brokers(tmp_path)
+    sb._controller._cdp.text_verification = "mismatch"
+
+    failed = await first.fill_composer("approved")
+    assert not failed.ok
+    assert first._m5_context_token is not None
+    assert first._m5_write_state.content_owner == first._m5_lease_owner
+
+    blocked = await second.fill_composer("other")
+    assert not blocked.ok
+    assert second._m5_context_token is None
+
+    cleanup = await first.close_composer()
+    assert cleanup.ok
+    assert first._m5_write_state.content_owner is None
+
+
 async def test_active_content_owner_blocks_other_m5_writer(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

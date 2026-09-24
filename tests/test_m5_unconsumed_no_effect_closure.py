@@ -35,20 +35,27 @@ class _Clock:
         return self.now
 
 
-class _FailNoEffectLedger(EffectLedger):
+class _AmbiguousNoEffectLedger(EffectLedger):
+    """Write NO_EFFECT once, then report failure as an ambiguous fsync analogue."""
+
     def __init__(self, *, path: Path) -> None:
         super().__init__(path=path)
-        self.fail_no_effect = True
+        self.fail_after_no_effect_write = True
 
     def append_durable(self, record):  # type: ignore[no-untyped-def]
-        if self.fail_no_effect and record.state is EffectState.NO_EFFECT:
-            raise EffectLedgerError("injected NO_EFFECT durability failure")
         super().append_durable(record)
+        if self.fail_after_no_effect_write and record.state is EffectState.NO_EFFECT:
+            self.fail_after_no_effect_write = False
+            raise EffectLedgerError("injected ambiguous NO_EFFECT durability failure")
 
 
 def _intent(action: str) -> WriteIntent:
     risk, compensation = DEFAULT_REGISTRY.require(action)
-    payload = {"text": "hello"} if action == "post" else {"post_url": "https://x.com/u/status/123"}
+    payload = (
+        {"text": "hello"}
+        if action == "post"
+        else {"post_url": "https://x.com/u/status/123"}
+    )
     return WriteIntent(
         action_type=action,
         target_type="post",
@@ -92,19 +99,20 @@ def _runtime(
     tmp_path: Path,
     *,
     ledger: EffectLedger | None = None,
-) -> tuple[CommitGateway, EffectLedger, AuthorizationEpoch, _Clock]:
+) -> tuple[CommitGateway, EffectLedger, KillSwitch, AuthorizationEpoch, _Clock]:
     clock = _Clock()
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     actual_ledger = ledger or EffectLedger(cfg)
+    kill = KillSwitch(cfg)
     epoch = AuthorizationEpoch()
     gateway = CommitGateway(
         ledger=actual_ledger,
-        kill_switch=KillSwitch(cfg),
+        kill_switch=kill,
         authorization_epoch=epoch,
         clock=clock,
         permit_ttl_seconds=60.0,
     )
-    return gateway, actual_ledger, epoch, clock
+    return gateway, actual_ledger, kill, epoch, clock
 
 
 def _consume(
@@ -128,7 +136,7 @@ def _consume(
 def test_fenced_unconsumed_closure_persists_no_effect_and_resolves_recovery(
     tmp_path: Path,
 ) -> None:
-    gateway, ledger, epoch, clock = _runtime(tmp_path)
+    gateway, ledger, _, epoch, clock = _runtime(tmp_path)
     intent = _intent("post")
     grant, attempt = _claimed(intent, epoch=epoch, clock=clock)
     permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
@@ -147,7 +155,10 @@ def test_fenced_unconsumed_closure_persists_no_effect_and_resolves_recovery(
     assert grant.state is GrantState.SPENT
     assert attempt.state is AttemptState.NO_EFFECT
     records = ledger.read_records()
-    assert [record.state for record in records] == [EffectState.RESERVED, EffectState.NO_EFFECT]
+    assert [record.state for record in records] == [
+        EffectState.RESERVED,
+        EffectState.NO_EFFECT,
+    ]
     terminal = records[-1]
     assert terminal.details["reason"] == "consume_denied:kill_switch"
     assert terminal.details["permit_id"] == permit.permit_id
@@ -165,7 +176,7 @@ def test_fenced_unconsumed_closure_persists_no_effect_and_resolves_recovery(
 def test_best_effort_unconsumed_closure_terminalizes_without_ledger_row(
     tmp_path: Path,
 ) -> None:
-    gateway, ledger, epoch, clock = _runtime(tmp_path)
+    gateway, ledger, _, epoch, clock = _runtime(tmp_path)
     intent = _intent("bookmark")
     grant, attempt = _claimed(intent, epoch=epoch, clock=clock)
     permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
@@ -190,7 +201,7 @@ def test_best_effort_unconsumed_closure_terminalizes_without_ledger_row(
 
 
 def test_consumed_permit_cannot_be_closed_as_no_effect(tmp_path: Path) -> None:
-    gateway, ledger, epoch, clock = _runtime(tmp_path)
+    gateway, ledger, _, epoch, clock = _runtime(tmp_path)
     intent = _intent("post")
     grant, attempt = _claimed(intent, epoch=epoch, clock=clock)
     permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
@@ -214,11 +225,11 @@ def test_consumed_permit_cannot_be_closed_as_no_effect(tmp_path: Path) -> None:
     assert attempt.state is AttemptState.EFFECT_UNKNOWN
 
 
-def test_failed_fenced_closure_preserves_reserved_state_and_can_retry(
+def test_ambiguous_fenced_closure_keeps_attempt_issued_and_redurables_on_retry(
     tmp_path: Path,
 ) -> None:
-    ledger = _FailNoEffectLedger(path=tmp_path / "effects.ndjson")
-    gateway, _, epoch, clock = _runtime(tmp_path, ledger=ledger)
+    ledger = _AmbiguousNoEffectLedger(path=tmp_path / "effects.ndjson")
+    gateway, _, _, epoch, clock = _runtime(tmp_path, ledger=ledger)
     intent = _intent("post")
     grant, attempt = _claimed(intent, epoch=epoch, clock=clock)
     permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
@@ -229,29 +240,56 @@ def test_failed_fenced_closure_preserves_reserved_state_and_can_retry(
             reason="consume_denied:policy_mismatch",
         )
 
+    # The row may already be visible after an ambiguous durability report, but
+    # in-memory authority must not be retired until a durability retry succeeds.
     assert permit.consumed is False
     assert grant.state is GrantState.SPENT
     assert attempt.state is AttemptState.RESERVED
-    projection = ledger.recovery_projection()
-    assert len(projection) == 1
-    assert projection[0].effective_state is EffectState.EFFECT_UNKNOWN
-    assert projection[0].unresolved is True
+    assert [record.state for record in ledger.read_records()] == [
+        EffectState.RESERVED,
+        EffectState.NO_EFFECT,
+    ]
 
-    ledger.fail_no_effect = False
     gateway.close_unconsumed_permit_no_effect(
         permit,
         reason="consume_denied:policy_mismatch",
     )
 
     assert attempt.state is AttemptState.NO_EFFECT
-    terminal = ledger.read_records()[-1]
-    assert terminal.state is EffectState.NO_EFFECT
+    records = ledger.read_records()
+    assert [record.state for record in records] == [
+        EffectState.RESERVED,
+        EffectState.NO_EFFECT,
+    ]
+    terminal = records[-1]
     assert terminal.details["reason"] == "consume_denied:policy_mismatch"
     assert ledger.recovery_projection()[0].unresolved is False
 
 
+def test_closure_remains_available_after_kill_revocation(tmp_path: Path) -> None:
+    gateway, ledger, kill, epoch, clock = _runtime(tmp_path)
+    intent = _intent("post")
+    grant, attempt = _claimed(intent, epoch=epoch, clock=clock)
+    permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+
+    kill.trip()
+    with pytest.raises(GatewayDenied, match="kill_switch"):
+        _consume(gateway, permit, intent, effect=EffectVerb.SUBMIT_CONTENT)
+
+    assert permit.consumed is False
+    gateway.close_unconsumed_permit_no_effect(
+        permit,
+        reason="consume_denied:kill_switch",
+    )
+
+    assert grant.state is GrantState.SPENT
+    assert attempt.state is AttemptState.NO_EFFECT
+    assert ledger.read_records()[-1].state is EffectState.NO_EFFECT
+    assert ledger.recovery_projection()[0].unresolved is False
+
+
 def test_invalid_closure_reason_does_not_change_issued_permit(tmp_path: Path) -> None:
-    gateway, ledger, epoch, clock = _runtime(tmp_path)
+    gateway, ledger, _, epoch, clock = _runtime(tmp_path)
     intent = _intent("post")
     grant, attempt = _claimed(intent, epoch=epoch, clock=clock)
     permit = gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)

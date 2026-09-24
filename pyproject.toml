@@ -73,6 +73,7 @@ select = ["E", "F", "W", "I", "B", "ASYNC"]
 # comment lines): wrapping them would obscure review, not help it.
 "src/webwire/write_broker.py" = ["E501"]
 "src/webwire/m5_write_broker.py" = ["E501"]
+"src/webwire/m5_scoped_write_broker.py" = ["E501"]
 "src/webwire/safety/models.py" = ["E501"]
 "src/webwire/capabilities/*_image.py" = ["E501"]
 "tests/test_broker.py" = ["E501"]

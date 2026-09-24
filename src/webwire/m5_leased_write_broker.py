@@ -378,11 +378,32 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             lambda: super(M5LeasedWriteBroker, self).attach_media(image_path)
         )
 
+    async def _cleanup_after_kill(self) -> ActionResult:
+        """Reduce browser state after kill without reopening mutation authority."""
+        try:
+            nav = await self._sb.navigate(
+                "https://x.com/home",
+                wait_until="domcontentloaded",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(
+                f"close_composer kill cleanup error: {exc!r}",
+                failure_category=FailureCategory.UNKNOWN,
+            )
+        if not nav.ok:
+            return nav
+        return ok_result(data={"cleanup": "kill_navigated_away"})
+
     async def close_composer(self) -> ActionResult:
         async with self._m5_write_state.lock:
             if (blocked := self._require_content_owner()) is not None:
                 return blocked
-            result = await super().close_composer()
+            if self._kill.tripped():
+                result = await self._cleanup_after_kill()
+            else:
+                result = await super().close_composer()
+                if not result.ok and self._kill.tripped():
+                    result = await self._cleanup_after_kill()
             if result.ok:
                 self._clear_context()
                 self._release_content_owner()
@@ -536,7 +557,7 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
                 await self._dismiss_delete_dialog()
                 return confirm_baselined
             clicked_item = await self._delete_eval(self._click_bound_delete_item_js(menu_token))
-            if not (clicked_item.ok and clicked_item.data):
+            if not clicked_item.ok or clicked_item.data != "clicked":
                 return soft_failure(
                     "delete_post: bound Delete menu item became stale",
                     failure_category=FailureCategory.UNKNOWN,
@@ -561,7 +582,7 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             clicked_confirm = await self._delete_eval(
                 self._click_bound_delete_confirm_js(confirm_token)
             )
-            if not (clicked_confirm.ok and clicked_confirm.data):
+            if not clicked_confirm.ok or clicked_confirm.data != "clicked":
                 await self._dismiss_delete_dialog()
                 return soft_failure(
                     "delete_post: bound confirmation changed after authority crossing",

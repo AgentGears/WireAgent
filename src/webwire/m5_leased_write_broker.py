@@ -109,7 +109,7 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
                     self._clear_context()
                     self._release_content_owner()
                 raise
-            if not result.ok or self._m5_context_token is None:
+            if self._m5_context_token is None:
                 self._clear_context()
                 self._release_content_owner()
             return result

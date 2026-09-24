@@ -18,11 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from webwire.safety.commit_gateway import (
-    CommitGateway,
-    GatewayDenied,
-    GatewayStateError,
-)
+from webwire.safety.commit_gateway import CommitGateway, EffectPermit
 from webwire.safety.effect_policy import (
     DEFAULT_EFFECT_POLICIES,
     EffectPolicyRegistry,
@@ -203,9 +199,10 @@ class M5ExecutionSession:
     def retry_clean_precommit(self) -> EffectAttempt:
         """Claim the next bounded attempt under the same ACTIVE approval."""
         with self._lock:
-            if self._authorized is not None:
+            authorized = self._authorized
+            if authorized is not None and authorized.permit is not None:
                 raise M5ExecutionStateError(
-                    "effect authority was already scoped; start a new human approval instead"
+                    "commit authority was issued; start a new human approval instead"
                 )
             if self._attempt.state is not AttemptState.NO_EFFECT:
                 raise M5ExecutionStateError(
@@ -249,7 +246,7 @@ class M5ExecutionSession:
             evidence=evidence,
         )
 
-    def _require_consumed_receipt(self):  # type: ignore[no-untyped-def]
+    def _require_consumed_receipt(self) -> tuple[AuthorizedEffect, EffectPermit]:
         with self._lock:
             authorized = self._authorized
             if authorized is None:

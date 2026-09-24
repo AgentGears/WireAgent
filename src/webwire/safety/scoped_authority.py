@@ -1,15 +1,14 @@
-"""M5 layer 4 — intent-bound preparation and delayed scoped effects.
+"""M5 Layer 4 — intent-bound preparation and delayed scoped effects.
 
-Layer 4 is the process-local least-authority adapter between Layer 3's
+This module is the process-local least-authority adapter between Layer 3's
 CommitGateway and the concrete M5 write broker. Capability migration remains
 Layer 5.
 
-A scoped effect handle is deliberately *not* an EffectPermit. It can only ask the
-CommitGateway to mint/reserve/spend at the broker's final mutation seam. This
-keeps slow state probes, delete-menu staging, and composer preparation outside
-the durable uncertainty window. The trusted Layer-5 orchestrator retains an
-:class:`AuthorizedEffect` receipt; capability code receives only its narrow
-``authority`` object.
+A scoped effect handle is deliberately *not* an EffectPermit. Slow navigation,
+state probing, delete-menu staging, and composer verification happen first. The
+permit is minted/reserved/spent only when the concrete broker reaches its final
+mutation seam. The trusted orchestrator retains :class:`AuthorizedEffect`; a
+capability receives only its narrow ``authority`` member.
 
 Threat model: same-process engineering boundary against accidental overreach,
 not a hostile-Python sandbox. Untrusted code still requires process/OS isolation
@@ -69,15 +68,7 @@ _CommitGate = Callable[[], Optional[ActionResult]]
 _EffectInvocation = Callable[[_CommitGate], Awaitable[ActionResult]]
 
 _POST_TARGET_ACTIONS = frozenset(
-    {
-        "bookmark",
-        "remove_bookmark",
-        "like",
-        "unlike",
-        "reply",
-        "quote",
-        "delete_post",
-    }
+    {"bookmark", "remove_bookmark", "like", "unlike", "reply", "quote", "delete_post"}
 )
 _CONTENT_ACTIONS = frozenset({"post", "reply", "quote"})
 _STATUS_HOSTS = frozenset({"x.com", "www.x.com", "twitter.com", "www.twitter.com"})
@@ -154,8 +145,8 @@ class _IntentBinding:
         if not isinstance(payload, dict):
             raise ScopedAuthorityDenied("payload_invalid", "intent payload must be a dict")
 
-        target_id = frozen.target_id
         target_type = frozen.target_type
+        target_id = frozen.target_id
         if not isinstance(target_type, str) or not target_type:
             raise ScopedAuthorityDenied("target_missing", "target_type must be non-empty")
         if not isinstance(target_id, str) or not target_id:
@@ -236,6 +227,8 @@ class _IntentBinding:
 
 @dataclass
 class _PreparationTracker:
+    """Per-attempt staging state with explicit ownership of async mutations."""
+
     intent_hash: str
     action_type: str
     target_id: str
@@ -244,9 +237,11 @@ class _PreparationTracker:
     text_filled: bool = False
     media_attached: int = 0
     sealed: bool = False
-    in_flight: bool = False
     cleanup_in_flight: bool = False
-    revision: int = 0
+    effect_in_flight: bool = False
+    generation: int = 0
+    _active_stage: Optional[int] = None
+    _next_token: int = 0
     _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def _require_binding_unlocked(self, binding: _IntentBinding) -> None:
@@ -270,23 +265,29 @@ class _PreparationTracker:
         with self._lock:
             return self.cleanup_in_flight
 
+    def stage_snapshot(self) -> tuple[bool, bool, int]:
+        with self._lock:
+            return self.composer_opened, self.text_filled, self.media_attached
+
     def ready(self, binding: _IntentBinding) -> bool:
         with self._lock:
             self._require_binding_unlocked(binding)
             return (
-                not self.in_flight
+                self._active_stage is None
                 and not self.cleanup_in_flight
+                and not self.effect_in_flight
                 and self.composer_opened
                 and self.text_filled
                 and self.media_attached == self.expected_media
             )
 
-    def ready_and_sealed(self, binding: _IntentBinding) -> bool:
+    def effect_ready(self, binding: _IntentBinding) -> bool:
         with self._lock:
             self._require_binding_unlocked(binding)
             return (
                 self.sealed
-                and not self.in_flight
+                and self.effect_in_flight
+                and self._active_stage is None
                 and not self.cleanup_in_flight
                 and self.composer_opened
                 and self.text_filled
@@ -299,8 +300,9 @@ class _PreparationTracker:
             if self.sealed:
                 raise ScopedAuthorityDenied("preparation_sealed")
             if (
-                self.in_flight
+                self._active_stage is not None
                 or self.cleanup_in_flight
+                or self.effect_in_flight
                 or not self.composer_opened
                 or not self.text_filled
                 or self.media_attached != self.expected_media
@@ -308,21 +310,26 @@ class _PreparationTracker:
                 raise ScopedAuthorityDenied("preparation_incomplete")
             self.sealed = True
 
-    def begin(self, binding: _IntentBinding) -> int:
+    def begin_stage(self, binding: _IntentBinding) -> tuple[int, int]:
         with self._lock:
             self._require_binding_unlocked(binding)
             if self.sealed:
                 raise ScopedAuthorityDenied("preparation_sealed")
-            if self.in_flight:
-                raise ScopedAuthorityDenied("preparation_in_flight")
+            if self.effect_in_flight:
+                raise ScopedAuthorityDenied("effect_in_flight")
             if self.cleanup_in_flight:
                 raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
-            self.in_flight = True
-            return self.revision
+            if self._active_stage is not None:
+                raise ScopedAuthorityDenied("preparation_in_flight")
+            self._next_token += 1
+            token = self._next_token
+            self._active_stage = token
+            return token, self.generation
 
-    def finish(
+    def finish_stage(
         self,
-        revision: int,
+        token: int,
+        generation: int,
         *,
         succeeded: bool,
         composer_opened: bool = False,
@@ -330,10 +337,14 @@ class _PreparationTracker:
         media_delta: int = 0,
     ) -> bool:
         with self._lock:
+            # A stale completion never owns a newer operation's latch.
+            if self._active_stage != token:
+                return False
+            self._active_stage = None
             valid = (
-                self.in_flight
+                self.generation == generation
                 and not self.cleanup_in_flight
-                and self.revision == revision
+                and not self.effect_in_flight
                 and not self.sealed
             )
             if valid and succeeded:
@@ -342,15 +353,16 @@ class _PreparationTracker:
                 if text_filled:
                     self.text_filled = True
                 self.media_attached += media_delta
-            self.in_flight = False
             return valid
 
     def begin_cleanup(self) -> None:
         with self._lock:
             if self.cleanup_in_flight:
                 raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
+            if self.effect_in_flight:
+                raise ScopedAuthorityDenied("effect_in_flight")
             self.cleanup_in_flight = True
-            self.revision += 1
+            self.generation += 1
             self.composer_opened = False
             self.text_filled = False
             self.media_attached = 0
@@ -358,6 +370,28 @@ class _PreparationTracker:
     def finish_cleanup(self) -> None:
         with self._lock:
             self.cleanup_in_flight = False
+
+    def begin_effect(self, binding: _IntentBinding) -> None:
+        with self._lock:
+            self._require_binding_unlocked(binding)
+            if self.effect_in_flight:
+                raise ScopedAuthorityDenied("effect_in_flight")
+            if self.cleanup_in_flight:
+                raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
+            if self._active_stage is not None:
+                raise ScopedAuthorityDenied("preparation_in_flight")
+            if (
+                not self.sealed
+                or not self.composer_opened
+                or not self.text_filled
+                or self.media_attached != self.expected_media
+            ):
+                raise ScopedAuthorityDenied("preparation_incomplete")
+            self.effect_in_flight = True
+
+    def finish_effect(self) -> None:
+        with self._lock:
+            self.effect_in_flight = False
 
 
 _EFFECT_BY_ACTION: dict[str, EffectVerb] = {
@@ -375,6 +409,7 @@ _EFFECT_BY_ACTION: dict[str, EffectVerb] = {
 @dataclass
 class _PermitHolder:
     permit: Optional[EffectPermit] = None
+    _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
 
 class _PreparationBase:
@@ -490,12 +525,13 @@ class _PreparationBase:
 
     async def attach_media(self, image_path: str) -> ActionResult:
         self._require_live(PreparationVerb.ATTACH_MEDIA)
-        tracker = self.__tracker
-        if not tracker.text_filled:
+        opened, text_filled, media_attached = self.__tracker.stage_snapshot()
+        del opened
+        if not text_filled:
             raise ScopedAuthorityDenied("preparation_order")
-        if tracker.media_attached >= len(self.__binding.media):
+        if media_attached >= len(self.__binding.media):
             raise ScopedAuthorityDenied("media_not_approved", image_path)
-        expected = self.__binding.media[tracker.media_attached]
+        expected = self.__binding.media[media_attached]
         if image_path != expected.source_path:
             raise ScopedAuthorityDenied("media_order_mismatch")
         try:
@@ -505,22 +541,26 @@ class _PreparationBase:
         if digest != expected.sha256:
             raise ScopedAuthorityDenied("media_changed_after_approval")
         self._require_live(PreparationVerb.ATTACH_MEDIA)
-        revision = tracker.begin(self.__binding)
+        token, generation = self.__tracker.begin_stage(self.__binding)
         try:
             result = await self.__attach_media(expected.source_path)
         except BaseException:
-            tracker.finish(revision, succeeded=False)
+            self.__tracker.finish_stage(token, generation, succeeded=False)
             raise
-        tracker.finish(revision, succeeded=result.ok, media_delta=1)
+        self.__tracker.finish_stage(
+            token,
+            generation,
+            succeeded=result.ok,
+            media_delta=1,
+        )
         return result
 
     async def close_composer(self) -> ActionResult:
-        tracker = self.__tracker
-        tracker.begin_cleanup()
+        self.__tracker.begin_cleanup()
         try:
             return await self.__close_composer()
         finally:
-            tracker.finish_cleanup()
+            self.__tracker.finish_cleanup()
 
 
 class PostPreparationAuthority(_PreparationBase):
@@ -533,19 +573,20 @@ class PostPreparationAuthority(_PreparationBase):
     async def fill_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.OPEN_COMPOSER)
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        tracker = self._tracker()
-        if tracker.text_filled or tracker.media_attached:
+        _, already_filled, media_attached = self._tracker().stage_snapshot()
+        if already_filled or media_attached:
             raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        revision = tracker.begin(self._binding())
+        token, generation = self._tracker().begin_stage(self._binding())
         try:
             result = await self.__fill_composer(self._expected_text())
         except BaseException:
-            tracker.finish(revision, succeeded=False)
+            self._tracker().finish_stage(token, generation, succeeded=False)
             raise
-        tracker.finish(
-            revision,
+        self._tracker().finish_stage(
+            token,
+            generation,
             succeeded=result.ok,
             composer_opened=True,
             text_filled=True,
@@ -563,36 +604,38 @@ class ReplyPreparationAuthority(_PreparationBase):
 
     async def open_reply_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
         self._require_live(PreparationVerb.OPEN_COMPOSER)
-        tracker = self._tracker()
-        if tracker.composer_opened or tracker.text_filled or tracker.media_attached:
+        opened, filled, media = self._tracker().stage_snapshot()
+        if opened or filled or media:
             raise ScopedAuthorityDenied("preparation_order")
         if post_url != self._expected_post_url() or target_post_id != self._expected_target_post_id():
             raise ScopedAuthorityDenied("target_mismatch")
-        revision = tracker.begin(self._binding())
+        token, generation = self._tracker().begin_stage(self._binding())
         try:
             result = await self.__open_reply(
                 self._expected_post_url(), self._expected_target_post_id()
             )
         except BaseException:
-            tracker.finish(revision, succeeded=False)
+            self._tracker().finish_stage(token, generation, succeeded=False)
             raise
-        tracker.finish(revision, succeeded=result.ok, composer_opened=True)
+        self._tracker().finish_stage(
+            token, generation, succeeded=result.ok, composer_opened=True
+        )
         return result
 
     async def fill_reply_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        tracker = self._tracker()
-        if not tracker.composer_opened or tracker.text_filled:
+        opened, filled, _ = self._tracker().stage_snapshot()
+        if not opened or filled:
             raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        revision = tracker.begin(self._binding())
+        token, generation = self._tracker().begin_stage(self._binding())
         try:
             result = await self.__fill_reply(self._expected_text())
         except BaseException:
-            tracker.finish(revision, succeeded=False)
+            self._tracker().finish_stage(token, generation, succeeded=False)
             raise
-        tracker.finish(revision, succeeded=result.ok, text_filled=True)
+        self._tracker().finish_stage(token, generation, succeeded=result.ok, text_filled=True)
         return result
 
 
@@ -606,36 +649,38 @@ class QuotePreparationAuthority(_PreparationBase):
 
     async def open_quote_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
         self._require_live(PreparationVerb.OPEN_COMPOSER)
-        tracker = self._tracker()
-        if tracker.composer_opened or tracker.text_filled or tracker.media_attached:
+        opened, filled, media = self._tracker().stage_snapshot()
+        if opened or filled or media:
             raise ScopedAuthorityDenied("preparation_order")
         if post_url != self._expected_post_url() or target_post_id != self._expected_target_post_id():
             raise ScopedAuthorityDenied("target_mismatch")
-        revision = tracker.begin(self._binding())
+        token, generation = self._tracker().begin_stage(self._binding())
         try:
             result = await self.__open_quote(
                 self._expected_post_url(), self._expected_target_post_id()
             )
         except BaseException:
-            tracker.finish(revision, succeeded=False)
+            self._tracker().finish_stage(token, generation, succeeded=False)
             raise
-        tracker.finish(revision, succeeded=result.ok, composer_opened=True)
+        self._tracker().finish_stage(
+            token, generation, succeeded=result.ok, composer_opened=True
+        )
         return result
 
     async def fill_quote_composer(self, text: str) -> ActionResult:
         self._require_live(PreparationVerb.FILL_COMPOSER)
-        tracker = self._tracker()
-        if not tracker.composer_opened or tracker.text_filled:
+        opened, filled, _ = self._tracker().stage_snapshot()
+        if not opened or filled:
             raise ScopedAuthorityDenied("preparation_order")
         if text != self._expected_text():
             raise ScopedAuthorityDenied("payload_mismatch")
-        revision = tracker.begin(self._binding())
+        token, generation = self._tracker().begin_stage(self._binding())
         try:
             result = await self.__fill_quote(self._expected_text())
         except BaseException:
-            tracker.finish(revision, succeeded=False)
+            self._tracker().finish_stage(token, generation, succeeded=False)
             raise
-        tracker.finish(revision, succeeded=result.ok, text_filled=True)
+        self._tracker().finish_stage(token, generation, succeeded=result.ok, text_filled=True)
         return result
 
 
@@ -649,6 +694,7 @@ class _EffectAuthorityBase:
         "__effect",
         "__invoke",
         "__holder",
+        "__tracker",
     )
 
     def __init__(
@@ -662,6 +708,7 @@ class _EffectAuthorityBase:
         effect: EffectVerb,
         invoke: _EffectInvocation,
         holder: _PermitHolder,
+        tracker: Optional[_PreparationTracker] = None,
     ) -> None:
         self.__gateway = gateway
         self.__grant = grant
@@ -671,6 +718,7 @@ class _EffectAuthorityBase:
         self.__effect = effect
         self.__invoke = invoke
         self.__holder = holder
+        self.__tracker = tracker
 
     @property
     def effect(self) -> EffectVerb:
@@ -678,38 +726,47 @@ class _EffectAuthorityBase:
 
     @property
     def consumed(self) -> bool:
-        permit = self.__holder.permit
-        return bool(permit is not None and permit.consumed)
+        with self.__holder._lock:
+            permit = self.__holder.permit
+            return bool(permit is not None and permit.consumed)
 
     def _commit_gate(self) -> Optional[ActionResult]:
         binding = self.__binding
-        permit = self.__holder.permit
-        try:
-            if permit is None:
-                permit = self.__gateway.authorize_commit(
-                    grant=self.__grant,
-                    attempt=self.__attempt,
-                    intent=self.__frozen_intent,
+        with self.__holder._lock:
+            permit = self.__holder.permit
+            try:
+                if permit is None:
+                    permit = self.__gateway.authorize_commit(
+                        grant=self.__grant,
+                        attempt=self.__attempt,
+                        intent=self.__frozen_intent,
+                    )
+                    self.__holder.permit = permit
+                self.__gateway.consume_permit(
+                    permit,
+                    effect=self.__effect,
+                    intent_hash=binding.intent_hash,
+                    actor_id=binding.actor_id,
+                    target_type=binding.target_type,
+                    target_id=binding.target_id,
+                    policy_binding=binding.policy_binding,
                 )
-                self.__holder.permit = permit
-            self.__gateway.consume_permit(
-                permit,
-                effect=self.__effect,
-                intent_hash=binding.intent_hash,
-                actor_id=binding.actor_id,
-                target_type=binding.target_type,
-                target_id=binding.target_id,
-                policy_binding=binding.policy_binding,
-            )
-        except GatewayDenied as exc:
-            return soft_failure(
-                f"scoped commit denied: {exc.reason}",
-                failure_category=FailureCategory.SECURITY,
-            )
+            except GatewayDenied as exc:
+                return soft_failure(
+                    f"scoped commit denied: {exc.reason}",
+                    failure_category=FailureCategory.SECURITY,
+                )
         return None
 
     async def _invoke_exact(self) -> ActionResult:
-        return await self.__invoke(self._commit_gate)
+        tracker = self.__tracker
+        if tracker is not None:
+            tracker.begin_effect(self.__binding)
+        try:
+            return await self.__invoke(self._commit_gate)
+        finally:
+            if tracker is not None:
+                tracker.finish_effect()
 
 
 class SetBookmarkAuthority(_EffectAuthorityBase):
@@ -762,12 +819,18 @@ class AuthorizedEffect:
 
     @property
     def permit(self) -> Optional[EffectPermit]:
-        """Exact permit after the mutation boundary is attempted, else ``None``."""
-        return self._holder.permit
+        with self._holder._lock:
+            return self._holder.permit
 
 
 class ScopedAuthorityBroker:
-    __slots__ = ("__write_broker", "__gateway", "__policies", "__preparations")
+    __slots__ = (
+        "__write_broker",
+        "__gateway",
+        "__policies",
+        "__preparations",
+        "__lock",
+    )
 
     def __init__(
         self,
@@ -783,6 +846,7 @@ class ScopedAuthorityBroker:
         self.__gateway = commit_gateway
         self.__policies = policies
         self.__preparations: dict[str, _PreparationTracker] = {}
+        self.__lock = threading.RLock()
 
     def _freeze_binding(self, intent: WriteIntent) -> tuple[WriteIntent, _IntentBinding]:
         frozen = deepcopy(intent)
@@ -858,21 +922,22 @@ class ScopedAuthorityBroker:
             authorization_epoch=self.__gateway.authorization_epoch,
         )
 
-        tracker = self.__preparations.get(attempt.attempt_id)
-        if tracker is None:
-            tracker = _PreparationTracker(
-                binding.intent_hash,
-                binding.action_type,
-                binding.target_id,
-                len(binding.media),
-            )
-            self.__preparations[attempt.attempt_id] = tracker
-        else:
-            tracker.require_binding(binding)
-            if tracker.is_sealed():
-                raise ScopedAuthorityDenied("preparation_sealed")
-            if tracker.cleanup_active():
-                raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
+        with self.__lock:
+            tracker = self.__preparations.get(attempt.attempt_id)
+            if tracker is None:
+                tracker = _PreparationTracker(
+                    binding.intent_hash,
+                    binding.action_type,
+                    binding.target_id,
+                    len(binding.media),
+                )
+                self.__preparations[attempt.attempt_id] = tracker
+            else:
+                tracker.require_binding(binding)
+                if tracker.is_sealed():
+                    raise ScopedAuthorityDenied("preparation_sealed")
+                if tracker.cleanup_active():
+                    raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
 
         common: dict[str, Any] = {
             "write_broker": self.__write_broker,
@@ -910,10 +975,11 @@ class ScopedAuthorityBroker:
 
         tracker: Optional[_PreparationTracker] = None
         if binding.action_type in _CONTENT_ACTIONS:
-            tracker = self.__preparations.get(attempt.attempt_id)
-            if tracker is None:
-                raise ScopedAuthorityDenied("preparation_incomplete")
-            tracker.seal(binding)
+            with self.__lock:
+                tracker = self.__preparations.get(attempt.attempt_id)
+                if tracker is None:
+                    raise ScopedAuthorityDenied("preparation_incomplete")
+                tracker.seal(binding)
 
         broker = self.__write_broker
         holder = _PermitHolder()
@@ -921,70 +987,58 @@ class ScopedAuthorityBroker:
         invoke: _EffectInvocation
 
         if expected is EffectVerb.SET_BOOKMARK:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_bookmark(binding.post_url, _commit_gate=gate)
+
             cls = SetBookmarkAuthority
         elif expected is EffectVerb.CLEAR_BOOKMARK:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_remove_bookmark(binding.post_url, _commit_gate=gate)
+
             cls = ClearBookmarkAuthority
         elif expected is EffectVerb.SET_LIKE:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_like(binding.post_url, _commit_gate=gate)
+
             cls = SetLikeAuthority
         elif expected is EffectVerb.CLEAR_LIKE:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_unlike(binding.post_url, _commit_gate=gate)
+
             cls = ClearLikeAuthority
         elif expected is EffectVerb.SUBMIT_CONTENT:
             assert tracker is not None
 
             async def precommit_check() -> Optional[ActionResult]:
-                if not tracker.ready_and_sealed(binding):
+                if not tracker.effect_ready(binding):
                     return soft_failure(
-                        "approved preparation state is not sealed/complete",
+                        "approved preparation state is not sealed/active/complete",
                         failure_category=FailureCategory.SECURITY,
                     )
-                text_r = await broker.read_composer_text()
-                if not text_r.ok:
-                    return text_r
-                if (text_r.data or {}).get("composer_text", "") != binding.normalized_text:
-                    return soft_failure(
-                        "composer text no longer matches approved intent",
-                        failure_category=FailureCategory.SECURITY,
-                    )
-                count_r = await broker.count_attachments()
-                if not count_r.ok:
-                    return count_r
-                if (count_r.data or {}).get("count") != len(binding.media):
-                    return soft_failure(
-                        "composer attachment count no longer matches approved intent",
-                        failure_category=FailureCategory.SECURITY,
-                    )
-                if binding.media:
-                    ready_r = await broker.verify_attachment_ready()
-                    if not ready_r.ok:
-                        return ready_r
-                    if (ready_r.data or {}).get("ready") is not True:
-                        return soft_failure(
-                            "approved attachment is not ready at submit boundary",
-                            failure_category=FailureCategory.SECURITY,
-                        )
                 return None
 
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.click_submit(
                     _commit_gate=gate,
                     _precommit_check=precommit_check,
+                    _expected_text=binding.normalized_text,
+                    _expected_attachments=len(binding.media),
                 )
+
             cls = SubmitContentAuthority
         elif expected is EffectVerb.DELETE_POST:
+
             async def invoke(gate: _CommitGate) -> ActionResult:
                 return await broker.delete_post(
                     binding.post_url,
                     binding.target_post_id,
                     _commit_gate=gate,
                 )
+
             cls = DeletePostAuthority
         else:  # pragma: no cover
             raise ScopedAuthorityDenied("effect_not_implemented", expected.value)
@@ -998,5 +1052,6 @@ class ScopedAuthorityBroker:
             effect=expected,
             invoke=invoke,
             holder=holder,
+            tracker=tracker,
         )
         return AuthorizedEffect(authority=authority, attempt=attempt, _holder=holder)

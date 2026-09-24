@@ -435,7 +435,7 @@ class M5WriteBroker(WriteBroker):
                     '"[role=\'menuitem\'],a,button");'
                     'for(var i=0;i<items.length;i++){'
                     'var t=(items[i].innerText||"").trim();'
-                    'if(t==="Delete"||t==="Delete post"||t==="删除"||t==="删除帖子"){' 
+                    'if(t==="Delete"||t==="Delete post"||t==="删除"||t==="删除帖子"){'
                     'items[i].click();return "delete_item_clicked:"+t;}}}'
                     'return null;})()'
                 ),

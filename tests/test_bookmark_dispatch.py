@@ -41,7 +41,11 @@ class _FakeM5BookmarkBroker:
 
     def __init__(self) -> None:
         self.bookmark_clicks: list[str] = []
-        self._bookmarked_posts: set[str] = set()
+        self._bookmarked_ids: set[str] = set()
+
+    @staticmethod
+    def _post_id(post_url: str) -> str:
+        return post_url.rstrip("/").rsplit("/", 1)[-1]
 
     async def click_bookmark(
         self,
@@ -49,17 +53,22 @@ class _FakeM5BookmarkBroker:
         *,
         _commit_gate,  # type: ignore[no-untyped-def]
     ) -> Any:
-        if post_url in self._bookmarked_posts:
+        post_id = self._post_id(post_url)
+        if post_id in self._bookmarked_ids:
             return ok_result(data={"bookmarked": True, "result": "already_satisfied"})
         denied = _commit_gate()
         if denied is not None:
             return denied
         self.bookmark_clicks.append(post_url)
-        self._bookmarked_posts.add(post_url)
+        self._bookmarked_ids.add(post_id)
         return ok_result(data={"bookmarked": True})
 
     async def read_bookmark_state(self, post_url: str) -> Any:
-        state = "bookmarked" if post_url in self._bookmarked_posts else "not_bookmarked"
+        state = (
+            "bookmarked"
+            if self._post_id(post_url) in self._bookmarked_ids
+            else "not_bookmarked"
+        )
         return ok_result(data={"bookmark_state": state})
 
 
@@ -98,7 +107,6 @@ def dispatcher(tmp_path: Path) -> Dispatcher:
     d._broker = ReadOnlyBroker(sm.sb, d._kill, cfg)  # type: ignore[arg-type]
     fake = _install_fake_m5(d, cfg)
     d._test_m5_bookmark_broker = fake  # type: ignore[attr-defined]
-    # Migrated adapter must ignore this legacy factory entirely.
     d._write_kernel._write_broker_factory = lambda: object()  # type: ignore[attr-defined]
     return d
 

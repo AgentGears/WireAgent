@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from super_browser.results.types import FailureCategory
 
 from webwire.config import WebWireConfig

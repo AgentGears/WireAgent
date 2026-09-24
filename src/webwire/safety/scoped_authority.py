@@ -245,6 +245,7 @@ class _PreparationTracker:
     media_attached: int = 0
     sealed: bool = False
     in_flight: bool = False
+    cleanup_in_flight: bool = False
     revision: int = 0
     _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -265,11 +266,16 @@ class _PreparationTracker:
         with self._lock:
             return self.sealed
 
+    def cleanup_active(self) -> bool:
+        with self._lock:
+            return self.cleanup_in_flight
+
     def ready(self, binding: _IntentBinding) -> bool:
         with self._lock:
             self._require_binding_unlocked(binding)
             return (
                 not self.in_flight
+                and not self.cleanup_in_flight
                 and self.composer_opened
                 and self.text_filled
                 and self.media_attached == self.expected_media
@@ -281,6 +287,7 @@ class _PreparationTracker:
             return (
                 self.sealed
                 and not self.in_flight
+                and not self.cleanup_in_flight
                 and self.composer_opened
                 and self.text_filled
                 and self.media_attached == self.expected_media
@@ -293,6 +300,7 @@ class _PreparationTracker:
                 raise ScopedAuthorityDenied("preparation_sealed")
             if (
                 self.in_flight
+                or self.cleanup_in_flight
                 or not self.composer_opened
                 or not self.text_filled
                 or self.media_attached != self.expected_media
@@ -307,6 +315,8 @@ class _PreparationTracker:
                 raise ScopedAuthorityDenied("preparation_sealed")
             if self.in_flight:
                 raise ScopedAuthorityDenied("preparation_in_flight")
+            if self.cleanup_in_flight:
+                raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
             self.in_flight = True
             return self.revision
 
@@ -320,7 +330,12 @@ class _PreparationTracker:
         media_delta: int = 0,
     ) -> bool:
         with self._lock:
-            valid = self.in_flight and self.revision == revision and not self.sealed
+            valid = (
+                self.in_flight
+                and not self.cleanup_in_flight
+                and self.revision == revision
+                and not self.sealed
+            )
             if valid and succeeded:
                 if composer_opened:
                     self.composer_opened = True
@@ -330,15 +345,19 @@ class _PreparationTracker:
             self.in_flight = False
             return valid
 
-    def invalidate(self) -> None:
+    def begin_cleanup(self) -> None:
         with self._lock:
+            if self.cleanup_in_flight:
+                raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
+            self.cleanup_in_flight = True
             self.revision += 1
             self.composer_opened = False
             self.text_filled = False
             self.media_attached = 0
-            # Deliberately leave in_flight unchanged. A concurrent cleanup
-            # invalidates the running operation, and new staging remains blocked
-            # until that operation returns and clears its latch via finish().
+
+    def finish_cleanup(self) -> None:
+        with self._lock:
+            self.cleanup_in_flight = False
 
 
 _EFFECT_BY_ACTION: dict[str, EffectVerb] = {
@@ -423,6 +442,8 @@ class _PreparationBase:
         tracker = self.__tracker
         if tracker.is_sealed():
             raise ScopedAuthorityDenied("preparation_sealed")
+        if tracker.cleanup_active():
+            raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
         grant = self.__grant
         attempt = self.__attempt
         binding = self.__binding
@@ -495,8 +516,11 @@ class _PreparationBase:
 
     async def close_composer(self) -> ActionResult:
         tracker = self.__tracker
-        tracker.invalidate()
-        return await self.__close_composer()
+        tracker.begin_cleanup()
+        try:
+            return await self.__close_composer()
+        finally:
+            tracker.finish_cleanup()
 
 
 class PostPreparationAuthority(_PreparationBase):
@@ -847,6 +871,8 @@ class ScopedAuthorityBroker:
             tracker.require_binding(binding)
             if tracker.is_sealed():
                 raise ScopedAuthorityDenied("preparation_sealed")
+            if tracker.cleanup_active():
+                raise ScopedAuthorityDenied("preparation_cleanup_in_flight")
 
         common: dict[str, Any] = {
             "write_broker": self.__write_broker,

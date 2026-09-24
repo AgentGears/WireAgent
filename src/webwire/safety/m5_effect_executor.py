@@ -15,7 +15,9 @@ Outcome rule:
 - permit issued but not consumed -> explicit gateway-owned NO_EFFECT closure;
 - permit consumed -> verify the canonical target through a read-only evidence
   surface; record EFFECT_CONFIRMED only when the mutation call succeeded and
-  readback proves the intended state, otherwise record EFFECT_UNKNOWN.
+  readback proves the intended state, otherwise record EFFECT_UNKNOWN;
+- an exception/cancellation after authority crosses terminalizes UNKNOWN before
+  it is re-raised, so a surviving process never silently loses uncertainty.
 
 The caller-owned WriteIntent is never re-read after ``runtime.issue``. Once a
 permit exists, verification reconstructs the status URL from the permit's
@@ -29,8 +31,12 @@ from typing import Optional, Protocol, runtime_checkable
 
 from webwire.envelope import ActionResult
 from webwire.safety.execution_models import AttemptState
-from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+from webwire.safety.m5_execution_runtime import (
+    M5ExecutionRuntime,
+    M5ExecutionSession,
+)
 from webwire.safety.models import WriteIntent
+from webwire.safety.scoped_authority import AuthorizedEffect
 
 __all__ = [
     "M5EffectExecution",
@@ -103,9 +109,18 @@ class M5EffectExecutor:
             session.resolve_no_external_effect(reason="effect_authority_shape_mismatch")
             raise M5EffectExecutorDenied("authority_shape_mismatch", action)
 
-        result = await apply()
-        permit = receipt.permit
+        try:
+            result = await apply()
+        except BaseException as exc:
+            self._terminalize_interruption(
+                session,
+                receipt,
+                phase="mutation",
+                exc=exc,
+            )
+            raise
 
+        permit = receipt.permit
         if permit is None:
             # authorize_commit can fail after REQUIRED reservation I/O began.
             # That state is intentionally unresolved and cannot be converted to
@@ -136,10 +151,21 @@ class M5EffectExecutor:
                 permit_consumed=False,
             )
 
-        verification = await self._verify(
-            action=action,
-            target_id=permit.target_id,
-        )
+        try:
+            verification = await self._verify(
+                action=action,
+                target_id=permit.target_id,
+            )
+        except BaseException as exc:
+            session.record_unknown(
+                evidence={
+                    "phase": "verification",
+                    "mutation_ok": bool(result.ok),
+                    "exception_type": type(exc).__name__,
+                }
+            )
+            raise
+
         state_key, expected_state = _EXPECTED_STATE[action]
         verified_state = (
             (verification.data or {}).get(state_key)
@@ -167,6 +193,33 @@ class M5EffectExecutor:
             attempt_state=session.attempt.state,
             permit_issued=True,
             permit_consumed=True,
+        )
+
+    def _terminalize_interruption(
+        self,
+        session: M5ExecutionSession,
+        receipt: AuthorizedEffect,
+        *,
+        phase: str,
+        exc: BaseException,
+    ) -> None:
+        permit = receipt.permit
+        if permit is None:
+            if not session.attempt.reservation_started:
+                session.resolve_no_external_effect(
+                    reason=f"{phase}_interrupted_before_commit_authority"
+                )
+            return
+        if not permit.consumed:
+            session.resolve_no_external_effect(
+                reason=f"{phase}_interrupted_before_permit_consumption"
+            )
+            return
+        session.record_unknown(
+            evidence={
+                "phase": phase,
+                "exception_type": type(exc).__name__,
+            }
         )
 
     async def _verify(self, *, action: str, target_id: str) -> ActionResult:

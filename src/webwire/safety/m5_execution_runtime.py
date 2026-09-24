@@ -285,7 +285,7 @@ class M5ExecutionRuntime:
             raise M5ExecutionStateError("runtime/gateway policy registry mismatch")
         self._scoped = scoped_authority
         self._gateway = commit_gateway
-        self._grants = grants or ApprovalGrantStore()
+        self._grants = grants if grants is not None else ApprovalGrantStore()
         self._policies = policies
 
     def issue(self, intent: WriteIntent) -> M5ExecutionSession:

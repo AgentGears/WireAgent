@@ -14,8 +14,7 @@ Two lease modes are intentional:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import Any
+import json
 
 from super_browser.results.types import FailureCategory
 
@@ -23,7 +22,7 @@ from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.m5_write_broker import M5WriteBroker
 from webwire.safety.media_verify import verify_post_text
-from webwire.safety.post_submit import capture_new_post_id, capture_pre_submit_ids
+from webwire.safety.post_submit import capture_new_post_id
 
 __all__ = ["M5LeasedEvidenceReader"]
 
@@ -51,12 +50,60 @@ class M5LeasedEvidenceReader:
         )
 
     async def capture_pre_submit_ids(self) -> ActionResult:
-        """Capture visible status IDs without relinquishing composer ownership."""
+        """Capture visible status IDs without relinquishing composer ownership.
+
+        Unlike the historical helper, this path does not coerce CDP/evaluation
+        failure to an empty set: an empty baseline can be legitimate, so error
+        and emptiness must remain distinct safety facts.
+        """
         broker = self.__broker
 
         async def operation() -> ActionResult:
-            ids = await capture_pre_submit_ids(broker)
-            return ok_result(data={"status_ids": sorted(ids)})
+            expr = (
+                '(function(){'
+                'var links=document.querySelectorAll("a[href*=\'/status/\']");'
+                'var ids={};'
+                'for(var i=0;i<links.length;i++){'
+                'var href=links[i].getAttribute("href")||"";'
+                'var m=href.match(/\\/status\\/(\\d+)/);'
+                'if(m)ids[m[1]]=1;'
+                '}'
+                'return JSON.stringify(Object.keys(ids));'
+                '})()'
+            )
+            try:
+                result = await broker._sb._controller._cdp.evaluate(expr)
+            except Exception as exc:  # noqa: BLE001
+                return soft_failure(
+                    f"pre-submit identity baseline evaluation failed: {exc!r}",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not result.ok or not result.data or "exceptionDetails" in result.data:
+                return soft_failure(
+                    "pre-submit identity baseline evaluation did not return evidence",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            raw = result.data.get("result", {}).get("value")
+            if not isinstance(raw, str):
+                return soft_failure(
+                    "pre-submit identity baseline returned malformed evidence",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                return soft_failure(
+                    f"pre-submit identity baseline was not valid JSON: {exc!r}",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not isinstance(parsed, list) or not all(
+                isinstance(value, str) for value in parsed
+            ):
+                return soft_failure(
+                    "pre-submit identity baseline had invalid status IDs",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            return ok_result(data={"status_ids": sorted(set(parsed))})
 
         return await broker._owned_content(operation)
 
@@ -103,15 +150,3 @@ class M5LeasedEvidenceReader:
             )
 
         return await broker._one_shot(operation)
-
-    async def _one_shot_evidence(
-        self,
-        operation: Callable[[], Awaitable[Any]],
-    ) -> ActionResult:
-        """Reserved helper for later content evidence operations."""
-        broker = self.__broker
-
-        async def wrapped() -> ActionResult:
-            return ok_result(data=await operation())
-
-        return await broker._one_shot(wrapped)

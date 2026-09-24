@@ -43,6 +43,21 @@ class M5ScopedWriteBroker(M5WriteBroker):
         return "function vis(e){return !!(e&&e.isConnected&&e.getClientRects().length);}"
 
     @staticmethod
+    def _require_baselined(result: ActionResult, label: str) -> ActionResult:
+        """Accept provenance exclusion only when the baseline is explicitly proven."""
+        value = (
+            result.data.get("result", {}).get("value")
+            if result.ok and result.data and "exceptionDetails" not in result.data
+            else None
+        )
+        if value == "baselined":
+            return ok_result(data={"baselined": True})
+        return soft_failure(
+            f"could not establish provenance baseline: {label} ({value!r})",
+            failure_category=FailureCategory.SECURITY,
+        )
+
+    @staticmethod
     def _composer_root_js(textarea_var: str = "ta") -> str:
         return (
             f"var root={textarea_var}.closest(\"[role='dialog']\")||{textarea_var}.closest('form');"
@@ -140,9 +155,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     async def _baseline_composers(self, baseline: str) -> ActionResult:
         result = await self._sb._controller._cdp.evaluate(self._baseline_composers_js(baseline))
-        if result.ok:
-            return ok_result(data={"baselined": True})
-        return soft_failure("could not baseline existing composer contexts")
+        return self._require_baselined(result, "existing composer contexts")
 
     def _require_context(self) -> tuple[str, str, str] | None:
         if not self._m5_context_token or not self._m5_context_kind:
@@ -154,7 +167,9 @@ class M5ScopedWriteBroker(M5WriteBroker):
         if (r := self._guard()) is not None:
             return r
         baseline = secrets.token_hex(16)
-        await self._baseline_composers(baseline)
+        baseline_result = await self._baseline_composers(baseline)
+        if not baseline_result.ok:
+            return baseline_result
         result = await super().fill_composer(text)
         if not result.ok:
             return result
@@ -183,7 +198,9 @@ class M5ScopedWriteBroker(M5WriteBroker):
             return nav
         await asyncio.sleep(0.5)
         baseline = secrets.token_hex(16)
-        await self._baseline_composers(baseline)
+        baseline_result = await self._baseline_composers(baseline)
+        if not baseline_result.ok:
+            return baseline_result
         clicked = await self._sb._controller._cdp.evaluate(
             self._target_click_js(target_post_id, "reply", "m5-context-reply")
         )
@@ -248,8 +265,13 @@ class M5ScopedWriteBroker(M5WriteBroker):
         await asyncio.sleep(0.5)
         composer_baseline = secrets.token_hex(16)
         menu_baseline = secrets.token_hex(16)
-        await self._baseline_composers(composer_baseline)
-        await self._sb._controller._cdp.evaluate(self._baseline_menus_js(menu_baseline))
+        composer_result = await self._baseline_composers(composer_baseline)
+        if not composer_result.ok:
+            return composer_result
+        menu_result = await self._sb._controller._cdp.evaluate(self._baseline_menus_js(menu_baseline))
+        menu_baselined = self._require_baselined(menu_result, "existing quote menus")
+        if not menu_baselined.ok:
+            return menu_baselined
         repost = await self._sb._controller._cdp.evaluate(
             self._target_click_js(target_post_id, "retweet", "m5-context-quote")
         )
@@ -345,7 +367,6 @@ class M5ScopedWriteBroker(M5WriteBroker):
             "var inputs=root.querySelectorAll(\"input[type='file']\");"
             "if(inputs.length===0){var form=root.closest('form')||root.querySelector('form');"
             "if(form)inputs=form.querySelectorAll(\"input[type='file']\");}"
-            "if(inputs.length===0)inputs=document.querySelectorAll(\"input[type='file']\");"
             "if(inputs.length!==1)return inputs.length?'ambiguous':'missing';"
             "inputs[0].setAttribute('data-wireagent-media-input',token);return 'bound';})()"
         )
@@ -399,7 +420,10 @@ class M5ScopedWriteBroker(M5WriteBroker):
                 f"approved composer media input binding failed: {marked_value!r}",
                 failure_category=FailureCategory.SECURITY,
             )
-        await cdp.evaluate(self._baseline_context_images_js(context_token, baseline))
+        baseline_result = await cdp.evaluate(self._baseline_context_images_js(context_token, baseline))
+        baselined = self._require_baselined(baseline_result, "existing composer media")
+        if not baselined.ok:
+            return baselined
         upload = await self._sb.upload_file(f"[data-wireagent-media-input='{input_token}']", image_path)
         if not upload.ok:
             return upload

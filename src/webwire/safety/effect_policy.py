@@ -246,9 +246,10 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
             )
         )
 
-    # Bookmark directions are state-first in the concrete broker and have
-    # broker-level regressions covering selector coexistence, directional-only
-    # clicks, and zero-mutation already-satisfied behavior.
+    # Bookmark is private and the concrete broker establishes a true semantic
+    # state-set: target-scoped state read first, directional-only click, and a
+    # zero-mutation already-satisfied replay. No additional meaningful external
+    # residual effect is known, so BEST_EFFORT is evidence-backed here.
     add("bookmark", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_BOOKMARK})
     add(
         "remove_bookmark",
@@ -256,13 +257,14 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
         {EffectVerb.CLEAR_BOOKMARK},
     )
 
-    # Layer-4 M5 broker regressions now prove the same semantic state-set
-    # contract for like/unlike at the concrete mutation boundary: real DOM state
-    # is read first, already-satisfied replay performs zero mutation and consumes
-    # no permit, and the exact directional click is reachable only after the
-    # private commit gate. That evidence is sufficient for SAFE_STATE_SET.
-    add("like", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_LIKE})
-    add("unlike", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.CLEAR_LIKE})
+    # Like/unlike are public engagement effects. Layer-4 broker regressions prove
+    # directional DOM idempotence, but they do not prove the stronger replay
+    # contract required for BEST_EFFORT: a repeated engagement can have residual
+    # platform effects (notifications, counters, callbacks, analytics) even when
+    # the final boolean state is unchanged. Keep them fenced until that external
+    # semantic property is established independently of selector behavior.
+    add("like", ReplaySemantics.UNKNOWN, {EffectVerb.SET_LIKE})
+    add("unlike", ReplaySemantics.UNKNOWN, {EffectVerb.CLEAR_LIKE})
 
     # Future mutation families have no real broker implementation yet. Their
     # replay behavior is UNKNOWN until an implementation + regression proves a

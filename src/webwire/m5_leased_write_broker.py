@@ -8,6 +8,7 @@ M5 write attempts share one ``SuperBrowser`` instance:
 - one active content-composer owner at a time per browser;
 - target-click -> transient-context binding cannot interleave with another M5
   writer;
+- plain-post composer binding happens before any approved text is typed;
 - focus -> keyboard typing and upload -> preview binding stay inside the lease;
 - one-step engagement/delete cannot navigate over an owned content context;
 - delete menu and confirmation controls are causally bound to the approved target.
@@ -154,6 +155,76 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
         return ok_result(data={"context_text_verified": True})
 
     @staticmethod
+    def _bind_empty_plain_composer_js(context_token: str) -> str:
+        token = json.dumps(context_token)
+        return (
+            "(function(){"
+            "function vis(e){return !!(e&&e.isConnected&&e.getClientRects().length);}"
+            f"var token={token};"
+            "var tas=document.querySelectorAll(\"[data-testid='tweetTextarea_0']\");"
+            "var found=[];"
+            "for(var i=0;i<tas.length;i++){var ta=tas[i];if(!vis(ta))continue;"
+            "var root=ta.closest(\"[role='dialog']\")||ta.closest('form');"
+            "if(!root){root=ta.parentElement;while(root&&root!==document.body&&"
+            "root.querySelectorAll(\"[data-testid='tweetButton']\").length!==1)"
+            "{root=root.parentElement;}}"
+            "if(!root||root===document.body)continue;found.push([root,ta]);}"
+            "if(found.length!==1)return found.length?'ambiguous':'missing';"
+            "var root=found[0][0],ta=found[0][1];"
+            "if((ta.innerText||'').trim()!=='')return 'nonempty';"
+            "root.setAttribute('data-wireagent-context',token);"
+            "root.setAttribute('data-wireagent-context-kind','post');"
+            "root.setAttribute('data-wireagent-context-target','none');"
+            "var imgs=root.querySelectorAll('img');"
+            "for(var j=0;j<imgs.length;j++)"
+            "imgs[j].setAttribute('data-wireagent-context-preexisting',token);"
+            "return 'bound';})()"
+        )
+
+    async def _open_empty_plain_composer(self, text: str) -> ActionResult:
+        if (r := self._guard()) is not None:
+            return r
+        nav = await self._sb.navigate(
+            "https://x.com/compose/post",
+            wait_until="domcontentloaded",
+        )
+        if not nav.ok:
+            return nav
+        context_token = secrets.token_hex(16)
+        cdp = self._sb._controller._cdp
+        for _ in range(20):
+            bound = await cdp.evaluate(self._bind_empty_plain_composer_js(context_token))
+            value = bound.data.get("result", {}).get("value") if bound.ok and bound.data else None
+            if value == "bound":
+                self._m5_context_token = context_token
+                self._m5_context_kind = "post"
+                self._m5_context_target = "none"
+                break
+            if value in {"ambiguous", "nonempty"}:
+                return soft_failure(
+                    f"plain-post composer is not uniquely empty: {value!r}",
+                    failure_category=FailureCategory.SECURITY,
+                )
+            await asyncio.sleep(0.25)
+        else:
+            return soft_failure(
+                "plain-post composer did not appear",
+                failure_category=FailureCategory.SELECTOR_NOT_FOUND,
+            )
+
+        focused = await self._focus_bound_textarea()
+        if not focused.ok:
+            return focused
+        if (r := self._guard()) is not None:
+            return r
+        try:
+            await self._sb._page.engine_page.backend_page.keyboard.type(text, delay=10)
+            await asyncio.sleep(0.25)
+        except Exception as exc:  # noqa: BLE001
+            return soft_failure(f"fill_composer error: {exc!r}")
+        return await self._verify_bound_text(text)
+
+    @staticmethod
     def _mark_media_input_js(context_token: str, input_token: str) -> str:
         """Bind only an input causally inside the approved composer/form."""
         context = json.dumps(context_token)
@@ -289,7 +360,7 @@ class M5LeasedWriteBroker(M5ScopedWriteBroker):
             await asyncio.sleep(self._DELETE_POLL_INTERVAL_S)
 
     async def fill_composer(self, text: str) -> ActionResult:
-        return await self._start_content(lambda: super(M5LeasedWriteBroker, self).fill_composer(text))
+        return await self._start_content(lambda: self._open_empty_plain_composer(text))
 
     async def open_reply_on_target(self, post_url: str, target_post_id: str) -> ActionResult:
         return await self._start_content(

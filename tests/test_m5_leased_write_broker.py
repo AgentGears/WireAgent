@@ -38,8 +38,12 @@ class _CDP:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.text_verification = "match"
+        self.plain_bind_result = "bound"
 
     async def evaluate(self, expr: str) -> ActionResult:
+        if "data-wireagent-context-target','none'" in expr and "nonempty" in expr:
+            self.events.append("bind_plain_context")
+            return ok_result(data={"result": {"value": self.plain_bind_result}})
         if "data-wireagent-context-baseline" in expr and "baselined" in expr:
             self.events.append("baseline")
             return ok_result(data={"result": {"value": "baselined"}})
@@ -95,9 +99,47 @@ def _brokers(tmp_path: Path) -> tuple[M5LeasedWriteBroker, M5LeasedWriteBroker, 
     return first, second, sb
 
 
+async def test_plain_post_binds_empty_context_before_typing(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.m5_leased_write_broker.asyncio.sleep", _no_sleep)
+    first, _, sb = _brokers(tmp_path)
+
+    result = await first.fill_composer("approved")
+    assert result.ok
+    assert sb.events[:5] == [
+        "navigate:https://x.com/compose/post",
+        "bind_plain_context",
+        "focus",
+        "type:approved",
+        "verify_bound_text",
+    ]
+
+
+async def test_plain_post_rejects_nonempty_or_ambiguous_context_before_typing(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.m5_leased_write_broker.asyncio.sleep", _no_sleep)
+    first, _, sb = _brokers(tmp_path)
+
+    sb._controller._cdp.plain_bind_result = "nonempty"
+    nonempty = await first.fill_composer("approved")
+    assert not nonempty.ok
+    assert not any(event.startswith("type:") for event in sb.events)
+    assert first._m5_write_state.content_owner is None
+
+    sb.events.clear()
+    sb._controller._cdp.plain_bind_result = "ambiguous"
+    ambiguous = await first.fill_composer("approved")
+    assert not ambiguous.ok
+    assert not any(event.startswith("type:") for event in sb.events)
+    assert first._m5_write_state.content_owner is None
+
+
 async def test_active_content_owner_blocks_other_m5_writer(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.m5_leased_write_broker.asyncio.sleep", _no_sleep)
     monkeypatch.setattr("webwire.m5_scoped_write_broker.asyncio.sleep", _no_sleep)
     monkeypatch.setattr("webwire.m5_write_broker.asyncio.sleep", _no_sleep)
     first, second, sb = _brokers(tmp_path)

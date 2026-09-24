@@ -116,6 +116,14 @@ def test_default_policy_table_matches_m5_assignments() -> None:
         assert future.durability is DurabilityPolicy.REQUIRED
 
 
+def test_public_engagement_dom_idempotence_does_not_imply_best_effort() -> None:
+    """Lock the residual-effects distinction into the default policy truth."""
+    for action in ("like", "unlike"):
+        policy = DEFAULT_EFFECT_POLICIES.require(action)
+        assert policy.replay_semantics is ReplaySemantics.UNKNOWN
+        assert policy.durability is DurabilityPolicy.REQUIRED
+
+
 def test_every_existing_risk_action_has_an_effect_policy() -> None:
     assert set(DEFAULT_EFFECT_POLICIES.known_actions()) == set(DEFAULT_REGISTRY.known_actions())
 

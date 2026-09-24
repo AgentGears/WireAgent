@@ -1,4 +1,4 @@
-"""M5 layer-1 tests for EffectPolicy derivation and registry truth."""
+"""M5 tests for EffectPolicy derivation and registry truth."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from webwire.safety.effect_policy import (
     EffectPolicy,
     EffectPolicyRegistry,
     EffectVerb,
+    PreparationVerb,
     ReplaySemantics,
     derive_durability,
 )
@@ -71,30 +72,56 @@ def test_registry_rejects_durability_downgrade() -> None:
 
 
 def test_default_policy_table_matches_m5_assignments() -> None:
-    assert DEFAULT_EFFECT_POLICIES.require("post").durability == DurabilityPolicy.REQUIRED
-    assert DEFAULT_EFFECT_POLICIES.require("reply").durability == DurabilityPolicy.REQUIRED
-    assert DEFAULT_EFFECT_POLICIES.require("quote").durability == DurabilityPolicy.REQUIRED
+    content_preparation = frozenset(
+        {
+            PreparationVerb.OPEN_COMPOSER,
+            PreparationVerb.FILL_COMPOSER,
+            PreparationVerb.ATTACH_MEDIA,
+        }
+    )
+    for action in ("post", "reply", "quote"):
+        content = DEFAULT_EFFECT_POLICIES.require(action)
+        assert content.durability == DurabilityPolicy.REQUIRED
+        assert content.preparation_effects == content_preparation
+        assert content.allowed_effects == frozenset({EffectVerb.SUBMIT_CONTENT})
 
     delete = DEFAULT_EFFECT_POLICIES.require("delete_post")
     assert delete.replay_semantics == ReplaySemantics.SAFE_TARGET_DELETE
     assert delete.durability == DurabilityPolicy.REQUIRED
+    assert delete.preparation_effects == frozenset()
+    assert delete.allowed_effects == frozenset({EffectVerb.DELETE_POST})
 
     bookmark = DEFAULT_EFFECT_POLICIES.require("bookmark")
     assert bookmark.replay_semantics is ReplaySemantics.SAFE_STATE_SET
     assert bookmark.durability is DurabilityPolicy.BEST_EFFORT
+    assert bookmark.preparation_effects == frozenset()
+    assert bookmark.allowed_effects == frozenset({EffectVerb.SET_BOOKMARK})
 
-    # Like/unlike are intentionally conservative until their concrete broker
-    # methods gain state-first, selector-coexistence regressions. A high-level
-    # capability pre-read is not enough evidence for a broker-level SAFE claim.
-    for action in ("like", "unlike"):
+    # Directional/state-first DOM behavior is necessary but not sufficient to
+    # prove replay safety for public engagement. A repeated like/unlike may have
+    # residual platform effects even when the final boolean state is unchanged.
+    for action, effect in (
+        ("like", EffectVerb.SET_LIKE),
+        ("unlike", EffectVerb.CLEAR_LIKE),
+    ):
         engagement = DEFAULT_EFFECT_POLICIES.require(action)
         assert engagement.replay_semantics is ReplaySemantics.UNKNOWN
         assert engagement.durability is DurabilityPolicy.REQUIRED
+        assert engagement.preparation_effects == frozenset()
+        assert engagement.allowed_effects == frozenset({effect})
 
     for action in ("follow", "unfollow", "repost", "unrepost"):
         future = DEFAULT_EFFECT_POLICIES.require(action)
         assert future.replay_semantics is ReplaySemantics.UNKNOWN
         assert future.durability is DurabilityPolicy.REQUIRED
+
+
+def test_public_engagement_dom_idempotence_does_not_imply_best_effort() -> None:
+    """Lock the residual-effects distinction into the default policy truth."""
+    for action in ("like", "unlike"):
+        policy = DEFAULT_EFFECT_POLICIES.require(action)
+        assert policy.replay_semantics is ReplaySemantics.UNKNOWN
+        assert policy.durability is DurabilityPolicy.REQUIRED
 
 
 def test_every_existing_risk_action_has_an_effect_policy() -> None:
@@ -120,8 +147,16 @@ def test_policy_binding_is_stable_and_sensitive_to_authority() -> None:
         allowed_effects={EffectVerb.SET_BOOKMARK, EffectVerb.CLEAR_BOOKMARK},
         replay_semantics=ReplaySemantics.SAFE_STATE_SET,
     )
+    prep_changed = EffectPolicy.derive(
+        action_type="x",
+        risk_tier=RiskTier.PRIVATE_REVERSIBLE,
+        allowed_effects={EffectVerb.SET_BOOKMARK},
+        replay_semantics=ReplaySemantics.SAFE_STATE_SET,
+        preparation_effects={PreparationVerb.OPEN_COMPOSER},
+    )
     assert p1.binding_hash() == p2.binding_hash()
     assert p1.binding_hash() != broader.binding_hash()
+    assert p1.binding_hash() != prep_changed.binding_hash()
 
 
 def test_no_per_action_uncertainty_policy_exists() -> None:

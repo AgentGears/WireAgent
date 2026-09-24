@@ -10,7 +10,12 @@ recorded unknown outcomes still require reconciliation; the special case is a
 process crash before a BEST_EFFORT terminal record exists, where replay safety
 is the only available guarantee.
 
-Source of truth: docs/M5_DESIGN.md §4.
+Layer 4 separates bounded preparation authority from the one-shot canonical
+external effect. ``PreparationVerb`` describes staging that may happen while an
+exact human ApprovalGrant remains ACTIVE; ``EffectVerb`` is permit-consumable
+commit authority and therefore belongs on ``EffectPermit``.
+
+Source of truth: docs/M5_DESIGN.md §4 and docs/M5_LAYER4_DESIGN.md.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ __all__ = [
     "EffectPolicy",
     "EffectPolicyRegistry",
     "EffectVerb",
+    "PreparationVerb",
     "ReplaySemantics",
     "DEFAULT_EFFECT_POLICIES",
     "derive_durability",
@@ -38,7 +44,7 @@ __all__ = [
 
 
 class ReplaySemantics(StrEnum):
-    """Replay behavior of one semantic effect, independent of impact/risk."""
+    """Replay behavior of one canonical semantic effect, independent of impact/risk."""
 
     SAFE_STATE_SET = "safe_state_set"
     SAFE_TARGET_DELETE = "safe_target_delete"
@@ -54,8 +60,23 @@ class DurabilityPolicy(StrEnum):
     BEST_EFFORT = "best_effort"
 
 
+class PreparationVerb(StrEnum):
+    """Bounded precommit staging authority; never carried by EffectPermit.
+
+    Preparation may touch browser/service draft state, but it cannot publish the
+    policy's canonical effect. It is usable only while the exact human approval
+    remains ACTIVE and claimed; Layer 4 scoped authorities enforce that runtime
+    condition. Cleanup is a reducing operation and is intentionally not a
+    PreparationVerb requiring continuing approval.
+    """
+
+    OPEN_COMPOSER = "open_composer"
+    FILL_COMPOSER = "fill_composer"
+    ATTACH_MEDIA = "attach_media"
+
+
 class EffectVerb(StrEnum):
-    """Semantic authority verbs. These are not generic DOM primitives."""
+    """Permit-consumable canonical semantic effects, never generic DOM primitives."""
 
     SET_BOOKMARK = "set_bookmark"
     CLEAR_BOOKMARK = "clear_bookmark"
@@ -65,9 +86,6 @@ class EffectVerb(StrEnum):
     UNFOLLOW = "unfollow"
     REPOST = "repost"
     UNREPOST = "unrepost"
-    OPEN_COMPOSER = "open_composer"
-    FILL_COMPOSER = "fill_composer"
-    ATTACH_MEDIA = "attach_media"
     SUBMIT_CONTENT = "submit_content"
     DELETE_POST = "delete_post"
 
@@ -76,7 +94,7 @@ def derive_durability(
     risk_tier: RiskTier,
     replay_semantics: ReplaySemantics,
 ) -> DurabilityPolicy:
-    """Derive fencing from risk and replay semantics."""
+    """Derive canonical-effect fencing from risk and replay semantics."""
     if risk_tier in {
         RiskTier.PUBLIC_AMPLIFYING_REVERSIBLE,
         RiskTier.PUBLIC_CONTENT_IRREVERSIBLE,
@@ -95,14 +113,21 @@ def derive_durability(
 
 @dataclass(frozen=True)
 class EffectPolicy:
-    """Registry-owned declaration for one action type."""
+    """Registry-owned declaration for one action type.
+
+    ``allowed_effects`` is intentionally the permit-consumable canonical effect
+    set. ``preparation_effects`` is separate staging authority and is included in
+    the binding hash so an approval under one staging surface cannot silently be
+    reused after that surface changes.
+    """
 
     action_type: str
     risk_tier: RiskTier
     allowed_effects: frozenset[EffectVerb]
     replay_semantics: ReplaySemantics
     durability: DurabilityPolicy
-    schema_version: int = 1
+    preparation_effects: frozenset[PreparationVerb] = frozenset()
+    schema_version: int = 2
 
     @classmethod
     def derive(
@@ -112,6 +137,7 @@ class EffectPolicy:
         risk_tier: RiskTier,
         allowed_effects: Iterable[EffectVerb],
         replay_semantics: ReplaySemantics,
+        preparation_effects: Iterable[PreparationVerb] = (),
     ) -> "EffectPolicy":
         effects = frozenset(allowed_effects)
         if not effects:
@@ -124,6 +150,7 @@ class EffectPolicy:
             allowed_effects=effects,
             replay_semantics=replay_semantics,
             durability=derive_durability(risk_tier, replay_semantics),
+            preparation_effects=frozenset(preparation_effects),
         )
 
     def validate(self) -> None:
@@ -148,6 +175,9 @@ class EffectPolicy:
             "schema_version": self.schema_version,
             "action_type": self.action_type,
             "risk_tier": self.risk_tier.value,
+            "preparation_effects": sorted(
+                effect.value for effect in self.preparation_effects
+            ),
             "allowed_effects": sorted(effect.value for effect in self.allowed_effects),
             "replay_semantics": self.replay_semantics.value,
             "durability": self.durability.value,
@@ -202,6 +232,8 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
         action_type: str,
         replay: ReplaySemantics,
         effects: Iterable[EffectVerb],
+        *,
+        preparation: Iterable[PreparationVerb] = (),
     ) -> None:
         risk_meta, _ = risk_registry.require(action_type)
         reg.register(
@@ -210,12 +242,14 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
                 risk_tier=risk_meta.derive_tier(),
                 allowed_effects=effects,
                 replay_semantics=replay,
+                preparation_effects=preparation,
             )
         )
 
-    # Bookmark directions are state-first in the concrete WriteBroker and have
-    # broker-level regressions covering selector coexistence and zero-mutation
-    # already-satisfied behavior, so SAFE_STATE_SET is evidence-backed here.
+    # Bookmark is private and the concrete broker establishes a true semantic
+    # state-set: target-scoped state read first, directional-only click, and a
+    # zero-mutation already-satisfied replay. No additional meaningful external
+    # residual effect is known, so BEST_EFFORT is evidence-backed here.
     add("bookmark", ReplaySemantics.SAFE_STATE_SET, {EffectVerb.SET_BOOKMARK})
     add(
         "remove_bookmark",
@@ -223,11 +257,12 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
         {EffectVerb.CLEAR_BOOKMARK},
     )
 
-    # LikeCapability performs a high-level pre-state read, but the concrete
-    # click_like/click_unlike broker methods remain selector-first and lack the
-    # broker-level semantic regressions required to prove replay safety under
-    # selector coexistence/DOM churn. Until that evidence lands, UNKNOWN keeps
-    # both directions durably fenced rather than weakening safety by assertion.
+    # Like/unlike are public engagement effects. Layer-4 broker regressions prove
+    # directional DOM idempotence, but they do not prove the stronger replay
+    # contract required for BEST_EFFORT: a repeated engagement can have residual
+    # platform effects (notifications, counters, callbacks, analytics) even when
+    # the final boolean state is unchanged. Keep them fenced until that external
+    # semantic property is established independently of selector behavior.
     add("like", ReplaySemantics.UNKNOWN, {EffectVerb.SET_LIKE})
     add("unlike", ReplaySemantics.UNKNOWN, {EffectVerb.CLEAR_LIKE})
 
@@ -239,15 +274,29 @@ def _build_default(risk_registry: RiskRegistry = DEFAULT_REGISTRY) -> EffectPoli
     add("repost", ReplaySemantics.UNKNOWN, {EffectVerb.REPOST})
     add("unrepost", ReplaySemantics.UNKNOWN, {EffectVerb.UNREPOST})
 
-    content_effects = {
-        EffectVerb.OPEN_COMPOSER,
-        EffectVerb.FILL_COMPOSER,
-        EffectVerb.ATTACH_MEDIA,
-        EffectVerb.SUBMIT_CONTENT,
+    content_preparation = {
+        PreparationVerb.OPEN_COMPOSER,
+        PreparationVerb.FILL_COMPOSER,
+        PreparationVerb.ATTACH_MEDIA,
     }
-    add("post", ReplaySemantics.NON_IDEMPOTENT_CREATE, content_effects)
-    add("reply", ReplaySemantics.NON_IDEMPOTENT_CREATE, content_effects)
-    add("quote", ReplaySemantics.NON_IDEMPOTENT_CREATE, content_effects)
+    add(
+        "post",
+        ReplaySemantics.NON_IDEMPOTENT_CREATE,
+        {EffectVerb.SUBMIT_CONTENT},
+        preparation=content_preparation,
+    )
+    add(
+        "reply",
+        ReplaySemantics.NON_IDEMPOTENT_CREATE,
+        {EffectVerb.SUBMIT_CONTENT},
+        preparation=content_preparation,
+    )
+    add(
+        "quote",
+        ReplaySemantics.NON_IDEMPOTENT_CREATE,
+        {EffectVerb.SUBMIT_CONTENT},
+        preparation=content_preparation,
+    )
     add("delete_post", ReplaySemantics.SAFE_TARGET_DELETE, {EffectVerb.DELETE_POST})
 
     return reg

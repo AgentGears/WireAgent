@@ -23,6 +23,8 @@ class _BlockingPreparationBroker:
     def __init__(self) -> None:
         self.fill_started = asyncio.Event()
         self.fill_release = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
         self.fill_calls = 0
         self.composer_text = ""
 
@@ -39,6 +41,8 @@ class _BlockingPreparationBroker:
         raise AssertionError(f"unexpected attachment: {path}")
 
     async def close_composer(self) -> ActionResult:
+        self.close_started.set()
+        await self.close_release.wait()
         self.composer_text = ""
         return ok_result(data={"cleanup": "closed"})
 
@@ -121,7 +125,7 @@ async def test_second_staging_mutation_is_rejected_while_first_is_in_flight(
     scoped.scope_effect(grant=grant, attempt=attempt, intent=intent)
 
 
-async def test_cleanup_invalidates_in_flight_success_before_readiness(
+async def test_cleanup_fences_new_staging_until_cleanup_finishes(
     tmp_path: Path,
 ) -> None:
     intent, scoped, broker, grant, attempt = _runtime(tmp_path)
@@ -130,17 +134,24 @@ async def test_cleanup_invalidates_in_flight_success_before_readiness(
     first = asyncio.create_task(prep.fill_composer("approved text"))
     await broker.fill_started.wait()
 
-    cleanup = await prep.close_composer()
-    assert cleanup.ok
+    cleanup_task = asyncio.create_task(prep.close_composer())
+    await broker.close_started.wait()
 
-    # Cleanup does not let a second mutation start while the first broker call
-    # is still outstanding.
-    with pytest.raises(ScopedAuthorityDenied, match="preparation_in_flight"):
-        await prep.fill_composer("approved text")
-
+    # Let the stale fill return while cleanup is still deliberately blocked.
     broker.fill_release.set()
     assert (await first).ok
 
-    # The stale completion is not allowed to resurrect readiness after cleanup.
+    # The staging latch has cleared, but cleanup's independent fence must still
+    # prevent a new mutation from starting until the reducing operation returns.
+    with pytest.raises(ScopedAuthorityDenied, match="preparation_cleanup_in_flight"):
+        await prep.fill_composer("approved text")
+    with pytest.raises(ScopedAuthorityDenied, match="preparation_cleanup_in_flight"):
+        scoped.prepare(grant=grant, attempt=attempt, intent=intent)
+
+    broker.close_release.set()
+    cleanup = await cleanup_task
+    assert cleanup.ok
+
+    # The stale fill completion cannot resurrect readiness after cleanup.
     with pytest.raises(ScopedAuthorityDenied, match="preparation_incomplete"):
         scoped.scope_effect(grant=grant, attempt=attempt, intent=intent)

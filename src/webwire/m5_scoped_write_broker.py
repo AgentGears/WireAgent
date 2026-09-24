@@ -32,7 +32,7 @@ class M5ScopedWriteBroker(M5WriteBroker):
 
     scoped_authority_version = 2
 
-    def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._m5_context_token: Optional[str] = None
         self._m5_context_kind: Optional[str] = None

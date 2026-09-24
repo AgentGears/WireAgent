@@ -15,7 +15,7 @@ from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.dedupe import DedupeStore
 from webwire.safety.effect_ledger import EffectLedger, EffectState
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
-from webwire.safety.execution_models import AuthorizationEpoch
+from webwire.safety.execution_models import AttemptState, AuthorizationEpoch
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.m5_capability_adapter import M5EngagementCapabilityAdapter
 from webwire.safety.m5_effect_executor import M5EffectExecutor

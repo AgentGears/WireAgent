@@ -32,6 +32,13 @@ from webwire.safety.models import (
     Visibility,
     WriteIntent,
 )
+from webwire.safety.recovery_guard import (
+    RecoveryBlock,
+    RecoveryEffect,
+    RecoveryGuard,
+    RecoveryGuardUnavailable,
+    RecoveryStatus,
+)
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
 from webwire.safety.scoped_authority import (
     AuthorizedEffect,
@@ -85,6 +92,11 @@ __all__ = [
     "EffectLedgerCorruptError",
     "EffectState",
     "RecoveryProjection",
+    "RecoveryGuard",
+    "RecoveryGuardUnavailable",
+    "RecoveryBlock",
+    "RecoveryEffect",
+    "RecoveryStatus",
     "AuthorizedEffect",
     "ScopedAuthorityBroker",
     "ScopedAuthorityDenied",

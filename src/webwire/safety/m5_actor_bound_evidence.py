@@ -236,15 +236,19 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                 "var nodes=art.querySelectorAll(\"[data-testid='tweetText']\"),found=[];"
                 "for(var i=0;i<nodes.length;i++)"
                 "if(nodes[i].closest('article')===art)found.push(nodes[i]);"
-                "if(found.length===0)return '';"
-                "return found.length===1?(found[0].innerText||''):null;}"
+                "if(found.length===0)return {status:'pending'};"
+                "if(found.length!==1)return {status:'ambiguous'};"
+                "return {status:'ready',text:(found[0].innerText||'')};}"
                 "var arts=document.querySelectorAll('article'),matches=[];"
                 "for(var ai=0;ai<arts.length;ai++){var own=ownStatus(arts[ai]);"
                 "if(own&&own.id===target)matches.push({own:own,text:directText(arts[ai])});}"
                 "if(matches.length!==1)return JSON.stringify({status:'missing_or_ambiguous',"
                 "matches:matches.length});"
-                "var m=matches[0];return JSON.stringify({status:'found',actor:m.own.actor,"
-                "id:m.own.id,path:m.own.path,text:m.text});})()"
+                "var m=matches[0];"
+                "if(m.text.status==='pending')return JSON.stringify({status:'pending_text'});"
+                "if(m.text.status!=='ready')return JSON.stringify({status:'ambiguous_text'});"
+                "return JSON.stringify({status:'found',actor:m.own.actor,"
+                "id:m.own.id,path:m.own.path,text:m.text.text});})()"
             )
 
             last: dict[str, object] | None = None
@@ -280,8 +284,14 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                         failure_category=FailureCategory.UNKNOWN,
                     )
                 last = parsed
-                if parsed.get("status") == "found":
+                status = parsed.get("status")
+                if status == "found":
                     break
+                if status == "ambiguous_text":
+                    return soft_failure(
+                        "captured status direct text evidence was ambiguous",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
                 await asyncio.sleep(0.25)
 
             if last is None or last.get("status") != "found":

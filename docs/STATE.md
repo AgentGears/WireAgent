@@ -19,11 +19,15 @@
 
 **v0.3 stabilized live path + M5 effect-transaction boundary complete.**
 
-Canonical merged baseline after the full M5 build order:
+Canonical M5 runtime baseline after the full build order:
 
 ```text
-main = 0c62402ae01b50d7662b3978cbf2bee4109aa035
+m5_runtime_baseline = 0c62402ae01b50d7662b3978cbf2bee4109aa035
 ```
+
+That SHA is the PR #8 Layer-7 squash containing the completed M5 runtime. Later
+documentation-only commits may advance `main` without changing this runtime
+baseline.
 
 M5 status:
 

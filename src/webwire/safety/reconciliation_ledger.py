@@ -494,6 +494,35 @@ class ReconciliationLedger:
                 except OSError:
                     pass
 
+    def _initial_visible_size(self) -> tuple[bool, int]:
+        try:
+            stat_result = self._path.stat()
+        except FileNotFoundError:
+            return False, 0
+        except OSError as exc:
+            raise ReconciliationLedgerError(
+                f"could not stat reconciliation ledger before append: {exc!r}"
+            ) from exc
+        return True, stat_result.st_size
+
+    def _append_failure_may_have_changed_file(
+        self,
+        *,
+        initially_existed: bool,
+        initial_size: int,
+        bytes_reported: int,
+    ) -> bool:
+        """Conservatively classify whether failed persistence touched fact bytes."""
+        if bytes_reported > 0:
+            return True
+        try:
+            current_size = self._path.stat().st_size
+        except FileNotFoundError:
+            return initially_existed
+        except OSError:
+            return True
+        return current_size != initial_size
+
     def read_records(self) -> list[ReconciliationRecord]:
         """Diagnostic validated read; never substitutes for recovery authority.
 
@@ -580,6 +609,7 @@ class ReconciliationLedger:
             self._validate_history([*existing, record])
             payload = (record.to_jsonl() + "\n").encode("utf-8")
             self._ensure_parent()
+            initially_existed, initial_size = self._initial_visible_size()
 
             fd: Optional[int] = None
             total = 0
@@ -597,7 +627,11 @@ class ReconciliationLedger:
                     total += written
                 os.fsync(fd)
             except OSError as exc:
-                if total > 0:
+                if self._append_failure_may_have_changed_file(
+                    initially_existed=initially_existed,
+                    initial_size=initial_size,
+                    bytes_reported=total,
+                ):
                     self._path_state.ambiguous_fact = record
                 raise ReconciliationLedgerError(
                     f"durable reconciliation ledger append failed: {exc!r}"

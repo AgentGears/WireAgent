@@ -3,7 +3,7 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.3 — M5 effect-transaction boundary Layers 1–6 merged; Layer 7 journal audit-only migration in progress.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway.
+**Status: v0.3 — M5 effect-transaction boundary Layers 1–7 complete and merged.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable unresolved-effect replay enforcement through RecoveryGuard, and an audit-only invocation journal.
 
 ## Framing
 
@@ -116,8 +116,8 @@ commit-authority boundaries; leaves the browser intact. External trip: create
   required.
 - **Process-local budgets and semantic dedupe.** Per-action/global token buckets
   and the TTL dedupe store remain defense-in-depth controls while the process is
-  alive. Layer 7 intentionally stops rebuilding them from the best-effort audit
-  journal; process restart resets those windows. A future cross-restart budget
+  alive. Layer 7 no longer rebuilds them from the best-effort audit journal;
+  process restart resets those windows. A future cross-restart budget
   requirement needs its own durable policy-state contract.
 - **Unknown outcomes are never blindly retried.** Once an external effect is
   durably uncertain, RecoveryGuard—not a best-effort journal row—owns the
@@ -141,5 +141,5 @@ activation is re-observed at final authority boundaries rather than claimed as
 strict cross-process linearization.
 
 See `docs/M5_DESIGN.md` for the frozen M5 contract,
-`docs/M5_LAYER7_PLAN.md` for the final migration boundary, and `docs/STATE.md`
-for the living project record.
+`docs/M5_LAYER7_PLAN.md` for the final migration boundary and close-out evidence,
+and `docs/STATE.md` for the living project record.

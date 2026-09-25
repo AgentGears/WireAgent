@@ -323,6 +323,7 @@ class Dispatcher:
             )
             return result
 
+        policy_decision = "allowed"
         try:
             if capability.tier == CapabilityTier.WRITE:
                 actor = self._session.resolved_handle
@@ -341,6 +342,7 @@ class Dispatcher:
                             "authority stack is not installed",
                             failure_category=FailureCategory.SECURITY,
                         )
+                        policy_decision = "denied"
                     elif not actor:
                         from super_browser.results.types import FailureCategory
 
@@ -350,6 +352,7 @@ class Dispatcher:
                             "M5 migrated writes require a whoami-resolved actor identity",
                             failure_category=FailureCategory.SECURITY,
                         )
+                        policy_decision = "denied"
                     else:
                         if name in _M5_ENGAGEMENT_CAPABILITIES:
                             write_cap = cast(
@@ -406,6 +409,7 @@ class Dispatcher:
                         f"unmigrated WRITE capability {name!r} is disabled",
                         failure_category=FailureCategory.SECURITY,
                     )
+                    policy_decision = "denied"
             else:
                 from typing import cast as _cast
 
@@ -442,7 +446,7 @@ class Dispatcher:
             capability=name,
             input=input,
             result=result,
-            policy_decision="allowed",
+            policy_decision=policy_decision,
             actions=[],
             started_monotonic=started_monotonic,
             capability_tier=(

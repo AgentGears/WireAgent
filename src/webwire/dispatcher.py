@@ -4,10 +4,8 @@ The dispatcher owns the browser session, read broker, kill switch, invocation
 journal, write-policy kernel, and the staged M5 live execution stack. Capability
 code never receives the raw SuperBrowser facade.
 
-Layer-5 migration is intentionally incremental. Engagement, plain-text content,
-and post/reply/quote media writes are routed through M5 scoped authority;
-remaining write capabilities stay on the legacy WriteKernel/WriteBroker path
-until their dedicated migration slices land.
+Layer-5 migration routes all supported live remote mutations through M5 scoped
+authority. ``compose_post`` remains a dry-run WRITE shell with no remote effect.
 """
 
 from __future__ import annotations
@@ -33,6 +31,7 @@ from webwire.session import SessionManager
 
 if TYPE_CHECKING:
     from webwire.safety.m5_capability_adapter import M5EngagementCapabilityAdapter
+    from webwire.safety.m5_delete_adapter import M5DeleteCapabilityAdapter
     from webwire.safety.m5_live_runtime import M5LiveExecutionStack
     from webwire.safety.m5_media_adapter import M5MediaCapabilityAdapter
     from webwire.safety.m5_post_text_adapter import M5PostTextCapabilityAdapter
@@ -48,6 +47,7 @@ _M5_ENGAGEMENT_CAPABILITIES = frozenset({"bookmark_post", "like_post"})
 _M5_POST_TEXT_CAPABILITY = "post_text"
 _M5_REPLY_CAPABILITY = "reply_post"
 _M5_QUOTE_CAPABILITY = "quote_post"
+_M5_DELETE_CAPABILITY = "delete_post"
 _M5_MEDIA_CAPABILITIES = frozenset(
     {
         "post_photo",
@@ -62,6 +62,7 @@ _M5_MIGRATED_CAPABILITIES = _M5_ENGAGEMENT_CAPABILITIES | _M5_MEDIA_CAPABILITIES
     _M5_POST_TEXT_CAPABILITY,
     _M5_REPLY_CAPABILITY,
     _M5_QUOTE_CAPABILITY,
+    _M5_DELETE_CAPABILITY,
 }
 
 
@@ -117,6 +118,7 @@ class Dispatcher:
         self._m5_post_text_adapter: Optional[M5PostTextCapabilityAdapter] = None
         self._m5_reply_adapter: Optional[M5ReplyCapabilityAdapter] = None
         self._m5_quote_adapter: Optional[M5QuoteCapabilityAdapter] = None
+        self._m5_delete_adapter: Optional[M5DeleteCapabilityAdapter] = None
         self._m5_media_adapters: dict[str, M5MediaCapabilityAdapter] = {}
 
         # Transitional legacy factory. Migrated M5 capabilities never receive or
@@ -242,6 +244,7 @@ class Dispatcher:
             self._m5_post_text_adapter = None
             self._m5_reply_adapter = None
             self._m5_quote_adapter = None
+            self._m5_delete_adapter = None
             self._m5_media_adapters.clear()
             self._broker = None
             return await self._session.stop()
@@ -369,6 +372,11 @@ class Dispatcher:
                                 WriteCapability,
                                 self._m5_media_capability_adapter(name, capability),
                             )
+                        elif name == _M5_DELETE_CAPABILITY:
+                            write_cap = cast(
+                                WriteCapability,
+                                self._m5_delete_capability_adapter(capability),
+                            )
                         else:  # pragma: no cover - guarded by migrated set above
                             raise RuntimeError(f"unsupported M5 migrated capability: {name!r}")
                         result = await self._write_kernel.execute(
@@ -462,6 +470,7 @@ class Dispatcher:
         self._m5_post_text_adapter = None
         self._m5_reply_adapter = None
         self._m5_quote_adapter = None
+        self._m5_delete_adapter = None
         self._m5_media_adapters.clear()
 
     def _m5_capability_adapter(
@@ -549,6 +558,23 @@ class Dispatcher:
 
         adapter = M5MediaCapabilityAdapter(capability, stack.media_executor)
         self._m5_media_adapters[name] = adapter
+        return adapter
+
+    def _m5_delete_capability_adapter(
+        self,
+        capability: "Capability | WriteCapability",
+    ) -> "M5DeleteCapabilityAdapter":
+        stack = self._m5_stack
+        if stack is None:
+            raise RuntimeError("M5 live execution stack is not installed")
+        adapter = self._m5_delete_adapter
+        if adapter is not None:
+            return adapter
+
+        from webwire.safety.m5_delete_adapter import M5DeleteCapabilityAdapter
+
+        adapter = M5DeleteCapabilityAdapter(capability, stack.delete_executor)
+        self._m5_delete_adapter = adapter
         return adapter
 
     async def _post_whoami_hook(self, result: ActionResult) -> None:

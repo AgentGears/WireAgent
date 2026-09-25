@@ -1,4 +1,4 @@
-"""Audit regressions for Layer-5 Dispatcher-level write denials."""
+"""Audit regressions for Dispatcher-level M5 write denials."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any
 from webwire.capabilities.base import CapabilityTier
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
-from webwire.journal import read_recent_write_records
 from webwire.session import SessionManager
 
 
@@ -48,7 +47,6 @@ def _assert_one_denied_write(cfg: WebWireConfig, capability: str) -> None:
     assert record["capability_tier"] == "write"
     assert record["action_type"] is None
     assert record["dedupe_key"] is None
-    assert read_recent_write_records(cfg.journal_path(), 0.0) == []
 
 
 async def test_missing_actor_denial_journals_once_as_denied(tmp_path: Path) -> None:

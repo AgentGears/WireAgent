@@ -1,11 +1,13 @@
 """Dispatcher — the single entry point for capability execution.
 
 The dispatcher owns the browser session, read broker, kill switch, invocation
-journal, write-policy kernel, and the staged M5 live execution stack. Capability
-code never receives the raw SuperBrowser facade.
+journal, write-policy kernel, and the M5 live execution stack. Capability code
+never receives the raw SuperBrowser facade.
 
-Layer-5 migration routes all supported live remote mutations through M5 scoped
-authority. ``compose_post`` remains a dry-run WRITE shell with no remote effect.
+Supported remote mutations route through M5 scoped authority. ``compose_post``
+remains a dry-run WRITE shell with no remote effect. Since Layer 7, the
+invocation journal is audit/diagnostic output only; it never hydrates live
+mutation safety state.
 """
 
 from __future__ import annotations
@@ -89,10 +91,9 @@ class Dispatcher:
         self._registry = CapabilityRegistry()
         self._broker: Optional[ReadOnlyBroker] = None
         self._registered_default = False
-        # During staged Layer-5 migration, reads/downloads and M5 writes still
-        # share one browser. Serialize supported Dispatcher invocations so no
-        # sibling task can navigate over an owned M5 composer. Same-task re-entry
-        # is allowed to avoid deadlocking trusted orchestration hooks.
+        # Reads/downloads and M5 writes share one browser. Serialize supported
+        # Dispatcher invocations so no sibling task can navigate over an owned
+        # M5 composer. Same-task re-entry is allowed for trusted orchestration.
         self._invoke_lock = asyncio.Lock()
         self._invoke_lock_owner: Optional[asyncio.Task[Any]] = None
 
@@ -108,6 +109,8 @@ class Dispatcher:
         from webwire.safety.commit_gateway import CommitGateway
         from webwire.safety.execution_models import AuthorizationEpoch
 
+        # These two controls are process-local defense in depth. Layer 7 no
+        # longer rebuilds either one from the best-effort invocation journal.
         self._dedupe = DedupeStore(ttl_seconds=3600)
         self._bucket = TokenBucket()
 
@@ -131,9 +134,9 @@ class Dispatcher:
         self._m5_delete_adapter: Optional[M5DeleteCapabilityAdapter] = None
         self._m5_media_adapters: dict[str, M5MediaCapabilityAdapter] = {}
 
-        # WriteKernel still owns the transitional confirmation shell, but after
-        # Layer-5 migration it never receives a live legacy WriteBroker. M5
-        # adapters ignore this token and compose_post is a proven dry-run no-op.
+        # WriteKernel owns the confirmation shell but never receives a live
+        # legacy WriteBroker. M5 adapters ignore this inert token and
+        # compose_post is a proven dry-run no-op.
         def _make_write_broker() -> _NoMutationBroker:
             return _NoMutationBroker()
 
@@ -219,27 +222,9 @@ class Dispatcher:
             )
         self._broker = stack.read_broker
 
-        # Transitional legacy safety hydration. Layer 7 will retire the journal
-        # safety role only after all write capabilities and RecoveryGuard move.
-        try:
-            import time as _time
-
-            from webwire.journal import read_recent_write_records
-
-            records = read_recent_write_records(
-                self._config.journal_path(), _time.time() - 3600.0,
-            )
-            n_dedupe = self._dedupe.hydrate_records(records)
-            n_budget = self._bucket.hydrate_records(records)
-            if n_dedupe or n_budget:
-                logger.info(
-                    "Hydrated safety stores from journal: %d dedupe entries, %d budget events",
-                    n_dedupe,
-                    n_budget,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("safety-store hydration failed: %r", exc)
-
+        # Layer 7 intentionally performs no journal-backed safety hydration.
+        # Dedupe/rate windows begin empty for each process; durable unresolved
+        # replay authority has already been established by RecoveryGuard above.
         self._register_defaults()
         try:
             data = r.data or {}
@@ -480,6 +465,9 @@ class Dispatcher:
         if name == "whoami" and result.ok:
             await self._post_whoami_hook(result)
 
+        if capability.tier == CapabilityTier.WRITE:
+            policy_decision = self._audit_policy_decision(policy_decision, result)
+
         write_facts = self._write_facts(capability, result)
         self._journal_write(
             trace_id=trace_id,
@@ -643,6 +631,26 @@ class Dispatcher:
             await self._session.checkpoint_session()
         except Exception as exc:  # noqa: BLE001
             logger.warning("post-whoami checkpoint failed: %r", exc)
+
+    @staticmethod
+    def _audit_policy_decision(current: str, result: ActionResult) -> str:
+        """Return truthful audit policy metadata without creating authority.
+
+        Dispatcher-level denials keep their explicit value. A result that came
+        through WriteKernel exposes its actual policy verdict in ``result.data``;
+        use it for audit instead of the old overloaded ``allowed`` marker. If an
+        exception/result bypassed normal kernel shaping, fall back to outcome
+        truth rather than claiming the policy allowed a failed invocation.
+        """
+
+        if current != "allowed":
+            return current
+        data = result.data if isinstance(result.data, dict) else None
+        if data and isinstance(data.get("policy"), dict):
+            verdict = data["policy"].get("verdict")
+            if isinstance(verdict, str) and verdict:
+                return verdict
+        return "allowed" if result.ok else "denied"
 
     @staticmethod
     def _write_facts(

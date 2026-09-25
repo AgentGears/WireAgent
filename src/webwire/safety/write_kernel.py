@@ -30,11 +30,13 @@ from webwire.safety.models import (
     PolicyVerdict,
     WriteIntent,
 )
+from webwire.safety.recovery_guard import RecoveryGuardUnavailable
 from webwire.safety.risk_registry import RiskRegistry
 from webwire.safety.token_bucket import TokenBucket
 
 if TYPE_CHECKING:
     from webwire.broker import ReadOnlyBroker
+    from webwire.safety.recovery_guard import RecoveryGuard
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,7 @@ class WriteKernel:
         *,
         write_broker_factory=None,  # callable(kill_switch) -> WriteBroker; set by dispatcher
         auto_approve_private: bool = False,
+        recovery_guard: Optional["RecoveryGuard"] = None,
     ) -> None:
         self._kill = kill_switch
         self._risk = risk_registry
@@ -122,6 +125,7 @@ class WriteKernel:
         self._journal = journal
         self._write_broker_factory = write_broker_factory
         self._auto_approve_private = auto_approve_private
+        self._recovery_guard = recovery_guard
         # Pending confirmation tokens: token_str -> ConfirmationToken
         self._pending_tokens: dict[str, ConfirmationToken] = {}
 
@@ -131,6 +135,8 @@ class WriteKernel:
         broker: ReadOnlyBroker,
         input: dict[str, Any],
         actor_identity: Optional[str] = None,
+        *,
+        enforce_recovery_guard: bool = True,
     ) -> ActionResult:
         """Run the full write pipeline. Returns an ActionResult.
 
@@ -138,6 +144,10 @@ class WriteKernel:
         returns CONFIRMATION_REQUIRED with a token.
         Second call (confirmation_token present): validates the token, runs
         execute→journal→verify.
+
+        Layer 6 checks durable unresolved semantic replay before any browser-
+        capable preview. Deliberate no-effect shells may explicitly bypass that
+        gate because they cannot cross a remote mutation boundary.
         """
         trace: dict[str, Any] = {"action": write_cap.name, "stages": []}
 
@@ -153,10 +163,11 @@ class WriteKernel:
         # 2. Compose the intent.
         intent = write_cap.compose(input, actor_identity)
         risk_tier = intent.risk_tier()
+        semantic_key = intent.dedupe_key()
         trace["intent"] = {
             "action_type": intent.action_type,
             "target": f"{intent.target_type}:{intent.target_id}",
-            "dedupe_key": intent.dedupe_key(),
+            "dedupe_key": semantic_key,
             "intent_hash": intent.intent_hash(),
             "risk_tier": risk_tier.value,
         }
@@ -194,6 +205,74 @@ class WriteKernel:
                 blocked_by="risk_meta_mismatch",
             ), trace, None)
 
+        # 2c. Layer-6 durable recovery gate. compose() is declarative; preview()
+        # may navigate. Refresh from the EffectLedger on every guarded write so
+        # an EFFECT_UNKNOWN created while this process survives cannot be replayed
+        # merely because startup hydration happened earlier.
+        if enforce_recovery_guard and self._recovery_guard is not None:
+            try:
+                recovery_block = self._recovery_guard.require_clear(
+                    semantic_key,
+                    refresh=True,
+                )
+            except RecoveryGuardUnavailable:
+                trace["stages"].append("denied:reconciliation_required")
+                trace["recovery"] = {
+                    "available": False,
+                    "semantic_key": semantic_key,
+                }
+                return self._finish(
+                    PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason=(
+                            "M5 recovery authority is unavailable; reconciliation "
+                            "is required before mutation"
+                        ),
+                        risk_tier=risk_tier,
+                        intent_hash=intent.intent_hash(),
+                        blocked_by="reconciliation_required",
+                    ),
+                    trace,
+                    {
+                        "reconciliation_required": True,
+                        "recovery_unavailable": True,
+                        "semantic_key": semantic_key,
+                    },
+                )
+            if recovery_block is not None:
+                effects = [
+                    {
+                        "effect_id": effect.effect_id,
+                        "raw_state": effect.raw_state.value,
+                        "effective_state": effect.effective_state.value,
+                    }
+                    for effect in recovery_block.effects
+                ]
+                trace["stages"].append("denied:reconciliation_required")
+                trace["recovery"] = {
+                    "available": True,
+                    "semantic_key": semantic_key,
+                    "effects": effects,
+                }
+                return self._finish(
+                    PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason=(
+                            "durable unresolved effect requires reconciliation before "
+                            "semantic replay"
+                        ),
+                        risk_tier=risk_tier,
+                        intent_hash=intent.intent_hash(),
+                        blocked_by="reconciliation_required",
+                    ),
+                    trace,
+                    {
+                        "reconciliation_required": True,
+                        "semantic_key": semantic_key,
+                        "effects": effects,
+                    },
+                )
+
         # 3. Policy evaluation (before preview — cheap gates first).
 
         # 3a. Token bucket.
@@ -206,7 +285,7 @@ class WriteKernel:
             ), trace, None)
 
         # 3b. Dedupe.
-        if not self._dedupe.check(intent.dedupe_key()):
+        if not self._dedupe.check(semantic_key):
             trace["stages"].append("denied:dedupe")
             return self._finish(PolicyDecision(
                 verdict=PolicyVerdict.DENY, reason="duplicate action within TTL",
@@ -281,7 +360,7 @@ class WriteKernel:
             # (dry_run=True, e.g. compose_post's deliberate no-op) records
             # nothing — dedupe guards side effects, and a no-op has none
             # (otherwise a confirmed dry-run would block the real post).
-            self._dedupe.record(intent.dedupe_key())
+            self._dedupe.record(semantic_key)
             trace["dedupe_recorded"] = True
         else:
             trace["dedupe_recorded"] = False

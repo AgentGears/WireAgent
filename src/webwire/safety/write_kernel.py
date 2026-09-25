@@ -136,6 +136,8 @@ class WriteKernel:
         broker: ReadOnlyBroker,
         input: dict[str, Any],
         actor_identity: Optional[str] = None,
+        *,
+        enforce_recovery_guard: Optional[bool] = None,
     ) -> ActionResult:
         """Run the full write pipeline. Returns an ActionResult.
 
@@ -146,8 +148,9 @@ class WriteKernel:
 
         Layer 6 checks durable unresolved semantic replay before any browser-
         capable preview. The only exemption is the named ``compose_post`` shell,
-        whose execution contract has no remote mutation. Callers cannot disable
-        the recovery gate for arbitrary capabilities.
+        whose execution contract has no remote mutation. The transitional
+        ``enforce_recovery_guard`` keyword is accepted for Dispatcher source
+        compatibility but cannot grant an exemption to any other capability.
         """
         trace: dict[str, Any] = {"action": write_cap.name, "stages": []}
 
@@ -211,6 +214,8 @@ class WriteKernel:
         # merely because startup hydration happened earlier. The exemption is an
         # internal allowlist, not a caller-controlled switch.
         recovery_exempt = write_cap.name in _RECOVERY_GUARD_EXEMPT_CAPABILITIES
+        if enforce_recovery_guard is False and not recovery_exempt:
+            trace["recovery_exemption_ignored"] = True
         if not recovery_exempt and self._recovery_guard is not None:
             try:
                 recovery_block = self._recovery_guard.require_clear(

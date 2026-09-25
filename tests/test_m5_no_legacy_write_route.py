@@ -8,7 +8,6 @@ import webwire.dispatcher as dispatcher_module
 from webwire.capabilities.base import CapabilityTier
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
-from webwire.envelope import ok_result
 from webwire.session import SessionManager
 from webwire.write_broker import WriteBroker
 
@@ -62,7 +61,7 @@ async def test_write_kernel_factory_no_longer_constructs_legacy_write_broker(
 
     assert not isinstance(broker, WriteBroker)
     try:
-        broker.delete_post
+        _ = getattr(broker, "delete_post")
     except RuntimeError as exc:
         assert "legacy mutation broker surface is disabled" in str(exc)
     else:  # pragma: no cover - fail loudly if authority reappears

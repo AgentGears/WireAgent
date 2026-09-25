@@ -524,20 +524,13 @@ class ReconciliationLedger:
         return current_size != initial_size
 
     def read_records(self) -> list[ReconciliationRecord]:
-        """Diagnostic validated read; never substitutes for recovery authority.
+        """Return only durability-established reconciliation authority.
 
-        This method still refuses a current-process ambiguity latch. Startup and
-        enforcement code that intends to treat rows as recovery authority must
-        call ``read_authoritative()`` so surviving bytes are positively
-        re-durabilized first.
+        Public readers intentionally share the same safety contract as startup
+        recovery. Raw parse-only reads stay private so a future projector cannot
+        accidentally treat merely visible bytes as recovery authority.
         """
-        with self._lock:
-            if self._path_state.ambiguous_fact is not None:
-                raise ReconciliationLedgerAmbiguousError(
-                    "reconciliation ledger durability is ambiguous; exact-fact "
-                    "re-durability is required"
-                )
-            return self._read_records_unchecked()
+        return self.read_authoritative()
 
     def read_authoritative(self) -> list[ReconciliationRecord]:
         """Read startup/enforcement authority after re-establishing file durability.

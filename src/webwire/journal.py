@@ -35,12 +35,7 @@ from webwire.config import ScreenshotPolicy, WebWireConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "BrowserActionEntry",
-    "JournalRecord",
-    "Journal",
-    "read_recent_write_records",
-]
+__all__ = ["BrowserActionEntry", "JournalRecord", "Journal"]
 
 
 @dataclass
@@ -57,9 +52,10 @@ class BrowserActionEntry:
 class JournalRecord:
     """One capability invocation, serialized as one NDJSON line.
 
-    ``policy_decision`` is audit metadata, not commit authority. Historical
-    callers may use coarse Dispatcher values such as ``allowed``/``denied``;
-    Layer 7 deliberately forbids interpreting this field as a safety fact.
+    ``policy_decision`` is audit metadata, not commit authority. Dispatcher
+    pre-kernel gates use coarse values such as ``denied``/``killed`` while
+    WriteKernel-shaped results record the actual kernel verdict when available.
+    Layer 7 forbids interpreting any journal field as a durable safety fact.
     """
 
     timestamp: str
@@ -185,26 +181,3 @@ class Journal:
         """Relative path for a screenshot artifact."""
 
         return self._config.screenshot_dir() / f"{trace_id}.png"
-
-
-def read_recent_write_records(
-    journal_path: Path,
-    cutoff_epoch: float,
-) -> list[dict[str, Any]]:
-    """Retired Layer-7 compatibility shim; always returns no safety records.
-
-    Before M5 completed, Dispatcher used this helper to rebuild in-memory
-    dedupe/rate-limit state from best-effort audit rows. That made the journal a
-    live safety input while still failing open on missing/corrupt data. Layer 7
-    intentionally retires that role: EffectLedger + RecoveryGuard own durable
-    unresolved-effect safety, while dedupe and token buckets are process-local
-    defense-in-depth controls.
-
-    The arguments are retained temporarily so older callers fail *safe with
-    respect to authority separation* rather than silently continuing to consume
-    journal rows. Diagnostic tooling that needs journal history should read it
-    as audit data and must not feed the result into mutation authority.
-    """
-
-    del journal_path, cutoff_epoch
-    return []

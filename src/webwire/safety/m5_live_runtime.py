@@ -25,6 +25,7 @@ from webwire.safety.m5_effect_executor import M5EffectExecutor
 from webwire.safety.m5_evidence_reader import M5LeasedEvidenceReader
 from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
 from webwire.safety.m5_post_text_executor import M5PostTextExecutor
+from webwire.safety.m5_reply_executor import M5ReplyExecutor
 from webwire.safety.scoped_authority import ScopedAuthorityBroker
 
 __all__ = ["M5LiveExecutionStack", "build_live_m5_execution_stack"]
@@ -41,6 +42,7 @@ class M5LiveExecutionStack:
     evidence_reader: M5LeasedEvidenceReader
     effect_executor: M5EffectExecutor
     post_text_executor: M5PostTextExecutor
+    reply_executor: M5ReplyExecutor
 
 
 def build_live_m5_execution_stack(
@@ -80,6 +82,10 @@ def build_live_m5_execution_stack(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
     )
+    reply_executor = M5ReplyExecutor(
+        runtime=execution_runtime,
+        evidence_reader=evidence_reader,
+    )
     return M5LiveExecutionStack(
         read_broker=read_broker,
         write_broker=write_broker,
@@ -88,4 +94,5 @@ def build_live_m5_execution_stack(
         evidence_reader=evidence_reader,
         effect_executor=effect_executor,
         post_text_executor=post_text_executor,
+        reply_executor=reply_executor,
     )

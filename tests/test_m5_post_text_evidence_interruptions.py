@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, ok_result

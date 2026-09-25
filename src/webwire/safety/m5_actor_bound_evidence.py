@@ -2,14 +2,14 @@
 
 The historical post-submit helpers accepted the first newly visible status link
 and the historical text verifier could select an article through any descendant
-status link.  Neither is sufficient for M5 terminal truth: hydration gaps,
+status link. Neither is sufficient for M5 terminal truth: hydration gaps,
 nested statuses, or concurrent same-text posts must never be promoted to
 ``EFFECT_CONFIRMED``.
 
 The supported live reader therefore establishes a stable pre-submit snapshot of
-direct article-owned status IDs, requires exactly one new direct status after
-the submit boundary, and verifies that status through its direct timestamp,
-actor, canonical URL, and direct text.  The executor finally compares the
+direct article-owned status IDs, requires one stable unique new direct status
+after the submit boundary, and verifies that status through its direct timestamp,
+actor, canonical URL, and direct text. The executor finally compares the
 observed actor with the immutable approved actor carried by the consumed permit.
 """
 
@@ -146,12 +146,13 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
         *,
         exclude_ids: set[str] | None = None,
     ) -> ActionResult:
-        """Require exactly one new direct article-owned status after submit."""
+        """Require one stable unique new direct article-owned status after submit."""
 
         broker = self.__strong_broker
         excluded = set(pre_submit_ids) | set(exclude_ids or ())
 
         async def operation() -> ActionResult:
+            previous_candidate: tuple[str, str, str] | None = None
             for _ in range(20):
                 statuses = await self._direct_status_snapshot()
                 if statuses is None:
@@ -167,28 +168,34 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                     )
                 if len(candidates) == 1:
                     candidate = candidates[0]
-                    post_url = f"https://x.com{candidate['path']}"
-                    identity = status_url_identity(post_url)
-                    expected = (
+                    current = (
                         candidate["actor"].lstrip("@").casefold(),
                         candidate["id"],
+                        candidate["path"],
                     )
+                    post_url = f"https://x.com{candidate['path']}"
+                    identity = status_url_identity(post_url)
+                    expected = (current[0], current[1])
                     if identity != expected:
                         return soft_failure(
                             "post-submit direct timestamp produced a non-canonical status URL",
                             failure_category=FailureCategory.UNKNOWN,
                         )
-                    return ok_result(
-                        data={
-                            "post_id": candidate["id"],
-                            "post_url": post_url,
-                            "post_actor": candidate["actor"],
-                            "direct_status_owned": True,
-                        }
-                    )
+                    if previous_candidate == current:
+                        return ok_result(
+                            data={
+                                "post_id": candidate["id"],
+                                "post_url": post_url,
+                                "post_actor": candidate["actor"],
+                                "direct_status_owned": True,
+                            }
+                        )
+                    previous_candidate = current
+                else:
+                    previous_candidate = None
                 await asyncio.sleep(0.25)
             return soft_failure(
-                "post-submit evidence did not identify one unique new direct status",
+                "post-submit evidence did not stabilize on one unique new direct status",
                 failure_category=FailureCategory.UNKNOWN,
             )
 

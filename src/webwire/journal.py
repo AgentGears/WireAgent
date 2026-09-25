@@ -1,27 +1,24 @@
-"""Append-only journal — one record per capability invocation.
+"""Append-only invocation audit journal.
 
-Per the Phase 0a design (Point 4 decision):
+Layer 7 makes this file explicitly audit/diagnostic output only:
+
 - NDJSON at ``.webwire/journal.ndjson``, one record per capability invocation
-  (NOT per low-level browser action).
+  (not per low-level browser action).
 - ``browser_actions`` is a nested list of per-action summaries.
-- Screenshots default to FAILURE-ONLY (not every run) — X pages expose private
-  timeline/DM/account content, and failure-only keeps the journal from becoming
-  a surveillance artifact. Config supports never / on_failure / always.
+- Screenshots default to FAILURE-ONLY because X pages can expose private account
+  content; config still supports never / on_failure / always.
+- WRITE-tier records retain useful action/risk/dedupe facts as evidence, but no
+  live safety component may rebuild execution authority from those fields.
+- append I/O is intentionally best-effort and never participates in M5 commit,
+  replay, approval, dedupe, or rate-limit authority.
 
-Write facts (P0 hydration fix, 2026-09-22): every WRITE-tier record carries
-``capability_tier``, ``action_type``, ``risk_tier``, and — when the kernel
-actually recorded the write in the dedupe store — ``dedupe_key``. These fields
-are the source both safety stores rebuild from on start (dedupe memory +
-token-bucket budgets). The journal is therefore load-bearing for safety, not
-merely evidence; it is still never rewritten, only rotated whole.
+Rotation remains an audit-retention concern: at 10 MB or 31 days of age,
+whichever comes first, the active file is renamed to
+``journal-YYYY-MM.ndjson`` and a fresh file starts. Six rotated files are
+retained. History is aged out in whole files; no file is edited in place.
 
-Rotation (spec decision 3): at 10 MB or 31 days of age, whichever comes first,
-the active file is renamed to ``journal-YYYY-MM.ndjson`` and a fresh file
-starts. Six rotated files are retained. History is aged out in whole files;
-no file is ever edited in place.
-
-Thread-safety: append is a single ``write()`` of one line under a file lock —
-sufficient for the single-process, async, single-writer model.
+Thread-safety: append is a single ``write()`` of one line under the supported
+single-process, async, single-writer model.
 """
 
 from __future__ import annotations
@@ -43,66 +40,55 @@ __all__ = [
     "JournalRecord",
     "Journal",
     "read_recent_write_records",
-    "parse_iso_epoch",
 ]
 
 
 @dataclass
 class BrowserActionEntry:
     """One low-level browser action inside a capability invocation."""
+
     action: str
     params_redacted: dict[str, Any] = field(default_factory=dict)
-    result_category: Optional[str] = None   # SuccessCategory / "failure"
+    result_category: Optional[str] = None
     duration_ms: float = 0.0
 
 
 @dataclass
 class JournalRecord:
-    """One capability invocation, serialized as one NDJSON line."""
-    timestamp: str                           # ISO 8601 UTC
+    """One capability invocation, serialized as one NDJSON line.
+
+    ``policy_decision`` is audit metadata, not commit authority. Historical
+    callers may use coarse Dispatcher values such as ``allowed``/``denied``;
+    Layer 7 deliberately forbids interpreting this field as a safety fact.
+    """
+
+    timestamp: str
     trace_id: str
     capability: str
-    target: Optional[str] = None             # redacted target URL/identifier
+    target: Optional[str] = None
     input_redacted: dict[str, Any] = field(default_factory=dict)
     kill_switch_tripped: bool = False
-    policy_decision: str = "allowed"         # allowed | denied | unsupported | killed
+    policy_decision: str = "allowed"
     result_ok: Optional[bool] = None
     success_category: Optional[str] = None
     failure_category: Optional[str] = None
     error_message: Optional[str] = None
     browser_actions: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: float = 0.0
-    screenshot: Optional[str] = None         # relative path if captured
-    # -- Write facts (P0 hydration fix). Present only on WRITE-tier records
-    # that reached the kernel's policy stage. dedupe_key is set ONLY when the
-    # kernel recorded the write (success, or uncertain submit with
-    # public_side_effect=True) — gate-denied attempts journal no key.
-    capability_tier: Optional[str] = None    # "write" | None (reads stay None)
-    action_type: Optional[str] = None        # kernel action_type, e.g. "bookmark"
-    risk_tier: Optional[str] = None          # e.g. "private_reversible"
-    dedupe_key: Optional[str] = None         # semantic key, only if recorded
+    screenshot: Optional[str] = None
+    # Write facts remain useful for diagnostics/forensics only. They do not
+    # hydrate DedupeStore, TokenBucket, RecoveryGuard, or commit authority.
+    capability_tier: Optional[str] = None
+    action_type: Optional[str] = None
+    risk_tier: Optional[str] = None
+    dedupe_key: Optional[str] = None
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), default=str, separators=(",", ":"))
 
 
-def parse_iso_epoch(iso: str) -> Optional[float]:
-    """Parse an ISO 8601 timestamp to epoch seconds. Returns None on failure."""
-    try:
-        s = iso.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        return dt.timestamp()
-    except (ValueError, TypeError):
-        return None
-
-
 class Journal:
-    """Append-only NDJSON journal with size/age rotation.
-
-    The journal does not decide screenshot policy on its own — the caller
-    (dispatcher) passes ``screenshot_captured`` and the relative path. The
-    journal just records the truth.
-    """
+    """Append-only NDJSON audit journal with size/age rotation."""
 
     def __init__(
         self,
@@ -117,7 +103,6 @@ class Journal:
         self._rotate_max_bytes = rotate_max_bytes
         self._rotate_age_days = rotate_age_days
         self._retain_rotated = retain_rotated
-        # Ensure parent exists lazily on first append.
         self._ready = False
 
     def _ensure(self) -> None:
@@ -129,26 +114,22 @@ class Journal:
             logger.warning("Could not create journal dir %s: %r", self._path.parent, exc)
         self._ready = True
 
-    # -- rotation -----------------------------------------------------------
-
     def rotated_paths(self) -> list[Path]:
         """Rotated journal files in the state dir, oldest-first by name."""
+
         parent = self._path.parent
         if not parent.exists():
             return []
-        prefix = self._path.stem + "-"  # "journal-"
+        prefix = self._path.stem + "-"
         return sorted(
-            p for p in parent.glob(f"{prefix}*.ndjson")
+            p
+            for p in parent.glob(f"{prefix}*.ndjson")
             if p.name != self._path.name
         )
 
     def maybe_rotate(self) -> None:
-        """Rotate when the active file exceeds the size or age threshold.
+        """Rotate audit history when the configured size/age threshold is met."""
 
-        Renames the active file to ``journal-YYYY-MM.ndjson`` (UTC month of
-        rotation; numeric suffix on collision), prunes beyond ``retain_rotated``,
-        never rewrites content. Never raises into the capability path.
-        """
         try:
             if not self._path.exists() or self._path.stat().st_size == 0:
                 return
@@ -165,7 +146,9 @@ class Journal:
             self._path.rename(target)
             logger.info(
                 "Journal rotated: %s (%d bytes, %.1f days old)",
-                target.name, size, age_days,
+                target.name,
+                size,
+                age_days,
             )
             rotated = self.rotated_paths()
             for stale in rotated[: max(0, len(rotated) - self._retain_rotated)]:
@@ -177,12 +160,9 @@ class Journal:
         except OSError as exc:
             logger.warning("Journal rotation check failed: %r", exc)
 
-    # -- append -------------------------------------------------------------
-
     def append(self, record: JournalRecord) -> None:
-        """Append one record. Never raises into the capability path — journal
-        failures are logged, not propagated, so a journal issue cannot block
-        legitimate capability execution."""
+        """Append one best-effort audit record; never affect capability outcome."""
+
         self._ensure()
         self.maybe_rotate()
         try:
@@ -193,92 +173,38 @@ class Journal:
 
     def should_capture_screenshot(self, failed: bool) -> bool:
         """Apply the configured screenshot policy to a capability outcome."""
+
         policy = self._config.screenshots
         if policy == ScreenshotPolicy.NEVER:
             return False
         if policy == ScreenshotPolicy.ALWAYS:
             return True
-        # ON_FAILURE (default)
         return failed
 
     def screenshot_relpath(self, trace_id: str) -> Path:
         """Relative path for a screenshot artifact."""
+
         return self._config.screenshot_dir() / f"{trace_id}.png"
 
 
-# ---------------------------------------------------------------------------
-# Hydration reader — shared by DedupeStore and TokenBucket
-# ---------------------------------------------------------------------------
+def read_recent_write_records(
+    journal_path: Path,
+    cutoff_epoch: float,
+) -> list[dict[str, Any]]:
+    """Retired Layer-7 compatibility shim; always returns no safety records.
 
-def read_recent_write_records(journal_path: Path, cutoff_epoch: float) -> list[dict[str, Any]]:
-    """Return recent WRITE-tier records the safety stores rebuild from.
+    Before M5 completed, Dispatcher used this helper to rebuild in-memory
+    dedupe/rate-limit state from best-effort audit rows. That made the journal a
+    live safety input while still failing open on missing/corrupt data. Layer 7
+    intentionally retires that role: EffectLedger + RecoveryGuard own durable
+    unresolved-effect safety, while dedupe and token buckets are process-local
+    defense-in-depth controls.
 
-    Tail-scans the active journal file newest-to-oldest and stops at the first
-    record older than ``cutoff_epoch`` (records are chronological). If every
-    record in the active file is newer than the cutoff — i.e. a rotation
-    boundary falls inside the window — scanning continues into the newest
-    rotated file. An unparsable line (torn tail after a crash) is logged as a
-    WARNING naming the file and line, and skipped; the rest still hydrates.
-
-    Semantics for both consumers:
-    - Only ``capability_tier == "write"`` and ``policy_decision == "allowed"``
-      records are returned (dispatcher-level "allowed" = reached the kernel's
-      policy stage).
-    - Each returned dict carries ``_epoch`` (parsed timestamp in epoch seconds).
-    - Bucket replay counts gate-denied invocations too — marginally
-      conservative (blocks more), never less protective than live accounting.
+    The arguments are retained temporarily so older callers fail *safe with
+    respect to authority separation* rather than silently continuing to consume
+    journal rows. Diagnostic tooling that needs journal history should read it
+    as audit data and must not feed the result into mutation authority.
     """
-    records: list[dict[str, Any]] = []
 
-    def _scan(path: Path) -> bool:
-        """Scan one file newest-first. Returns True if the file is fully inside
-        the window (scan should continue into the next-older file)."""
-        if not path.exists():
-            return False
-        file_records: list[dict[str, Any]] = []
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            logger.warning("Could not read journal %s: %r", path, exc)
-            return False
-        for lineno in range(len(lines) - 1, -1, -1):
-            line = lines[lineno].strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Journal %s line %d is not valid JSON (torn tail after a crash?) — skipped",
-                    path.name, lineno + 1,
-                )
-                continue
-            epoch = parse_iso_epoch(rec.get("timestamp") or "")
-            if epoch is None:
-                continue  # unparseable timestamp: cannot place in the window
-            if epoch < cutoff_epoch:
-                # Oldest-than-cutoff record: window closed for this file.
-                file_records.reverse()
-                records.extend(file_records)
-                return False
-            if rec.get("capability_tier") == "write" and rec.get("policy_decision") == "allowed":
-                rec["_epoch"] = epoch
-                file_records.append(rec)
-        # Every record in this file was inside the window.
-        file_records.reverse()
-        records.extend(file_records)
-        return True
-
-    active_inside_window = _scan(journal_path)
-    if active_inside_window:
-        # Rotation boundary falls inside the window — continue into the newest
-        # rotated file. If the active file is missing entirely (rotation
-        # happened, then a crash before the first append), scan rotated too.
-        parent = journal_path.parent
-        prefix = journal_path.stem + "-"
-        rotated = sorted(
-            (p for p in parent.glob(f"{prefix}*.ndjson") if p.name != journal_path.name)
-        ) if parent.exists() else []
-        if rotated:
-            _scan(rotated[-1])
-    return records
+    del journal_path, cutoff_epoch
+    return []

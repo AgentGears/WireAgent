@@ -67,6 +67,10 @@ class M5EngagementCapabilityAdapter:
         journal-backed dedupe layer also blocks an in-process clean replay.
         """
         del broker
+        # A receipt is scoped to exactly one execute/verify pair. Clear before
+        # entering the executor so an exception can never expose a receipt from
+        # an earlier invocation to a later verification path.
+        self._execution.set(None)
         execution = await self._executor.execute(intent)
         result = execution.result
 

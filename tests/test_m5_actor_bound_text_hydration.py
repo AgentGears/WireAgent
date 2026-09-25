@@ -1,4 +1,4 @@
-"""Hydration regressions for Layer-5 actor-bound post evidence."""
+"""Hydration regressions for Layer-5 actor-bound content evidence."""
 
 from __future__ import annotations
 
@@ -108,4 +108,146 @@ async def test_empty_approved_text_accepts_only_stable_direct_text_absence(
     assert result.data["post_actor"] == "Actor"
     # The absence must be observed repeatedly; one transient missing node is
     # never enough to confirm an empty approved media-only post.
+    assert len(sb._controller._cdp.expressions) == 8
+
+
+async def test_reply_waits_for_direct_text_node_hydration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
+    reader, sb = _reader(
+        tmp_path,
+        [
+            {
+                "status": "pending_text",
+                "targetIndex": 0,
+                "replyIndex": 1,
+                "replyActor": "Actor",
+                "replyPath": "/Actor/status/222",
+            },
+            {
+                "status": "found",
+                "targetIndex": 0,
+                "replyIndex": 1,
+                "replyActor": "Actor",
+                "replyPath": "/Actor/status/222",
+                "replyText": "approved reply",
+            },
+        ],
+    )
+
+    result = await reader.verify_reply_in_thread(
+        target_post_id="111",
+        reply_post_id="222",
+        actor_id="@Actor",
+        normalized_text="approved reply",
+    )
+
+    assert result.ok is True
+    assert result.data == {
+        "thread_bound": True,
+        "target_post_id": "111",
+        "reply_post_id": "222",
+        "reply_actor": "Actor",
+        "reply_url": "https://x.com/Actor/status/222",
+        "text_matches": True,
+    }
+    assert len(sb._controller._cdp.expressions) == 2
+
+
+async def test_empty_reply_text_requires_stable_direct_text_absence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
+    pending = {
+        "status": "pending_text",
+        "targetIndex": 0,
+        "replyIndex": 1,
+        "replyActor": "Actor",
+        "replyPath": "/Actor/status/222",
+    }
+    reader, sb = _reader(tmp_path, [pending])
+
+    result = await reader.verify_reply_in_thread(
+        target_post_id="111",
+        reply_post_id="222",
+        actor_id="@Actor",
+        normalized_text="",
+    )
+
+    assert result.ok is True
+    assert result.data["thread_bound"] is True
+    assert result.data["text_matches"] is True
+    assert len(sb._controller._cdp.expressions) == 8
+
+
+async def test_quote_waits_for_outer_text_node_hydration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
+    reader, sb = _reader(
+        tmp_path,
+        [
+            {
+                "status": "pending_text",
+                "quoteActor": "Actor",
+                "quotePath": "/Actor/status/333",
+                "quoteTargetIds": ["111"],
+            },
+            {
+                "status": "found",
+                "quoteActor": "Actor",
+                "quotePath": "/Actor/status/333",
+                "quoteText": "approved quote",
+                "quoteTargetIds": ["111"],
+                "expectedTarget": "111",
+            },
+        ],
+    )
+
+    result = await reader.verify_quote_attachment(
+        quote_post_id="333",
+        target_post_id="111",
+        actor_id="@Actor",
+        normalized_text="approved quote",
+    )
+
+    assert result.ok is True
+    assert result.data == {
+        "quote_attachment_verified": True,
+        "target_post_id": "111",
+        "quote_post_id": "333",
+        "quote_actor": "Actor",
+        "quote_url": "https://x.com/Actor/status/333",
+        "text_matches": True,
+    }
+    assert len(sb._controller._cdp.expressions) == 2
+
+
+async def test_empty_quote_text_requires_stable_direct_text_absence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
+    pending = {
+        "status": "pending_text",
+        "quoteActor": "Actor",
+        "quotePath": "/Actor/status/333",
+        "quoteTargetIds": ["111"],
+    }
+    reader, sb = _reader(tmp_path, [pending])
+
+    result = await reader.verify_quote_attachment(
+        quote_post_id="333",
+        target_post_id="111",
+        actor_id="@Actor",
+        normalized_text="",
+    )
+
+    assert result.ok is True
+    assert result.data["quote_attachment_verified"] is True
+    assert result.data["text_matches"] is True
     assert len(sb._controller._cdp.expressions) == 8

@@ -12,10 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import webwire.journal as journal_module
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
 from webwire.envelope import ActionResult, ok_result
-from webwire.journal import Journal, JournalRecord, read_recent_write_records
+from webwire.journal import Journal, JournalRecord
 from webwire.safety import (
     DedupeStore,
     EffectLedger,
@@ -37,7 +38,7 @@ def _audit_write(
         timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         trace_id=trace_id,
         capability="post_text",
-        policy_decision="allowed",
+        policy_decision="allow",
         result_ok=True,
         capability_tier="write",
         action_type=action_type,
@@ -76,37 +77,15 @@ class _StartSession:
         return ok_result(data={})
 
 
-
-def test_journal_reader_is_retired_as_safety_input(tmp_path: Path) -> None:
+def test_legacy_journal_hydration_apis_are_removed(tmp_path: Path) -> None:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
-    journal = Journal(cfg)
-    journal.append(_audit_write("audit-1"))
+    Journal(cfg).append(_audit_write("audit-1"))
 
     assert cfg.journal_path().exists()
-    assert read_recent_write_records(cfg.journal_path(), 0.0) == []
-
-
-def test_dedupe_does_not_hydrate_from_journal_after_layer7(tmp_path: Path) -> None:
-    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
-    key = "@actor|post|none|none|same"
-    Journal(cfg).append(_audit_write("audit-2", dedupe_key=key))
-
-    store = DedupeStore(ttl_seconds=3600)
-    assert store.hydrate_from_journal(cfg.journal_path()) == 0
-    assert store.size() == 0
-    assert store.check(key) is True
-
-
-def test_token_bucket_does_not_replay_journal_budget_after_layer7(tmp_path: Path) -> None:
-    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
-    journal = Journal(cfg)
-    for index in range(10):
-        journal.append(_audit_write(f"audit-budget-{index}"))
-
-    bucket = TokenBucket()
-    records = read_recent_write_records(cfg.journal_path(), 0.0)
-    assert bucket.hydrate_records(records) == 0
-    assert bucket.remaining("post") == 3
+    assert not hasattr(journal_module, "read_recent_write_records")
+    assert not hasattr(DedupeStore, "hydrate_from_journal")
+    assert not hasattr(DedupeStore, "hydrate_records")
+    assert not hasattr(TokenBucket, "hydrate_records")
 
 
 async def test_dispatcher_start_does_not_hydrate_audit_journal(

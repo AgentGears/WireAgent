@@ -95,10 +95,13 @@ async def verify_post_text(broker: Any, posted_url: str, normalized: str) -> boo
 
 
 async def count_post_media(broker: Any, posted_url: str) -> int:
-    """Count tweetPhoto elements in the posted status's OWN article (scoped
-    by the status id — the first article on a reply permalink is the parent).
-    Polls until the article renders and photos load, or deadline. 0 on any
-    failure — callers treat 0 as unverified, honestly."""
+    """Count media owned by the exact posted status's direct article.
+
+    The article is selected only by a direct timestamp-owned status link. Media
+    nested under quoted-content subtrees or nested articles is not evidence for
+    the outer post. Poll until owned photos render or the deadline passes; zero
+    remains unverified so callers fail closed rather than infer attachment truth.
+    """
     try:
         post_id = _post_id_from_url(posted_url)
         if post_id is None or not hasattr(broker, "_sb"):
@@ -108,13 +111,23 @@ async def count_post_media(broker: Any, posted_url: str) -> int:
             return 0
         cdp = broker._sb._controller._cdp
         expr = (
-            '(function(){'
+            "(function(){"
+            f"var target='{post_id}';"
             'var arts=document.querySelectorAll("article");'
-            'for(var i=0;i<arts.length;i++){'
-            f'var link=arts[i].querySelector("a[href*=\'/status/{post_id}\']");'
-            'if(!link)continue;'
-            'return arts[i].querySelectorAll("[data-testid=\'tweetPhoto\']").length;}'
-            'return null;})()'
+            "for(var i=0;i<arts.length;i++){var art=arts[i],owns=false;"
+            "var links=art.querySelectorAll('a[href]');"
+            "for(var j=0;j<links.length;j++){var a=links[j];"
+            "if(a.closest('article')!==art||!a.querySelector('time'))continue;"
+            "try{var u=new URL(a.href,location.href);"
+            "var m=u.pathname.match(/\\/status\\/(\\d+)(?:\\/|$)/);"
+            "if(m&&m[1]===target){owns=true;break;}}catch(e){}}"
+            "if(!owns)continue;"
+            'var photos=art.querySelectorAll("[data-testid=\'tweetPhoto\']"),count=0;'
+            "for(var p=0;p<photos.length;p++){var photo=photos[p];"
+            "if(photo.closest('article')!==art)continue;"
+            'var quote=photo.closest("[data-testid=\'quoteTweet\']");'
+            "if(quote&&art.contains(quote))continue;count++;}"
+            "return count;}return null;})()"
         )
 
         async def _read() -> Optional[int]:
@@ -125,7 +138,7 @@ async def count_post_media(broker: Any, posted_url: str) -> int:
             if value is None:
                 return None        # article not rendered yet — keep polling
             if value == 0:
-                return None        # photos may still be loading — keep polling
+                return None        # owned photos may still be loading
             return int(value)
 
         count = await _poll_until_present(_read)

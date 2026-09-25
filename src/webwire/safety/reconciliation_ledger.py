@@ -88,6 +88,18 @@ _LINEAGE_FIELDS = (
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    """Build a JSON object only when every source key occurs exactly once."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
 def _validate_json_value(value: Any, path: str) -> None:
     """Reject values JSON would coerce or encode non-portably."""
     if value is None or isinstance(value, (str, bool, int)):
@@ -501,10 +513,13 @@ class ReconciliationLedger:
             if not line.strip():
                 continue
             try:
-                raw = json.loads(line)
-            except json.JSONDecodeError as exc:
+                raw = json.loads(
+                    line,
+                    object_pairs_hook=_reject_duplicate_object_keys,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise ReconciliationLedgerCorruptError(
-                    f"reconciliation ledger line {lineno} is not valid JSON"
+                    f"reconciliation ledger line {lineno} is not strict JSON"
                 ) from exc
             records.append(ReconciliationRecord.from_dict(raw))
         self._validate_history(records)

@@ -12,12 +12,8 @@ than best-effort audit data.
 
 from __future__ import annotations
 
-import logging
 import time
-from pathlib import Path
-from typing import Any, Iterable, Optional
-
-logger = logging.getLogger(__name__)
+from typing import Optional
 
 __all__ = ["DedupeStore"]
 
@@ -44,45 +40,6 @@ class DedupeStore:
 
         t = now if now is not None else time.time()
         self._entries[key] = t + self._ttl
-
-    def hydrate_records(
-        self,
-        records: Iterable[dict[str, Any]],
-        now: Optional[float] = None,
-    ) -> int:
-        """Compatibility-only manual hydration; not used by the live M5 runtime.
-
-        Layer 7 removes every supported journal-to-safety-state path. This
-        helper remains temporarily for callers/tests that already hold explicit
-        record data, but callers must not treat audit-journal rows as M5
-        authority. ``hydrate_from_journal`` below is intentionally retired.
-        """
-
-        t = now if now is not None else time.time()
-        hydrated = 0
-        for rec in records:
-            key = rec.get("dedupe_key")
-            epoch = rec.get("_epoch")
-            if not key or epoch is None:
-                continue
-            expiry = float(epoch) + self._ttl
-            if expiry <= t:
-                continue
-            self._entries[key] = expiry
-            hydrated += 1
-        if hydrated:
-            logger.info("DedupeStore manually hydrated %d compatibility entries", hydrated)
-        return hydrated
-
-    def hydrate_from_journal(
-        self,
-        journal_path: Path,
-        now: Optional[float] = None,
-    ) -> int:
-        """Retired compatibility entry point; journal audit data is not authority."""
-
-        del journal_path, now
-        return 0
 
     def _prune(self, now: float) -> None:
         expired = [key for key, expiry in self._entries.items() if expiry <= now]

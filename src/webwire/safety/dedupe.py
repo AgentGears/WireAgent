@@ -1,16 +1,13 @@
-"""Dedupe store — prevents repeated identical writes within a TTL window.
+"""Process-local semantic dedupe for write invocations.
 
-Per review Q3 hardening:
-- Dedupe key is canonical semantic intent (actor + action + target + variant),
-  not just (action, target). Inverse actions (like vs unlike) are distinct.
-- TTL-based (default 1h), so re-liking after the window is allowed.
-- In-memory hot cache, hydrated from the recent journal window on boot, so a
-  process restart during a loop doesn't erase the guard.
+The key is canonical semantic intent (actor + action + target + variant), not
+just ``(action, target)``. Inverse actions such as like/unlike remain distinct.
 
-P0 hydration fix (2026-09-22): hydration now reads the write-fact fields the
-journal actually writes (``dedupe_key`` on kernel-recorded writes), via the
-shared tail-scan reader in ``webwire.journal``. The previous implementation
-expected fields the journal never wrote and silently hydrated 0 entries.
+M5 Layer 7 deliberately makes this store process-local defense-in-depth. It is
+not restart authority and is no longer rebuilt from ``journal.ndjson``. Durable
+uncertain-effect replay safety belongs to EffectLedger + RecoveryGuard. A future
+cross-restart dedupe requirement needs a dedicated persistence contract rather
+than best-effort audit data.
 """
 
 from __future__ import annotations
@@ -20,43 +17,47 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from webwire.journal import read_recent_write_records
-
 logger = logging.getLogger(__name__)
 
 __all__ = ["DedupeStore"]
 
 
 class DedupeStore:
-    """TTL-based dedupe with journal hydration on boot."""
+    """TTL-based in-memory semantic dedupe for the current process."""
 
     def __init__(self, ttl_seconds: float = 3600.0) -> None:
         self._ttl = ttl_seconds
-        # key -> expiry timestamp
         self._entries: dict[str, float] = {}
 
     def check(self, key: str, now: Optional[float] = None) -> bool:
-        """True if the key is NOT a duplicate (i.e. the action is allowed).
-        Does NOT record — call record() after a successful write."""
+        """True when ``key`` is not a duplicate inside the live TTL window."""
+
         t = now if now is not None else time.time()
         self._prune(t)
         expiry = self._entries.get(key)
         if expiry is not None and expiry > t:
-            return False  # duplicate within TTL
+            return False
         return True
 
     def record(self, key: str, now: Optional[float] = None) -> None:
-        """Record that a write with this key was executed."""
+        """Record one semantic write in the current process-local window."""
+
         t = now if now is not None else time.time()
         self._entries[key] = t + self._ttl
 
-    # -- hydration ----------------------------------------------------------
+    def hydrate_records(
+        self,
+        records: Iterable[dict[str, Any]],
+        now: Optional[float] = None,
+    ) -> int:
+        """Compatibility-only manual hydration; not used by the live M5 runtime.
 
-    def hydrate_records(self, records: Iterable[dict[str, Any]], now: Optional[float] = None) -> int:
-        """Rebuild entries from journal write records (each carrying ``_epoch``
-        and, for kernel-recorded writes, ``dedupe_key``). Returns the count
-        hydrated. Records without a dedupe_key (gate-denied attempts) are
-        skipped — they created no semantic write."""
+        Layer 7 removes every supported journal-to-safety-state path. This
+        helper remains temporarily for callers/tests that already hold explicit
+        record data, but callers must not treat audit-journal rows as M5
+        authority. ``hydrate_from_journal`` below is intentionally retired.
+        """
+
         t = now if now is not None else time.time()
         hydrated = 0
         for rec in records:
@@ -66,25 +67,27 @@ class DedupeStore:
                 continue
             expiry = float(epoch) + self._ttl
             if expiry <= t:
-                continue  # already outside the TTL window
+                continue
             self._entries[key] = expiry
             hydrated += 1
         if hydrated:
-            logger.info("DedupeStore hydrated %d entries from journal", hydrated)
+            logger.info("DedupeStore manually hydrated %d compatibility entries", hydrated)
         return hydrated
 
-    def hydrate_from_journal(self, journal_path: Path, now: Optional[float] = None) -> int:
-        """Hydrate from the journal at ``journal_path`` (compat entry point;
-        the dispatcher feeds both stores from one shared read)."""
-        t = now if now is not None else time.time()
-        records = read_recent_write_records(journal_path, t - self._ttl)
-        return self.hydrate_records(records, now=t)
+    def hydrate_from_journal(
+        self,
+        journal_path: Path,
+        now: Optional[float] = None,
+    ) -> int:
+        """Retired compatibility entry point; journal audit data is not authority."""
+
+        del journal_path, now
+        return 0
 
     def _prune(self, now: float) -> None:
-        """Remove expired entries."""
-        expired = [k for k, exp in self._entries.items() if exp <= now]
-        for k in expired:
-            del self._entries[k]
+        expired = [key for key, expiry in self._entries.items() if expiry <= now]
+        for key in expired:
+            del self._entries[key]
 
     def size(self) -> int:
         return len(self._entries)

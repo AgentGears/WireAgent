@@ -151,7 +151,9 @@ def test_delete_evidence_js_binds_permalink_and_ignores_generic_errors(
     assert "if(!atTarget)return JSON.stringify({status:'wrong_page'" in expr
     assert "a.closest('article')!==art||!a.querySelector('time')" in expr
     assert "n.closest('article')" in expr
-    assert "ts.length===1" in expr
+    assert "if(!wrapped)stones.push(t)" in expr
+    assert "stones.length===1" in expr
+    assert "stones.length>1" in expr
     assert "This post was deleted" in expr
     assert "Something went wrong" not in expr
     assert "This post is unavailable" not in expr

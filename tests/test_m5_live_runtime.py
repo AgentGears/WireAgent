@@ -18,6 +18,8 @@ from webwire.safety.m5_effect_executor import M5EffectExecutor
 from webwire.safety.m5_evidence_reader import M5LeasedEvidenceReader
 from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
 from webwire.safety.m5_live_runtime import build_live_m5_execution_stack
+from webwire.safety.m5_media_evidence import M5LeasedMediaEvidenceReader
+from webwire.safety.m5_media_executor import M5MediaExecutor
 from webwire.safety.m5_post_text_executor import M5PostTextExecutor
 from webwire.safety.m5_quote_executor import M5QuoteExecutor
 from webwire.safety.m5_reply_executor import M5ReplyExecutor
@@ -50,10 +52,12 @@ def test_live_stack_uses_one_shared_authority_root(tmp_path: Path) -> None:
     assert isinstance(stack.scoped_authority, ScopedAuthorityBroker)
     assert isinstance(stack.execution_runtime, M5ExecutionRuntime)
     assert isinstance(stack.evidence_reader, M5LeasedEvidenceReader)
+    assert isinstance(stack.media_evidence_reader, M5LeasedMediaEvidenceReader)
     assert isinstance(stack.effect_executor, M5EffectExecutor)
     assert isinstance(stack.post_text_executor, M5PostTextExecutor)
     assert isinstance(stack.reply_executor, M5ReplyExecutor)
     assert isinstance(stack.quote_executor, M5QuoteExecutor)
+    assert isinstance(stack.media_executor, M5MediaExecutor)
     assert stack.read_broker._kill is kill
     assert stack.write_broker._kill is kill
     assert gateway._kill is kill
@@ -65,10 +69,14 @@ def test_live_stack_uses_one_shared_authority_root(tmp_path: Path) -> None:
     assert stack.post_text_executor._runtime is stack.execution_runtime
     assert stack.reply_executor._runtime is stack.execution_runtime
     assert stack.quote_executor._runtime is stack.execution_runtime
+    assert stack.media_executor._runtime is stack.execution_runtime
     assert stack.effect_executor._evidence is stack.evidence_reader
     assert stack.post_text_executor._evidence is stack.evidence_reader
     assert stack.reply_executor._evidence is stack.evidence_reader
     assert stack.quote_executor._evidence is stack.evidence_reader
+    assert stack.media_executor._content_evidence is stack.evidence_reader
+    assert stack.media_executor._media_evidence is stack.media_evidence_reader
+    assert stack.media_evidence_reader._M5LeasedMediaEvidenceReader__broker is stack.write_broker
 
 
 def test_repeated_live_stack_for_same_facade_shares_browser_lease_state(

@@ -75,7 +75,7 @@ async def test_post_text_waits_for_direct_text_node_hydration(
     assert result.ok is True
     assert result.data["post_id"] == "123"
     assert result.data["post_actor"] == "Actor"
-    assert result.data["direct_text_absent_stable"] is False
+    assert "direct_text_absent_stable" not in result.data
     assert len(sb._controller._cdp.expressions) == 2
     expr = sb._controller._cdp.expressions[0]
     assert "status:'pending_text'" in expr

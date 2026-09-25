@@ -20,8 +20,9 @@ two objects merely happening to point at the same hot-file path.
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Optional
 
+from webwire.config import WebWireConfig
 from webwire.m5_leased_read_broker import M5LeasedReadBroker
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
@@ -77,7 +78,7 @@ def build_live_m5_read_broker(
     super_browser: Any,
     kill_switch: KillSwitch,
     *,
-    config=None,  # type: ignore[no-untyped-def]
+    config: Optional[WebWireConfig] = None,
 ) -> M5LeasedReadBroker:
     """Build the live read surface from the same owned facade as M5 writes."""
 

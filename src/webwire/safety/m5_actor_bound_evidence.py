@@ -47,6 +47,7 @@ _DIRECT_STATUS_SNAPSHOT_JS = (
     "if(own&&!seen[own.id]){seen[own.id]=1;out.push(own);}}"
     "return JSON.stringify(out);})()"
 )
+_EMPTY_TEXT_STABLE_POLLS = 8
 
 
 def status_url_identity(url: str) -> tuple[str, str] | None:
@@ -210,6 +211,7 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
             )
         url_actor, post_id = identity
         broker = self.__strong_broker
+        approved_text = normalize_text(normalized_text)
 
         async def operation() -> ActionResult:
             nav = await broker._sb.navigate(post_url, wait_until="domcontentloaded")
@@ -245,13 +247,16 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                 "if(matches.length!==1)return JSON.stringify({status:'missing_or_ambiguous',"
                 "matches:matches.length});"
                 "var m=matches[0];"
-                "if(m.text.status==='pending')return JSON.stringify({status:'pending_text'});"
+                "if(m.text.status==='pending')return JSON.stringify({status:'pending_text',"
+                "actor:m.own.actor,id:m.own.id,path:m.own.path});"
                 "if(m.text.status!=='ready')return JSON.stringify({status:'ambiguous_text'});"
                 "return JSON.stringify({status:'found',actor:m.own.actor,"
                 "id:m.own.id,path:m.own.path,text:m.text.text});})()"
             )
 
             last: dict[str, object] | None = None
+            empty_text_streak = 0
+            direct_text_absent = False
             for _ in range(20):
                 try:
                     evaluated = await broker._sb._controller._cdp.evaluate(expr)
@@ -292,6 +297,16 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                         "captured status direct text evidence was ambiguous",
                         failure_category=FailureCategory.UNKNOWN,
                     )
+                if status == "pending_text" and not approved_text:
+                    empty_text_streak += 1
+                    if empty_text_streak >= _EMPTY_TEXT_STABLE_POLLS:
+                        last = dict(parsed)
+                        last["status"] = "found"
+                        last["text"] = ""
+                        direct_text_absent = True
+                        break
+                else:
+                    empty_text_streak = 0
                 await asyncio.sleep(0.25)
 
             if last is None or last.get("status") != "found":
@@ -326,7 +341,7 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                     "captured status actor disagreed with the captured status URL",
                     failure_category=FailureCategory.UNKNOWN,
                 )
-            if normalize_text(text) != normalize_text(normalized_text):
+            if normalize_text(text) != approved_text:
                 return soft_failure(
                     "captured direct post text did not match the approved text",
                     failure_category=FailureCategory.UNKNOWN,
@@ -335,6 +350,7 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                 data={
                     "text_matches": True,
                     "direct_status_owned": True,
+                    "direct_text_absent_stable": direct_text_absent,
                     "post_id": post_id,
                     "post_actor": actor,
                     "post_url": direct_url,

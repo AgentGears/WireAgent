@@ -116,8 +116,6 @@ def test_exact_retry_redurables_visible_fact_and_clears_latch(
     with pytest.raises(ReconciliationLedgerError):
         first.append_durable(record)
 
-    # The first injected call has already failed; subsequent fsyncs use the real
-    # primitive. The second object shares the exact ambiguity latch.
     second.append_durable(record)
 
     assert first.durability_ambiguous is False
@@ -215,9 +213,6 @@ def test_zero_byte_write_failure_after_ocreat_does_not_skip_later_directory_fsyn
     with pytest.raises(ReconciliationLedgerError, match="append failed"):
         ledger.append_durable(record)
 
-    # O_CREAT happened, so an empty file may now exist, but no fact bytes are
-    # ambiguous. The subsequent successful append still has to durabilize the
-    # parent entry instead of treating file existence as proof that it was done.
     assert ledger.path.exists()
     assert ledger.path.stat().st_size == 0
     assert ledger.durability_ambiguous is False
@@ -239,6 +234,30 @@ def test_zero_byte_write_failure_after_ocreat_does_not_skip_later_directory_fsyn
 
     assert ledger.path.parent in parent_calls
     assert ledger.read_records() == [record]
+
+
+def test_write_error_after_hidden_partial_change_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
+    record = _record()
+    real_write = os.write
+
+    def write_then_raise(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+        real_write(fd, bytes(data[:16]))
+        raise OSError("injected error after underlying write")
+
+    monkeypatch.setattr(os, "write", write_then_raise)
+
+    with pytest.raises(ReconciliationLedgerError, match="append failed"):
+        ledger.append_durable(record)
+
+    # The ledger loop received no byte count, but the visible file changed.
+    # Size-based classification must therefore latch ambiguity.
+    assert ledger.durability_ambiguous is True
+    with pytest.raises(ReconciliationLedgerAmbiguousError):
+        ledger.read_records()
 
 
 def test_short_writes_are_completed_before_fsync(

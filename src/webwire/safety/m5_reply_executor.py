@@ -97,6 +97,7 @@ class M5ReplyExecutor:
         if not isinstance(post_url, str):
             session.resolve_no_external_effect(reason="reply_payload_url_invalid")
             return self._clean_failure(session, "approved reply post_url is invalid")
+        bound_post_url = post_url or f"https://x.com/i/status/{target_post_id}"
 
         valid, char_count = validate_length(normalized)
         if not valid or not normalized:
@@ -116,7 +117,7 @@ class M5ReplyExecutor:
             return self._clean_failure(session, "reply preparation authority shape mismatch")
 
         try:
-            opened = await preparation.open_reply_on_target(post_url, target_post_id)
+            opened = await preparation.open_reply_on_target(bound_post_url, target_post_id)
         except BaseException as exc:
             await self._abort_precommit(
                 session,
@@ -165,7 +166,23 @@ class M5ReplyExecutor:
             )
             return self._execution(fill, session, None)
 
-        readback = await preparation.read_composer_text()
+        try:
+            readback = await preparation.read_composer_text()
+        except BaseException as exc:
+            await self._abort_precommit(
+                session,
+                preparation,
+                reason="reply_composer_readback_interrupted",
+            )
+            return self._execution(
+                hard_failure(
+                    "reply composer readback was interrupted before commit authority: "
+                    f"{type(exc).__name__}",
+                    failure_category=FailureCategory.SECURITY,
+                ),
+                session,
+                None,
+            )
         composer_text = (
             (readback.data or {}).get("composer_text", "")
             if readback.ok and isinstance(readback.data, dict)
@@ -344,15 +361,32 @@ class M5ReplyExecutor:
             else {}
         )
         verified_url = verification_data.get("reply_url")
-        confirmed = bool(
+        reply_actor = verification_data.get("reply_actor")
+        approved_actor = actor_id.lstrip("@").casefold()
+        reply_id_valid = bool(
             isinstance(reply_post_id, str)
-            and reply_post_id
+            and reply_post_id.isdigit()
+            and reply_post_id != target_post_id
+        )
+        actor_verified = bool(
+            isinstance(reply_actor, str)
+            and reply_actor.lstrip("@").casefold() == approved_actor
+        )
+        url_verified = bool(
+            reply_id_valid
+            and isinstance(verified_url, str)
+            and f"/status/{reply_post_id}" in verified_url
+        )
+        confirmed = bool(
+            reply_id_valid
             and verification is not None
             and verification.ok
             and verification_data.get("thread_bound") is True
             and verification_data.get("text_matches") is True
             and verification_data.get("target_post_id") == target_post_id
             and verification_data.get("reply_post_id") == reply_post_id
+            and actor_verified
+            and url_verified
         )
         evidence = {
             "submit_result_ok": bool(submit_result.ok),
@@ -362,7 +396,8 @@ class M5ReplyExecutor:
             "verified_reply_url": verified_url,
             "thread_bound": bool(verification_data.get("thread_bound") is True),
             "text_verified": bool(verification_data.get("text_matches") is True),
-            "actor_verified": bool(verification_data.get("reply_actor")),
+            "actor_verified": actor_verified,
+            "url_verified": url_verified,
         }
 
         if confirmed:

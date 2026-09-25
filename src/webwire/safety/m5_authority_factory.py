@@ -8,9 +8,8 @@ lease required by Layer 4's transient DOM ownership contract.
 The live factory deliberately does not attach WireAgent state directly to the
 third-party SuperBrowser facade. Some SDK facade implementations may use slots
 or otherwise reject arbitrary attributes. WireAgent instead keeps one stable
-process-local proxy for each exact facade identity; the leased broker attaches
-its state to that owned proxy. Repeated construction for the same facade reuses
-the same proxy and therefore the same browser-write lease.
+process-local proxy for each exact facade identity; both live read and write
+brokers are built from that proxy and therefore share one browser lease.
 
 The write broker and CommitGateway must also share the exact same KillSwitch
 instance. This makes the operator's in-process trip state one authority source
@@ -21,8 +20,10 @@ two objects merely happening to point at the same hot-file path.
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Optional
 
+from webwire.config import WebWireConfig
+from webwire.m5_leased_read_broker import M5LeasedReadBroker
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectPolicyRegistry
@@ -30,6 +31,7 @@ from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.scoped_authority import ScopedAuthorityBroker, ScopedAuthorityDenied
 
 __all__ = [
+    "build_live_m5_read_broker",
     "build_live_m5_write_broker",
     "build_live_scoped_authority_broker",
 ]
@@ -70,6 +72,17 @@ def _live_facade(super_browser: Any) -> _LeaseCompatibleBrowserFacade:
         facade = _LeaseCompatibleBrowserFacade(super_browser)
         _LIVE_FACADES[key] = (super_browser, facade)
         return facade
+
+
+def build_live_m5_read_broker(
+    super_browser: Any,
+    kill_switch: KillSwitch,
+    *,
+    config: Optional[WebWireConfig] = None,
+) -> M5LeasedReadBroker:
+    """Build the live read surface from the same owned facade as M5 writes."""
+
+    return M5LeasedReadBroker(_live_facade(super_browser), kill_switch, config)
 
 
 def build_live_m5_write_broker(

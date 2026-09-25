@@ -113,6 +113,8 @@ def test_set_resolved_handle_ignores_empty(tmp_path: Path) -> None:
 async def test_actor_flows_into_write_dedupe_key(tmp_path: Path) -> None:
     """End-to-end plumbing: after identity is bound, a write invocation's
     dedupe key carries the handle (was '?|bookmark|...')."""
+    from types import SimpleNamespace
+
     from webwire.broker import ReadOnlyBroker
 
     class _StubSB:
@@ -130,6 +132,9 @@ async def test_actor_flows_into_write_dedupe_key(tmp_path: Path) -> None:
     d = Dispatcher(cfg, session_manager=sm)  # type: ignore[arg-type]
     d._broker = ReadOnlyBroker(sm.sb, d._kill, cfg)  # type: ignore[arg-type]
     d._session.set_resolved_handle("infaag")
+    # This test stops at confirmation; a sentinel executor is enough to prove
+    # actor plumbing through the M5 adapter without opening any mutation path.
+    d._m5_stack = SimpleNamespace(effect_executor=object())  # type: ignore[assignment]
 
     r = await d.invoke("bookmark_post", {"post_url": "https://x.com/a/status/1"})
     assert r.ok is True
@@ -269,7 +274,6 @@ def test_dry_run_execute_records_no_dedupe(tmp_path: Path) -> None:
     assert r2.data["trace"]["dedupe_recorded"] is False
     assert dedupe.size() == 0
 
-    # The identical invocation is NOT blocked — it reaches confirmation again.
     r3 = asyncio.run(kernel.execute(cap, object(), {"text": "hello"}))
     assert r3.ok is True
     assert r3.data["policy"]["verdict"] == "confirmation_required"

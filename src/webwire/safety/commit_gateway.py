@@ -235,6 +235,64 @@ class CommitGateway:
         self._issued_permits.pop(permit.permit_id, None)
         self._issued_attempts.pop(permit.permit_id, None)
 
+    def _close_unconsumed_permit_no_effect(
+        self,
+        permit: EffectPermit,
+        *,
+        reason: str,
+        failure_reason: str,
+    ) -> None:
+        """Persist a proved NO_EFFECT and retire one unconsumed permit.
+
+        The grant has already been spent by ``authorize_commit``. This closure
+        therefore never releases the claim or restores approval authority. For a
+        fenced permit the durable NO_EFFECT row is written before the in-memory
+        attempt becomes terminal, so a failed write preserves conservative
+        RESERVED recovery semantics and leaves the permit available for an
+        explicit retry of the closure.
+        """
+        if permit.consumed:
+            raise GatewayStateError("cannot no-effect-close a consumed permit")
+        attempt = self._canonical_attempt(permit)
+        if permit.fenced:
+            try:
+                self._ledger.append_durable(
+                    self._terminal_record(
+                        permit,
+                        EffectState.NO_EFFECT,
+                        {"reason": reason},
+                    )
+                )
+            except EffectLedgerError as exc:
+                raise GatewayDenied(failure_reason, str(exc)) from exc
+        attempt.mark_no_effect_after_authority()
+        self._evict_permit(permit)
+
+    def close_unconsumed_permit_no_effect(
+        self,
+        permit: EffectPermit,
+        *,
+        reason: str,
+    ) -> None:
+        """Close issued authority when no external effect crossed the boundary.
+
+        This is the Layer-5 authority-reducing closure for the interval between
+        successful ``authorize_commit`` and successful ``consume_permit``. It is
+        intentionally independent of live kill/policy/epoch state: those may be
+        exactly why consumption was denied. The caller must invoke it only when
+        the canonical mutation did not execute and ``permit.consumed`` is still
+        false.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise GatewayStateError("NO_EFFECT closure requires a non-empty reason")
+        with self._protocol_lock:
+            self._require_issued_permit(permit)
+            self._close_unconsumed_permit_no_effect(
+                permit,
+                reason=reason.strip(),
+                failure_reason="no_effect_close_failed",
+            )
+
     def _close_expired_unconsumed(self, permit: EffectPermit) -> None:
         """Close unused authority without leaving false uncertainty.
 
@@ -243,22 +301,11 @@ class CommitGateway:
         the mutation boundary; the canonical attempt therefore terminalizes as
         NO_EFFECT without releasing/reusing the approval.
         """
-        if permit.consumed:
-            raise GatewayStateError("cannot expiry-close a consumed permit")
-        attempt = self._canonical_attempt(permit)
-        if permit.fenced:
-            try:
-                self._ledger.append_durable(
-                    self._terminal_record(
-                        permit,
-                        EffectState.NO_EFFECT,
-                        {"reason": "permit_expired"},
-                    )
-                )
-            except EffectLedgerError as exc:
-                raise GatewayDenied("expiry_close_failed", str(exc)) from exc
-        attempt.mark_no_effect_after_authority()
-        self._evict_permit(permit)
+        self._close_unconsumed_permit_no_effect(
+            permit,
+            reason="permit_expired",
+            failure_reason="expiry_close_failed",
+        )
 
     def _prune_expired_unconsumed(self, now: float) -> None:
         expired = [

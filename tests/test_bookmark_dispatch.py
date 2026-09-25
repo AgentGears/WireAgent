@@ -1,26 +1,29 @@
-"""Dispatcher-level tests for bookmark_post — the Phase 3 canary write.
-
-Tests the write pipeline at the DISPATCHER level (not just kernel level),
-including ChatGPT's specifically-requested confirmation-token replay test.
-
-Uses a stubbed session (no real browser) with a FakeWriteBroker that records
-clicks, so the pipeline mechanics are testable without live X.
-"""
+"""Dispatcher-level tests for the M5-migrated bookmark_post canary."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
+from webwire.envelope import ok_result
+from webwire.safety.commit_gateway import CommitGateway
+from webwire.safety.effect_ledger import EffectLedger
+from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+from webwire.safety.execution_models import AuthorizationEpoch
+from webwire.safety.m5_effect_executor import M5EffectExecutor
+from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+from webwire.safety.scoped_authority import ScopedAuthorityBroker
 from webwire.session import SessionManager
 
 
 class _StubSB:
-    """Stand-in for SuperBrowser. The FakeWriteBroker records its calls."""
+    """Bare session facade; canary mutation is provided by the fake M5 broker."""
+
     _page = None
     _controller = None
 
@@ -30,24 +33,68 @@ class _StubSessionManager(SessionManager):
         super().__init__(config)
         self._sb = _StubSB()  # type: ignore[assignment]
         self._started = True
+        self.set_resolved_handle("@actor")
 
 
-class _FakeWriteBroker:
-    """Records bookmark clicks + bookmark-state reads. Pretends to be a WriteBroker."""
+class _FakeM5BookmarkBroker:
+    """Stateful bookmark seam that requires the private commit callback."""
+
     def __init__(self) -> None:
         self.bookmark_clicks: list[str] = []
-        self._bookmarked_posts: set[str] = set()
+        self._bookmarked_ids: set[str] = set()
 
-    async def click_bookmark(self, post_url: str) -> Any:
+    @staticmethod
+    def _post_id(post_url: str) -> str:
+        return post_url.rstrip("/").rsplit("/", 1)[-1]
+
+    async def click_bookmark(
+        self,
+        post_url: str,
+        *,
+        _commit_gate,  # type: ignore[no-untyped-def]
+    ) -> Any:
+        post_id = self._post_id(post_url)
+        if post_id in self._bookmarked_ids:
+            return ok_result(data={"bookmarked": True, "result": "already_satisfied"})
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
         self.bookmark_clicks.append(post_url)
-        self._bookmarked_posts.add(post_url)
-        from webwire.envelope import ok_result
+        self._bookmarked_ids.add(post_id)
         return ok_result(data={"bookmarked": True})
 
     async def read_bookmark_state(self, post_url: str) -> Any:
-        from webwire.envelope import ok_result
-        state = "bookmarked" if post_url in self._bookmarked_posts else "not_bookmarked"
+        state = (
+            "bookmarked"
+            if self._post_id(post_url) in self._bookmarked_ids
+            else "not_bookmarked"
+        )
         return ok_result(data={"bookmark_state": state})
+
+
+def _install_fake_m5(d: Dispatcher, cfg: WebWireConfig) -> _FakeM5BookmarkBroker:
+    fake = _FakeM5BookmarkBroker()
+    gateway = CommitGateway(
+        ledger=EffectLedger(cfg),
+        kill_switch=d._kill,
+        authorization_epoch=AuthorizationEpoch(),
+        policies=DEFAULT_EFFECT_POLICIES,
+        permit_ttl_seconds=60.0,
+    )
+    scoped = ScopedAuthorityBroker(
+        fake,
+        gateway,
+        policies=DEFAULT_EFFECT_POLICIES,
+    )
+    runtime = M5ExecutionRuntime(
+        scoped_authority=scoped,
+        commit_gateway=gateway,
+        policies=DEFAULT_EFFECT_POLICIES,
+    )
+    executor = M5EffectExecutor(runtime=runtime, evidence_reader=fake)  # type: ignore[arg-type]
+    d._m5_stack = SimpleNamespace(effect_executor=executor)  # type: ignore[assignment]
+    d._m5_canary_adapters.clear()
+    return fake
 
 
 @pytest.fixture
@@ -56,16 +103,18 @@ def dispatcher(tmp_path: Path) -> Dispatcher:
     sm = _StubSessionManager(cfg)
     d = Dispatcher(cfg, session_manager=sm)  # type: ignore[arg-type]
     from webwire.broker import ReadOnlyBroker
+
     d._broker = ReadOnlyBroker(sm.sb, d._kill, cfg)  # type: ignore[arg-type]
-    # Override the WriteBroker factory with a fake that records clicks.
-    fake_wb = _FakeWriteBroker()
-    d._write_kernel._write_broker_factory = lambda: fake_wb  # type: ignore[attr-defined]
+    fake = _install_fake_m5(d, cfg)
+    d._test_m5_bookmark_broker = fake  # type: ignore[attr-defined]
+    d._write_kernel._write_broker_factory = lambda: object()  # type: ignore[attr-defined]
     return d
 
 
 async def test_bookmark_first_invoke_returns_confirmation_required(dispatcher) -> None:
-    """Gate 4: first invoke must stop at confirmation_required."""
-    r = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     assert r.ok is True
     policy = r.data["policy"]
     assert policy["verdict"] == "confirmation_required"
@@ -74,23 +123,24 @@ async def test_bookmark_first_invoke_returns_confirmation_required(dispatcher) -
 
 
 async def test_bookmark_full_pipeline_executes(dispatcher) -> None:
-    """Gates 4+5: first invoke → confirm, second invoke with token → execute."""
-    # Phase 1.
-    r1 = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r1 = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     token = r1.data["data"]["confirmation_token"]
-    # Phase 2.
     r2 = await dispatcher.invoke(
         "bookmark_post",
         {"post_url": "https://x.com/jack/status/20", "confirmation_token": token},
     )
-    policy = r2.data["policy"]
-    assert policy["verdict"] == "allow"
+    assert r2.data["policy"]["verdict"] == "allow"
     assert r2.data["trace"]["execute_ok"] is True
+    fake = dispatcher._test_m5_bookmark_broker
+    assert fake.bookmark_clicks == ["https://x.com/jack/status/20"]
 
 
 async def test_bookmark_intent_mismatch_blocked(dispatcher) -> None:
-    """Gate: token for post A cannot bookmark post B."""
-    r1 = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r1 = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     token = r1.data["data"]["confirmation_token"]
     r2 = await dispatcher.invoke(
         "bookmark_post",
@@ -101,51 +151,43 @@ async def test_bookmark_intent_mismatch_blocked(dispatcher) -> None:
 
 
 async def test_bookmark_dedupe_blocks_replay(dispatcher) -> None:
-    """Gate 8: immediate replay of the same bookmark is blocked by dedupe."""
-    # Full pipeline once.
-    r1 = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r1 = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     token = r1.data["data"]["confirmation_token"]
     await dispatcher.invoke(
         "bookmark_post",
         {"post_url": "https://x.com/jack/status/20", "confirmation_token": token},
     )
-    # Replay — should be dedupe-blocked at phase 1 (before confirmation).
-    r2 = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r2 = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     assert r2.ok is False
     assert r2.data["policy"]["blocked_by"] == "dedupe"
 
 
 async def test_bookmark_confirmation_token_replay_after_execution(dispatcher) -> None:
-    """ChatGPT's specific request: confirmation-token replay after successful
-    execution at the DISPATCHER level (not just kernel). The kernel already
-    rejects consumed tokens, but the dispatcher integration is part of the
-    trusted boundary."""
-    # Execute.
-    r1 = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r1 = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     token = r1.data["data"]["confirmation_token"]
     r2 = await dispatcher.invoke(
         "bookmark_post",
         {"post_url": "https://x.com/jack/status/20", "confirmation_token": token},
     )
     assert r2.data["policy"]["verdict"] == "allow"
-    # Replay the same token — should be blocked (by dedupe, since the action
-    # was already executed and recorded).
     r3 = await dispatcher.invoke(
         "bookmark_post",
         {"post_url": "https://x.com/jack/status/20", "confirmation_token": token},
     )
     assert r3.ok is False
-    # The replay is caught — either by consumed_token or dedupe (both are valid;
-    # dedupe fires first because it's checked before token validation).
     assert r3.data["policy"]["blocked_by"] in ("consumed_token", "dedupe")
 
 
 async def test_bookmark_kill_switch_blocks(dispatcher) -> None:
-    """Kill switch blocks the bookmark at the dispatcher top (before reaching
-    the kernel). The dispatcher-level kill returns a simple kill_switched()
-    envelope — not the kernel's policy-structured DENY, because the dispatcher
-    kill gate fires first (it's the coarser, earlier gate)."""
     dispatcher.kill_switch.trip()
-    r = await dispatcher.invoke("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
+    r = await dispatcher.invoke(
+        "bookmark_post", {"post_url": "https://x.com/jack/status/20"}
+    )
     assert r.ok is False
     assert r.failure_category.value == "security"

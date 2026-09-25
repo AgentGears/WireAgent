@@ -41,14 +41,22 @@ async def _no_sleep(*args: Any, **kwargs: Any) -> None:
     return None
 
 
+def _reader(tmp_path: Path, payloads: list[dict[str, Any]]) -> tuple[M5ActorBoundEvidenceReader, _SB]:
+    sb = _SB(payloads)
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    broker = M5LeasedWriteBroker(sb, KillSwitch(cfg))  # type: ignore[arg-type]
+    return M5ActorBoundEvidenceReader(broker), sb
+
+
 async def test_post_text_waits_for_direct_text_node_hydration(
     tmp_path: Path,
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
-    sb = _SB(
+    reader, sb = _reader(
+        tmp_path,
         [
-            {"status": "pending_text"},
+            {"status": "pending_text", "actor": "Actor", "id": "123", "path": "/Actor/status/123"},
             {
                 "status": "found",
                 "actor": "Actor",
@@ -56,11 +64,8 @@ async def test_post_text_waits_for_direct_text_node_hydration(
                 "path": "/Actor/status/123",
                 "text": "approved text",
             },
-        ]
+        ],
     )
-    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
-    broker = M5LeasedWriteBroker(sb, KillSwitch(cfg))  # type: ignore[arg-type]
-    reader = M5ActorBoundEvidenceReader(broker)
 
     result = await reader.verify_post_text(
         "https://x.com/Actor/status/123",
@@ -70,7 +75,37 @@ async def test_post_text_waits_for_direct_text_node_hydration(
     assert result.ok is True
     assert result.data["post_id"] == "123"
     assert result.data["post_actor"] == "Actor"
+    assert result.data["direct_text_absent_stable"] is False
     assert len(sb._controller._cdp.expressions) == 2
     expr = sb._controller._cdp.expressions[0]
     assert "status:'pending_text'" in expr
     assert "status:'ambiguous_text'" in expr
+
+
+async def test_empty_approved_text_accepts_only_stable_direct_text_absence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
+    pending = {
+        "status": "pending_text",
+        "actor": "Actor",
+        "id": "456",
+        "path": "/Actor/status/456",
+    }
+    reader, sb = _reader(tmp_path, [pending])
+
+    result = await reader.verify_post_text(
+        "https://x.com/Actor/status/456",
+        "",
+    )
+
+    assert result.ok is True
+    assert result.data["text_matches"] is True
+    assert result.data["direct_status_owned"] is True
+    assert result.data["direct_text_absent_stable"] is True
+    assert result.data["post_id"] == "456"
+    assert result.data["post_actor"] == "Actor"
+    # The absence must be observed repeatedly; one transient missing node is
+    # never enough to confirm an empty approved media-only post.
+    assert len(sb._controller._cdp.expressions) == 8

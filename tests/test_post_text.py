@@ -18,8 +18,8 @@ from webwire.session import SessionManager
 
 
 class _StubSB:
-    _page = None
-    _controller = None
+    _page: Any = None
+    _controller: Any = None
 
 
 class _StubSessionManager(SessionManager):

@@ -346,15 +346,15 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
                     "captured direct post text did not match the approved text",
                     failure_category=FailureCategory.UNKNOWN,
                 )
-            return ok_result(
-                data={
-                    "text_matches": True,
-                    "direct_status_owned": True,
-                    "direct_text_absent_stable": direct_text_absent,
-                    "post_id": post_id,
-                    "post_actor": actor,
-                    "post_url": direct_url,
-                }
-            )
+            evidence = {
+                "text_matches": True,
+                "direct_status_owned": True,
+                "post_id": post_id,
+                "post_actor": actor,
+                "post_url": direct_url,
+            }
+            if direct_text_absent:
+                evidence["direct_text_absent_stable"] = True
+            return ok_result(data=evidence)
 
         return await broker._one_shot(operation)

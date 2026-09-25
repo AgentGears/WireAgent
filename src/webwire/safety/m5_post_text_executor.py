@@ -135,7 +135,23 @@ class M5PostTextExecutor:
                 readback,
             )
 
-        baseline = await self._evidence.capture_pre_submit_ids()
+        try:
+            baseline = await self._evidence.capture_pre_submit_ids()
+        except BaseException as exc:
+            await self._abort_precommit(
+                session,
+                preparation,
+                reason="pre_submit_identity_baseline_interrupted",
+            )
+            return self._execution(
+                hard_failure(
+                    "pre-submit identity baseline was interrupted before commit "
+                    f"authority: {type(exc).__name__}",
+                    failure_category=FailureCategory.SECURITY,
+                ),
+                session,
+                None,
+            )
         if not baseline.ok or not isinstance(baseline.data, dict):
             await self._abort_precommit(
                 session,
@@ -236,14 +252,32 @@ class M5PostTextExecutor:
         pre_submit_ids: set[str],
         normalized: str,
     ) -> M5PostTextExecution:
-        capture = await self._evidence.capture_new_post(pre_submit_ids)
+        try:
+            capture = await self._evidence.capture_new_post(pre_submit_ids)
+        except BaseException as exc:
+            return self._post_submit_evidence_interrupted(
+                session,
+                submit_result,
+                phase="capture_new_post",
+                exc=exc,
+            )
         capture_data = capture.data if capture.ok and isinstance(capture.data, dict) else {}
         post_id = capture_data.get("post_id")
         post_url = capture_data.get("post_url")
 
         verification: Optional[ActionResult] = None
         if isinstance(post_id, str) and post_id and isinstance(post_url, str) and post_url:
-            verification = await self._evidence.verify_post_text(post_url, normalized)
+            try:
+                verification = await self._evidence.verify_post_text(post_url, normalized)
+            except BaseException as exc:
+                return self._post_submit_evidence_interrupted(
+                    session,
+                    submit_result,
+                    phase="verify_post_text",
+                    exc=exc,
+                    post_id=post_id,
+                    post_url=post_url,
+                )
 
         confirmed = bool(
             post_id
@@ -292,6 +326,42 @@ class M5PostTextExecutor:
             "submitted_text": normalized,
         }
         return self._execution(result, session, verification or capture)
+
+    def _post_submit_evidence_interrupted(
+        self,
+        session: M5ExecutionSession,
+        submit_result: ActionResult,
+        *,
+        phase: str,
+        exc: BaseException,
+        post_id: Optional[str] = None,
+        post_url: Optional[str] = None,
+    ) -> M5PostTextExecution:
+        evidence = {
+            "phase": phase,
+            "exception_type": type(exc).__name__,
+            "submit_result_ok": bool(submit_result.ok),
+            "posted_post_id": post_id,
+            "posted_url": post_url,
+        }
+        try:
+            session.record_unknown(evidence=evidence)
+        except Exception as persist_exc:  # noqa: BLE001
+            return self._unresolved_persistence_failure(session, persist_exc)
+        result = hard_failure(
+            "post-submit evidence was interrupted after authority crossed; "
+            "reconciliation is required",
+            failure_category=FailureCategory.UNKNOWN,
+        )
+        result.data = {
+            "public_side_effect": True,
+            "reconciliation_required": True,
+            "m5_effect_state": AttemptState.EFFECT_UNKNOWN.value,
+            "evidence_phase": phase,
+            "posted_url": post_url,
+            "posted_post_id": post_id,
+        }
+        return self._execution(result, session, None)
 
     async def _abort_precommit(
         self,

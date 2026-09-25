@@ -1,365 +1,154 @@
-"""Hydration tests — P0 fix (2026-09-22): journal-sourced rebuild of BOTH
-safety stores (dedupe memory + token-bucket budgets).
+"""Layer-7 regressions: invocation journal is audit-only.
 
-Spec decisions under test:
-1. Dedupe key recorded on success OR uncertain submit (public_side_effect=True);
-   gate-denied attempts journal no key.
-2. Bucket budgets rehydrate from journaled write invocations (marginally
-   conservative; never less protective).
-3. Rotation (10 MB / 31 days, retain 6): hydration spans the rotation boundary.
-4. Fail-open on missing/corrupt journal; torn tail logs a WARNING naming the
-   file, and the rest still hydrates.
-Plus the original regression: records written by the REAL Journal.append path
-must hydrate (the 2026-09-22 review proved the old code hydrated 0 of them).
+The pre-M5/P0 runtime rebuilt dedupe and token-bucket state from
+``journal.ndjson``. Layer 7 intentionally retires that data path. These tests
+pin the new authority split while preserving the live process-local controls.
 """
 
 from __future__ import annotations
 
-import json
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
-
-from super_browser.results import ActionError, ErrorCategory, action_result
 
 from webwire.config import WebWireConfig
-from webwire.dispatcher import Dispatcher
-from webwire.envelope import ok_result
 from webwire.journal import Journal, JournalRecord, read_recent_write_records
 from webwire.safety import (
-    DEFAULT_REGISTRY,
     DedupeStore,
-    KillSwitch,
+    EffectLedger,
+    EffectLedgerRecord,
+    EffectState,
+    RecoveryGuard,
     RiskTier,
     TokenBucket,
-    WriteIntent,
-    WriteKernel,
 )
-from webwire.safety.write_kernel import PreviewResult
 
 
-def _ts(minutes_ago: float = 0.0) -> str:
-    return (
-        datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
-    ).isoformat(timespec="milliseconds")
-
-
-def _write_record(
+def _audit_write(
     trace_id: str,
     *,
-    minutes_ago: float = 0.0,
-    action_type: str = "bookmark",
-    dedupe_key: Optional[str] = "?|bookmark|post|123|",
-    capability: str = "bookmark_post",
+    action_type: str = "post",
+    dedupe_key: str = "@actor|post|none|none|same",
 ) -> JournalRecord:
     return JournalRecord(
-        timestamp=_ts(minutes_ago),
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         trace_id=trace_id,
-        capability=capability,
+        capability="post_text",
         policy_decision="allowed",
         result_ok=True,
         capability_tier="write",
         action_type=action_type,
-        risk_tier="private_reversible",
+        risk_tier="public_content_irreversible",
         dedupe_key=dedupe_key,
     )
 
 
-# ---------------------------------------------------------------------------
-# 1 + 6. Dispatcher journals write facts; schema carries every field
-# ---------------------------------------------------------------------------
-
-class _KernelShapedResult:
-    """Builds ActionResult data shaped like WriteKernel._finish output."""
-
-    @staticmethod
-    def build(*, dedupe_recorded: bool, action_type: str = "bookmark") -> Any:
-        return ok_result(data={
-            "policy": {"verdict": "allow", "risk_tier": "private_reversible"},
-            "trace": {
-                "action": "bookmark_post",
-                "intent": {
-                    "action_type": action_type,
-                    "dedupe_key": "?|bookmark|post|123|",
-                    "risk_tier": "private_reversible",
-                },
-                "dedupe_recorded": dedupe_recorded,
-            },
-        })
-
-
-def test_dispatcher_journals_write_facts(tmp_path: Path) -> None:
-    d = Dispatcher(WebWireConfig(state_dir=tmp_path, kill_env_var=None))
-    cap = d._registry.get("bookmark_post")
-    assert cap is not None
-
-    facts = d._write_facts(cap, _KernelShapedResult.build(dedupe_recorded=True))
-    assert facts == {
-        "action_type": "bookmark",
-        "risk_tier": "private_reversible",
-        "dedupe_key": "?|bookmark|post|123|",
-    }
-
-    d._journal_write(
-        trace_id="t1", capability="bookmark_post", input={"post_url": "https://x.com/a/status/1"},
-        result=_KernelShapedResult.build(dedupe_recorded=True), policy_decision="allowed",
-        actions=[], started_monotonic=time.monotonic(),
-        capability_tier="write", **facts,
+def _unknown_record(*, semantic_key: str) -> EffectLedgerRecord:
+    return EffectLedgerRecord(
+        effect_id="effect-unknown-1",
+        semantic_key=semantic_key,
+        state=EffectState.EFFECT_UNKNOWN,
+        action_type="post",
+        intent_hash="intent-hash",
+        policy_binding="policy-binding",
+        actor_id="@actor",
+        target_type="none",
+        target_id="none",
+        details={"reason": "uncertain external outcome"},
     )
-    line = (tmp_path / "journal.ndjson").read_text(encoding="utf-8").strip()
-    rec = json.loads(line)
-    assert rec["capability_tier"] == "write"
-    assert rec["action_type"] == "bookmark"
-    assert rec["risk_tier"] == "private_reversible"
-    assert rec["dedupe_key"] == "?|bookmark|post|123|"
 
 
-def test_gate_denied_write_journals_no_dedupe_key(tmp_path: Path) -> None:
-    """A write the kernel did NOT record (dedupe_recorded absent/False) journals
-    the action facts but no key — it must never hydrate as an executed write."""
-    d = Dispatcher(WebWireConfig(state_dir=tmp_path, kill_env_var=None))
-    cap = d._registry.get("bookmark_post")
-
-    facts = d._write_facts(cap, _KernelShapedResult.build(dedupe_recorded=False))
-    assert facts["action_type"] == "bookmark"
-    assert facts["dedupe_key"] is None
-
-    d._journal_write(
-        trace_id="t2", capability="bookmark_post", input={},
-        result=_KernelShapedResult.build(dedupe_recorded=False), policy_decision="allowed",
-        actions=[], started_monotonic=time.monotonic(),
-        capability_tier="write", **facts,
-    )
-    rec = json.loads((tmp_path / "journal.ndjson").read_text(encoding="utf-8").strip())
-    assert rec["dedupe_key"] is None
-    assert rec["action_type"] == "bookmark"
-
-    # And a hydrating store ignores it.
-    store = DedupeStore(ttl_seconds=3600)
-    recs = read_recent_write_records(tmp_path / "journal.ndjson", time.time() - 3600)
-    assert store.hydrate_records(recs) == 0
-
-
-# ---------------------------------------------------------------------------
-# 2. THE regression: real Journal.append output must hydrate
-# ---------------------------------------------------------------------------
-
-def test_hydrate_from_real_journal_pipeline(tmp_path: Path) -> None:
-    """The 2026-09-22 review proved the old hydrate_from_journal read fields
-    the journal never writes and hydrated 0 entries. Records produced by the
-    REAL writer must now hydrate. (Appended in chronological order — the
-    tail-scan's documented assumption, true of any real append-only journal.)"""
-    j = Journal(WebWireConfig(state_dir=tmp_path))
-    j.append(_write_record("r0", minutes_ago=120, dedupe_key="?|like|post|7|"))  # outside TTL
-    j.append(_write_record("r1", minutes_ago=30, dedupe_key="?|like|post|9|", action_type="like"))
-    j.append(_write_record("r2", minutes_ago=10, dedupe_key="?|like|post|8|", action_type="like"))
-
-    store = DedupeStore(ttl_seconds=3600)
-    n = store.hydrate_from_journal(tmp_path / "journal.ndjson")
-    assert n == 2
-    assert store.check("?|like|post|9|") is False   # duplicate — blocked
-    assert store.check("?|like|post|8|") is False   # duplicate — blocked
-    assert store.check("?|like|post|7|") is True    # outside window — allowed
-    assert store.check("?|like|post|6|") is True    # never seen — allowed
-
-
-# ---------------------------------------------------------------------------
-# 3. Decision 1: degraded public submit records the key and blocks retry
-# ---------------------------------------------------------------------------
-
-class FakeUncertainPostCap:
-    """Post capability whose execute returns a degraded result: submit clicked,
-    outcome uncertain, public side effect possible."""
-
-    name = "post_text"
-
-    def compose(self, input: dict[str, Any], actor_identity: Optional[str]) -> WriteIntent:
-        meta, comp = DEFAULT_REGISTRY.get("post")
-        return WriteIntent(
-            action_type="post", target_type="none", target_id="none",
-            risk_meta=meta, compensation=comp,
-            semantic_variant="abc123", actor_identity=actor_identity,
-        )
-
-    async def preview(self, intent: WriteIntent, broker: Any) -> PreviewResult:
-        return PreviewResult(summary="Will post")
-
-    async def execute(self, intent: WriteIntent, broker: Any) -> Any:
-        r = action_result(
-            ok=False,
-            error=ActionError(
-                ErrorCategory.UNKNOWN,
-                "Submit clicked but result uncertain.",
-                recoverable=False,
-            ),
-        )
-        r.data = {
-            "result": "submit_clicked_verification_pending",
-            "public_side_effect": True,
-        }
-        return r
-
-    async def verify(self, intent: WriteIntent, broker: Any) -> Any:
-        return ok_result(data={"verified": False})
-
-
-def test_degraded_public_submit_records_and_blocks_retry(tmp_path: Path) -> None:
+def test_journal_reader_is_retired_as_safety_input(tmp_path: Path) -> None:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
-    kernel = WriteKernel(
-        KillSwitch(cfg), DEFAULT_REGISTRY, TokenBucket(),
-        DedupeStore(ttl_seconds=3600), Journal(cfg),
-    )
-    cap = FakeUncertainPostCap()
-    dedupe = kernel._dedupe
-    import asyncio
+    journal = Journal(cfg)
+    journal.append(_audit_write("audit-1"))
 
-    # Phase 1: confirmation required.
-    r1 = asyncio.run(kernel.execute(cap, object(), {"text": "hello"}))
-    token = r1.data["data"]["confirmation_token"]
-
-    # Phase 2: execute returns degraded (uncertain submit) — must still record.
-    r2 = asyncio.run(kernel.execute(
-        cap, object(), {"text": "hello", "confirmation_token": token}
-    ))
-    assert r2.ok is False
-    assert r2.data["trace"]["dedupe_recorded"] is True
-    assert dedupe.size() == 1
-
-    # Retry within TTL: denied at the dedupe gate, before confirmation.
-    r3 = asyncio.run(kernel.execute(cap, object(), {"text": "hello"}))
-    assert r3.ok is False
-    assert r3.data["policy"]["blocked_by"] == "dedupe"
+    assert cfg.journal_path().exists()
+    assert read_recent_write_records(cfg.journal_path(), 0.0) == []
 
 
-# ---------------------------------------------------------------------------
-# 4. Decision 2: bucket budgets rehydrate
-# ---------------------------------------------------------------------------
+def test_dedupe_does_not_hydrate_from_journal_after_layer7(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    key = "@actor|post|none|none|same"
+    Journal(cfg).append(_audit_write("audit-2", dedupe_key=key))
 
-def test_bucket_hydration_reduces_budgets(tmp_path: Path) -> None:
-    j = Journal(WebWireConfig(state_dir=tmp_path))
-    for i in range(3):
-        j.append(_write_record(
-            f"p{i}", action_type="post", dedupe_key=f"?|post|none|none|v{i}",
-            capability="post_text",
-        ))
-    # A read-tier record must not count.
-    j.append(JournalRecord(
-        timestamp=_ts(0), trace_id="rd", capability="whoami",
-        policy_decision="allowed", result_ok=True,
-    ))
+    store = DedupeStore(ttl_seconds=3600)
+    assert store.hydrate_from_journal(cfg.journal_path()) == 0
+    assert store.size() == 0
+    assert store.check(key) is True
+
+
+def test_token_bucket_does_not_replay_journal_budget_after_layer7(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    journal = Journal(cfg)
+    for index in range(10):
+        journal.append(_audit_write(f"audit-budget-{index}"))
 
     bucket = TokenBucket()
-    recs = read_recent_write_records(tmp_path / "journal.ndjson", time.time() - 3600)
-    assert bucket.hydrate_records(recs) == 3
-    assert bucket.remaining("post") == 0
-    allowed, reason = bucket.acquire("post", RiskTier.PUBLIC_CONTENT_IRREVERSIBLE)
+    records = read_recent_write_records(cfg.journal_path(), 0.0)
+    assert bucket.hydrate_records(records) == 0
+    assert bucket.remaining("post") == 3
+
+
+def test_process_local_dedupe_still_blocks_live_duplicate() -> None:
+    key = "@actor|post|none|none|same"
+    store = DedupeStore(ttl_seconds=3600)
+
+    assert store.check(key) is True
+    store.record(key)
+    assert store.check(key) is False
+
+
+def test_process_local_token_bucket_still_enforces_limits() -> None:
+    bucket = TokenBucket()
+    tier = RiskTier.PUBLIC_CONTENT_IRREVERSIBLE
+
+    for _ in range(3):
+        allowed, _ = bucket.acquire("post", tier)
+        assert allowed is True
+    allowed, reason = bucket.acquire("post", tier)
     assert allowed is False
     assert "token_bucket(post)" in reason
 
 
-# ---------------------------------------------------------------------------
-# 5. Decision 3: hydration spans the rotation boundary
-# ---------------------------------------------------------------------------
+def test_effect_ledger_unknown_blocks_independently_of_missing_journal(
+    tmp_path: Path,
+) -> None:
+    semantic_key = "@actor|post|none|none|same"
+    ledger = EffectLedger(path=tmp_path / "effects.ndjson")
+    ledger.append_durable(_unknown_record(semantic_key=semantic_key))
 
-def test_rotation_boundary_hydration(tmp_path: Path) -> None:
-    active = tmp_path / "journal.ndjson"
-    rotated = tmp_path / "journal-2026-08.ndjson"
+    guard = RecoveryGuard(ledger)
+    status = guard.hydrate()
 
-    rotated_lines = [
-        json.dumps({
-            "timestamp": _ts(120), "trace_id": "old1", "capability": "bookmark_post",
-            "policy_decision": "allowed", "capability_tier": "write",
-            "action_type": "bookmark", "dedupe_key": "?|bookmark|post|1|",
-        }),
-        json.dumps({
-            "timestamp": _ts(30), "trace_id": "old2", "capability": "bookmark_post",
-            "policy_decision": "allowed", "capability_tier": "write",
-            "action_type": "bookmark", "dedupe_key": "?|bookmark|post|2|",
-        }),
-    ]
-    active_lines = [
-        json.dumps({
-            "timestamp": _ts(5), "trace_id": "new1", "capability": "bookmark_post",
-            "policy_decision": "allowed", "capability_tier": "write",
-            "action_type": "bookmark", "dedupe_key": "?|bookmark|post|3|",
-        }),
-    ]
-    rotated.write_text("\n".join(rotated_lines) + "\n", encoding="utf-8")
-    active.write_text("\n".join(active_lines) + "\n", encoding="utf-8")
-
-    recs = read_recent_write_records(active, time.time() - 3600)
-    keys = {r["dedupe_key"] for r in recs}
-    # post|1 is 2h old (outside), post|2 spans the rotation (inside), post|3 active.
-    assert keys == {"?|bookmark|post|2|", "?|bookmark|post|3|"}
-
-    store = DedupeStore(ttl_seconds=3600)
-    assert store.hydrate_records(recs) == 2
+    assert status.available is True
+    assert status.unresolved_semantic_keys == (semantic_key,)
+    block = guard.require_clear(semantic_key, refresh=False)
+    assert block is not None
+    assert block.effect_ids == ("effect-unknown-1",)
+    assert not (tmp_path / "journal.ndjson").exists()
 
 
-# ---------------------------------------------------------------------------
-# 6. Decision 4: torn tail warns and the rest still hydrates
-# ---------------------------------------------------------------------------
+def test_forged_journal_fact_cannot_create_recovery_block(tmp_path: Path) -> None:
+    semantic_key = "@actor|post|none|none|same"
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    Journal(cfg).append(_audit_write("forged-audit", dedupe_key=semantic_key))
 
-def test_torn_tail_warns_and_hydrates(tmp_path: Path, caplog) -> None:
-    j = Journal(WebWireConfig(state_dir=tmp_path))
-    j.append(_write_record("good", dedupe_key="?|bookmark|post|42|"))
-    # Simulate a torn write: half a JSON line.
-    with (tmp_path / "journal.ndjson").open("a", encoding="utf-8") as f:
-        f.write('{"timestamp": "2026-09-22T00:00:00.000+00:00", "trace_i')
+    guard = RecoveryGuard(EffectLedger(path=tmp_path / "effects.ndjson"))
+    status = guard.hydrate()
 
-    with caplog.at_level("WARNING", logger="webwire.journal"):
-        recs = read_recent_write_records(tmp_path / "journal.ndjson", time.time() - 3600)
-    assert len(recs) == 1
-    assert recs[0]["dedupe_key"] == "?|bookmark|post|42|"
-    assert "not valid JSON" in caplog.text
-    assert "journal.ndjson" in caplog.text
-
-    store = DedupeStore(ttl_seconds=3600)
-    assert store.hydrate_records(recs) == 1
+    assert status.available is True
+    assert status.unresolved_semantic_keys == ()
+    assert guard.require_clear(semantic_key, refresh=False) is None
 
 
-def test_missing_journal_fails_open(tmp_path: Path) -> None:
-    """No journal at all → empty stores, full budgets. Documented fail-open."""
-    recs = read_recent_write_records(tmp_path / "journal.ndjson", time.time() - 3600)
-    assert recs == []
-    store = DedupeStore(ttl_seconds=3600)
-    assert store.hydrate_records(recs) == 0
-    bucket = TokenBucket()
-    assert bucket.hydrate_records(recs) == 0
-    assert bucket.acquire("bookmark", RiskTier.PRIVATE_REVERSIBLE)[0] is True
+def test_corrupt_journal_cannot_change_recovery_projection(tmp_path: Path) -> None:
+    semantic_key = "@actor|post|none|none|same"
+    (tmp_path / "journal.ndjson").write_text("{definitely-not-json\n", encoding="utf-8")
+    ledger = EffectLedger(path=tmp_path / "effects.ndjson")
+    ledger.append_durable(_unknown_record(semantic_key=semantic_key))
 
+    guard = RecoveryGuard(ledger)
+    status = guard.hydrate()
 
-# ---------------------------------------------------------------------------
-# 7. Rotation mechanics: size threshold, content preserved, never rewritten
-# ---------------------------------------------------------------------------
-
-def test_rotation_by_size(tmp_path: Path) -> None:
-    # Measure one record's serialized size so the threshold is deterministic
-    # (a full JournalRecord serializes well past 400 bytes).
-    probe_dir = tmp_path / "probe"
-    probe_dir.mkdir()
-    probe = Journal(WebWireConfig(state_dir=probe_dir))
-    probe.append(_write_record("probe"))
-    record_bytes = len((probe_dir / "journal.ndjson").read_text(encoding="utf-8"))
-    threshold = 2 * record_bytes + 10  # rotate when a 3rd record would land
-
-    j = Journal(
-        WebWireConfig(state_dir=tmp_path),
-        rotate_max_bytes=threshold, rotate_age_days=31.0, retain_rotated=6,
-    )
-    for i in range(6):
-        j.append(_write_record(f"s{i}", dedupe_key=f"?|bookmark|post|{i}|"))
-
-    rotated = j.rotated_paths()
-    assert len(rotated) == 1
-    total_lines = 0
-    for p in [tmp_path / "journal.ndjson", *rotated]:
-        total_lines += len([ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()])
-    assert total_lines == 6, "rotation moves history; it never loses or rewrites it"
-    # The rotated file holds the OLDER half; the active file got the rest.
-    rotated_ids = {
-        json.loads(ln)["trace_id"]
-        for ln in rotated[0].read_text(encoding="utf-8").splitlines() if ln.strip()
-    }
-    assert rotated_ids == {"s0", "s1", "s2"}
+    assert status.available is True
+    assert status.unresolved_semantic_keys == (semantic_key,)

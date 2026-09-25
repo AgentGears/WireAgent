@@ -1,7 +1,7 @@
 # M6 — Evidence-Bearing Reconciliation & Qualification Boundary
 
 ```text
-Status:   CANDIDATE — MAINTAINER-FIRST REVIEW FROZEN
+Status:   CANDIDATE — SECOND-PASS FINDINGS RECONCILED
 Base:     main 666064b3c5dc3f905be11321a3604460410dd583
 Runtime:  M5 baseline 0c62402ae01b50d7662b3978cbf2bee4109aa035
 Scope:    reconcile durable M5 uncertainty without rewriting history;
@@ -94,8 +94,8 @@ M6 must not:
   cannot distinguish this attempt from another external action;
 - trust a reconciliation row whose append reported durability failure merely
   because its bytes are visible;
-- expose a newly durable reconciliation to a write invocation before stale
-  confirmation authority has been invalidated;
+- expose a newly durable reconciliation to a write invocation while any
+  pre-reconciliation confirmation generation remains valid;
 - reset dedupe/rate/kill/policy state merely because recovery uncertainty was
   reconciled;
 - rotate/delete reconciliation safety facts using audit-journal retention rules;
@@ -116,9 +116,10 @@ M6 defines and qualifies:
 5. a composite `RecoveryProjector` joining effect and reconciliation truth;
 6. `RecoveryGuard` behavior after terminal reconciliation;
 7. a process-local reconciliation publication fence;
-8. crash, corruption, restart, ambiguity, and exact-fact retry semantics;
-9. a narrow local operator recovery workflow;
-10. stale-confirmation invalidation across a reconciliation boundary;
+8. a process-local confirmation epoch that invalidates pre-reconciliation human
+   confirmation authority;
+9. crash, corruption, restart, ambiguity, and exact-fact retry semantics;
+10. a narrow local operator recovery workflow;
 11. platform qualification of durability claims, especially Windows;
 12. evidence-driven replay-safety qualification such as like/unlike without
     presuming a policy upgrade.
@@ -192,13 +193,13 @@ Project-wide evidence laws apply:
 | **ReconciliationLedger** | Fsync-backed append-only safety ledger at `.webwire/reconciliations.ndjson`. |
 | **RecoveryProjector** | Validated join of EffectLedger and ReconciliationLedger into current recovery truth. |
 | **RecoveryGuard** | Process-local enforcement cache/gate derived from the composite projection. |
-| **ReconciliationAuthority** | Narrow local authority bound to one immutable reconciliation fact after explicit operator confirmation. |
+| **ReconciliationAuthority** | Ephemeral, monotonic-TTL local authority bound to one immutable reconciliation fact after explicit operator confirmation. |
 | **EvidenceCollector** | Read-only mechanism that gathers observations and may propose; it cannot commit a verdict. |
 | **Fresh invocation** | A new normal capability execution with new human confirmation and new M5 grant/attempt lineage. |
 | **Live attempt ownership** | A current in-process M5 attempt still capable of writing a terminal outcome for the target effect. |
 | **Durability-ambiguous reconciliation** | Complete row may be visible after append reported durability failure; it is not recovery authority until re-durability succeeds. |
-| **Reconciliation publication fence** | Process-local fence shared by terminal reconciliation and authoritative RecoveryGuard refresh so newly durable clear truth cannot be observed before stale confirmation invalidation. |
-| **Confirmation invalidation boundary** | Successful durable terminal reconciliation invalidates all pending pre-resolution WriteKernel confirmation tokens before clear truth becomes observable to writes. |
+| **Reconciliation publication fence** | Process-local fence shared by terminal reconciliation and authoritative RecoveryGuard refresh so publication and confirmation-generation invalidation have one ordering. |
+| **Confirmation epoch** | Process-local monotonically increasing generation carried by every WriteKernel confirmation token. Terminal reconciliation advances it before durable reconciliation I/O, making every older token stale. |
 
 ---
 
@@ -549,11 +550,14 @@ returns busy/inconclusive and does not navigate across the owner.
 Clearing recovery uncertainty is safety-relevant authority. It is not a normal
 capability write and does not reuse WriteKernel confirmation authority.
 
-ReconciliationAuthority is local/operator-facing, absent from normal capability
-registration, has no raw mutation surface, and is created only after explicit
-human confirmation of effect, verdict, evidence hash, and evidence summary.
+ReconciliationAuthority is:
 
-It binds exactly:
+- process-local and non-persisted;
+- local/operator-facing and absent from normal capability registration;
+- without a raw browser mutation surface;
+- minted only after explicit human confirmation of effect, verdict, evidence
+  hash, and evidence summary;
+- bound exactly to:
 
 ```text
 effect_id
@@ -562,8 +566,10 @@ evidence_hash
 operator_id
 ```
 
-It cannot mint ApprovalGrant/EffectPermit or mutate EffectLedger; it may only
-request persistence of that bound reconciliation fact.
+- issued with a short configurable TTL measured on a monotonic clock;
+- unusable for a new reconciliation start after expiry;
+- unable to mint ApprovalGrant/EffectPermit or mutate EffectLedger;
+- able only to request persistence of that bound reconciliation fact.
 
 Programmatic non-interactive model-authorized terminal reconciliation is out of
 scope.
@@ -572,12 +578,20 @@ scope.
 
 Single-use means one immutable **fact**, not one filesystem syscall.
 
-Before first durability I/O the coordinator freezes the complete record and
-checks evidence hash against approved authority. If persistence reports
-ambiguity, the same authority lineage may re-drive only the exact frozen fact.
-Verdict, evidence, lineage, and operator identity cannot change.
+Before first reconciliation durability I/O begins, the coordinator checks the
+authority's monotonic expiry, freezes the complete record, and verifies the
+evidence hash against approved authority.
 
-After known durable success authority is consumed permanently.
+Once persistence for that frozen fact has begun, the authority is committed to
+that fact. A later wall-clock or monotonic TTL expiry cannot prevent exact-fact
+re-durability after an ambiguous append; completing durability of already-started
+operator authority is recovery of the same fact, not minting new authority.
+
+If no persistence I/O has begun and the authority expires, it is terminally
+unusable and the operator must confirm again.
+
+After known durable success the authority is consumed permanently. Verdict,
+evidence, lineage, and operator identity can never change during retry.
 
 ### 10.2 Recovery-only, not in-flight rescue
 
@@ -600,53 +614,93 @@ eligible under the normal single-process assumption.
 
 Kill blocks external capability execution, not local read-only inspection or
 durable reconciliation bookkeeping. Reconciliation does not reset kill state,
-decrement authorization epoch, or mint authority. Future mutation remains
-subject to current kill/epoch gates.
+decrement authorization epoch, or mint execution authority. Future mutation
+remains subject to current kill/epoch gates.
 
 ---
 
-## 11. Reconciliation publication fence
+## 11. Reconciliation publication fence and confirmation epoch
 
-A durable reconciliation row becomes filesystem-visible before all in-memory
-post-conditions are necessarily complete. A concurrent write invocation must not
-observe newly clear recovery truth while a pre-resolution confirmation token is
-still valid.
+A durable reconciliation row can become filesystem-visible before an ordinary
+write invocation finishes its own policy sequence. M6 needs one process-local
+ordering between recovery publication and human confirmation authority.
 
-M6 therefore introduces one process-local **ReconciliationPublicationFence**
-shared by:
+M6 therefore introduces:
 
-- terminal ReconciliationCoordinator resolution;
-- authoritative composite RecoveryProjector/RecoveryGuard refresh used by write
-  enforcement.
+1. one **ReconciliationPublicationFence** shared by terminal reconciliation and
+   authoritative RecoveryGuard refresh used by write enforcement; and
+2. one process-local monotonically increasing **confirmation epoch** owned by
+   WriteKernel/Dispatcher confirmation state.
 
-Raw diagnostics may read files without this fence, but they are not authority.
+Every newly issued confirmation token captures the current confirmation epoch.
+Token validation requires exact equality with the current epoch in addition to
+all existing capability/intent/risk/TTL/single-use checks.
 
-WriteKernel confirmation-token issue/validate/consume/invalidate operations also
-use a synchronized token-store fence. Terminal reconciliation uses the
-publication fence first, then token-store fence for invalidation.
+Terminal reconciliation advances the confirmation epoch **before any
+ReconciliationLedger durability I/O begins**, while holding the publication
+fence. This invalidates every older token in one monotonic state transition.
+The implementation may lazily retain old token objects; they are authority-dead
+because their epoch no longer matches.
+
+This ordering intentionally prefers conservative invalidation:
+
+```text
+confirmation epoch advances
+→ old tokens immediately stale
+→ reconciliation append begins
+→ append may succeed or fail
+```
+
+If reconciliation persistence later fails, unrelated old tokens were invalidated
+unnecessarily, but no unsafe authority survives. New tokens can be issued later
+under the new epoch after the publication fence is released and ordinary policy
+checks run again.
+
+Raw diagnostics may read files without the publication fence, but they are not
+authority.
+
+### 11.1 Token-state synchronization
+
+Confirmation epoch read/advance, token issue, validation, consume, and any token
+store mutation are synchronized under one confirmation-state fence.
 
 Authoritative lock order:
 
 ```text
 ReconciliationPublicationFence
-  -> ReconciliationCoordinator protocol state
+  -> ReconciliationCoordinator protocol/lifecycle state
+    -> confirmation-state fence (advance epoch)
     -> ledger/path locks as required
-    -> WriteKernel confirmation-token store fence (for invalidation)
     -> RecoveryGuard publication/cache lock
 ```
 
 Implementations may collapse adjacent internal locks but preserve observable
 ordering and avoid reverse acquisition.
 
-A write-side RecoveryGuard refresh acquires the publication fence before reading
-composite truth. It therefore either:
+A write-side RecoveryGuard refresh acquires the publication fence. It therefore
+either:
 
-1. observes old unresolved state before reconciliation wins; or
-2. waits until durable reconciliation + pending-token invalidation complete,
-   then observes clear truth.
+1. completes against the old unresolved truth before reconciliation wins; or
+2. waits while reconciliation advances the confirmation epoch and performs its
+   durability protocol, then observes either fail-closed ambiguity/failure or
+   newly published clear truth.
 
-There is no supported state in which a write sees reconciliation-clear while
-pre-resolution confirmation authority remains valid.
+Because the epoch advances before persistence begins, there is no supported
+post-fsync cleanup obligation whose failure could leave durable clear truth next
+to stale human confirmation authority.
+
+### 11.2 Token race semantics
+
+A token operation racing reconciliation has one synchronized ordering:
+
+- validation/consume wins before confirmation-epoch advance; or
+- epoch advance wins and the old token is rejected as stale.
+
+For the semantic key still recovery-blocked before reconciliation, a second-phase
+write cannot legitimately pass RecoveryGuard and consume an old token before the
+reconciliation publication ordering permits it. Unrelated already-confirmed
+execution that crossed its own recovery/policy boundary before reconciliation is
+not retroactively cancelled by a later epoch bump.
 
 ---
 
@@ -662,7 +716,7 @@ Required ordering:
 
 ```text
 acquire ReconciliationPublicationFence
-→ acquire reconciliation protocol state/fence
+→ acquire reconciliation protocol/lifecycle fence
 → verify no live nonterminal M5 attempt owns effect_id
 → fully read/validate EffectLedger
 → require target raw RESERVED | EFFECT_UNKNOWN
@@ -670,56 +724,51 @@ acquire ReconciliationPublicationFence
 → canonicalize evidence + verify evidence_hash
 → fully read/validate/re-durable ReconciliationLedger
 → require no terminal reconciliation exists
-→ validate operator-authority binding
+→ validate ReconciliationAuthority binding + monotonic liveness
 → freeze complete ReconciliationRecord
-→ append exact record
+→ synchronously advance confirmation epoch
+→ mark authority committed to this exact frozen fact
+→ begin ReconciliationLedger append
 → fsync reconciliation file (+ required parent durability)
 → clear local ambiguity latch only after durability success
-→ consume reconciliation authority for frozen fact
-→ synchronously invalidate all pending pre-resolution WriteKernel confirmation
-  tokens in active supported runtime
+→ terminally consume reconciliation authority
 → refresh/publish composite RecoveryGuard state while publication fence is held
 → release publication fence
 → return durable reconciliation result
 ```
 
-If no active Dispatcher/WriteKernel exists, there are no supported pending
-tokens to invalidate; restart/standalone recovery already begins with an empty
-token store.
+If no active Dispatcher/WriteKernel exists, the reconciliation runtime still
+owns a process-local confirmation epoch; there are no previously issued tokens
+in that process to preserve. Restart naturally begins with no pending tokens.
 
-If append reports ambiguity, frozen fact/bounded authority lineage remains only
-for exact re-durability. Publication fence is released with recovery still
-blocked/unavailable; no clear state is published.
+If append reports ambiguity, the confirmation epoch remains advanced and all
+older tokens remain stale. Frozen fact/bounded authority lineage remains only for
+exact re-durability. Recovery remains blocked/unavailable until that succeeds.
 
-### 12.1 Why pending confirmations are invalidated
+If append fails cleanly before bytes may have been written, the epoch is still
+not rolled back. Human confirmation invalidation is monotonic and conservative.
+The operator may retry reconciliation with fresh reconciliation authority after
+normal validation.
 
-Current confirmation tokens are in-memory, capability/intent-bound, single-use,
-and time-limited. A token can remain unconsumed while RecoveryGuard denies its
-second phase. If reconciliation clears guard, that old token would otherwise
-cross without new post-reconciliation human confirmation.
+### 12.1 Why generation invalidation is global
 
-Durable terminal reconciliation is therefore a **global pending-confirmation
-invalidation boundary for the active supported runtime**. Invalidating unrelated
-pending tokens is conservative and intentional.
+A confirmation token can remain pending while RecoveryGuard denies its second
+phase. If reconciliation later clears the guard, that pre-reconciliation token
+must not cross without a new human confirmation.
 
-### 12.2 Confirmation token synchronization
+A monotonic confirmation epoch provides global invalidation without depending on
+partial dictionary mutation or a fallible post-fsync cleanup loop. Invalidating
+unrelated pending tokens is intentionally conservative; reconciliation is rare
+and safety-sensitive.
 
-M6 requires token issuance, validation/consume, and global invalidation to be
-synchronized. A token racing invalidation has one ordering:
-
-- token operation wins before invalidation; or
-- invalidation wins and token is rejected.
-
-For a semantic key still recovery-blocked, a token cannot legitimately cross
-RecoveryGuard before reconciliation publication completes.
-
-### 12.3 Concurrency
+### 12.2 Concurrency
 
 Within the supported process:
 
 - reconciliation operations serialize;
 - competing terminal verdicts yield at most one durable winner;
 - terminal M5 outcome writing and reconciliation do not race a live target;
+- confirmation epoch advancement is synchronized and monotonic;
 - authoritative guard refresh is publication-fenced;
 - complete joined snapshots only are published;
 - older clear snapshots never overwrite newer blocked/unavailable truth;
@@ -764,14 +813,15 @@ are visible.
 After either verdict:
 
 ```text
-old confirmation token: invalidated/not reconstructed
+old confirmation token: stale confirmation epoch / not reconstructed
 old ApprovalGrant:       not reconstructed; never reopened
 old EffectPermit:        not reconstructed/reused
 old EffectAttempt:       historical only
 ```
 
 A later mutation traverses all current independent gates and obtains new human
-confirmation before new M5 grant/attempt authority exists.
+confirmation under the current confirmation epoch before new M5 grant/attempt
+authority exists.
 
 ---
 
@@ -785,8 +835,9 @@ confirmation before new M5 grant/attempt authority exists.
 4. If either ledger cannot be read/validated/re-durability-established, cached
    clear state is discarded and mutation fails closed.
 5. Only `UNRESOLVED_UNKNOWN` contributes a recovery semantic-key block.
-6. Terminal reconciliation removes only that contribution after known durability
-   and pending-token invalidation.
+6. Terminal reconciliation removes only that contribution after known durability;
+   pre-reconciliation tokens are already stale because epoch advancement preceded
+   durability I/O.
 7. Diagnostic health/status never substitutes for enforcement.
 8. Invocation-journal content cannot affect recovery truth.
 9. Multiple unresolved effects sharing a key keep it blocked until all are
@@ -796,34 +847,41 @@ confirmation before new M5 grant/attempt authority exists.
 
 ## 15. Failure and crash semantics
 
-### 15.1 Crash before append
+### 15.1 Crash before confirmation-epoch advance
 
-No durable reconciliation; recovery remains blocked.
+No reconciliation persistence has begun. Existing token authority retains its
+ordinary lifetime, and unresolved recovery remains blocking.
 
-### 15.2 Complete bytes visible but fsync reports failure
+### 15.2 Crash/failure after epoch advance but before reconciliation append
 
-Fact is locally durability-ambiguous. Projection unavailable; exact retry
-re-establishes durability without duplicate.
+Old tokens are conservatively stale. No reconciliation row exists; unresolved
+recovery remains blocked after restart/current-process refresh.
 
-### 15.3 Durable append, crash before token invalidation / guard publication
+### 15.3 Complete bytes visible but fsync reports failure
 
-Process death discards pending tokens. Restart re-establishes reconciliation
-file durability, rebuilds composite truth, and is safe without an in-memory
-post-append marker.
+Old tokens are already stale. The fact is locally durability-ambiguous;
+projection is unavailable and exact retry re-establishes durability without a
+duplicate.
 
-### 15.4 Durable append, token invalidation succeeds, guard refresh fails
+### 15.4 Durable append, crash before guard publication
 
-Process remains fail-closed. Invalidated tokens stay invalid.
+Process death discards all pending tokens. Restart re-establishes reconciliation
+file durability and rebuilds composite truth safely.
 
-### 15.5 Corrupt ReconciliationLedger
+### 15.5 Durable append, guard refresh fails
+
+Current process remains fail-closed. Confirmation epoch remains advanced; stale
+tokens never regain validity.
+
+### 15.6 Corrupt ReconciliationLedger
 
 Recovery unavailable; no EffectLedger-only fallback.
 
-### 15.6 Corrupt EffectLedger
+### 15.7 Corrupt EffectLedger
 
 Existing M5 fail-closed behavior remains.
 
-### 15.7 Invocation journal failure/corruption
+### 15.8 Invocation journal failure/corruption
 
 No M6 authority effect.
 
@@ -851,7 +909,7 @@ Frozen semantics:
 - inspection may remain inconclusive;
 - resolve presents lineage, verdict, canonical evidence hash, and summary;
 - terminal resolution requires explicit interactive confirmation in same local
-  session;
+  session and uses a short-lived monotonic ReconciliationAuthority;
 - no hidden non-interactive Dispatcher capability bypass;
 - resolve performs no compensating remote write;
 - reconciliation may complete while kill is tripped but does not reset kill;
@@ -929,39 +987,43 @@ Failed qualification is retained evidence; conservative policy stays unchanged.
 9. Every terminal fact carries strict evidence, canonical evidence hash, and
    explicit operator identity.
 10. Evidence collectors may propose; they may not commit truth.
-11. ReconciliationAuthority binds one immutable fact and may re-drive only that
-    fact through durability ambiguity.
+11. ReconciliationAuthority is process-local, monotonic-TTL, bound to one
+    immutable fact, and may re-drive only that already-started fact through
+    durability ambiguity after TTL expiry.
 12. A live in-process attempt cannot be reconciled while it can emit M5 terminal
     outcome.
-13. Known reconciliation durability precedes recovery-clear publication.
-14. Visible-but-ambiguous reconciliation bytes never clear recovery.
-15. Same-path instances share ambiguity state; exact re-durability clears it.
-16. Startup establishes reconciliation-file durability before using rows to
+13. Confirmation epoch advances before ReconciliationLedger durability I/O.
+14. Confirmation epoch is monotonic and never rolled back after a failed
+    reconciliation attempt.
+15. Every confirmation token carries the epoch at issuance and validation
+    requires the current epoch.
+16. Confirmation epoch/token issue/validate/consume operations are synchronized.
+17. Known reconciliation durability precedes recovery-clear publication.
+18. Visible-but-ambiguous reconciliation bytes never clear recovery.
+19. Same-path instances share ambiguity state; exact re-durability clears it.
+20. Startup establishes reconciliation-file durability before using rows to
     clear recovery.
-17. Newly durable reconciliation is publication-fenced from write-side recovery
-    refresh until pending confirmations are invalidated.
-18. Confirmation token issue/validate/consume/invalidate is synchronized.
-19. Terminal reconciliation invalidates all pending pre-resolution confirmation
-    tokens in active supported runtime.
-20. Reconciliation does not reset dedupe, token bucket, kill, risk, actor,
+21. Newly durable reconciliation is publication-fenced from authoritative
+    write-side recovery refresh.
+22. Reconciliation does not reset dedupe, token bucket, kill, risk, actor,
     policy, authorization epoch, grant, or permit state.
-21. Contradictory terminal reconciliation is corruption; M6 has no correction or
+23. Contradictory terminal reconciliation is corruption; M6 has no correction or
     supersession protocol.
-22. Recovery validates both safety ledgers and fails closed if either is corrupt,
+24. Recovery validates both safety ledgers and fails closed if either is corrupt,
     unavailable, or locally durability-ambiguous.
-23. Multiple unresolved effects sharing semantic key keep it blocked until all
+25. Multiple unresolved effects sharing semantic key keep it blocked until all
     are settled/reconciled.
-24. Reconciliation clears only recovery uncertainty; never grants execution.
-25. Later mutation is fresh M5 invocation and cannot use pre-reconciliation
+26. Reconciliation clears only recovery uncertainty; never grants execution.
+27. Later mutation is fresh M5 invocation and cannot use pre-reconciliation
     human confirmation authority.
-26. Failed/missing observation is never generic proof of no effect.
-27. Browser evidence inspection respects M5 read/composer coordination.
-28. Reconciliation safety facts have no automatic rotation/TTL/deletion in M6.
-29. Invocation journal content has zero reconciliation/recovery authority.
-30. M6 makes no new cross-process linearizability or exactly-once claim.
-31. Replay-safety promotion requires concrete broker-level evidence.
-32. Platform qualification claims are bounded to environment tested.
-33. M6 does not claim cryptographic integrity against hostile local state-file
+28. Failed/missing observation is never generic proof of no effect.
+29. Browser evidence inspection respects M5 read/composer coordination.
+30. Reconciliation safety facts have no automatic rotation/TTL/deletion in M6.
+31. Invocation journal content has zero reconciliation/recovery authority.
+32. M6 makes no new cross-process linearizability or exactly-once claim.
+33. Replay-safety promotion requires concrete broker-level evidence.
+34. Platform qualification claims are bounded to environment tested.
+35. M6 does not claim cryptographic integrity against hostile local state-file
     editing.
 
 ---
@@ -981,39 +1043,41 @@ Failed qualification is retained evidence; conservative policy stays unchanged.
 | R9 | Target M5 state already settled | Denied invalid target |
 | R10 | Live attempt owns effect | Denied `live_attempt_owned` under canonical lifecycle fence |
 | R11 | Evidence missing/empty/non-JSON/hash mismatch | Denied before append |
-| R12 | Operator authority missing/mismatched | Denied |
-| R13 | Append/fsync fails before known durability | Ambiguity latched; recovery cannot clear |
-| R14 | Complete bytes visible after fsync failure | Projector unavailable; exact re-durability required |
-| R15 | Exact re-durability succeeds | Latch clears; no duplicate; fact may enter projection |
-| R16 | Durable reconciliation then crash before in-memory post-steps | Restart drops pending tokens and recovers reconciliation safely |
-| R17 | Same terminal fact exact retry | Re-fsync allowed; no duplicate |
-| R18 | Contradictory terminal verdict | Corruption/fail-closed |
-| R19 | ReconciliationLedger corrupt | Recovery unavailable |
-| R20 | EffectLedger corrupt | M5 fail-closed preserved |
-| R21 | Forged journal reconciliation-looking data | No effect on recovery |
-| R22 | Two unresolved effects share key; one reconciled | Key remains blocked |
-| R23 | All unresolved effects sharing key reconciled | Recovery key clears after durable composite refresh |
-| R24 | Reconciliation completes | Old grant/permit/confirmation cannot authorize later mutation |
-| R25 | Concurrent reconciliation attempts | At most one terminal fact wins |
-| R26 | Evidence collector proposes without operator authority | Cannot append/clear |
-| R27 | Browser read fails during inspection | Inconclusive/error, never automatic no-effect |
-| R28 | Browser composer owned during inspection | Busy/inconclusive; no competing navigation |
-| R29 | Durable resolution but guard refresh fails | Process fail-closed; invalidated confirmations remain invalid |
-| R30 | Restart after either verdict | Histories preserved; old authority dead; recovery contribution clear |
-| R31 | Second ledger instance after ambiguous append | Shared ambiguity prevents clear |
-| R32 | Restart with complete surviving reconciliation row | Startup fsync succeeds before row may clear recovery |
-| R33 | Startup reconciliation re-durability fails | Recovery unavailable |
-| R34 | Authority retries ambiguous append | Only exact frozen fact accepted |
-| R35 | Pending token minted before reconciliation | Token invalidated before clear can become visible to writes |
-| R36 | Unrelated pending token exists | Also invalidated conservatively |
-| R37 | Write-side guard refresh races durable reconciliation before invalidation | Publication fence forces old-blocked or post-invalidation-clear ordering |
-| R38 | Token validation/consume races global invalidation | Synchronized token store yields one ordering; invalidated token cannot later cross |
-| R39 | `CONFIRMED_NO_EFFECT` while dedupe entry live | Recovery clears; independent dedupe may still deny |
-| R40 | Token bucket exhausted before reconciliation | No refund; future invocation remains bucket-governed |
-| R41 | Kill tripped during reconciliation | Local reconciliation may complete; kill remains tripped |
-| R42 | Automatic rotation/TTL attempted | Unsupported/rejected; safety fact retained |
-| R43 | `reconciliation_id` reused for different effect/fact | Corruption/fail-closed |
-| R44 | Windows durability qualification | Claim matches actual behavior; stronger unsupported claim rejected |
+| R12 | Operator authority missing/mismatched/expired before persistence start | Denied |
+| R13 | Authority expires after exact fact persistence has begun | May complete exact-fact durability only; no fact change permitted |
+| R14 | Confirmation token issued before reconciliation | Epoch advance makes token stale before reconciliation append begins |
+| R15 | Unrelated pending confirmation token exists | Also stale after global epoch advance |
+| R16 | Reconciliation fails cleanly after epoch advance but before append | Epoch remains advanced; old tokens stay stale; recovery remains blocked |
+| R17 | Append/fsync fails after bytes may be visible | Ambiguity latched; old tokens already stale; recovery cannot clear |
+| R18 | Complete bytes visible after fsync failure | Projector unavailable; exact re-durability required |
+| R19 | Exact re-durability succeeds | Latch clears; no duplicate; fact may enter projection |
+| R20 | Durable reconciliation then crash before guard publication | Restart drops tokens and recovers reconciliation safely |
+| R21 | Same terminal fact exact retry | Re-fsync allowed; no duplicate |
+| R22 | Contradictory terminal verdict | Corruption/fail-closed |
+| R23 | ReconciliationLedger corrupt | Recovery unavailable |
+| R24 | EffectLedger corrupt | M5 fail-closed preserved |
+| R25 | Forged journal reconciliation-looking data | No effect on recovery |
+| R26 | Two unresolved effects share key; one reconciled | Key remains blocked |
+| R27 | All unresolved effects sharing key reconciled | Recovery key clears after durable composite refresh |
+| R28 | Reconciliation completes | Old grant/permit/old-epoch confirmation cannot authorize later mutation |
+| R29 | Concurrent reconciliation attempts | At most one terminal fact wins |
+| R30 | Evidence collector proposes without operator authority | Cannot append/clear |
+| R31 | Browser read fails during inspection | Inconclusive/error, never automatic no-effect |
+| R32 | Browser composer owned during inspection | Busy/inconclusive; no competing navigation |
+| R33 | Durable resolution but guard refresh fails | Process fail-closed; confirmation epoch remains advanced |
+| R34 | Restart after either verdict | Histories preserved; old authority dead; recovery contribution clear |
+| R35 | Second ledger instance after ambiguous append | Shared ambiguity prevents clear |
+| R36 | Restart with complete surviving reconciliation row | Startup fsync succeeds before row may clear recovery |
+| R37 | Startup reconciliation re-durability fails | Recovery unavailable |
+| R38 | Authority retries ambiguous append after TTL expiry | Only exact already-started frozen fact may be re-durabilized |
+| R39 | Write-side guard refresh races reconciliation | Publication fence forces old-blocked or post-protocol result; no torn publication |
+| R40 | Token validation races confirmation-epoch advance | Synchronized state yields one ordering; stale epoch rejected |
+| R41 | `CONFIRMED_NO_EFFECT` while dedupe entry live | Recovery clears; independent dedupe may still deny |
+| R42 | Token bucket exhausted before reconciliation | No refund; future invocation remains bucket-governed |
+| R43 | Kill tripped during reconciliation | Local reconciliation may complete; kill remains tripped |
+| R44 | Automatic rotation/TTL attempted | Unsupported/rejected; safety fact retained |
+| R45 | `reconciliation_id` reused for different effect/fact | Corruption/fail-closed |
+| R46 | Windows durability qualification | Claim matches actual behavior; stronger unsupported claim rejected |
 
 Additional mandatory regressions:
 
@@ -1027,6 +1091,10 @@ Additional mandatory regressions:
 - no Dispatcher capability can obtain ReconciliationAuthority;
 - read-only inspection performs no external mutation;
 - operator identity distinct from X actor identity;
+- ReconciliationAuthority uses monotonic elapsed-time expiry rather than wall
+  clock and is not persisted across restart;
+- confirmation epoch is process-local and new process starts with no pending
+  tokens;
 - positive evidence cannot infer causal identity from content equality unless
   that predicate is qualified;
 - negative evidence cannot infer no-effect from failed observation;
@@ -1043,8 +1111,8 @@ Additional mandatory regressions:
 ```text
 1. Reconciliation record model + fsync-backed ReconciliationLedger
 2. ReconciliationPublicationFence + composite RecoveryProjector/RecoveryGuard
-3. Synchronized confirmation-token invalidation boundary
-4. ReconciliationCoordinator + local operator authority/workflow
+3. Confirmation epoch + synchronized confirmation-token lifecycle
+4. ReconciliationAuthority TTL + ReconciliationCoordinator/operator workflow
 5. Fault/restart/corruption/concurrency qualification
 6. Windows durability qualification for both safety ledgers
 7. Evidence-driven replay-safety qualification (like/unlike first candidate)
@@ -1076,10 +1144,13 @@ M6 is complete only when:
 ✓ historical M5 uncertainty remains immutable
 ✓ terminal reconciliation is separately durable and lineage-bound
 ✓ evidence cannot silently become authority
+✓ reconciliation authority is bounded by monotonic elapsed time
 ✓ inconclusive/missing evidence keeps unresolved effects blocked
 ✓ visible-but-not-known-durable reconciliation never clears recovery
-✓ reconciliation publication is linearized with stale-confirmation invalidation
-✓ pre-resolution human confirmation cannot cross a newly cleared recovery gate
+✓ confirmation epoch invalidates pre-reconciliation human confirmation before
+  reconciliation durability work can create clear truth
+✓ confirmation publication is linearized with authoritative RecoveryGuard refresh
+✓ failed reconciliation never rolls confirmation epoch backward
 ✓ reconciliation does not reset independent policy controls
 ✓ old execution authority is never restored
 ✓ restart recomputes same composite recovery truth

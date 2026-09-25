@@ -17,12 +17,12 @@
 
 ## Current version
 
-**v0.3 stabilized live path + M5 final migration candidate.**
+**v0.3 stabilized live path + M5 effect-transaction boundary complete.**
 
-Canonical merged baseline before the active Layer-7 branch:
+Canonical merged baseline after the full M5 build order:
 
 ```text
-main = 03df4d3458828cc131989fd44fe27d48cef1240c
+main = 0c62402ae01b50d7662b3978cbf2bee4109aa035
 ```
 
 M5 status:
@@ -34,12 +34,10 @@ M5 status:
 4. Scoped authorities                          MERGED
 5. Capability migration                        MERGED  PR #6
 6. RecoveryGuard                               MERGED  PR #7
-7. Journal audit-only live role                ACTIVE CANDIDATE
+7. Journal audit-only live role                MERGED  PR #8
 ```
 
-Active Layer-7 branch: `m5-layer7-journal-audit-only`.
-
-Normative M5 contract: `docs/M5_DESIGN.md`. Layer-7 implementation boundary:
+Normative M5 contract: `docs/M5_DESIGN.md`. Final Layer-7 boundary and evidence:
 `docs/M5_LAYER7_PLAN.md`.
 
 ## Architecture invariants — do not violate
@@ -93,8 +91,8 @@ Normative M5 contract: `docs/M5_DESIGN.md`. Layer-7 implementation boundary:
 17. **EffectLedger is the durable M5 safety authority.** Schema/history/lineage
     corruption fails closed. Exact-fact retry may re-fsync but may not rewrite
     contradictory history.
-18. **Invocation journal is audit-only after Layer 7.** Journal content must not
-    create, clear, dedupe, rate-limit, approve, recover, or authorize a mutation.
+18. **Invocation journal is audit-only.** Journal content must not create, clear,
+    dedupe, rate-limit, approve, recover, or authorize a mutation.
 19. **Dedupe TTL and token-bucket budgets are process-local defense in depth.**
     Restart resets those in-memory windows. A future cross-restart budget/dedupe
     requirement needs a dedicated durable policy store, not best-effort audit
@@ -102,9 +100,9 @@ Normative M5 contract: `docs/M5_DESIGN.md`. Layer-7 implementation boundary:
 20. **Same-process least authority is not a hostile-code sandbox.** Untrusted
     extensions require stronger process/OS isolation and no raw-browser escape.
 
-## M5 — current transaction boundary
+## M5 — completed transaction boundary
 
-The supported remote-write path is now:
+The supported remote-write path is:
 
 ```text
 Dispatcher
@@ -150,7 +148,7 @@ Key current facts:
 | M5 L4 | scoped authorities | MERGED |
 | M5 L5 | concrete capability migration | MERGED — PR #6 |
 | M5 L6 | RecoveryGuard startup/refresh enforcement | MERGED — PR #7 |
-| M5 L7 | invocation journal becomes audit-only | ACTIVE CANDIDATE |
+| M5 L7 | invocation journal becomes audit-only | MERGED — PR #8 |
 
 ## Capabilities
 
@@ -208,8 +206,6 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## Known gaps / open items
 
-- [ ] **M5 L7 final gate:** full CI and independent exact-head review/reconciliation
-  remain required before merge.
 - [ ] **Reconciliation semantics:** `EFFECT_UNKNOWN` remains terminal historical
   evidence; future resolution needs explicit evidence-bearing semantics rather
   than overwrite.
@@ -238,6 +234,18 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-09-25 — M5 complete; L7 merged (PR #8).** Final Layer-7 candidate
+  `390967d96f87cdb483334bd8a2120629312df3f4`; CI #366 green on Python
+  3.11/3.12 with **765 tests** on Python 3.11, Ruff clean, and mypy clean across
+  78 source files. Codex exact-head review was unavailable because the repository
+  code-review usage limit was exhausted; no GitWire review appeared. Per the
+  standing review rule, a distinct maintainer adversarial second pass substituted
+  for the unavailable external reviewer and found one additional coverage defect:
+  journal rotation regression coverage had been lost when the legacy hydration
+  suite was retired. The final candidate restored explicit rotation, URL
+  redaction, screenshot-policy, and real journal-I/O-failure regressions and was
+  revalidated by exact-head CI. Squash merge:
+  `0c62402ae01b50d7662b3978cbf2bee4109aa035`. **M5 Layers 1–7 are complete.**
 - **2026-09-25 — M5 L7 maintainer-first candidate work.** Started from merged
   Layer-6 baseline `03df4d3458828cc131989fd44fe27d48cef1240c`. Frozen Layer-7
   boundary: journal audit/diagnostics only; EffectLedger + RecoveryGuard remain
@@ -245,9 +253,7 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   process-local defense-in-depth controls. Maintainer-first review found and
   fixed: a dormant Dispatcher journal-hydration coupling; a misleading silent
   compatibility reader; stale public README restart-budget claims; stale audit
-  `policy_decision="allowed"` labeling; and obsolete hydration APIs/tests. No
-  independent Layer-7 review is authoritative until this first pass is frozen
-  and exact-head CI is green.
+  `policy_decision="allowed"` labeling; and obsolete hydration APIs/tests.
 - **2026-09-25 — M5 L6 merged (PR #7).** Candidate
   `f4e9f7c88a6c6f6fe64abbbd899352bd12eafeeb`; CI #363 green on Python
   3.11/3.12 with 763 tests, Ruff and mypy. Exact-head GitWire review completed

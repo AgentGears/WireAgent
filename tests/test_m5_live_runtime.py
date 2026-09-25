@@ -14,6 +14,9 @@ from webwire.safety.effect_ledger import EffectLedger
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
 from webwire.safety.execution_models import AuthorizationEpoch
 from webwire.safety.kill_switch import KillSwitch
+from webwire.safety.m5_actor_bound_evidence import M5ActorBoundEvidenceReader
+from webwire.safety.m5_actor_bound_media_executor import M5ActorBoundMediaExecutor
+from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
 from webwire.safety.m5_delete_evidence import M5LeasedDeleteEvidenceReader
 from webwire.safety.m5_delete_executor import M5DeleteExecutor
 from webwire.safety.m5_effect_executor import M5EffectExecutor
@@ -53,13 +56,16 @@ def test_live_stack_uses_one_shared_authority_root(tmp_path: Path) -> None:
     assert isinstance(stack.write_broker, M5LeasedWriteBroker)
     assert isinstance(stack.scoped_authority, ScopedAuthorityBroker)
     assert isinstance(stack.execution_runtime, M5ExecutionRuntime)
+    assert isinstance(stack.evidence_reader, M5ActorBoundEvidenceReader)
     assert isinstance(stack.evidence_reader, M5LeasedEvidenceReader)
     assert isinstance(stack.media_evidence_reader, M5LeasedMediaEvidenceReader)
     assert isinstance(stack.delete_evidence_reader, M5LeasedDeleteEvidenceReader)
     assert isinstance(stack.effect_executor, M5EffectExecutor)
+    assert isinstance(stack.post_text_executor, M5ActorBoundPostTextExecutor)
     assert isinstance(stack.post_text_executor, M5PostTextExecutor)
     assert isinstance(stack.reply_executor, M5ReplyExecutor)
     assert isinstance(stack.quote_executor, M5QuoteExecutor)
+    assert isinstance(stack.media_executor, M5ActorBoundMediaExecutor)
     assert isinstance(stack.media_executor, M5MediaExecutor)
     assert isinstance(stack.delete_executor, M5DeleteExecutor)
     assert stack.read_broker._kill is kill

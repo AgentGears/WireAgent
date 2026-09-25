@@ -100,6 +100,11 @@ def _reject_duplicate_object_keys(
     return result
 
 
+def _reject_non_json_constant(value: str) -> Any:
+    """Reject Python decoder extensions such as NaN and Infinity."""
+    raise ValueError(f"non-JSON numeric constant {value!r}")
+
+
 def _validate_json_value(value: Any, path: str) -> None:
     """Reject values JSON would coerce or encode non-portably."""
     if value is None or isinstance(value, (str, bool, int)):
@@ -511,11 +516,14 @@ class ReconciliationLedger:
         records: list[ReconciliationRecord] = []
         for lineno, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
-                continue
+                raise ReconciliationLedgerCorruptError(
+                    f"reconciliation ledger line {lineno} is blank"
+                )
             try:
                 raw = json.loads(
                     line,
                     object_pairs_hook=_reject_duplicate_object_keys,
+                    parse_constant=_reject_non_json_constant,
                 )
             except (json.JSONDecodeError, ValueError) as exc:
                 raise ReconciliationLedgerCorruptError(

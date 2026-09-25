@@ -1,4 +1,4 @@
-"""Safety subsystem — kill switch, write kernel, and M5 effect controls."""
+"""Safety subsystem — kill switch, write kernel, and effect controls."""
 
 from webwire.safety.dedupe import DedupeStore
 from webwire.safety.effect_ledger import (
@@ -31,6 +31,15 @@ from webwire.safety.models import (
     RiskTier,
     Visibility,
     WriteIntent,
+)
+from webwire.safety.reconciliation_ledger import (
+    ReconciliationLedger,
+    ReconciliationLedgerAmbiguousError,
+    ReconciliationLedgerCorruptError,
+    ReconciliationLedgerError,
+    ReconciliationRecord,
+    ReconciliationVerdict,
+    canonical_evidence_hash,
 )
 from webwire.safety.recovery_guard import (
     RecoveryBlock,
@@ -92,6 +101,13 @@ __all__ = [
     "EffectLedgerCorruptError",
     "EffectState",
     "RecoveryProjection",
+    "ReconciliationLedger",
+    "ReconciliationLedgerError",
+    "ReconciliationLedgerCorruptError",
+    "ReconciliationLedgerAmbiguousError",
+    "ReconciliationRecord",
+    "ReconciliationVerdict",
+    "canonical_evidence_hash",
     "RecoveryGuard",
     "RecoveryGuardUnavailable",
     "RecoveryBlock",

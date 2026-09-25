@@ -99,26 +99,29 @@ class RecoveryGuard:
     def refresh(self) -> RecoveryStatus:
         """Replace the cache from one validated ledger recovery projection.
 
+        The full read -> projection -> publication sequence is serialized under
+        the guard lock. Without that ordering, two concurrent refreshes could
+        publish snapshots out of order and let an older clear view overwrite a
+        newer unresolved one.
+
         The ledger validates syntax, lineage, and state history before returning
         a projection. If that read fails, cached blocks are discarded as
         authority and the guard remains unavailable until a later refresh can
         establish a fresh trustworthy projection.
         """
-        try:
-            projection = self._ledger.recovery_projection()
-        except EffectLedgerError as exc:
-            with self._lock:
+        with self._lock:
+            try:
+                projection = self._ledger.recovery_projection()
+            except EffectLedgerError as exc:
                 self._blocks = {}
                 self._hydrated = True
                 self._available = False
                 self._error = f"{type(exc).__name__}: {exc}"
-            raise RecoveryGuardUnavailable(
-                "M5 recovery state could not be established from the EffectLedger"
-            ) from exc
+                raise RecoveryGuardUnavailable(
+                    "M5 recovery state could not be established from the EffectLedger"
+                ) from exc
 
-        blocks = self._blocks_from_projection(projection)
-        with self._lock:
-            self._blocks = blocks
+            self._blocks = self._blocks_from_projection(projection)
             self._hydrated = True
             self._available = True
             self._error = None

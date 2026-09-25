@@ -101,7 +101,22 @@ async def test_quote_evidence_requires_actor_text_and_exact_target(tmp_path: Pat
     assert sb.navigations == ["https://x.com/i/status/222"]
 
 
-def test_quote_evidence_js_scopes_attachment_lineage(tmp_path: Path) -> None:
+async def test_quote_evidence_accepts_proven_empty_outer_commentary(tmp_path: Path) -> None:
+    reader, _ = _reader(tmp_path, [_found(text="")])
+
+    result = await reader.verify_quote_attachment(
+        quote_post_id="222",
+        target_post_id="111",
+        actor_id="@actor",
+        normalized_text="",
+    )
+
+    assert result.ok is True
+    assert result.data["quote_attachment_verified"] is True
+    assert result.data["text_matches"] is True
+
+
+def test_quote_evidence_js_scopes_attachment_and_outer_commentary(tmp_path: Path) -> None:
     reader, sb = _reader(tmp_path, [_found()])
 
     import asyncio
@@ -118,6 +133,8 @@ def test_quote_evidence_js_scopes_attachment_lineage(tmp_path: Path) -> None:
     expr = sb._controller._cdp.expressions[0]
     assert "a.closest('article')!==art" in expr
     assert "[data-testid='quoteTweet']" in expr
+    assert "closest(\"[data-testid='quoteTweet']\")" in expr
+    assert "if(found.length===0)return '';" in expr
     assert "var nested=art.querySelectorAll('article')" in expr
     assert "quoteTargetIds:targets" in expr
 

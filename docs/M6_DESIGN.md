@@ -1,7 +1,7 @@
 # M6 — Evidence-Bearing Reconciliation & Qualification Boundary
 
 ```text
-Status:   CANDIDATE — ADVERSARIAL SECOND-PASS FINDINGS RECONCILED
+Status:   CANDIDATE — EXACT-HEAD CI GREEN / REVIEW GATE
 Base:     main 666064b3c5dc3f905be11321a3604460410dd583
 Runtime:  M5 baseline 0c62402ae01b50d7662b3978cbf2bee4109aa035
 Scope:    reconcile durable M5 uncertainty without rewriting history;

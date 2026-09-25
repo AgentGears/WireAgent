@@ -74,11 +74,13 @@ class M5LeasedDeleteEvidenceReader:
                 "var nodes=document.querySelectorAll('span,div'),stones=[];"
                 "for(var ni=0;ni<nodes.length;ni++){var n=nodes[ni];"
                 "if(n.closest('article'))continue;"
-                "var t=(n.innerText||'').trim();if(phrases[t])stones.push(t);}"
-                "var uniq={};for(var si=0;si<stones.length;si++)uniq[stones[si]]=1;"
-                "var ts=Object.keys(uniq);"
-                "if(ts.length===1)return JSON.stringify({status:'deleted',tombstone:ts[0]});"
-                "if(ts.length>1)return JSON.stringify({status:'ambiguous_tombstone',count:ts.length});"
+                "var t=(n.innerText||'').trim();if(!phrases[t])continue;"
+                "var kids=n.children,wrapped=false;"
+                "for(var ki=0;ki<kids.length;ki++){"
+                "if(((kids[ki].innerText||'').trim())===t){wrapped=true;break;}}"
+                "if(!wrapped)stones.push(t);}"
+                "if(stones.length===1)return JSON.stringify({status:'deleted',tombstone:stones[0]});"
+                "if(stones.length>1)return JSON.stringify({status:'ambiguous_tombstone',count:stones.length});"
                 "return JSON.stringify({status:'pending'});})()"
             )
 

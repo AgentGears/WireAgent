@@ -135,6 +135,11 @@ def test_evidence_requires_nonempty_structured_minimum(bad: object) -> None:
         {
             "basis": "x",
             "observed_at": "2026-09-26T00:00:00+00:00",
+            "observations": [{"bad": ("tuple",)}],
+        },
+        {
+            "basis": "x",
+            "observed_at": "2026-09-26T00:00:00+00:00",
             "observations": [{1: "numeric-key"}],
         },
     ],
@@ -157,14 +162,39 @@ def test_evidence_allows_nested_finite_json() -> None:
     assert math.isfinite(evidence["observations"][1]["values"][3])
 
 
-def test_hash_is_canonical_across_object_key_order() -> None:
+def test_hash_is_canonical_across_object_key_order_and_unicode() -> None:
     first = _evidence()
+    first["observations"][0]["label"] = "مصالحة"
     second = {
         "observations": first["observations"],
         "observed_at": first["observed_at"],
         "basis": first["basis"],
     }
     assert canonical_evidence_hash(first) == canonical_evidence_hash(second)
+
+
+def test_evidence_correlation_like_keys_cannot_shadow_record_identity() -> None:
+    evidence = _evidence()
+    evidence.update(
+        {
+            "reconciliation_id": "forged-rec",
+            "effect_id": "forged-effect",
+            "semantic_key": "forged-key",
+            "operator_id": "forged-operator",
+        }
+    )
+    record = _record(
+        reconciliation_id="canonical-rec",
+        effect_id="canonical-effect",
+        evidence=evidence,
+    )
+    payload = record.to_dict()
+
+    assert payload["reconciliation_id"] == "canonical-rec"
+    assert payload["effect_id"] == "canonical-effect"
+    assert payload["semantic_key"] == "@actor|post|post|123|semantic"
+    assert payload["operator_id"] == "operator-local"
+    assert payload["evidence"]["effect_id"] == "forged-effect"
 
 
 def test_record_rejects_hash_mismatch_and_nonlowercase_digest() -> None:

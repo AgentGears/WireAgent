@@ -12,6 +12,7 @@ dedicated migration slices land.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -60,6 +61,12 @@ class Dispatcher:
         self._registry = CapabilityRegistry()
         self._broker: Optional[ReadOnlyBroker] = None
         self._registered_default = False
+        # During staged Layer-5 migration, legacy writes/downloads and M5 reads
+        # still share one browser. Serialize supported Dispatcher invocations so
+        # no sibling task can navigate over an owned M5 composer. Same-task
+        # re-entry is allowed to avoid deadlocking trusted orchestration hooks.
+        self._invoke_lock = asyncio.Lock()
+        self._invoke_lock_owner: Optional[asyncio.Task[Any]] = None
 
         from webwire.safety import (
             DEFAULT_EFFECT_POLICIES,
@@ -203,6 +210,15 @@ class Dispatcher:
         input: Optional[dict[str, Any]] = None,
     ) -> ActionResult:
         """Invoke a capability by name through the appropriate trust boundary."""
+        current_task = asyncio.current_task()
+        if current_task is not self._invoke_lock_owner:
+            async with self._invoke_lock:
+                self._invoke_lock_owner = current_task
+                try:
+                    return await self.invoke(name, input)
+                finally:
+                    self._invoke_lock_owner = None
+
         input = input or {}
         started_monotonic = time.monotonic()
         trace_id = _new_trace_id()

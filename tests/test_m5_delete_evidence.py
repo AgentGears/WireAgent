@@ -6,8 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from super_browser.results.types import FailureCategory
+
 from webwire.config import WebWireConfig
-from webwire.envelope import ActionResult, ok_result
+from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.m5_delete_evidence import M5LeasedDeleteEvidenceReader
@@ -38,9 +40,6 @@ class _SB:
     async def navigate(self, url: str, wait_until: str = "domcontentloaded") -> ActionResult:
         self.navigations.append(url)
         if not self.nav_ok:
-            from webwire.envelope import soft_failure
-            from super_browser.results.types import FailureCategory
-
             return soft_failure("nav failed", failure_category=FailureCategory.UNKNOWN)
         return ok_result(data={"url": url, "wait_until": wait_until})
 
@@ -72,7 +71,9 @@ async def test_delete_evidence_proves_unique_direct_target_present(tmp_path: Pat
     assert sb.navigations == ["https://x.com/u/status/123"]
 
 
-async def test_delete_evidence_requires_explicit_tombstone_for_deleted(tmp_path: Path) -> None:
+async def test_delete_evidence_requires_target_bound_explicit_tombstone(
+    tmp_path: Path,
+) -> None:
     reader, _ = _reader(
         tmp_path,
         [{"status": "deleted", "tombstone": "This post was deleted"}],
@@ -82,7 +83,7 @@ async def test_delete_evidence_requires_explicit_tombstone_for_deleted(tmp_path:
 
     assert result.ok is True
     assert result.data["post_state"] == "deleted"
-    assert result.data["evidence"] == "explicit_delete_tombstone"
+    assert result.data["evidence"] == "target_permalink_explicit_delete_tombstone"
 
 
 async def test_delete_evidence_blank_or_unloaded_page_stays_unknown(
@@ -108,6 +109,24 @@ async def test_delete_evidence_ambiguous_target_stays_unknown(tmp_path: Path) ->
     assert result.failure_category.value == "unknown"
 
 
+async def test_delete_evidence_wrong_permalink_stays_unknown(tmp_path: Path) -> None:
+    reader, _ = _reader(tmp_path, [{"status": "wrong_page", "path": "/home"}])
+
+    result = await reader.read_delete_state("https://x.com/u/status/123", "123")
+
+    assert result.ok is False
+    assert result.failure_category.value == "unknown"
+
+
+async def test_delete_evidence_ambiguous_tombstones_stay_unknown(tmp_path: Path) -> None:
+    reader, _ = _reader(tmp_path, [{"status": "ambiguous_tombstone", "count": 2}])
+
+    result = await reader.read_delete_state("https://x.com/u/status/123", "123")
+
+    assert result.ok is False
+    assert result.failure_category.value == "unknown"
+
+
 async def test_delete_evidence_navigation_failure_is_not_deletion(tmp_path: Path) -> None:
     reader, sb = _reader(tmp_path, [], nav_ok=False)
 
@@ -118,7 +137,7 @@ async def test_delete_evidence_navigation_failure_is_not_deletion(tmp_path: Path
     assert sb._controller._cdp.expressions == []
 
 
-def test_delete_evidence_js_ignores_nested_status_decoys_and_generic_errors(
+def test_delete_evidence_js_binds_permalink_and_ignores_generic_errors(
     tmp_path: Path,
 ) -> None:
     reader, sb = _reader(tmp_path, [{"status": "present"}])
@@ -128,8 +147,11 @@ def test_delete_evidence_js_ignores_nested_status_decoys_and_generic_errors(
     asyncio.run(reader.read_delete_state("https://x.com/u/status/123", "123"))
 
     expr = sb._controller._cdp.expressions[0]
+    assert "targetSuffix='/status/'+target" in expr
+    assert "if(!atTarget)return JSON.stringify({status:'wrong_page'" in expr
     assert "a.closest('article')!==art||!a.querySelector('time')" in expr
     assert "n.closest('article')" in expr
+    assert "ts.length===1" in expr
     assert "This post was deleted" in expr
     assert "Something went wrong" not in expr
     assert "This post is unavailable" not in expr

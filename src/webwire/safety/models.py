@@ -5,7 +5,8 @@ The hardened design (review conversation 6a4fb320) centers on:
   on intent, before any browser mutation.
 - RiskMeta: multi-dimensional risk metadata (visibility, reversibility,
   amplification, etc.) from which a RiskTier is derived.
-- ConfirmationToken: bound to an immutable intent hash; not a bare boolean.
+- ConfirmationToken: bound to one capability and one immutable intent hash; not
+  a bare boolean and not transferable across equal-intent capability surfaces.
 - PolicyDecision: the policy stage's verdict (allow/deny/dry_run/confirmation_required).
 """
 
@@ -125,11 +126,12 @@ class WriteIntent:
 
 @dataclass
 class ConfirmationToken:
-    """Bound to an immutable intent hash (review Q1). Not a bare confirm=True.
-    Single-use, expiring."""
+    """Bound to one capability + immutable intent hash. Single-use, expiring."""
+
     token: str
     intent_hash: str
     risk_tier: RiskTier
+    capability_name: str = ""
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0  # set by kernel; default 0 = invalid until set
     consumed: bool = False
@@ -156,7 +158,7 @@ class PolicyDecision:
     # Set when verdict == CONFIRMATION_REQUIRED.
     confirmation_token: Optional[ConfirmationToken] = None
     # Set when verdict == DENY (which gate blocked).
-    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "unknown_action" | "risk_meta_mismatch" | "expired_token" | "intent_mismatch" | "consumed_token"
+    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "unknown_action" | "risk_meta_mismatch" | "reconciliation_required" | "expired_token" | "intent_mismatch" | "capability_mismatch" | "consumed_token"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

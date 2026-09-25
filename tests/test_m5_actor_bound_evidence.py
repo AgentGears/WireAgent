@@ -50,10 +50,14 @@ class _SB:
 def _reader(
     tmp_path: Path,
     payloads: list[Any],
+    *,
+    content_owned: bool = False,
 ) -> tuple[M5ActorBoundEvidenceReader, _SB]:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     sb = _SB(payloads)
     broker = M5LeasedWriteBroker(sb, KillSwitch(cfg))  # type: ignore[arg-type]
+    if content_owned:
+        broker._m5_write_state.content_owner = broker._m5_lease_owner
     return M5ActorBoundEvidenceReader(broker), sb
 
 
@@ -86,7 +90,11 @@ async def test_stable_direct_baseline_requires_two_equal_snapshots(
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
     snapshot = [_status("Actor", "10"), _status("Other", "11")]
-    reader, sb = _reader(tmp_path, [snapshot, list(reversed(snapshot))])
+    reader, sb = _reader(
+        tmp_path,
+        [snapshot, list(reversed(snapshot))],
+        content_owned=True,
+    )
 
     result = await reader.capture_pre_submit_ids()
 
@@ -101,7 +109,7 @@ async def test_unstable_direct_baseline_fails_closed(
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("webwire.safety.m5_actor_bound_evidence.asyncio.sleep", _no_sleep)
     snapshots = [[_status("Actor", str(index))] for index in range(1, 21)]
-    reader, sb = _reader(tmp_path, snapshots)
+    reader, sb = _reader(tmp_path, snapshots, content_owned=True)
 
     result = await reader.capture_pre_submit_ids()
 

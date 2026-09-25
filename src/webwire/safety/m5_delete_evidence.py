@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from urllib.parse import urlparse
 
 from super_browser.results.types import FailureCategory
 
@@ -19,6 +21,25 @@ from webwire.envelope import ActionResult, ok_result, soft_failure
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 
 __all__ = ["M5LeasedDeleteEvidenceReader"]
+
+_DELETE_STATUS_PATH = re.compile(r"^/(?:i|[^/]+)/status/(\d+)(?:/|$)")
+
+
+def _delete_url_post_id(url: str) -> str | None:
+    """Return the target id for one canonical HTTPS X status permalink."""
+
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.netloc.casefold() not in {"x.com", "www.x.com"}:
+        return None
+    match = _DELETE_STATUS_PATH.match(parsed.path)
+    if match is None:
+        return None
+    return match.group(1)
 
 
 class M5LeasedDeleteEvidenceReader:
@@ -37,6 +58,11 @@ class M5LeasedDeleteEvidenceReader:
                 "delete evidence requires a numeric target post id",
                 failure_category=FailureCategory.SECURITY,
             )
+        if _delete_url_post_id(post_url) != post_id:
+            return soft_failure(
+                "delete evidence requires an HTTPS X permalink bound to the target post id",
+                failure_category=FailureCategory.UNKNOWN,
+            )
 
         broker = self.__broker
 
@@ -51,11 +77,13 @@ class M5LeasedDeleteEvidenceReader:
             expr = (
                 "(function(){"
                 f"var target={json.dumps(post_id)};"
+                "var host=(location.hostname||'').toLowerCase();"
                 "var path=location.pathname||'';"
-                "var targetSuffix='/status/'+target;"
-                "var atTarget=path===targetSuffix||path.endsWith(targetSuffix)||"
-                "path.indexOf(targetSuffix+'/')>=0;"
-                "if(!atTarget)return JSON.stringify({status:'wrong_page',path:path});"
+                "if(host!=='x.com'&&host!=='www.x.com')"
+                "return JSON.stringify({status:'wrong_page',host:host,path:path});"
+                "var statusMatch=path.match(/^\\/(?:i|[^/]+)\\/status\\/(\\d+)(?:\\/|$)/);"
+                "if(!statusMatch||statusMatch[1]!==target)"
+                "return JSON.stringify({status:'wrong_page',host:host,path:path});"
                 "function ownStatus(art){"
                 "var links=art.querySelectorAll('a[href]'),ids={};"
                 "for(var i=0;i<links.length;i++){var a=links[i];"

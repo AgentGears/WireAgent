@@ -48,6 +48,7 @@ _M5_POST_TEXT_CAPABILITY = "post_text"
 _M5_REPLY_CAPABILITY = "reply_post"
 _M5_QUOTE_CAPABILITY = "quote_post"
 _M5_DELETE_CAPABILITY = "delete_post"
+_M5_DRY_RUN_CAPABILITY = "compose_post"
 _M5_MEDIA_CAPABILITIES = frozenset(
     {
         "post_photo",
@@ -66,6 +67,13 @@ _M5_MIGRATED_CAPABILITIES = _M5_ENGAGEMENT_CAPABILITIES | _M5_MEDIA_CAPABILITIES
 }
 
 
+class _NoMutationBroker:
+    """Inert broker token for the legacy kernel shell after Layer-5 migration."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(f"legacy mutation broker surface is disabled: {name}")
+
+
 class Dispatcher:
     """Single entry point: ``await dispatcher.invoke(name, input)``."""
 
@@ -81,10 +89,10 @@ class Dispatcher:
         self._registry = CapabilityRegistry()
         self._broker: Optional[ReadOnlyBroker] = None
         self._registered_default = False
-        # During staged Layer-5 migration, legacy writes/downloads and M5 reads
-        # still share one browser. Serialize supported Dispatcher invocations so
-        # no sibling task can navigate over an owned M5 composer. Same-task
-        # re-entry is allowed to avoid deadlocking trusted orchestration hooks.
+        # During staged Layer-5 migration, reads/downloads and M5 writes still
+        # share one browser. Serialize supported Dispatcher invocations so no
+        # sibling task can navigate over an owned M5 composer. Same-task re-entry
+        # is allowed to avoid deadlocking trusted orchestration hooks.
         self._invoke_lock = asyncio.Lock()
         self._invoke_lock_owner: Optional[asyncio.Task[Any]] = None
 
@@ -121,15 +129,11 @@ class Dispatcher:
         self._m5_delete_adapter: Optional[M5DeleteCapabilityAdapter] = None
         self._m5_media_adapters: dict[str, M5MediaCapabilityAdapter] = {}
 
-        # Transitional legacy factory. Migrated M5 capabilities never receive or
-        # dereference this object; untouched write capabilities still use it.
-        def _make_write_broker():
-            from webwire.write_broker import WriteBroker
-
-            sb = self._session.sb
-            if sb is None:
-                raise RuntimeError("Cannot create WriteBroker: session not started")
-            return WriteBroker(sb, self._kill)
+        # WriteKernel still owns the transitional confirmation shell, but after
+        # Layer-5 migration it never receives a live legacy WriteBroker. M5
+        # adapters ignore this token and compose_post is a proven dry-run no-op.
+        def _make_write_broker() -> _NoMutationBroker:
+            return _NoMutationBroker()
 
         self._write_kernel = WriteKernel(
             kill_switch=self._kill,
@@ -385,13 +389,22 @@ class Dispatcher:
                             input,
                             actor_identity=actor,
                         )
-                else:
+                elif name == _M5_DRY_RUN_CAPABILITY:
                     write_cap = cast(WriteCapability, capability)
                     result = await self._write_kernel.execute(
                         write_cap,
                         self._broker,
                         input,
                         actor_identity=actor,
+                    )
+                else:
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    result = hard_failure(
+                        f"unmigrated WRITE capability {name!r} is disabled",
+                        failure_category=FailureCategory.SECURITY,
                     )
             else:
                 from typing import cast as _cast

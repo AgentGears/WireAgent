@@ -52,6 +52,29 @@ async def test_migrated_canary_denies_without_whoami_actor(tmp_path: Path) -> No
     assert "whoami-resolved actor identity" in result.error.message
 
 
+async def test_reply_migration_denies_without_whoami_actor(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    session = _StubSessionManager(cfg)
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+    started = await dispatcher.start()
+    assert started.ok is True
+    assert session.resolved_handle is None
+
+    result = await dispatcher.invoke(
+        "reply_post",
+        {
+            "post_url": "https://x.com/u/status/123",
+            "target_post_id": "123",
+            "text": "approved reply",
+        },
+    )
+
+    assert result.ok is False
+    assert result.failure_category.value == "security"
+    assert "whoami-resolved actor identity" in result.error.message
+    assert dispatcher._m5_reply_adapter is None
+
+
 async def test_migrated_canary_denies_if_live_stack_disappears(tmp_path: Path) -> None:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     session = _StubSessionManager(cfg)
@@ -93,6 +116,35 @@ async def test_confirmation_phase_caches_m5_adapter_not_registry_replacement(
     adapter = dispatcher._m5_canary_adapters["bookmark_post"]
     assert adapter is not original
     assert dispatcher._registry.get("bookmark_post") is original
+
+
+async def test_reply_confirmation_caches_dedicated_m5_adapter(
+    tmp_path: Path,
+) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    session = _StubSessionManager(cfg)
+    session.set_resolved_handle("@actor")
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+    started = await dispatcher.start()
+    assert started.ok is True
+    original = dispatcher._registry.get("reply_post")
+    assert original is not None
+
+    result = await dispatcher.invoke(
+        "reply_post",
+        {
+            "post_url": "https://x.com/u/status/123",
+            "target_post_id": "123",
+            "text": "approved reply",
+        },
+    )
+
+    assert result.ok is True
+    assert result.data["policy"]["verdict"] == "confirmation_required"
+    assert dispatcher._m5_reply_adapter is not None
+    assert dispatcher._m5_reply_adapter is not original
+    assert dispatcher._m5_post_text_adapter is None
+    assert dispatcher._registry.get("reply_post") is original
 
 
 async def test_start_fails_closed_when_live_stack_build_fails(

@@ -358,3 +358,333 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
             return ok_result(data=evidence)
 
         return await broker._one_shot(operation)
+
+    async def verify_reply_in_thread(
+        self,
+        *,
+        target_post_id: str,
+        reply_post_id: str,
+        actor_id: str,
+        normalized_text: str,
+    ) -> ActionResult:
+        """Actor-bound reply evidence with bounded direct-text hydration."""
+
+        broker = self.__strong_broker
+        target_url = f"https://x.com/i/status/{target_post_id}"
+        approved_actor = actor_id.lstrip("@").casefold()
+        approved_text = normalize_text(normalized_text)
+        if not approved_actor:
+            return soft_failure(
+                "reply verification requires an approved actor identity",
+                failure_category=FailureCategory.SECURITY,
+            )
+
+        async def operation() -> ActionResult:
+            nav = await broker._sb.navigate(target_url, wait_until="domcontentloaded")
+            if not nav.ok:
+                return nav
+
+            expr = (
+                "(function(){"
+                f"var target={json.dumps(target_post_id)},reply={json.dumps(reply_post_id)};"
+                "function ownStatus(art){"
+                "var links=art.querySelectorAll('a[href]'),found=[];"
+                "for(var i=0;i<links.length;i++){var a=links[i];"
+                "if(a.closest('article')!==art||!a.querySelector('time'))continue;"
+                "try{var u=new URL(a.href,location.href);"
+                "var m=u.pathname.match(/^\\/([^/]+)\\/status\\/(\\d+)(?:\\/|$)/);"
+                "if(m)found.push({actor:m[1],id:m[2],path:u.pathname});}catch(e){}"
+                "}"
+                "var uniq={};for(var j=0;j<found.length;j++)uniq[found[j].id]=found[j];"
+                "var ids=Object.keys(uniq);return ids.length===1?uniq[ids[0]]:null;}"
+                "function directText(art){"
+                "var ts=art.querySelectorAll(\"[data-testid='tweetText']\"),found=[];"
+                "for(var i=0;i<ts.length;i++)"
+                "if(ts[i].closest('article')===art)found.push(ts[i]);"
+                "if(found.length===0)return {status:'pending'};"
+                "if(found.length!==1)return {status:'ambiguous'};"
+                "return {status:'ready',text:(found[0].innerText||'')};}"
+                "var arts=document.querySelectorAll('article'),targets=[],replies=[];"
+                "for(var ai=0;ai<arts.length;ai++){var own=ownStatus(arts[ai]);if(!own)continue;"
+                "if(own.id===target)targets.push({i:ai,own:own});"
+                "if(own.id===reply)replies.push({i:ai,own:own,text:directText(arts[ai])});}"
+                "if(targets.length!==1||replies.length!==1)"
+                "return JSON.stringify({status:'missing_or_ambiguous',"
+                "targets:targets.length,replies:replies.length});"
+                "var t=targets[0],r=replies[0];"
+                "if(r.text.status==='pending')return JSON.stringify({status:'pending_text',"
+                "targetIndex:t.i,replyIndex:r.i,replyActor:r.own.actor,replyPath:r.own.path});"
+                "if(r.text.status!=='ready')return JSON.stringify({status:'ambiguous_text'});"
+                "return JSON.stringify({status:'found',targetIndex:t.i,replyIndex:r.i,"
+                "replyActor:r.own.actor,replyPath:r.own.path,replyText:r.text.text});})()"
+            )
+
+            last: dict[str, object] | None = None
+            empty_text_streak = 0
+            for _ in range(20):
+                try:
+                    evaluated = await broker._sb._controller._cdp.evaluate(expr)
+                except Exception as exc:  # noqa: BLE001
+                    return soft_failure(
+                        f"reply thread evidence evaluation failed: {exc!r}",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if not evaluated.ok or not evaluated.data or "exceptionDetails" in evaluated.data:
+                    return soft_failure(
+                        "reply thread evidence evaluation did not return evidence",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                raw = evaluated.data.get("result", {}).get("value")
+                if not isinstance(raw, str):
+                    return soft_failure(
+                        "reply thread evidence returned malformed evidence",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, ValueError) as exc:
+                    return soft_failure(
+                        f"reply thread evidence was not valid JSON: {exc!r}",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if not isinstance(parsed, dict):
+                    return soft_failure(
+                        "reply thread evidence was not an object",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                last = parsed
+                status = parsed.get("status")
+                if status == "found":
+                    break
+                if status == "ambiguous_text":
+                    return soft_failure(
+                        "captured reply direct text evidence was ambiguous",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if status == "pending_text" and not approved_text:
+                    empty_text_streak += 1
+                    if empty_text_streak >= _EMPTY_TEXT_STABLE_POLLS:
+                        last = dict(parsed)
+                        last["status"] = "found"
+                        last["replyText"] = ""
+                        break
+                else:
+                    empty_text_streak = 0
+                await asyncio.sleep(0.25)
+
+            if last is None or last.get("status") != "found":
+                return soft_failure(
+                    "reply status was not uniquely visible on the approved target thread",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            target_index = last.get("targetIndex")
+            reply_index = last.get("replyIndex")
+            reply_actor = last.get("replyActor")
+            reply_text = last.get("replyText")
+            reply_path = last.get("replyPath")
+            if (
+                not isinstance(target_index, int)
+                or not isinstance(reply_index, int)
+                or reply_index <= target_index
+            ):
+                return soft_failure(
+                    "captured reply was not rendered downstream of the approved target",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not isinstance(reply_actor, str) or reply_actor.casefold() != approved_actor:
+                return soft_failure(
+                    "captured reply actor did not match the approved actor",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not isinstance(reply_text, str) or normalize_text(reply_text) != approved_text:
+                return soft_failure(
+                    "captured reply text did not match the approved text",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not isinstance(reply_path, str) or f"/status/{reply_post_id}" not in reply_path:
+                return soft_failure(
+                    "captured reply timestamp did not own the expected status ID",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            return ok_result(
+                data={
+                    "thread_bound": True,
+                    "target_post_id": target_post_id,
+                    "reply_post_id": reply_post_id,
+                    "reply_actor": reply_actor,
+                    "reply_url": f"https://x.com{reply_path}",
+                    "text_matches": True,
+                }
+            )
+
+        return await broker._one_shot(operation)
+
+    async def verify_quote_attachment(
+        self,
+        *,
+        quote_post_id: str,
+        target_post_id: str,
+        actor_id: str,
+        normalized_text: str,
+    ) -> ActionResult:
+        """Actor/target-bound quote evidence with bounded text hydration."""
+
+        broker = self.__strong_broker
+        quote_url = f"https://x.com/i/status/{quote_post_id}"
+        approved_actor = actor_id.lstrip("@").casefold()
+        approved_text = normalize_text(normalized_text)
+        if not approved_actor:
+            return soft_failure(
+                "quote verification requires an approved actor identity",
+                failure_category=FailureCategory.SECURITY,
+            )
+
+        async def operation() -> ActionResult:
+            nav = await broker._sb.navigate(quote_url, wait_until="domcontentloaded")
+            if not nav.ok:
+                return nav
+
+            expr = (
+                "(function(){"
+                f"var quote={json.dumps(quote_post_id)},target={json.dumps(target_post_id)};"
+                "function ownStatus(art){"
+                "var links=art.querySelectorAll('a[href]'),found=[];"
+                "for(var i=0;i<links.length;i++){var a=links[i];"
+                "if(a.closest('article')!==art||!a.querySelector('time'))continue;"
+                "try{var u=new URL(a.href,location.href);"
+                "var m=u.pathname.match(/^\\/([^/]+)\\/status\\/(\\d+)(?:\\/|$)/);"
+                "if(m)found.push({actor:m[1],id:m[2],path:u.pathname});}catch(e){}"
+                "}"
+                "var uniq={};for(var j=0;j<found.length;j++)uniq[found[j].id]=found[j];"
+                "var ids=Object.keys(uniq);return ids.length===1?uniq[ids[0]]:null;}"
+                "function directText(art){"
+                "var ts=art.querySelectorAll(\"[data-testid='tweetText']\"),found=[];"
+                "for(var i=0;i<ts.length;i++){"
+                "if(ts[i].closest('article')!==art)continue;"
+                "if(ts[i].closest(\"[data-testid='quoteTweet']\"))continue;"
+                "found.push(ts[i]);}"
+                "if(found.length===0)return {status:'pending'};"
+                "if(found.length!==1)return {status:'ambiguous'};"
+                "return {status:'ready',text:(found[0].innerText||'')};}"
+                "function collectTargets(art){var ids={};"
+                "var roots=art.querySelectorAll(\"[data-testid='quoteTweet']\");"
+                "for(var ri=0;ri<roots.length;ri++){"
+                "var links=roots[ri].querySelectorAll(\"a[href*='/status/']\");"
+                "for(var li=0;li<links.length;li++){try{"
+                "var u=new URL(links[li].href,location.href);"
+                "var m=u.pathname.match(/\\/status\\/(\\d+)(?:\\/|$)/);"
+                "if(m&&m[1]!==quote)ids[m[1]]=1;}catch(e){}}}"
+                "var nested=art.querySelectorAll('article');"
+                "for(var ni=0;ni<nested.length;ni++){var own=ownStatus(nested[ni]);"
+                "if(own&&own.id!==quote)ids[own.id]=1;}"
+                "return Object.keys(ids).sort();}"
+                "var arts=document.querySelectorAll('article'),matches=[];"
+                "for(var ai=0;ai<arts.length;ai++){var own=ownStatus(arts[ai]);"
+                "if(own&&own.id===quote)matches.push({art:arts[ai],own:own});}"
+                "if(matches.length!==1)return JSON.stringify({status:'missing_or_ambiguous',"
+                "quotes:matches.length});"
+                "var q=matches[0],targets=collectTargets(q.art),text=directText(q.art);"
+                "if(!targets.length)return JSON.stringify({status:'pending_attachment',"
+                "quoteActor:q.own.actor,quotePath:q.own.path,quoteTargetIds:targets});"
+                "if(text.status==='pending')return JSON.stringify({status:'pending_text',"
+                "quoteActor:q.own.actor,quotePath:q.own.path,quoteTargetIds:targets});"
+                "if(text.status!=='ready')return JSON.stringify({status:'ambiguous_text'});"
+                "return JSON.stringify({status:'found',quoteActor:q.own.actor,"
+                "quotePath:q.own.path,quoteText:text.text,quoteTargetIds:targets,"
+                "expectedTarget:target});})()"
+            )
+
+            last: dict[str, object] | None = None
+            empty_text_streak = 0
+            for _ in range(20):
+                try:
+                    evaluated = await broker._sb._controller._cdp.evaluate(expr)
+                except Exception as exc:  # noqa: BLE001
+                    return soft_failure(
+                        f"quote attachment evidence evaluation failed: {exc!r}",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if not evaluated.ok or not evaluated.data or "exceptionDetails" in evaluated.data:
+                    return soft_failure(
+                        "quote attachment evidence evaluation did not return evidence",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                raw = evaluated.data.get("result", {}).get("value")
+                if not isinstance(raw, str):
+                    return soft_failure(
+                        "quote attachment evidence returned malformed evidence",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, ValueError) as exc:
+                    return soft_failure(
+                        f"quote attachment evidence was not valid JSON: {exc!r}",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if not isinstance(parsed, dict):
+                    return soft_failure(
+                        "quote attachment evidence was not an object",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                last = parsed
+                status = parsed.get("status")
+                if status == "found":
+                    break
+                if status == "ambiguous_text":
+                    return soft_failure(
+                        "captured quote direct text evidence was ambiguous",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if status == "pending_text" and not approved_text:
+                    empty_text_streak += 1
+                    if empty_text_streak >= _EMPTY_TEXT_STABLE_POLLS:
+                        last = dict(parsed)
+                        last["status"] = "found"
+                        last["quoteText"] = ""
+                        break
+                else:
+                    empty_text_streak = 0
+                await asyncio.sleep(0.25)
+
+            if last is None or last.get("status") != "found":
+                return soft_failure(
+                    "quoted target lineage was not explicitly visible in the captured post",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            quote_actor = last.get("quoteActor")
+            quote_path = last.get("quotePath")
+            quote_text = last.get("quoteText")
+            quote_targets = last.get("quoteTargetIds")
+            if not isinstance(quote_actor, str) or quote_actor.casefold() != approved_actor:
+                return soft_failure(
+                    "captured quote actor did not match the approved actor",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not isinstance(quote_text, str) or normalize_text(quote_text) != approved_text:
+                return soft_failure(
+                    "captured quote text did not match the approved text",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if not isinstance(quote_path, str) or f"/status/{quote_post_id}" not in quote_path:
+                return soft_failure(
+                    "captured quote timestamp did not own the expected status ID",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            if quote_targets != [target_post_id]:
+                return soft_failure(
+                    "captured quote attachment did not uniquely match the approved target",
+                    failure_category=FailureCategory.UNKNOWN,
+                )
+            return ok_result(
+                data={
+                    "quote_attachment_verified": True,
+                    "target_post_id": target_post_id,
+                    "quote_post_id": quote_post_id,
+                    "quote_actor": quote_actor,
+                    "quote_url": f"https://x.com{quote_path}",
+                    "text_matches": True,
+                }
+            )
+
+        return await broker._one_shot(operation)

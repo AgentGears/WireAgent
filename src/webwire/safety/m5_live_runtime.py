@@ -24,6 +24,8 @@ from webwire.safety.m5_authority_factory import (
 from webwire.safety.m5_effect_executor import M5EffectExecutor
 from webwire.safety.m5_evidence_reader import M5LeasedEvidenceReader
 from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+from webwire.safety.m5_media_evidence import M5LeasedMediaEvidenceReader
+from webwire.safety.m5_media_executor import M5MediaExecutor
 from webwire.safety.m5_post_text_executor import M5PostTextExecutor
 from webwire.safety.m5_quote_executor import M5QuoteExecutor
 from webwire.safety.m5_reply_executor import M5ReplyExecutor
@@ -41,10 +43,12 @@ class M5LiveExecutionStack:
     scoped_authority: ScopedAuthorityBroker
     execution_runtime: M5ExecutionRuntime
     evidence_reader: M5LeasedEvidenceReader
+    media_evidence_reader: M5LeasedMediaEvidenceReader
     effect_executor: M5EffectExecutor
     post_text_executor: M5PostTextExecutor
     reply_executor: M5ReplyExecutor
     quote_executor: M5QuoteExecutor
+    media_executor: M5MediaExecutor
 
 
 def build_live_m5_execution_stack(
@@ -76,6 +80,7 @@ def build_live_m5_execution_stack(
         policies=policies,
     )
     evidence_reader = M5LeasedEvidenceReader(write_broker)
+    media_evidence_reader = M5LeasedMediaEvidenceReader(write_broker)
     effect_executor = M5EffectExecutor(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
@@ -92,14 +97,21 @@ def build_live_m5_execution_stack(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
     )
+    media_executor = M5MediaExecutor(
+        runtime=execution_runtime,
+        content_evidence=evidence_reader,
+        media_evidence=media_evidence_reader,
+    )
     return M5LiveExecutionStack(
         read_broker=read_broker,
         write_broker=write_broker,
         scoped_authority=scoped_authority,
         execution_runtime=execution_runtime,
         evidence_reader=evidence_reader,
+        media_evidence_reader=media_evidence_reader,
         effect_executor=effect_executor,
         post_text_executor=post_text_executor,
         reply_executor=reply_executor,
         quote_executor=quote_executor,
+        media_executor=media_executor,
     )

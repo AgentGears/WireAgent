@@ -131,10 +131,12 @@ class ConfirmationToken:
     token: str
     intent_hash: str
     risk_tier: RiskTier
-    capability_name: str = ""
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0  # set by kernel; default 0 = invalid until set
     consumed: bool = False
+    # Appended after the legacy fields so positional construction retains its
+    # historical meaning. Kernel-issued tokens always populate this binding.
+    capability_name: str = ""
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         t = now if now is not None else time.time()

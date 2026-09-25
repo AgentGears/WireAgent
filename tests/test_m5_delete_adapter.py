@@ -36,12 +36,26 @@ class _OriginalDeleteCapability(DeletePostCapability):
 
 
 class _FakeDeleteExecutor:
-    def __init__(self, *, unknown: bool = False) -> None:
+    def __init__(self, *, unknown: bool = False, unknown_ok: bool = False) -> None:
         self.unknown = unknown
+        self.unknown_ok = unknown_ok
         self.calls = 0
 
     async def execute(self, intent) -> M5DeleteExecution:  # type: ignore[no-untyped-def]
         self.calls += 1
+        if self.unknown_ok:
+            return M5DeleteExecution(
+                result=ok_result(
+                    data={
+                        "result": "delete_submit_returned_ok_but_outcome_unknown",
+                        "m5_effect_state": AttemptState.EFFECT_UNKNOWN.value,
+                    }
+                ),
+                verification=None,
+                attempt_state=AttemptState.EFFECT_UNKNOWN,
+                permit_issued=True,
+                permit_consumed=True,
+            )
         if self.unknown:
             result = hard_failure("delete outcome unknown", failure_category=FailureCategory.UNKNOWN)
             result.data = {
@@ -90,6 +104,7 @@ def _kernel(
     tmp_path: Path,
     *,
     unknown: bool = False,
+    unknown_ok: bool = False,
 ) -> tuple[
     WriteKernel,
     M5DeleteCapabilityAdapter,
@@ -99,7 +114,7 @@ def _kernel(
 ]:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     capability = _OriginalDeleteCapability()
-    executor = _FakeDeleteExecutor(unknown=unknown)
+    executor = _FakeDeleteExecutor(unknown=unknown, unknown_ok=unknown_ok)
     adapter = M5DeleteCapabilityAdapter(capability, executor)  # type: ignore[arg-type]
     dedupe = DedupeStore(ttl_seconds=3600)
     kernel = WriteKernel(
@@ -165,3 +180,54 @@ async def test_delete_unknown_marks_dedupe_and_never_calls_legacy_methods(
         "@actor",
     )
     assert dedupe.check(intent.dedupe_key()) is False
+
+
+async def test_delete_adapter_fails_closed_if_unknown_executor_drifts_to_ok(
+    tmp_path: Path,
+) -> None:
+    kernel, adapter, capability, executor, dedupe = _kernel(tmp_path, unknown_ok=True)
+
+    result = await _confirm_and_execute(kernel, adapter)
+
+    assert result.data["policy"]["verdict"] == "deny"
+    assert result.data["trace"]["execute_ok"] is False
+    assert result.data["trace"]["verify_ok"] is False
+    assert result.data["trace"]["dedupe_recorded"] is True
+    assert result.data["data"]["public_side_effect"] is True
+    assert result.data["data"]["reconciliation_required"] is True
+    assert result.data["data"]["m5_effect_state"] == AttemptState.EFFECT_UNKNOWN.value
+    assert capability.execute_calls == 0
+    assert capability.verify_calls == 0
+    assert executor.calls == 1
+    intent = capability.compose(
+        {"post_url": "https://x.com/actor/status/123", "target_post_id": "123"},
+        "@actor",
+    )
+    assert dedupe.check(intent.dedupe_key()) is False
+
+
+async def test_delete_adapter_verify_unknown_is_reconciliation_failure(
+    tmp_path: Path,
+) -> None:
+    _, adapter, capability, _, _ = _kernel(tmp_path)
+    intent = capability.compose(
+        {"post_url": "https://x.com/actor/status/123", "target_post_id": "123"},
+        "@actor",
+    )
+    adapter._execution.set(  # noqa: SLF001 - targeted transitional-contract regression
+        M5DeleteExecution(
+            result=ok_result(data={"m5_effect_state": AttemptState.EFFECT_UNKNOWN.value}),
+            verification=None,
+            attempt_state=AttemptState.EFFECT_UNKNOWN,
+            permit_issued=True,
+            permit_consumed=True,
+        )
+    )
+
+    result = await adapter.verify(intent, _LegacyBrokerSentinel())
+
+    assert result.ok is False
+    assert result.failure_category is FailureCategory.UNKNOWN
+    assert result.data["public_side_effect"] is True
+    assert result.data["reconciliation_required"] is True
+    assert result.data["m5_effect_state"] == AttemptState.EFFECT_UNKNOWN.value

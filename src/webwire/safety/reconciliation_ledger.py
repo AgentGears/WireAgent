@@ -1,9 +1,13 @@
 """M6 durable evidence-bearing reconciliation ledger.
 
-The reconciliation ledger is safety state, not audit output.  It is deliberately
+The reconciliation ledger is safety state, not audit output. It is deliberately
 orthogonal to ``EffectLedger``: M5 effect history remains immutable while M6
 records one later operator-authorized reconciliation fact for an unresolved
 ``effect_id``.
+
+Layer 1 validates the record schema, internal lineage shape, evidence identity,
+and reconciliation-history uniqueness. Cross-ledger equality with canonical M5
+lineage is enforced by the later RecoveryProjector/coordinator boundary.
 
 Source of truth: ``docs/M6_DESIGN.md`` §§7-8.
 """
@@ -159,7 +163,7 @@ class ReconciliationRecord:
     """One immutable M6 terminal reconciliation fact.
 
     Evidence is stored internally as canonical JSON rather than as the caller's
-    mutable ``dict``.  The public ``evidence`` property returns a fresh decoded
+    mutable ``dict``. The public ``evidence`` property returns a fresh decoded
     object, so post-construction caller mutation cannot alter the fact that was
     validated and hashed.
     """
@@ -229,7 +233,9 @@ class ReconciliationRecord:
         if evidence_hash != actual_hash:
             raise ValueError("evidence_hash does not match canonical evidence JSON")
 
-        actual_timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+        actual_timestamp = (
+            datetime.now(timezone.utc).isoformat() if timestamp is None else timestamp
+        )
         _validate_utc_provenance(actual_timestamp, "timestamp")
 
         object.__setattr__(self, "reconciliation_id", reconciliation_id)
@@ -328,7 +334,7 @@ class ReconciliationLedger:
     """Append-only fsync-backed M6 reconciliation safety ledger.
 
     All objects for one normalized path share a process-local writer lock and
-    durability-ambiguity latch.  The latch is intentionally stronger than M5's
+    durability-ambiguity latch. The latch is intentionally stronger than M5's
     exact-fact retry behavior: while set, ordinary reads and non-exact writes
     fail closed until the exact visible fact is re-durabilized.
     """
@@ -423,13 +429,11 @@ class ReconciliationLedger:
         by_id: dict[str, ReconciliationRecord] = {}
         by_effect: dict[str, ReconciliationRecord] = {}
         for record in records:
-            prior_id = by_id.get(record.reconciliation_id)
-            if prior_id is not None:
+            if record.reconciliation_id in by_id:
                 raise ReconciliationLedgerCorruptError(
                     f"reconciliation_id {record.reconciliation_id!r} appears more than once"
                 )
-            prior_effect = by_effect.get(record.effect_id)
-            if prior_effect is not None:
+            if record.effect_id in by_effect:
                 raise ReconciliationLedgerCorruptError(
                     f"effect_id {record.effect_id!r} has more than one terminal reconciliation"
                 )
@@ -440,14 +444,27 @@ class ReconciliationLedger:
         if not self._path.exists():
             return []
         try:
-            lines = self._path.read_text(encoding="utf-8").splitlines()
+            text = self._path.read_text(encoding="utf-8")
+        except UnicodeError as exc:
+            raise ReconciliationLedgerCorruptError(
+                "reconciliation ledger is not valid UTF-8"
+            ) from exc
         except OSError as exc:
             raise ReconciliationLedgerError(
                 f"reconciliation ledger read failed: {exc!r}"
             ) from exc
 
+        # Every successful append writes one complete JSON object plus newline.
+        # A non-empty file without that final delimiter is a torn tail even when
+        # the JSON object itself happens to be parseable. Blessing it would make
+        # a subsequent O_APPEND concatenate the next record onto the same line.
+        if text and not text.endswith("\n"):
+            raise ReconciliationLedgerCorruptError(
+                "reconciliation ledger has a torn tail (missing final newline)"
+            )
+
         records: list[ReconciliationRecord] = []
-        for lineno, line in enumerate(lines, start=1):
+        for lineno, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
                 continue
             try:
@@ -478,7 +495,13 @@ class ReconciliationLedger:
                     pass
 
     def read_records(self) -> list[ReconciliationRecord]:
-        """Read valid records only when current-process durability is unambiguous."""
+        """Diagnostic validated read; never substitutes for recovery authority.
+
+        This method still refuses a current-process ambiguity latch. Startup and
+        enforcement code that intends to treat rows as recovery authority must
+        call ``read_authoritative()`` so surviving bytes are positively
+        re-durabilized first.
+        """
         with self._lock:
             if self._path_state.ambiguous_fact is not None:
                 raise ReconciliationLedgerAmbiguousError(
@@ -490,8 +513,8 @@ class ReconciliationLedger:
     def read_authoritative(self) -> list[ReconciliationRecord]:
         """Read startup/enforcement authority after re-establishing file durability.
 
-        A missing file is valid empty history.  A current-process ambiguity latch
-        is *not* cleared by this method; only exact-fact retry may do that.  After
+        A missing file is valid empty history. A current-process ambiguity latch
+        is *not* cleared by this method; only exact-fact retry may do that. After
         process restart the old latch no longer exists, so this writable-handle
         fsync establishes current durability before surviving rows become
         authority.
@@ -530,10 +553,7 @@ class ReconciliationLedger:
                         "ambiguous reconciliation fact is not present as one "
                         "complete exact visible row"
                     )
-                try:
-                    self._redurable_existing_file()
-                except ReconciliationLedgerError:
-                    raise
+                self._redurable_existing_file()
                 self._path_state.ambiguous_fact = None
                 return
 
@@ -560,7 +580,6 @@ class ReconciliationLedger:
             self._validate_history([*existing, record])
             payload = (record.to_jsonl() + "\n").encode("utf-8")
             self._ensure_parent()
-            existed = self._path.exists()
 
             fd: Optional[int] = None
             total = 0
@@ -590,11 +609,14 @@ class ReconciliationLedger:
                     except OSError:
                         pass
 
-            if not existed:
-                try:
-                    self._fsync_directory(self._path.parent)
-                except OSError as exc:
-                    self._path_state.ambiguous_fact = record
-                    raise ReconciliationLedgerError(
-                        f"reconciliation ledger directory fsync failed: {exc!r}"
-                    ) from exc
+            # Always durabilize the directory entry. This is required not only
+            # for the ordinary first append but also after a prior clean failure
+            # where O_CREAT produced an empty visible file before zero bytes of
+            # the reconciliation record were written.
+            try:
+                self._fsync_directory(self._path.parent)
+            except OSError as exc:
+                self._path_state.ambiguous_fact = record
+                raise ReconciliationLedgerError(
+                    f"reconciliation ledger directory fsync failed: {exc!r}"
+                ) from exc

@@ -1,21 +1,19 @@
-"""Tests for Phase 4b post_text — the first live public content write.
-
-Focuses on the safety-critical execution paths:
-- Composer read-back assertion (step 10: ABORT if text mismatches).
-- Final kill-switch before submit (step 11: ABORT if tripped).
-- Conservative failure semantics (public_side_effect flag).
-- Token binding to normalized text.
-- Dedupe by text hash.
-"""
+"""Dispatcher-level tests for the M5-migrated ``post_text`` capability."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+from webwire.broker import ReadOnlyBroker
 from webwire.config import WebWireConfig
 from webwire.dispatcher import Dispatcher
-from webwire.envelope import ok_result
+from webwire.envelope import ActionResult, ok_result
+from webwire.safety.effect_ledger import EffectState
+from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+from webwire.safety.m5_post_text_executor import M5PostTextExecutor
+from webwire.safety.scoped_authority import ScopedAuthorityBroker
 from webwire.session import SessionManager
 
 
@@ -27,168 +25,282 @@ class _StubSB:
 class _StubSessionManager(SessionManager):
     def __init__(self, config: WebWireConfig) -> None:
         super().__init__(config)
-        self._sb = _StubSB()
+        self._sb = _StubSB()  # type: ignore[assignment]
         self._started = True
+        self.set_resolved_handle("@actor")
 
 
 class _FakePostBroker:
-    """Fake write broker that simulates the post composer flow.
-    Set composer_text_after_fill to control the read-back result.
-    Set should_fail_submit to simulate a submit error."""
-    def __init__(self, composer_text_after_fill: str = "test", kill=None):
-        self._kill = kill
-        self._composer_text = composer_text_after_fill
+    """Scoped content broker used by the Dispatcher migration tests."""
+
+    def __init__(self, composer_text_after_fill: str | None = None) -> None:
+        self._composer_text_after_fill = composer_text_after_fill
+        self._composer_text = ""
         self.fill_calls: list[str] = []
         self.submit_clicked = False
+        self.cleanup_calls = 0
+        self.gate_calls = 0
 
-    async def fill_composer(self, text: str) -> Any:
+    async def fill_composer(self, text: str) -> ActionResult:
         self.fill_calls.append(text)
+        self._composer_text = text
         return ok_result(data={"filled": True})
 
-    async def read_composer_text(self) -> Any:
-        return ok_result(data={"composer_text": self._composer_text})
+    async def read_composer_text(self) -> ActionResult:
+        text = (
+            self._composer_text_after_fill
+            if self._composer_text_after_fill is not None
+            else self._composer_text
+        )
+        return ok_result(data={"composer_text": text})
 
-    async def click_submit(self) -> Any:
+    async def verify_attachment_ready(self) -> ActionResult:
+        return ok_result(data={"ready": True})
+
+    async def count_attachments(self) -> ActionResult:
+        return ok_result(data={"count": 0})
+
+    async def attach_media(self, image_path: str) -> ActionResult:
+        raise AssertionError(f"plain post must not attach media: {image_path}")
+
+    async def close_composer(self) -> ActionResult:
+        self.cleanup_calls += 1
+        self._composer_text = ""
+        return ok_result(data={"closed": True})
+
+    async def click_submit(
+        self,
+        *,
+        _commit_gate,  # type: ignore[no-untyped-def]
+        _precommit_check,  # type: ignore[no-untyped-def]
+        _expected_text: str,
+        _expected_attachments: int,
+    ) -> ActionResult:
+        assert _expected_text == self._composer_text
+        assert _expected_attachments == 0
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        self.gate_calls += 1
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
         self.submit_clicked = True
-        return ok_result(data={"clicked": True})
-
-    async def capture_posted_url(self) -> Any:
-        if self.submit_clicked:
-            return ok_result(data={"posted_url": "https://x.com/test/status/123", "posted_post_id": "123"})
-        return ok_result(data={"posted_url": None})
+        return ok_result(data={"submitted": True})
 
 
-def _make_dispatcher(tmp_path: Path, fake_broker) -> Dispatcher:
+class _Evidence:
+    async def capture_pre_submit_ids(self) -> ActionResult:
+        return ok_result(data={"status_ids": ["10", "11"]})
+
+    async def capture_new_post(
+        self,
+        pre_submit_ids: set[str],
+        *,
+        exclude_ids: set[str] | None = None,
+    ) -> ActionResult:
+        assert pre_submit_ids == {"10", "11"}
+        assert exclude_ids in (None, set())
+        return ok_result(
+            data={
+                "post_id": "123",
+                "post_url": "https://x.com/actor/status/123",
+            }
+        )
+
+    async def verify_post_text(
+        self,
+        post_url: str,
+        normalized_text: str,
+    ) -> ActionResult:
+        assert post_url == "https://x.com/actor/status/123"
+        return ok_result(
+            data={
+                "text_matches": True,
+                "normalized_text": normalized_text,
+            }
+        )
+
+
+def _make_dispatcher(
+    tmp_path: Path,
+    fake_broker: _FakePostBroker,
+) -> Dispatcher:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
-    sm = _StubSessionManager(cfg)
-    d = Dispatcher(cfg, session_manager=sm)
-    from webwire.broker import ReadOnlyBroker
-    d._broker = ReadOnlyBroker(sm.sb, d._kill, cfg)
-    d._write_kernel._write_broker_factory = lambda: fake_broker
-    return d
+    session = _StubSessionManager(cfg)
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+    dispatcher._broker = ReadOnlyBroker(  # type: ignore[arg-type]
+        session.sb,
+        dispatcher._kill,
+        cfg,
+    )
+    scoped = ScopedAuthorityBroker(
+        fake_broker,
+        dispatcher._m5_gateway,
+    )
+    runtime = M5ExecutionRuntime(
+        scoped_authority=scoped,
+        commit_gateway=dispatcher._m5_gateway,
+    )
+    executor = M5PostTextExecutor(
+        runtime=runtime,
+        evidence_reader=_Evidence(),
+    )
+    dispatcher._m5_stack = SimpleNamespace(  # type: ignore[assignment]
+        post_text_executor=executor,
+    )
+    dispatcher._m5_post_text_adapter = None
+    dispatcher._write_kernel._write_broker_factory = lambda: object()  # type: ignore[attr-defined]
+    return dispatcher
 
 
-# -- Pipeline entry (confirmation gate) ------------------------------------
+async def _confirm(
+    dispatcher: Dispatcher,
+    text: str,
+) -> str:
+    result = await dispatcher.invoke("post_text", {"text": text})
+    assert result.ok is True
+    assert result.data["policy"]["verdict"] == "confirmation_required"
+    return result.data["data"]["confirmation_token"]
+
 
 async def test_post_text_first_invoke_confirmation_required(tmp_path: Path) -> None:
     fake = _FakePostBroker()
-    d = _make_dispatcher(tmp_path, fake)
-    r = await d.invoke("post_text", {"text": "Hello world"})
-    assert r.data["policy"]["verdict"] == "confirmation_required"
-    assert "confirmation_token" in r.data["data"]
-    assert fake.submit_clicked is False  # NOT submitted yet
+    dispatcher = _make_dispatcher(tmp_path, fake)
+
+    result = await dispatcher.invoke("post_text", {"text": "Hello world"})
+
+    assert result.ok is True
+    assert result.data["policy"]["verdict"] == "confirmation_required"
+    assert "confirmation_token" in result.data["data"]
+    assert fake.submit_clicked is False
 
 
 async def test_post_text_preview_warns_irreversible(tmp_path: Path) -> None:
-    fake = _FakePostBroker()
-    d = _make_dispatcher(tmp_path, fake)
-    r = await d.invoke("post_text", {"text": "Test"})
-    # Preview is in the confirmation_required response data.
-    warnings = r.data["data"].get("warnings", [])
-    preview = r.data["data"].get("preview", "")
+    dispatcher = _make_dispatcher(tmp_path, _FakePostBroker())
+
+    result = await dispatcher.invoke("post_text", {"text": "Test"})
+
+    warnings = result.data["data"].get("warnings", [])
+    preview = result.data["data"].get("preview", "")
     combined = preview + " ".join(warnings)
     assert "IRREVERSIBLE" in combined or "irreversible" in combined
 
 
-# -- Composer read-back assertion (step 10) --------------------------------
-
 async def test_post_text_composer_mismatch_aborts_before_submit(tmp_path: Path) -> None:
-    """ChatGPT's step 10: if DOM text ≠ normalized_text, ABORT. No submit."""
     fake = _FakePostBroker(composer_text_after_fill="DIFFERENT TEXT")
-    d = _make_dispatcher(tmp_path, fake)
-    r1 = await d.invoke("post_text", {"text": "Expected text"})
-    token = r1.data["data"]["confirmation_token"]
-    r2 = await d.invoke("post_text", {"text": "Expected text", "confirmation_token": token})
-    # Execute should have failed with pre_submit_mismatch.
-    exec_data = r2.data.get("data", {})
-    assert exec_data.get("result") == "pre_submit_mismatch"
-    assert exec_data.get("public_side_effect") is False
-    assert fake.submit_clicked is False  # NO submit
+    dispatcher = _make_dispatcher(tmp_path, fake)
+    token = await _confirm(dispatcher, "Expected text")
 
+    result = await dispatcher.invoke(
+        "post_text",
+        {"text": "Expected text", "confirmation_token": token},
+    )
 
-async def test_post_text_matching_composer_proceeds_to_submit(tmp_path: Path) -> None:
-    """When composer text matches, execution proceeds through submit."""
-    fake = _FakePostBroker(composer_text_after_fill="Hello world")
-    d = _make_dispatcher(tmp_path, fake)
-    r1 = await d.invoke("post_text", {"text": "Hello world"})
-    token = r1.data["data"]["confirmation_token"]
-    await d.invoke("post_text", {"text": "Hello world", "confirmation_token": token})
-    # Submit should have been clicked.
-    assert fake.submit_clicked is True
-
-
-# -- Final kill-switch before submit (step 11) -----------------------------
-
-async def test_post_text_kill_before_submit_aborts(tmp_path: Path) -> None:
-    """Kill switch tripped AFTER fill but BEFORE submit → killed_before_submit.
-    No submit clicked. No public side effect."""
-    fake = _FakePostBroker(composer_text_after_fill="test", kill=None)
-    d = _make_dispatcher(tmp_path, fake)
-    r1 = await d.invoke("post_text", {"text": "test"})
-    token = r1.data["data"]["confirmation_token"]
-    # Trip the kill switch that the fake broker checks.
-    fake._kill = d._kill  # wire it
-    d._kill.trip()
-    r2 = await d.invoke("post_text", {"text": "test", "confirmation_token": token})
-    # The dispatcher-level kill fires first (before the kernel).
-    assert r2.ok is False
-    assert r2.failure_category.value == "security"
+    assert result.ok is False
+    assert result.data["policy"]["verdict"] == "deny"
+    assert result.data["trace"]["execute_ok"] is False
     assert fake.submit_clicked is False
+    assert fake.cleanup_calls == 1
+    assert dispatcher._m5_ledger.read_records() == []
 
 
-# -- Token binding ----------------------------------------------------------
+async def test_post_text_matching_composer_records_confirmed_effect(tmp_path: Path) -> None:
+    fake = _FakePostBroker()
+    dispatcher = _make_dispatcher(tmp_path, fake)
+    token = await _confirm(dispatcher, "Hello world")
+
+    result = await dispatcher.invoke(
+        "post_text",
+        {"text": "Hello world", "confirmation_token": token},
+    )
+
+    assert result.data["policy"]["verdict"] == "allow"
+    assert result.data["trace"]["execute_ok"] is True
+    assert result.data["trace"]["verify_ok"] is True
+    assert fake.submit_clicked is True
+    assert fake.gate_calls == 1
+    assert [record.state for record in dispatcher._m5_ledger.read_records()] == [
+        EffectState.RESERVED,
+        EffectState.EFFECT_CONFIRMED,
+    ]
+
+
+async def test_post_text_kill_before_second_invoke_aborts(tmp_path: Path) -> None:
+    fake = _FakePostBroker()
+    dispatcher = _make_dispatcher(tmp_path, fake)
+    token = await _confirm(dispatcher, "test")
+    dispatcher.kill_switch.trip()
+
+    result = await dispatcher.invoke(
+        "post_text",
+        {"text": "test", "confirmation_token": token},
+    )
+
+    assert result.ok is False
+    assert result.failure_category.value == "security"
+    assert fake.submit_clicked is False
+    assert dispatcher._m5_ledger.read_records() == []
+
 
 async def test_post_text_token_binds_text(tmp_path: Path) -> None:
-    fake = _FakePostBroker()
-    d = _make_dispatcher(tmp_path, fake)
-    r1 = await d.invoke("post_text", {"text": "Text A"})
-    token = r1.data["data"]["confirmation_token"]
-    r2 = await d.invoke("post_text", {"text": "Text B", "confirmation_token": token})
-    assert r2.ok is False
-    assert r2.data["policy"]["blocked_by"] == "intent_mismatch"
+    dispatcher = _make_dispatcher(tmp_path, _FakePostBroker())
+    token = await _confirm(dispatcher, "Text A")
+
+    result = await dispatcher.invoke(
+        "post_text",
+        {"text": "Text B", "confirmation_token": token},
+    )
+
+    assert result.ok is False
+    assert result.data["policy"]["blocked_by"] == "intent_mismatch"
+    assert dispatcher._m5_ledger.read_records() == []
 
 
-# -- Dedupe ----------------------------------------------------------------
+async def test_post_text_dedupe_blocks_confirmed_replay(tmp_path: Path) -> None:
+    dispatcher = _make_dispatcher(tmp_path, _FakePostBroker())
+    token = await _confirm(dispatcher, "test post")
+    executed = await dispatcher.invoke(
+        "post_text",
+        {"text": "test post", "confirmation_token": token},
+    )
+    assert executed.ok is True
 
-async def test_post_text_dedupe_blocks_replay_on_success(tmp_path: Path) -> None:
-    """Dedupe only records on successful execution. The fake broker's submit
-    succeeds but _read_back_post_text fails (no _sb on fake), so the execute
-    returns a degraded failure and dedupe is NOT recorded. This is CORRECT
-    behavior: don't dedupe-block a failed write (the user may want to retry).
+    replay = await dispatcher.invoke("post_text", {"text": "test post"})
 
-    To test dedupe, we need a fully successful execute — which requires the
-    real browser's read-back. This is covered by the live smoke test instead.
-    Here we verify the dedupe key is correctly derived from the text hash."""
+    assert replay.ok is False
+    assert replay.data["policy"]["blocked_by"] == "dedupe"
+
+
+async def test_post_text_dedupe_key_contains_normalized_text_hash(tmp_path: Path) -> None:
     from webwire.safety.text_normalize import text_hash
-    fake = _FakePostBroker(composer_text_after_fill="test post")
-    d = _make_dispatcher(tmp_path, fake)
-    r1 = await d.invoke("post_text", {"text": "test post"})
-    # Verify the dedupe key includes the text hash.
-    dedupe_key = r1.data["trace"]["intent"]["dedupe_key"]
-    expected_hash = text_hash("test post")
-    assert expected_hash in dedupe_key
+
+    dispatcher = _make_dispatcher(tmp_path, _FakePostBroker())
+    result = await dispatcher.invoke("post_text", {"text": "test post"})
+
+    dedupe_key = result.data["trace"]["intent"]["dedupe_key"]
+    assert text_hash("test post") in dedupe_key
 
 
-# -- Normalization in pipeline ---------------------------------------------
+async def test_post_text_normalizes_before_scoped_fill(tmp_path: Path) -> None:
+    fake = _FakePostBroker()
+    dispatcher = _make_dispatcher(tmp_path, fake)
+    token = await _confirm(dispatcher, "  hello   world  ")
 
-async def test_post_text_normalizes_before_compose(tmp_path: Path) -> None:
-    """The text passed to fill_composer is the normalized version."""
-    fake = _FakePostBroker(composer_text_after_fill="hello world")
-    d = _make_dispatcher(tmp_path, fake)
-    r1 = await d.invoke("post_text", {"text": "  hello   world  "})
-    token = r1.data["data"]["confirmation_token"]
-    await d.invoke("post_text", {"text": "  hello   world  ", "confirmation_token": token})
-    # The fill_composer should have received the normalized text.
-    assert len(fake.fill_calls) == 1
-    assert fake.fill_calls[0] == "hello world"  # normalized
+    result = await dispatcher.invoke(
+        "post_text",
+        {"text": "  hello   world  ", "confirmation_token": token},
+    )
 
+    assert result.ok is True
+    assert fake.fill_calls == ["hello world"]
 
-# -- Kill switch at dispatcher level ----------------------------------------
 
 async def test_post_text_dispatcher_kill_blocks(tmp_path: Path) -> None:
-    fake = _FakePostBroker()
-    d = _make_dispatcher(tmp_path, fake)
-    d.kill_switch.trip()
-    r = await d.invoke("post_text", {"text": "test"})
-    assert r.ok is False
-    assert r.failure_category.value == "security"
+    dispatcher = _make_dispatcher(tmp_path, _FakePostBroker())
+    dispatcher.kill_switch.trip()
+
+    result = await dispatcher.invoke("post_text", {"text": "test"})
+
+    assert result.ok is False
+    assert result.failure_category.value == "security"

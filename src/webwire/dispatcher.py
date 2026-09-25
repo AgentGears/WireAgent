@@ -101,6 +101,7 @@ class Dispatcher:
             DEFAULT_REGISTRY,
             DedupeStore,
             EffectLedger,
+            RecoveryGuard,
             TokenBucket,
             WriteKernel,
         )
@@ -114,6 +115,7 @@ class Dispatcher:
         # the exact same KillSwitch as Dispatcher, so a trip revokes outstanding
         # grant/permit epochs even if no capability is currently running.
         self._m5_ledger = EffectLedger(self._config)
+        self._m5_recovery = RecoveryGuard(self._m5_ledger)
         self._m5_epoch = AuthorizationEpoch()
         self._m5_gateway = CommitGateway(
             ledger=self._m5_ledger,
@@ -142,13 +144,30 @@ class Dispatcher:
             dedupe=self._dedupe,
             journal=self._journal,
             write_broker_factory=_make_write_broker,
+            recovery_guard=self._m5_recovery,
         )
         self._register_defaults()
 
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> ActionResult:
-        """Start the session and install the coherent live M5 authority stack."""
+        """Hydrate recovery authority, then install the coherent live M5 stack."""
+        # Recovery truth is M5 authority, not diagnostics. Establish it before
+        # launching/restoring a browser so corrupt or unreadable effects history
+        # cannot accidentally become an empty replay-denial set.
+        try:
+            self._m5_recovery.hydrate()
+        except Exception as exc:  # RecoveryGuardUnavailable; keep boundary fail-closed
+            logger.exception("M5 recovery hydration failed")
+            from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import hard_failure
+
+            return hard_failure(
+                f"M5 recovery hydration failed: {exc!r}",
+                failure_category=FailureCategory.SECURITY,
+            )
+
         r = await self._session.start()
         if not r.ok:
             return r
@@ -419,6 +438,7 @@ class Dispatcher:
                         self._broker,
                         input,
                         actor_identity=actor,
+                        enforce_recovery_guard=False,
                     )
                 else:
                     from super_browser.results.types import FailureCategory

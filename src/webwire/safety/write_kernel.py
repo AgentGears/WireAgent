@@ -5,7 +5,7 @@ Every write capability MUST pass through this kernel; it does not call the
 broker directly for mutations.
 
 Hardened design (review conversation 6a4fb320):
-- Q1: confirmation tokens bound to immutable intent hashes (NOT bare confirm=True).
+- Q1: confirmation tokens bind one capability + immutable intent hash (NOT bare confirm=True).
 - Q2: per-action + global token bucket.
 - Q3: semantic dedupe, journal-hydrated.
 - Q4: multi-dimensional risk metadata, 4 derived tiers.
@@ -30,17 +30,20 @@ from webwire.safety.models import (
     PolicyVerdict,
     WriteIntent,
 )
+from webwire.safety.recovery_guard import RecoveryGuardUnavailable
 from webwire.safety.risk_registry import RiskRegistry
 from webwire.safety.token_bucket import TokenBucket
 
 if TYPE_CHECKING:
     from webwire.broker import ReadOnlyBroker
+    from webwire.safety.recovery_guard import RecoveryGuard
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["WriteKernel", "WriteCapability", "PreviewResult"]
 
 _CONFIRM_TTL_S = 300.0  # confirmation tokens expire after 5 min
+_RECOVERY_GUARD_EXEMPT_CAPABILITIES = frozenset({"compose_post"})
 
 
 @dataclass
@@ -114,6 +117,7 @@ class WriteKernel:
         *,
         write_broker_factory=None,  # callable(kill_switch) -> WriteBroker; set by dispatcher
         auto_approve_private: bool = False,
+        recovery_guard: Optional["RecoveryGuard"] = None,
     ) -> None:
         self._kill = kill_switch
         self._risk = risk_registry
@@ -122,6 +126,7 @@ class WriteKernel:
         self._journal = journal
         self._write_broker_factory = write_broker_factory
         self._auto_approve_private = auto_approve_private
+        self._recovery_guard = recovery_guard
         # Pending confirmation tokens: token_str -> ConfirmationToken
         self._pending_tokens: dict[str, ConfirmationToken] = {}
 
@@ -131,13 +136,21 @@ class WriteKernel:
         broker: ReadOnlyBroker,
         input: dict[str, Any],
         actor_identity: Optional[str] = None,
+        *,
+        enforce_recovery_guard: Optional[bool] = None,
     ) -> ActionResult:
         """Run the full write pipeline. Returns an ActionResult.
 
         First call (no confirmation_token in input): runs compose→preview→policy,
         returns CONFIRMATION_REQUIRED with a token.
-        Second call (confirmation_token present): validates the token, runs
-        execute→journal→verify.
+        Second call (confirmation_token present): validates the capability-bound
+        token, then runs execute→journal→verify.
+
+        Layer 6 checks durable unresolved semantic replay before any browser-
+        capable preview. The only exemption is the named ``compose_post`` shell,
+        whose execution contract has no remote mutation. The transitional
+        ``enforce_recovery_guard`` keyword is accepted for Dispatcher source
+        compatibility but cannot grant an exemption to any other capability.
         """
         trace: dict[str, Any] = {"action": write_cap.name, "stages": []}
 
@@ -153,10 +166,11 @@ class WriteKernel:
         # 2. Compose the intent.
         intent = write_cap.compose(input, actor_identity)
         risk_tier = intent.risk_tier()
+        semantic_key = intent.dedupe_key()
         trace["intent"] = {
             "action_type": intent.action_type,
             "target": f"{intent.target_type}:{intent.target_id}",
-            "dedupe_key": intent.dedupe_key(),
+            "dedupe_key": semantic_key,
             "intent_hash": intent.intent_hash(),
             "risk_tier": risk_tier.value,
         }
@@ -194,6 +208,78 @@ class WriteKernel:
                 blocked_by="risk_meta_mismatch",
             ), trace, None)
 
+        # 2c. Layer-6 durable recovery gate. compose() is declarative; preview()
+        # may navigate. Refresh from the EffectLedger on every guarded write so
+        # an EFFECT_UNKNOWN created while this process survives cannot be replayed
+        # merely because startup hydration happened earlier. The exemption is an
+        # internal allowlist, not a caller-controlled switch.
+        recovery_exempt = write_cap.name in _RECOVERY_GUARD_EXEMPT_CAPABILITIES
+        if enforce_recovery_guard is False and not recovery_exempt:
+            trace["recovery_exemption_ignored"] = True
+        if not recovery_exempt and self._recovery_guard is not None:
+            try:
+                recovery_block = self._recovery_guard.require_clear(
+                    semantic_key,
+                    refresh=True,
+                )
+            except RecoveryGuardUnavailable:
+                trace["stages"].append("denied:reconciliation_required")
+                trace["recovery"] = {
+                    "available": False,
+                    "semantic_key": semantic_key,
+                }
+                return self._finish(
+                    PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason=(
+                            "M5 recovery authority is unavailable; reconciliation "
+                            "is required before mutation"
+                        ),
+                        risk_tier=risk_tier,
+                        intent_hash=intent.intent_hash(),
+                        blocked_by="reconciliation_required",
+                    ),
+                    trace,
+                    {
+                        "reconciliation_required": True,
+                        "recovery_unavailable": True,
+                        "semantic_key": semantic_key,
+                    },
+                )
+            if recovery_block is not None:
+                effects = [
+                    {
+                        "effect_id": effect.effect_id,
+                        "raw_state": effect.raw_state.value,
+                        "effective_state": effect.effective_state.value,
+                    }
+                    for effect in recovery_block.effects
+                ]
+                trace["stages"].append("denied:reconciliation_required")
+                trace["recovery"] = {
+                    "available": True,
+                    "semantic_key": semantic_key,
+                    "effects": effects,
+                }
+                return self._finish(
+                    PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason=(
+                            "durable unresolved effect requires reconciliation before "
+                            "semantic replay"
+                        ),
+                        risk_tier=risk_tier,
+                        intent_hash=intent.intent_hash(),
+                        blocked_by="reconciliation_required",
+                    ),
+                    trace,
+                    {
+                        "reconciliation_required": True,
+                        "semantic_key": semantic_key,
+                        "effects": effects,
+                    },
+                )
+
         # 3. Policy evaluation (before preview — cheap gates first).
 
         # 3a. Token bucket.
@@ -206,7 +292,7 @@ class WriteKernel:
             ), trace, None)
 
         # 3b. Dedupe.
-        if not self._dedupe.check(intent.dedupe_key()):
+        if not self._dedupe.check(semantic_key):
             trace["stages"].append("denied:dedupe")
             return self._finish(PolicyDecision(
                 verdict=PolicyVerdict.DENY, reason="duplicate action within TTL",
@@ -227,11 +313,11 @@ class WriteKernel:
         preview = await write_cap.preview(intent, broker)
         trace["preview"] = preview.summary
 
-        # 5. Confirmation gate (token-bound, review Q1).
+        # 5. Confirmation gate (capability + intent bound).
         provided_token = input.get("confirmation_token")
         if provided_token is None:
             # First phase: issue a token and return confirmation_required.
-            token = self._issue_token(intent)
+            token = self._issue_token(intent, write_cap.name)
             trace["stages"].append("confirmation_required")
             return self._finish(PolicyDecision(
                 verdict=PolicyVerdict.CONFIRMATION_REQUIRED,
@@ -246,12 +332,18 @@ class WriteKernel:
                 "warnings": preview.warnings,
                 "confirmation_token": token.token,
                 "intent_hash": token.intent_hash,
+                "capability_name": token.capability_name,
                 "expires_at": token.expires_at,
             })
 
         # Second phase: validate the token.
         pending = self._pending_tokens.get(provided_token)
-        decision = self._validate_token(pending, intent, input)
+        decision = self._validate_token(
+            pending,
+            intent,
+            input,
+            capability_name=write_cap.name,
+        )
         if decision is not None:
             trace["stages"].append(f"denied:{decision.blocked_by}")
             return self._finish(decision, trace, None)
@@ -281,7 +373,7 @@ class WriteKernel:
             # (dry_run=True, e.g. compose_post's deliberate no-op) records
             # nothing — dedupe guards side effects, and a no-op has none
             # (otherwise a confirmed dry-run would block the real post).
-            self._dedupe.record(intent.dedupe_key())
+            self._dedupe.record(semantic_key)
             trace["dedupe_recorded"] = True
         else:
             trace["dedupe_recorded"] = False
@@ -309,15 +401,21 @@ class WriteKernel:
 
     # -- internals -----------------------------------------------------------
 
-    def _issue_token(self, intent: WriteIntent) -> ConfirmationToken:
-        """Issue a confirmation token bound to the intent hash."""
+    def _issue_token(
+        self,
+        intent: WriteIntent,
+        capability_name: str,
+    ) -> ConfirmationToken:
+        """Issue a token bound to one capability and one immutable intent."""
         import secrets
+
         token_str = secrets.token_urlsafe(16)
         now = time.time()
         token = ConfirmationToken(
             token=token_str,
             intent_hash=intent.intent_hash(),
             risk_tier=intent.risk_tier(),
+            capability_name=capability_name,
             created_at=now,
             expires_at=now + _CONFIRM_TTL_S,
         )
@@ -325,10 +423,15 @@ class WriteKernel:
         return token
 
     def _validate_token(
-        self, token: Optional[ConfirmationToken], intent: WriteIntent, input: dict[str, Any],
+        self,
+        token: Optional[ConfirmationToken],
+        intent: WriteIntent,
+        input: dict[str, Any],
+        *,
+        capability_name: str,
     ) -> Optional[PolicyDecision]:
-        """Validate the confirmation token. Returns a DENY decision if invalid,
-        None if valid."""
+        """Return a DENY decision for invalid confirmation authority, else None."""
+        del input
         now = time.time()
         if token is None:
             return PolicyDecision(
@@ -347,6 +450,16 @@ class WriteKernel:
                 verdict=PolicyVerdict.DENY, reason="confirmation token already used",
                 risk_tier=intent.risk_tier(), intent_hash=intent.intent_hash(),
                 blocked_by="consumed_token",
+            )
+        if token.capability_name != capability_name:
+            return PolicyDecision(
+                verdict=PolicyVerdict.DENY,
+                reason=(
+                    "capability changed since confirmation "
+                    f"({token.capability_name!r} != {capability_name!r})"
+                ),
+                risk_tier=intent.risk_tier(), intent_hash=intent.intent_hash(),
+                blocked_by="capability_mismatch",
             )
         if token.intent_hash != intent.intent_hash():
             return PolicyDecision(

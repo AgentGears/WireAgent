@@ -9,8 +9,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from webwire.config import WebWireConfig
+from webwire.dispatcher import Dispatcher
+from webwire.envelope import ActionResult, ok_result
 from webwire.journal import Journal, JournalRecord, read_recent_write_records
 from webwire.safety import (
     DedupeStore,
@@ -57,6 +61,22 @@ def _unknown_record(*, semantic_key: str) -> EffectLedgerRecord:
     )
 
 
+class _StartSession:
+    """Minimal SessionManager-shaped object for Dispatcher.start()."""
+
+    def __init__(self) -> None:
+        self.sb: Any = object()
+        self.session_loaded_state = "none"
+        self.ownership = "owned"
+        self.resolved_handle = None
+        self.start_calls = 0
+
+    async def start(self) -> ActionResult:
+        self.start_calls += 1
+        return ok_result(data={})
+
+
+
 def test_journal_reader_is_retired_as_safety_input(tmp_path: Path) -> None:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     journal = Journal(cfg)
@@ -87,6 +107,38 @@ def test_token_bucket_does_not_replay_journal_budget_after_layer7(tmp_path: Path
     records = read_recent_write_records(cfg.journal_path(), 0.0)
     assert bucket.hydrate_records(records) == 0
     assert bucket.remaining("post") == 3
+
+
+async def test_dispatcher_start_does_not_hydrate_audit_journal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A populated audit journal cannot seed a fresh live safety window."""
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    journal = Journal(cfg)
+    for index in range(10):
+        journal.append(
+            _audit_write(
+                f"pre-restart-{index}",
+                dedupe_key=f"@actor|post|none|none|v{index}",
+            )
+        )
+
+    session = _StartSession()
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+
+    def _install(_: Any) -> None:
+        dispatcher._m5_stack = SimpleNamespace(read_broker=object())  # type: ignore[assignment]
+
+    monkeypatch.setattr(dispatcher, "_install_m5_live_stack", _install)
+
+    result = await dispatcher.start()
+
+    assert result.ok is True
+    assert session.start_calls == 1
+    assert dispatcher._dedupe.size() == 0
+    assert dispatcher._bucket.remaining("post") == 3
 
 
 def test_process_local_dedupe_still_blocks_live_duplicate() -> None:
@@ -152,3 +204,23 @@ def test_corrupt_journal_cannot_change_recovery_projection(tmp_path: Path) -> No
 
     assert status.available is True
     assert status.unresolved_semantic_keys == (semantic_key,)
+
+
+def test_dispatcher_audit_policy_uses_actual_kernel_verdict() -> None:
+    result = ok_result(
+        data={
+            "policy": {"verdict": "confirmation_required"},
+            "trace": {"intent": {}},
+        }
+    )
+
+    assert (
+        Dispatcher._audit_policy_decision("allowed", result)
+        == "confirmation_required"
+    )
+
+
+def test_dispatcher_audit_policy_preserves_pre_kernel_denial() -> None:
+    result = ok_result(data={"policy": {"verdict": "allow"}})
+
+    assert Dispatcher._audit_policy_decision("denied", result) == "denied"

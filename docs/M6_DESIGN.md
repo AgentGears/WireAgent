@@ -1,7 +1,7 @@
 # M6 — Evidence-Bearing Reconciliation & Qualification Boundary
 
 ```text
-Status:   CANDIDATE — MAINTAINER-FIRST REVIEW IN PROGRESS
+Status:   CANDIDATE — MAINTAINER-FIRST REVIEW FROZEN
 Base:     main 666064b3c5dc3f905be11321a3604460410dd583
 Runtime:  M5 baseline 0c62402ae01b50d7662b3978cbf2bee4109aa035
 Scope:    reconcile durable M5 uncertainty without rewriting history;
@@ -325,7 +325,7 @@ no generic automatic negative-proof predicate.
 
 ```text
 ReconciliationRecord
-  reconciliation_id: non-empty string
+  reconciliation_id: non-empty globally unique string
   effect_id:          non-empty string
 
   # copied immutable M5 lineage
@@ -355,6 +355,10 @@ RESERVED | EFFECT_UNKNOWN
 ```
 
 Unknown effects, settled M5 effects, or changed lineage are invalid targets.
+
+`reconciliation_id` is globally unique within one ReconciliationLedger history.
+Reusing an existing ID for a different effect or different fact is corruption.
+The only accepted reuse is exact-fact re-durability of that same record.
 
 ### 7.2 Evidence and canonical hash
 
@@ -426,6 +430,9 @@ evidence
 ```
 
 Timestamp may differ only for exact-fact re-durability comparison.
+
+The ledger also validates global `reconciliation_id` uniqueness; the same ID on
+a non-identical record is corruption even if the effect differs.
 
 ### 8.1 Durability
 
@@ -616,7 +623,7 @@ Raw diagnostics may read files without this fence, but they are not authority.
 
 WriteKernel confirmation-token issue/validate/consume/invalidate operations also
 use a synchronized token-store fence. Terminal reconciliation uses the
-publication fence first, then the token-store fence for invalidation.
+publication fence first, then token-store fence for invalidation.
 
 Authoritative lock order:
 
@@ -628,18 +635,18 @@ ReconciliationPublicationFence
     -> RecoveryGuard publication/cache lock
 ```
 
-Implementations may collapse adjacent internal locks but must preserve the same
-observable ordering and avoid reverse acquisition.
+Implementations may collapse adjacent internal locks but preserve observable
+ordering and avoid reverse acquisition.
 
 A write-side RecoveryGuard refresh acquires the publication fence before reading
-composite recovery truth. Therefore it either:
+composite truth. It therefore either:
 
-1. observes the old unresolved state before reconciliation wins; or
-2. waits until durable reconciliation + pending-token invalidation are complete,
+1. observes old unresolved state before reconciliation wins; or
+2. waits until durable reconciliation + pending-token invalidation complete,
    then observes clear truth.
 
-There is no state in which the write path can observe reconciliation-clear while
-pre-resolution confirmation authority is still valid.
+There is no supported state in which a write sees reconciliation-clear while
+pre-resolution confirmation authority remains valid.
 
 ---
 
@@ -677,8 +684,8 @@ acquire ReconciliationPublicationFence
 ```
 
 If no active Dispatcher/WriteKernel exists, there are no supported pending
-confirmation tokens to invalidate; restart/standalone recovery already begins
-with an empty token store.
+tokens to invalidate; restart/standalone recovery already begins with an empty
+token store.
 
 If append reports ambiguity, frozen fact/bounded authority lineage remains only
 for exact re-durability. Publication fence is released with recovery still
@@ -703,8 +710,8 @@ synchronized. A token racing invalidation has one ordering:
 - token operation wins before invalidation; or
 - invalidation wins and token is rejected.
 
-For a semantic key that is still recovery-blocked, a token cannot legitimately
-cross the RecoveryGuard boundary before reconciliation publication completes.
+For a semantic key still recovery-blocked, a token cannot legitimately cross
+RecoveryGuard before reconciliation publication completes.
 
 ### 12.3 Concurrency
 
@@ -733,7 +740,7 @@ ReconciliationLedger ---/
 ```
 
 `EffectLedger.recovery_projection()` may remain an M5 diagnostic/helper; M6
-enforcement uses the composite projector under the publication fence.
+enforcement uses the composite projector under publication fence.
 
 | Raw M5 state | Reconciliation | Composite disposition | Guard |
 |---|---|---|---|
@@ -763,8 +770,8 @@ old EffectPermit:        not reconstructed/reused
 old EffectAttempt:       historical only
 ```
 
-A later mutation must traverse all current independent policy gates and obtain
-new human confirmation before new M5 grant/attempt authority exists.
+A later mutation traverses all current independent gates and obtains new human
+confirmation before new M5 grant/attempt authority exists.
 
 ---
 
@@ -773,8 +780,8 @@ new human confirmation before new M5 grant/attempt authority exists.
 1. Startup validates both safety ledgers before browser mutation is available.
 2. Existing reconciliation history is re-durability-fsynced before it may clear
    recovery in a new process.
-3. Every supported M5 mutation takes the publication fence and refreshes the
-   composite projection before browser-capable preview.
+3. Every supported M5 mutation takes publication fence and refreshes composite
+   projection before browser-capable preview.
 4. If either ledger cannot be read/validated/re-durability-established, cached
    clear state is discarded and mutation fails closed.
 5. Only `UNRESOLVED_UNKNOWN` contributes a recovery semantic-key block.
@@ -800,9 +807,9 @@ re-establishes durability without duplicate.
 
 ### 15.3 Durable append, crash before token invalidation / guard publication
 
-Process death discards pending confirmation tokens. Restart re-establishes
-reconciliation-file durability, rebuilds composite truth, and is safe without an
-in-memory post-append marker.
+Process death discards pending tokens. Restart re-establishes reconciliation
+file durability, rebuilds composite truth, and is safe without an in-memory
+post-append marker.
 
 ### 15.4 Durable append, token invalidation succeeds, guard refresh fails
 
@@ -916,44 +923,45 @@ Failed qualification is retained evidence; conservative policy stays unchanged.
 3. Reconciliation is a separate durable evidence/authority axis.
 4. Only raw `RESERVED` or `EFFECT_UNKNOWN` effects are valid targets.
 5. Reconciliation lineage exactly matches canonical M5 effect lineage.
-6. Exactly two terminal verdicts exist.
-7. Inconclusive evidence appends no recovery-authoritative terminal fact.
-8. Every terminal fact carries strict evidence, canonical evidence hash, and
+6. `reconciliation_id` is globally unique; non-identical reuse is corruption.
+7. Exactly two terminal verdicts exist.
+8. Inconclusive evidence appends no recovery-authoritative terminal fact.
+9. Every terminal fact carries strict evidence, canonical evidence hash, and
    explicit operator identity.
-9. Evidence collectors may propose; they may not commit truth.
-10. ReconciliationAuthority binds one immutable fact and may re-drive only that
+10. Evidence collectors may propose; they may not commit truth.
+11. ReconciliationAuthority binds one immutable fact and may re-drive only that
     fact through durability ambiguity.
-11. A live in-process attempt cannot be reconciled while it can emit M5 terminal
+12. A live in-process attempt cannot be reconciled while it can emit M5 terminal
     outcome.
-12. Known reconciliation durability precedes recovery-clear publication.
-13. Visible-but-ambiguous reconciliation bytes never clear recovery.
-14. Same-path instances share ambiguity state; exact re-durability clears it.
-15. Startup establishes reconciliation-file durability before using rows to
+13. Known reconciliation durability precedes recovery-clear publication.
+14. Visible-but-ambiguous reconciliation bytes never clear recovery.
+15. Same-path instances share ambiguity state; exact re-durability clears it.
+16. Startup establishes reconciliation-file durability before using rows to
     clear recovery.
-16. Newly durable reconciliation is publication-fenced from write-side recovery
-    refresh until pending confirmation tokens are invalidated.
-17. Confirmation token issue/validate/consume/invalidate is synchronized.
-18. Terminal reconciliation invalidates all pending pre-resolution confirmation
+17. Newly durable reconciliation is publication-fenced from write-side recovery
+    refresh until pending confirmations are invalidated.
+18. Confirmation token issue/validate/consume/invalidate is synchronized.
+19. Terminal reconciliation invalidates all pending pre-resolution confirmation
     tokens in active supported runtime.
-19. Reconciliation does not reset dedupe, token bucket, kill, risk, actor,
+20. Reconciliation does not reset dedupe, token bucket, kill, risk, actor,
     policy, authorization epoch, grant, or permit state.
-20. Contradictory terminal reconciliation is corruption; M6 has no correction or
+21. Contradictory terminal reconciliation is corruption; M6 has no correction or
     supersession protocol.
-21. Recovery validates both safety ledgers and fails closed if either is corrupt,
+22. Recovery validates both safety ledgers and fails closed if either is corrupt,
     unavailable, or locally durability-ambiguous.
-22. Multiple unresolved effects sharing semantic key keep it blocked until all
+23. Multiple unresolved effects sharing semantic key keep it blocked until all
     are settled/reconciled.
-23. Reconciliation clears only recovery uncertainty; never grants execution.
-24. Later mutation is fresh M5 invocation and cannot use pre-reconciliation
+24. Reconciliation clears only recovery uncertainty; never grants execution.
+25. Later mutation is fresh M5 invocation and cannot use pre-reconciliation
     human confirmation authority.
-25. Failed/missing observation is never generic proof of no effect.
-26. Browser evidence inspection respects M5 read/composer coordination.
-27. Reconciliation safety facts have no automatic rotation/TTL/deletion in M6.
-28. Invocation journal content has zero reconciliation/recovery authority.
-29. M6 makes no new cross-process linearizability or exactly-once claim.
-30. Replay-safety promotion requires concrete broker-level evidence.
-31. Platform qualification claims are bounded to environment tested.
-32. M6 does not claim cryptographic integrity against hostile local state-file
+26. Failed/missing observation is never generic proof of no effect.
+27. Browser evidence inspection respects M5 read/composer coordination.
+28. Reconciliation safety facts have no automatic rotation/TTL/deletion in M6.
+29. Invocation journal content has zero reconciliation/recovery authority.
+30. M6 makes no new cross-process linearizability or exactly-once claim.
+31. Replay-safety promotion requires concrete broker-level evidence.
+32. Platform qualification claims are bounded to environment tested.
+33. M6 does not claim cryptographic integrity against hostile local state-file
     editing.
 
 ---
@@ -998,13 +1006,14 @@ Failed qualification is retained evidence; conservative policy stays unchanged.
 | R34 | Authority retries ambiguous append | Only exact frozen fact accepted |
 | R35 | Pending token minted before reconciliation | Token invalidated before clear can become visible to writes |
 | R36 | Unrelated pending token exists | Also invalidated conservatively |
-| R37 | Write-side guard refresh races durable reconciliation before invalidation | Publication fence forces old-blocked or post-invalidation-clear ordering; never clear-with-old-token-valid |
+| R37 | Write-side guard refresh races durable reconciliation before invalidation | Publication fence forces old-blocked or post-invalidation-clear ordering |
 | R38 | Token validation/consume races global invalidation | Synchronized token store yields one ordering; invalidated token cannot later cross |
 | R39 | `CONFIRMED_NO_EFFECT` while dedupe entry live | Recovery clears; independent dedupe may still deny |
 | R40 | Token bucket exhausted before reconciliation | No refund; future invocation remains bucket-governed |
 | R41 | Kill tripped during reconciliation | Local reconciliation may complete; kill remains tripped |
 | R42 | Automatic rotation/TTL attempted | Unsupported/rejected; safety fact retained |
-| R43 | Windows durability qualification | Claim matches actual behavior; stronger unsupported claim rejected |
+| R43 | `reconciliation_id` reused for different effect/fact | Corruption/fail-closed |
+| R44 | Windows durability qualification | Claim matches actual behavior; stronger unsupported claim rejected |
 
 Additional mandatory regressions:
 

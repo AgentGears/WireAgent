@@ -13,14 +13,11 @@ best-effort invocation journal.
 
 from __future__ import annotations
 
-import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+from typing import Optional
 
 from webwire.safety.models import RiskTier
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["TokenBucket", "BucketLimits", "DEFAULT_LIMITS"]
 
@@ -63,7 +60,7 @@ class TokenBucket:
     def acquire(self, action_type: str, risk_tier: RiskTier) -> tuple[bool, str]:
         """Try to consume one live-process action/global token."""
 
-        del risk_tier  # tier is part of the caller contract; limits are action keyed today.
+        del risk_tier  # caller contract retains the tier; limits are action keyed today.
         now = time.time()
         global_ok, global_reason = self._check_bucket("_global", now)
         if not global_ok:
@@ -81,7 +78,9 @@ class TokenBucket:
             return True, "no_limit"
         state = self._states.setdefault(key, _WindowState())
         cutoff = now - limits.window_seconds
-        state.timestamps = [timestamp for timestamp in state.timestamps if timestamp >= cutoff]
+        state.timestamps = [
+            timestamp for timestamp in state.timestamps if timestamp >= cutoff
+        ]
         if len(state.timestamps) >= limits.max_count:
             return False, f"exceeded {limits.max_count}/{limits.window_seconds:.0f}s"
         return True, "ok"
@@ -99,25 +98,3 @@ class TokenBucket:
         cutoff = now - limits.window_seconds
         active = [timestamp for timestamp in state.timestamps if timestamp >= cutoff]
         return max(0, limits.max_count - len(active))
-
-    def hydrate_records(self, records: Iterable[dict[str, Any]]) -> int:
-        """Compatibility-only manual hydration; not used by live M5 Layer 7.
-
-        The supported runtime never supplies journal rows here after Layer 7.
-        This helper remains temporarily for explicit compatibility callers that
-        already hold record data; such data is not M5 authority.
-        """
-
-        replayed = 0
-        for rec in records:
-            action = rec.get("action_type")
-            epoch = rec.get("_epoch")
-            if not action or epoch is None:
-                continue
-            self._states.setdefault("_global", _WindowState()).timestamps.append(float(epoch))
-            if action in self._limits:
-                self._states.setdefault(action, _WindowState()).timestamps.append(float(epoch))
-            replayed += 1
-        if replayed:
-            logger.info("TokenBucket manually hydrated %d compatibility events", replayed)
-        return replayed

@@ -4,10 +4,10 @@ The dispatcher owns the browser session, read broker, kill switch, invocation
 journal, write-policy kernel, and the staged M5 live execution stack. Capability
 code never receives the raw SuperBrowser facade.
 
-Layer-5 migration is intentionally incremental. ``bookmark_post`` and
-``like_post`` are the first live canaries routed through M5 scoped authority;
-other write capabilities remain on the legacy WriteKernel/WriteBroker path until
-their dedicated migration slices land.
+Layer-5 migration is intentionally incremental. ``bookmark_post``, ``like_post``,
+and ``post_text`` are routed through M5 scoped authority; other write
+capabilities remain on the legacy WriteKernel/WriteBroker path until their
+dedicated migration slices land.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from webwire.session import SessionManager
 if TYPE_CHECKING:
     from webwire.safety.m5_capability_adapter import M5EngagementCapabilityAdapter
     from webwire.safety.m5_live_runtime import M5LiveExecutionStack
+    from webwire.safety.m5_post_text_adapter import M5PostTextCapabilityAdapter
     from webwire.safety.write_kernel import WriteCapability
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["Dispatcher"]
 
 _M5_ENGAGEMENT_CAPABILITIES = frozenset({"bookmark_post", "like_post"})
+_M5_POST_TEXT_CAPABILITY = "post_text"
+_M5_MIGRATED_CAPABILITIES = _M5_ENGAGEMENT_CAPABILITIES | {_M5_POST_TEXT_CAPABILITY}
 
 
 class Dispatcher:
@@ -85,8 +88,9 @@ class Dispatcher:
         )
         self._m5_stack: Optional[M5LiveExecutionStack] = None
         self._m5_canary_adapters: dict[str, M5EngagementCapabilityAdapter] = {}
+        self._m5_post_text_adapter: Optional[M5PostTextCapabilityAdapter] = None
 
-        # Transitional legacy factory. Migrated M5 canaries never receive or
+        # Transitional legacy factory. Migrated M5 capabilities never receive or
         # dereference this object; untouched write capabilities still use it.
         def _make_write_broker():
             from webwire.write_broker import WriteBroker
@@ -185,6 +189,7 @@ class Dispatcher:
         """Stop the session. Does not trip the kill switch."""
         self._m5_stack = None
         self._m5_canary_adapters.clear()
+        self._m5_post_text_adapter = None
         self._broker = None
         return await self._session.stop()
 
@@ -256,7 +261,7 @@ class Dispatcher:
 
                 from webwire.safety.write_kernel import WriteCapability
 
-                if name in _M5_ENGAGEMENT_CAPABILITIES:
+                if name in _M5_MIGRATED_CAPABILITIES:
                     if self._m5_stack is None:
                         from super_browser.results.types import FailureCategory
 
@@ -277,10 +282,16 @@ class Dispatcher:
                             failure_category=FailureCategory.SECURITY,
                         )
                     else:
-                        write_cap = cast(
-                            WriteCapability,
-                            self._m5_capability_adapter(name, capability),
-                        )
+                        if name in _M5_ENGAGEMENT_CAPABILITIES:
+                            migrated_capability = self._m5_capability_adapter(
+                                name,
+                                capability,
+                            )
+                        else:
+                            migrated_capability = self._m5_post_text_capability_adapter(
+                                capability
+                            )
+                        write_cap = cast(WriteCapability, migrated_capability)
                         result = await self._write_kernel.execute(
                             write_cap,
                             self._broker,
@@ -368,6 +379,7 @@ class Dispatcher:
             self._m5_gateway,
         )
         self._m5_canary_adapters.clear()
+        self._m5_post_text_adapter = None
 
     def _m5_capability_adapter(
         self,
@@ -385,6 +397,23 @@ class Dispatcher:
 
         adapter = M5EngagementCapabilityAdapter(capability, stack.effect_executor)
         self._m5_canary_adapters[name] = adapter
+        return adapter
+
+    def _m5_post_text_capability_adapter(
+        self,
+        capability: "Capability | WriteCapability",
+    ) -> "M5PostTextCapabilityAdapter":
+        stack = self._m5_stack
+        if stack is None:
+            raise RuntimeError("M5 live execution stack is not installed")
+        adapter = self._m5_post_text_adapter
+        if adapter is not None:
+            return adapter
+
+        from webwire.safety.m5_post_text_adapter import M5PostTextCapabilityAdapter
+
+        adapter = M5PostTextCapabilityAdapter(capability, stack.post_text_executor)
+        self._m5_post_text_adapter = adapter
         return adapter
 
     async def _post_whoami_hook(self, result: ActionResult) -> None:

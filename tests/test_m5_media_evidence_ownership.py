@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from webwire.envelope import ActionResult, ok_result
 from webwire.safety.media_verify import count_post_media
 

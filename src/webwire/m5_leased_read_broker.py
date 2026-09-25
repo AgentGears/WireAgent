@@ -15,13 +15,13 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
-from super_browser import SuperBrowser
 from super_browser.results.types import FailureCategory
 
 from webwire.broker import ReadOnlyBroker
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, soft_failure
 from webwire.m5_leased_write_broker import _browser_state
+from webwire.safety.kill_switch import KillSwitch
 
 __all__ = ["M5LeasedReadBroker"]
 
@@ -31,10 +31,13 @@ class M5LeasedReadBroker(ReadOnlyBroker):
 
     def __init__(
         self,
-        sb: SuperBrowser,
-        kill_switch,
+        sb: Any,
+        kill_switch: KillSwitch,
         config: Optional[WebWireConfig] = None,
-    ) -> None:  # type: ignore[no-untyped-def]
+    ) -> None:
+        # Live construction passes WireAgent's attribute-capable facade proxy,
+        # while isolated tests may pass a direct fake facade. Both expose the
+        # same ReadOnlyBroker contract at runtime.
         super().__init__(sb, kill_switch, config)
         self._m5_write_state = _browser_state(sb)
 

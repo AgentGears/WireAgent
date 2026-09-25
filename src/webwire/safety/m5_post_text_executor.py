@@ -105,7 +105,23 @@ class M5PostTextExecutor:
             session.resolve_no_external_effect(reason="preparation_shape_mismatch")
             return self._clean_failure(session, "post preparation authority shape mismatch")
 
-        fill = await preparation.fill_composer(normalized)
+        try:
+            fill = await preparation.fill_composer(normalized)
+        except BaseException as exc:
+            await self._abort_precommit(
+                session,
+                preparation,
+                reason="fill_composer_interrupted",
+            )
+            return self._execution(
+                hard_failure(
+                    "post composer fill was interrupted before commit authority: "
+                    f"{type(exc).__name__}",
+                    failure_category=FailureCategory.SECURITY,
+                ),
+                session,
+                None,
+            )
         if not fill.ok:
             await self._abort_precommit(
                 session,
@@ -114,7 +130,23 @@ class M5PostTextExecutor:
             )
             return self._execution(fill, session, None)
 
-        readback = await preparation.read_composer_text()
+        try:
+            readback = await preparation.read_composer_text()
+        except BaseException as exc:
+            await self._abort_precommit(
+                session,
+                preparation,
+                reason="composer_readback_interrupted",
+            )
+            return self._execution(
+                hard_failure(
+                    "post composer readback was interrupted before commit authority: "
+                    f"{type(exc).__name__}",
+                    failure_category=FailureCategory.SECURITY,
+                ),
+                session,
+                None,
+            )
         composer_text = (
             (readback.data or {}).get("composer_text", "")
             if readback.ok and isinstance(readback.data, dict)

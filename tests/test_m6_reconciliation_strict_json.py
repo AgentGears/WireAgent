@@ -67,3 +67,50 @@ def test_duplicate_nested_evidence_key_is_corruption(tmp_path: Path) -> None:
 
     with pytest.raises(ReconciliationLedgerCorruptError, match="strict JSON"):
         ReconciliationLedger(path=path).read_records()
+
+
+def test_blank_line_is_corruption_not_silently_skipped(tmp_path: Path) -> None:
+    line = _record().to_jsonl()
+    path = tmp_path / "reconciliations.ndjson"
+    path.write_text(line + "\n\n", encoding="utf-8")
+
+    with pytest.raises(ReconciliationLedgerCorruptError, match="line 2 is blank"):
+        ReconciliationLedger(path=path).read_records()
+
+
+def test_whitespace_only_line_is_corruption(tmp_path: Path) -> None:
+    line = _record().to_jsonl()
+    path = tmp_path / "reconciliations.ndjson"
+    path.write_text(line + "\n   \n", encoding="utf-8")
+
+    with pytest.raises(ReconciliationLedgerCorruptError, match="line 2 is blank"):
+        ReconciliationLedger(path=path).read_records()
+
+
+def test_nan_decoder_extension_is_rejected_as_non_json(tmp_path: Path) -> None:
+    line = _record().to_jsonl()
+    # Replace a string-valued field with Python's decoder extension. The strict
+    # raw parser must reject this before schema validation can normalize it.
+    line = line.replace('"operator_id":"operator-local"', '"operator_id":NaN')
+    path = tmp_path / "reconciliations.ndjson"
+    path.write_text(line + "\n", encoding="utf-8")
+
+    with pytest.raises(ReconciliationLedgerCorruptError, match="strict JSON"):
+        ReconciliationLedger(path=path).read_records()
+
+
+@pytest.mark.parametrize("constant", ["Infinity", "-Infinity"])
+def test_infinity_decoder_extensions_are_rejected(
+    tmp_path: Path,
+    constant: str,
+) -> None:
+    line = _record().to_jsonl()
+    line = line.replace(
+        '"operator_id":"operator-local"',
+        f'"operator_id":{constant}',
+    )
+    path = tmp_path / "reconciliations.ndjson"
+    path.write_text(line + "\n", encoding="utf-8")
+
+    with pytest.raises(ReconciliationLedgerCorruptError, match="strict JSON"):
+        ReconciliationLedger(path=path).read_records()

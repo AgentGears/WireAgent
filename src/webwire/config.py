@@ -24,7 +24,7 @@ class ScreenshotPolicy(StrEnum):
 class WebWireConfig:
     """Immutable configuration for an Agent-WebWire runtime."""
 
-    # -- Runtime state directory. Holds journal.ndjson, kill file, screenshots.
+    # -- Runtime state directory. Holds audit, safety, kill, and screenshot state.
     # Default is ./.webwire relative to CWD.
     state_dir: Path = field(default_factory=lambda: Path(".webwire"))
 
@@ -86,6 +86,10 @@ class WebWireConfig:
     def effects_path(self) -> Path:
         """Absolute path to the fsync-backed M5 safety ledger."""
         return self.state_dir / "effects.ndjson"
+
+    def reconciliations_path(self) -> Path:
+        """Absolute path to the fsync-backed M6 reconciliation ledger."""
+        return self.state_dir / "reconciliations.ndjson"
 
     def screenshot_dir(self) -> Path:
         """Directory for screenshot artifacts."""

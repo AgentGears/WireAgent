@@ -167,7 +167,11 @@ def test_first_entry_directory_fsync_failure_latches_ambiguity(
             raise OSError("injected directory fsync failure")
         real_fsync_directory(path)
 
-    monkeypatch.setattr(ReconciliationLedger, "_fsync_directory", staticmethod(fail_parent))
+    monkeypatch.setattr(
+        ReconciliationLedger,
+        "_fsync_directory",
+        staticmethod(fail_parent),
+    )
 
     with pytest.raises(ReconciliationLedgerError, match="directory fsync failed"):
         ledger.append_durable(record)
@@ -196,6 +200,69 @@ def test_clean_open_failure_before_any_bytes_does_not_latch(
     assert ledger.read_records() == []
 
 
+def test_zero_byte_write_failure_after_ocreat_does_not_skip_later_directory_fsync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
+    record = _record()
+    real_write = os.write
+
+    def fail_before_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+        raise OSError("injected zero-byte write failure")
+
+    monkeypatch.setattr(os, "write", fail_before_write)
+    with pytest.raises(ReconciliationLedgerError, match="append failed"):
+        ledger.append_durable(record)
+
+    # O_CREAT happened, so an empty file may now exist, but no fact bytes are
+    # ambiguous. The subsequent successful append still has to durabilize the
+    # parent entry instead of treating file existence as proof that it was done.
+    assert ledger.path.exists()
+    assert ledger.path.stat().st_size == 0
+    assert ledger.durability_ambiguous is False
+
+    monkeypatch.setattr(os, "write", real_write)
+    real_fsync_directory = ReconciliationLedger._fsync_directory
+    parent_calls: list[Path] = []
+
+    def track_directory(path: Path) -> None:
+        parent_calls.append(path)
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        ReconciliationLedger,
+        "_fsync_directory",
+        staticmethod(track_directory),
+    )
+    ledger.append_durable(record)
+
+    assert ledger.path.parent in parent_calls
+    assert ledger.read_records() == [record]
+
+
+def test_short_writes_are_completed_before_fsync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ledger = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
+    record = _record()
+    real_write = os.write
+    calls = 0
+
+    def short_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        chunk = max(1, len(data) // 2)
+        return real_write(fd, bytes(data[:chunk]))
+
+    monkeypatch.setattr(os, "write", short_write)
+    ledger.append_durable(record)
+
+    assert calls > 1
+    assert ledger.read_records() == [record]
+
+
 def test_partial_write_latches_and_torn_tail_is_never_repaired_silently(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -218,9 +285,27 @@ def test_partial_write_latches_and_torn_tail_is_never_repaired_silently(
         ledger.append_durable(record)
 
     assert ledger.durability_ambiguous is True
-    with pytest.raises(ReconciliationLedgerCorruptError, match="not valid JSON"):
+    with pytest.raises(ReconciliationLedgerCorruptError, match="torn tail"):
         ledger.append_durable(record)
     assert ledger.durability_ambiguous is True
+
+
+def test_complete_json_without_terminal_newline_is_torn_corruption(tmp_path: Path) -> None:
+    path = tmp_path / "reconciliations.ndjson"
+    path.write_text(_record().to_jsonl(), encoding="utf-8")
+    ledger = ReconciliationLedger(path=path)
+
+    with pytest.raises(ReconciliationLedgerCorruptError, match="torn tail"):
+        ledger.read_records()
+
+
+def test_non_utf8_ledger_is_corruption(tmp_path: Path) -> None:
+    path = tmp_path / "reconciliations.ndjson"
+    path.write_bytes(b"\xff\n")
+    ledger = ReconciliationLedger(path=path)
+
+    with pytest.raises(ReconciliationLedgerCorruptError, match="valid UTF-8"):
+        ledger.read_records()
 
 
 def test_authoritative_startup_read_fsyncs_existing_file_with_writable_handle(

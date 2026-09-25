@@ -1,6 +1,6 @@
 # M5 Layer 5 — Capability Migration Plan
 
-**Status:** implementation in progress  
+**Status:** implementation complete; review gate in progress  
 **Base:** Layer 4 squash `5650982`  
 **Scope:** migrate supported live write execution onto scoped authority and gateway-owned outcome truth
 
@@ -17,9 +17,11 @@ Layer 5 turns the Layer-4 least-authority model into the supported live executio
 7. Add migration/bypass regressions and retire supported legacy mutation routes.
 8. Run maintainer-first exhaustive review, then an independent GitWire second-opinion pass on the exact candidate head.
 
+All implementation steps 1–7 are complete. Step 8 is the final review gate.
+
 ## 2. First safety gate: issued-but-unconsumed closure
 
-If `authorize_commit()` issued a permit but `consume_permit()` denied before `permit.consumed` became true, the canonical broker did not cross the mutation boundary. Layer 5 must be able to retire that issued authority immediately as proved `NO_EFFECT` instead of waiting for permit expiry.
+If `authorize_commit()` issued a permit but `consume_permit()` denied before `permit.consumed` became true, the canonical broker did not cross the mutation boundary. Layer 5 can retire that issued authority immediately as proved `NO_EFFECT` instead of waiting for permit expiry.
 
 The closure contract is:
 
@@ -31,9 +33,22 @@ The closure contract is:
 - if the durable close fails, the permit remains issued and the attempt remains `RESERVED`, preserving conservative recovery and permitting an explicit closure retry;
 - a consumed permit can never be rewritten as `NO_EFFECT`.
 
-## 3. Migration invariants
+## 3. Completed supported live surface
 
-Layer 5 must preserve all of the following:
+The supported Dispatcher routes every remote mutation through M5 scoped authority:
+
+- engagement: `bookmark_post`, `like_post`;
+- text content: `post_text`, `reply_post`, `quote_post`;
+- media content: `post_photo`, `reply_photo`, `quote_photo`, `post_multi_image`, `reply_multi_image`, `quote_multi_image`;
+- destructive state change: `delete_post`.
+
+`compose_post` remains outside the M5 mutation set only because it is a deliberate dry-run/no-effect shell. The transitional `WriteKernel` receives an inert no-mutation broker, and any future unmigrated WRITE capability is denied before composition rather than falling back to legacy mutation authority.
+
+Post-submit confirmation is deliberately evidence-bound. Plain posts require a stable pre-submit direct-status baseline, one stable unique new direct status, direct timestamp ownership, exact status ID and canonical actor-owned URL, approved actor, and exact direct text. Reply and quote paths additionally prove their approved target/thread or quoted-target lineage. Media confirmation proves the same content lineage plus rendered attachment count; it does not claim source-byte equivalence after platform transcoding. Delete confirmation requires target-permalink-bound explicit deletion evidence; absence, generic errors, wrong-page state, or ambiguity remain UNKNOWN.
+
+## 4. Migration invariants
+
+Layer 5 preserves all of the following:
 
 1. Every supported remote mutation crosses exactly one Commit Gateway.
 2. Capability-facing code never receives a raw M5 broker/browser mutation surface.
@@ -46,7 +61,7 @@ Layer 5 must preserve all of the following:
 9. Broker and CommitGateway in the supported live path share the exact same `KillSwitch` instance.
 10. Legacy live mutation routes are unavailable from the supported Dispatcher/capability path after migration.
 
-## 4. Deliberately deferred
+## 5. Deliberately deferred
 
 - RecoveryGuard startup/replay blocking implementation (Layer 6);
 - invocation-journal role retirement (Layer 7);

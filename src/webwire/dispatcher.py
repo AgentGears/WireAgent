@@ -262,6 +262,24 @@ class Dispatcher:
     ) -> ActionResult:
         """Invoke a capability by name through the appropriate trust boundary."""
         current_task = asyncio.current_task()
+        if current_task is not self._invoke_lock_owner and self._kill.tripped():
+            from webwire.envelope import kill_switched
+
+            early_input = input or {}
+            started_monotonic = time.monotonic()
+            trace_id = _new_trace_id()
+            result = kill_switched()
+            self._journal_write(
+                trace_id=trace_id,
+                capability=name,
+                input=early_input,
+                result=result,
+                policy_decision="killed",
+                actions=[],
+                started_monotonic=started_monotonic,
+            )
+            return result
+
         if current_task is not self._invoke_lock_owner:
             async with self._invoke_lock:
                 self._invoke_lock_owner = current_task
@@ -275,6 +293,8 @@ class Dispatcher:
         trace_id = _new_trace_id()
         capability = self._registry.get(name)
 
+        # Recheck after acquiring the lock so a trip that races with the wait
+        # still dominates capability execution.
         if self._kill.tripped():
             from webwire.envelope import kill_switched
 

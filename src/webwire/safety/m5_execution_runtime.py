@@ -69,6 +69,51 @@ PreparationAuthority = (
 )
 
 
+class _PruningApprovalGrantStore(ApprovalGrantStore):
+    """Default Layer-5 registry with bounded terminal-grant retention.
+
+    Execution sessions retain their exact grant object directly, so the registry
+    does not need to keep SPENT/REVOKED or elapsed ACTIVE grants after a later
+    approval is issued.  Pruning at the next mint preserves immediate ``get()``
+    behavior while preventing a long-lived Dispatcher from accumulating one
+    historical grant for every completed write.
+    """
+
+    def _prune_terminal(self) -> None:
+        now = self._clock
+        with self._lock:
+            stale: list[str] = []
+            sampled_now = now()
+            for grant_id, grant in self._grants.items():
+                with grant._lock:
+                    if grant.state is not GrantState.ACTIVE or grant.is_expired(sampled_now):
+                        stale.append(grant_id)
+            for grant_id in stale:
+                self._grants.pop(grant_id, None)
+
+    def mint(
+        self,
+        *,
+        intent_hash: str,
+        actor_id: str,
+        action_type: str,
+        target_type: str,
+        target_id: str,
+        policy_binding: str,
+        authorization_epoch: int,
+    ) -> ApprovalGrant:
+        self._prune_terminal()
+        return super().mint(
+            intent_hash=intent_hash,
+            actor_id=actor_id,
+            action_type=action_type,
+            target_type=target_type,
+            target_id=target_id,
+            policy_binding=policy_binding,
+            authorization_epoch=authorization_epoch,
+        )
+
+
 @dataclass
 class M5ExecutionSession:
     """Trusted lifecycle owner for one human-approved semantic intent.
@@ -285,7 +330,7 @@ class M5ExecutionRuntime:
             raise M5ExecutionStateError("runtime/gateway policy registry mismatch")
         self._scoped = scoped_authority
         self._gateway = commit_gateway
-        self._grants = grants if grants is not None else ApprovalGrantStore()
+        self._grants = grants if grants is not None else _PruningApprovalGrantStore()
         self._policies = policies
 
     def issue(self, intent: WriteIntent) -> M5ExecutionSession:

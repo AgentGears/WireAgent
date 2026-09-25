@@ -126,10 +126,43 @@ def _validate_utc_provenance(value: Any, field_name: str) -> str:
     return value
 
 
+def _validate_artifact_references(value: Any, path: str) -> None:
+    """Require content identity whenever evidence references an external artifact."""
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_artifact_references(item, f"{path}[{index}]")
+        return
+    if not isinstance(value, dict):
+        return
+
+    for key, item in value.items():
+        item_path = f"{path}.{key}"
+        if key == "artifact":
+            if not isinstance(item, dict):
+                raise ValueError(f"{item_path} must be an object")
+            kind = item.get("kind")
+            if not isinstance(kind, str) or not kind:
+                raise ValueError(f"{item_path}.kind must be a non-empty string")
+            digest = item.get("sha256")
+            if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+                raise ValueError(
+                    f"{item_path}.sha256 must be lowercase SHA-256 hexadecimal"
+                )
+            location = item.get("location")
+            if location is not None and (
+                not isinstance(location, str) or not location
+            ):
+                raise ValueError(
+                    f"{item_path}.location must be None or a non-empty string"
+                )
+        _validate_artifact_references(item, item_path)
+
+
 def _canonicalize_evidence(evidence: Any) -> str:
     if not isinstance(evidence, dict) or not evidence:
         raise ValueError("evidence must be a non-empty JSON object")
     _validate_json_value(evidence, "evidence")
+    _validate_artifact_references(evidence, "evidence")
 
     basis = evidence.get("basis")
     if not isinstance(basis, str) or not basis:

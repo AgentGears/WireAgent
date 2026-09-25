@@ -47,6 +47,8 @@ class _ReplyBroker:
         return ok_result(data={"filled": True})
 
     async def read_composer_text(self) -> ActionResult:
+        if self.mode == "readback_raise":
+            raise RuntimeError("readback interrupted")
         text = "wrong" if self.mode == "text_mismatch" else self.composer_text
         return ok_result(data={"composer_text": text})
 
@@ -107,6 +109,9 @@ class _Evidence:
         raise_baseline: bool = False,
         raise_capture: bool = False,
         raise_verify: bool = False,
+        reply_post_id: str = "999",
+        include_actor: bool = True,
+        include_url: bool = True,
     ) -> None:
         self.baseline_ok = baseline_ok
         self.capture_ok = capture_ok
@@ -114,6 +119,9 @@ class _Evidence:
         self.raise_baseline = raise_baseline
         self.raise_capture = raise_capture
         self.raise_verify = raise_verify
+        self.reply_post_id = reply_post_id
+        self.include_actor = include_actor
+        self.include_url = include_url
         self.baseline_calls = 0
         self.capture_calls = 0
         self.verify_calls = 0
@@ -141,8 +149,8 @@ class _Evidence:
             return soft_failure("capture failed", failure_category=FailureCategory.UNKNOWN)
         return ok_result(
             data={
-                "post_id": "999",
-                "post_url": "https://x.com/actor/status/999",
+                "post_id": self.reply_post_id,
+                "post_url": f"https://x.com/actor/status/{self.reply_post_id}",
             }
         )
 
@@ -156,26 +164,31 @@ class _Evidence:
     ) -> ActionResult:
         self.verify_calls += 1
         assert target_post_id == "123"
-        assert reply_post_id == "999"
+        assert reply_post_id == self.reply_post_id
         assert actor_id == "@actor"
         assert normalized_text == "hello reply"
         if self.raise_verify:
             raise RuntimeError("verification interrupted")
         if not self.verify_ok:
             return soft_failure("thread proof failed", failure_category=FailureCategory.UNKNOWN)
-        return ok_result(
-            data={
-                "thread_bound": True,
-                "target_post_id": "123",
-                "reply_post_id": "999",
-                "reply_actor": "actor",
-                "reply_url": "https://x.com/actor/status/999",
-                "text_matches": True,
-            }
-        )
+        data = {
+            "thread_bound": True,
+            "target_post_id": "123",
+            "reply_post_id": self.reply_post_id,
+            "text_matches": True,
+        }
+        if self.include_actor:
+            data["reply_actor"] = "actor"
+        if self.include_url:
+            data["reply_url"] = f"https://x.com/actor/status/{self.reply_post_id}"
+        return ok_result(data=data)
 
 
-def _intent(text: str = "hello reply") -> WriteIntent:
+def _intent(
+    text: str = "hello reply",
+    *,
+    post_url: str = "https://x.com/target/status/123",
+) -> WriteIntent:
     risk, compensation = DEFAULT_REGISTRY.require("reply")
     return WriteIntent(
         action_type="reply",
@@ -187,7 +200,7 @@ def _intent(text: str = "hello reply") -> WriteIntent:
         payload={
             "normalized_text": text,
             "char_count": len(text),
-            "post_url": "https://x.com/target/status/123",
+            "post_url": post_url,
             "target_post_id": "123",
         },
         actor_identity="@actor",
@@ -244,6 +257,18 @@ async def test_reply_success_records_reserved_then_confirmed(tmp_path: Path) -> 
     assert terminal.details["reply_post_id"] == "999"
     assert terminal.details["thread_bound"] is True
     assert terminal.details["text_verified"] is True
+    assert terminal.details["actor_verified"] is True
+    assert terminal.details["url_verified"] is True
+
+
+async def test_reply_target_id_only_uses_canonical_layer4_url(tmp_path: Path) -> None:
+    broker = _ReplyBroker()
+    executor, _ = _executor(tmp_path, broker=broker, evidence=_Evidence())
+
+    execution = await executor.execute(_intent(post_url=""))
+
+    assert execution.result.ok is True
+    assert broker.open_calls == [("https://x.com/i/status/123", "123")]
 
 
 async def test_strong_reply_evidence_confirms_uncertain_click(tmp_path: Path) -> None:
@@ -291,6 +316,54 @@ async def test_reply_thread_verification_failure_records_unknown(tmp_path: Path)
     assert ledger.read_records()[-1].state is EffectState.EFFECT_UNKNOWN
 
 
+async def test_reply_ok_evidence_without_actor_still_records_unknown(tmp_path: Path) -> None:
+    broker = _ReplyBroker()
+    executor, ledger = _executor(
+        tmp_path,
+        broker=broker,
+        evidence=_Evidence(include_actor=False),
+    )
+
+    execution = await executor.execute(_intent())
+
+    assert execution.attempt_state is AttemptState.EFFECT_UNKNOWN
+    terminal = ledger.read_records()[-1]
+    assert terminal.state is EffectState.EFFECT_UNKNOWN
+    assert terminal.details["actor_verified"] is False
+
+
+async def test_reply_ok_evidence_without_verified_url_still_records_unknown(
+    tmp_path: Path,
+) -> None:
+    broker = _ReplyBroker()
+    executor, ledger = _executor(
+        tmp_path,
+        broker=broker,
+        evidence=_Evidence(include_url=False),
+    )
+
+    execution = await executor.execute(_intent())
+
+    assert execution.attempt_state is AttemptState.EFFECT_UNKNOWN
+    terminal = ledger.read_records()[-1]
+    assert terminal.state is EffectState.EFFECT_UNKNOWN
+    assert terminal.details["url_verified"] is False
+
+
+async def test_reply_capture_cannot_reuse_target_id(tmp_path: Path) -> None:
+    broker = _ReplyBroker()
+    executor, ledger = _executor(
+        tmp_path,
+        broker=broker,
+        evidence=_Evidence(reply_post_id="123"),
+    )
+
+    execution = await executor.execute(_intent())
+
+    assert execution.attempt_state is AttemptState.EFFECT_UNKNOWN
+    assert ledger.read_records()[-1].state is EffectState.EFFECT_UNKNOWN
+
+
 async def test_reply_capture_interruption_records_unknown(tmp_path: Path) -> None:
     broker = _ReplyBroker()
     executor, ledger = _executor(
@@ -328,6 +401,20 @@ async def test_reply_baseline_interruption_is_clean_precommit(tmp_path: Path) ->
         broker=broker,
         evidence=_Evidence(raise_baseline=True),
     )
+
+    execution = await executor.execute(_intent())
+
+    assert execution.result.ok is False
+    assert execution.attempt_state is AttemptState.NO_EFFECT
+    assert execution.permit_issued is False
+    assert broker.submit_calls == 0
+    assert broker.cleanup_calls == 1
+    assert ledger.read_records() == []
+
+
+async def test_reply_readback_interruption_is_clean_precommit(tmp_path: Path) -> None:
+    broker = _ReplyBroker(mode="readback_raise")
+    executor, ledger = _executor(tmp_path, broker=broker, evidence=_Evidence())
 
     execution = await executor.execute(_intent())
 

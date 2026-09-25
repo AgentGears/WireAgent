@@ -291,9 +291,7 @@ async def test_kernel_recovery_unavailable_fails_closed_before_preview(
     assert cap.preview_calls == 0
 
 
-async def test_explicit_no_effect_shell_can_bypass_recovery_guard(
-    tmp_path: Path,
-) -> None:
+async def test_caller_flag_cannot_bypass_recovery_guard(tmp_path: Path) -> None:
     ledger = EffectLedger(path=tmp_path / "effects.ndjson")
     key = "alice|like|post|123|"
     ledger.append_durable(_record(key, EffectState.EFFECT_UNKNOWN))
@@ -310,9 +308,10 @@ async def test_explicit_no_effect_shell_can_bypass_recovery_guard(
         enforce_recovery_guard=False,
     )
 
-    assert result.ok is True
-    assert result.data["policy"]["verdict"] == "confirmation_required"
-    assert cap.preview_calls == 1
+    assert result.ok is False
+    assert result.data["policy"]["blocked_by"] == "reconciliation_required"
+    assert result.data["trace"]["recovery_exemption_ignored"] is True
+    assert cap.preview_calls == 0
 
 
 class _StartProbeSession:

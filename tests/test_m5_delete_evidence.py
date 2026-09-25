@@ -71,6 +71,16 @@ async def test_delete_evidence_proves_unique_direct_target_present(tmp_path: Pat
     assert sb.navigations == ["https://x.com/u/status/123"]
 
 
+async def test_delete_evidence_accepts_canonical_i_status_fallback(tmp_path: Path) -> None:
+    reader, sb = _reader(tmp_path, [{"status": "present"}])
+
+    result = await reader.read_delete_state("https://x.com/i/status/123", "123")
+
+    assert result.ok is True
+    assert result.data["post_state"] == "present"
+    assert sb.navigations == ["https://x.com/i/status/123"]
+
+
 async def test_delete_evidence_requires_target_bound_explicit_tombstone(
     tmp_path: Path,
 ) -> None:
@@ -84,6 +94,33 @@ async def test_delete_evidence_requires_target_bound_explicit_tombstone(
     assert result.ok is True
     assert result.data["post_state"] == "deleted"
     assert result.data["evidence"] == "target_permalink_explicit_delete_tombstone"
+
+
+async def test_delete_evidence_rejects_non_x_origin_before_navigation(tmp_path: Path) -> None:
+    reader, sb = _reader(
+        tmp_path,
+        [{"status": "deleted", "tombstone": "This post was deleted"}],
+    )
+
+    result = await reader.read_delete_state("https://evil.example/u/status/123", "123")
+
+    assert result.ok is False
+    assert result.failure_category.value == "unknown"
+    assert sb.navigations == []
+    assert sb._controller._cdp.expressions == []
+
+
+async def test_delete_evidence_rejects_input_status_id_mismatch_before_navigation(
+    tmp_path: Path,
+) -> None:
+    reader, sb = _reader(tmp_path, [{"status": "deleted"}])
+
+    result = await reader.read_delete_state("https://x.com/u/status/999", "123")
+
+    assert result.ok is False
+    assert result.failure_category.value == "unknown"
+    assert sb.navigations == []
+    assert sb._controller._cdp.expressions == []
 
 
 async def test_delete_evidence_blank_or_unloaded_page_stays_unknown(
@@ -118,6 +155,32 @@ async def test_delete_evidence_wrong_permalink_stays_unknown(tmp_path: Path) -> 
     assert result.failure_category.value == "unknown"
 
 
+async def test_delete_evidence_redirect_to_non_x_origin_stays_unknown(tmp_path: Path) -> None:
+    reader, _ = _reader(
+        tmp_path,
+        [{"status": "wrong_page", "host": "evil.example", "path": "/u/status/123"}],
+    )
+
+    result = await reader.read_delete_state("https://x.com/u/status/123", "123")
+
+    assert result.ok is False
+    assert result.failure_category.value == "unknown"
+
+
+async def test_delete_evidence_redirect_to_different_status_id_stays_unknown(
+    tmp_path: Path,
+) -> None:
+    reader, _ = _reader(
+        tmp_path,
+        [{"status": "wrong_page", "host": "x.com", "path": "/u/status/999"}],
+    )
+
+    result = await reader.read_delete_state("https://x.com/u/status/123", "123")
+
+    assert result.ok is False
+    assert result.failure_category.value == "unknown"
+
+
 async def test_delete_evidence_ambiguous_tombstones_stay_unknown(tmp_path: Path) -> None:
     reader, _ = _reader(tmp_path, [{"status": "ambiguous_tombstone", "count": 2}])
 
@@ -137,7 +200,7 @@ async def test_delete_evidence_navigation_failure_is_not_deletion(tmp_path: Path
     assert sb._controller._cdp.expressions == []
 
 
-def test_delete_evidence_js_binds_permalink_and_ignores_generic_errors(
+def test_delete_evidence_js_binds_origin_permalink_id_and_ignores_generic_errors(
     tmp_path: Path,
 ) -> None:
     reader, sb = _reader(tmp_path, [{"status": "present"}])
@@ -147,8 +210,10 @@ def test_delete_evidence_js_binds_permalink_and_ignores_generic_errors(
     asyncio.run(reader.read_delete_state("https://x.com/u/status/123", "123"))
 
     expr = sb._controller._cdp.expressions[0]
-    assert "targetSuffix='/status/'+target" in expr
-    assert "if(!atTarget)return JSON.stringify({status:'wrong_page'" in expr
+    assert "host!=='x.com'&&host!=='www.x.com'" in expr
+    assert "statusMatch=path.match" in expr
+    assert "statusMatch[1]!==target" in expr
+    assert "if(!statusMatch||statusMatch[1]!==target)" in expr
     assert "a.closest('article')!==art||!a.querySelector('time')" in expr
     assert "n.closest('article')" in expr
     assert "if(!wrapped)stones.push(t)" in expr

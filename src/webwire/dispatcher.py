@@ -160,9 +160,17 @@ class Dispatcher:
                 failure_category=FailureCategory.SECURITY,
             )
 
-        from webwire.m5_leased_read_broker import M5LeasedReadBroker
+        stack = self._m5_stack
+        if stack is None:
+            from super_browser.results.types import FailureCategory
 
-        self._broker = M5LeasedReadBroker(sb, self._kill, self._config)
+            from webwire.envelope import hard_failure
+
+            return hard_failure(
+                "M5 live execution stack was not retained after initialization",
+                failure_category=FailureCategory.SECURITY,
+            )
+        self._broker = stack.read_broker
 
         # Transitional legacy safety hydration. Layer 7 will retire the journal
         # safety role only after all write capabilities and RecoveryGuard move.
@@ -395,6 +403,7 @@ class Dispatcher:
             sb,
             self._kill,
             self._m5_gateway,
+            config=self._config,
         )
         self._m5_canary_adapters.clear()
         self._m5_post_text_adapter = None

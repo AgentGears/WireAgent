@@ -153,7 +153,9 @@ class Dispatcher:
                 failure_category=FailureCategory.SECURITY,
             )
 
-        self._broker = ReadOnlyBroker(sb, self._kill, self._config)
+        from webwire.m5_leased_read_broker import M5LeasedReadBroker
+
+        self._broker = M5LeasedReadBroker(sb, self._kill, self._config)
 
         # Transitional legacy safety hydration. Layer 7 will retire the journal
         # safety role only after all write capabilities and RecoveryGuard move.

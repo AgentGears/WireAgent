@@ -16,6 +16,9 @@ from webwire.m5_leased_write_broker import M5LeasedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectPolicyRegistry
 from webwire.safety.kill_switch import KillSwitch
+from webwire.safety.m5_actor_bound_evidence import M5ActorBoundEvidenceReader
+from webwire.safety.m5_actor_bound_media_executor import M5ActorBoundMediaExecutor
+from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
 from webwire.safety.m5_authority_factory import (
     build_live_m5_read_broker,
     build_live_m5_write_broker,
@@ -83,14 +86,17 @@ def build_live_m5_execution_stack(
         commit_gateway=commit_gateway,
         policies=policies,
     )
-    evidence_reader = M5LeasedEvidenceReader(write_broker)
+    # Supported live content verification is actor-bound.  The generic reader
+    # remains available to isolated tests, but live post/media confirmation must
+    # prove direct status ownership and return the observed actor.
+    evidence_reader = M5ActorBoundEvidenceReader(write_broker)
     media_evidence_reader = M5LeasedMediaEvidenceReader(write_broker)
     delete_evidence_reader = M5LeasedDeleteEvidenceReader(write_broker)
     effect_executor = M5EffectExecutor(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
     )
-    post_text_executor = M5PostTextExecutor(
+    post_text_executor = M5ActorBoundPostTextExecutor(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
     )
@@ -102,7 +108,7 @@ def build_live_m5_execution_stack(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
     )
-    media_executor = M5MediaExecutor(
+    media_executor = M5ActorBoundMediaExecutor(
         runtime=execution_runtime,
         content_evidence=evidence_reader,
         media_evidence=media_evidence_reader,

@@ -61,7 +61,7 @@ async def test_write_kernel_factory_no_longer_constructs_legacy_write_broker(
 
     assert not isinstance(broker, WriteBroker)
     try:
-        _ = getattr(broker, "delete_post")
+        _ = broker.delete_post
     except RuntimeError as exc:
         assert "legacy mutation broker surface is disabled" in str(exc)
     else:  # pragma: no cover - fail loudly if authority reappears

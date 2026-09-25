@@ -1,13 +1,15 @@
 """Actor-bound standalone-post evidence for Layer 5.
 
-The historical text verifier could select an article through any descendant
-status link.  That is insufficient for M5 terminal truth: a nested status or a
-new same-text status owned by another actor must never be promoted to
+The historical post-submit helpers accepted the first newly visible status link
+and the historical text verifier could select an article through any descendant
+status link.  Neither is sufficient for M5 terminal truth: hydration gaps,
+nested statuses, or concurrent same-text posts must never be promoted to
 ``EFFECT_CONFIRMED``.
 
-This live evidence reader requires one article that directly owns the captured
-status timestamp, returns the observed actor/status URL, and verifies only that
-article's direct text.  The executor remains responsible for comparing the
+The supported live reader therefore establishes a stable pre-submit snapshot of
+direct article-owned status IDs, requires exactly one new direct status after
+the submit boundary, and verifies that status through its direct timestamp,
+actor, canonical URL, and direct text.  The executor finally compares the
 observed actor with the immutable approved actor carried by the consumed permit.
 """
 
@@ -28,6 +30,23 @@ from webwire.safety.text_normalize import normalize_text
 __all__ = ["M5ActorBoundEvidenceReader", "status_url_identity"]
 
 _STATUS_PATH = re.compile(r"^/([^/]+)/status/(\d+)(?:/|$)")
+_DIRECT_STATUS_SNAPSHOT_JS = (
+    "(function(){"
+    "function ownStatus(art){"
+    "var links=art.querySelectorAll('a[href]'),found=[];"
+    "for(var i=0;i<links.length;i++){var a=links[i];"
+    "if(a.closest('article')!==art||!a.querySelector('time'))continue;"
+    "try{var u=new URL(a.href,location.href);"
+    "var m=u.pathname.match(/^\\/([^/]+)\\/status\\/(\\d+)(?:\\/|$)/);"
+    "if(m)found.push({actor:m[1],id:m[2],path:u.pathname});}catch(e){}"
+    "}"
+    "var uniq={};for(var j=0;j<found.length;j++)uniq[found[j].id]=found[j];"
+    "var ids=Object.keys(uniq);return ids.length===1?uniq[ids[0]]:null;}"
+    "var arts=document.querySelectorAll('article'),out=[],seen={};"
+    "for(var ai=0;ai<arts.length;ai++){var own=ownStatus(arts[ai]);"
+    "if(own&&!seen[own.id]){seen[own.id]=1;out.push(own);}}"
+    "return JSON.stringify(out);})()"
+)
 
 
 def status_url_identity(url: str) -> tuple[str, str] | None:
@@ -58,6 +77,122 @@ class M5ActorBoundEvidenceReader(M5LeasedEvidenceReader):
     def __init__(self, broker: M5LeasedWriteBroker) -> None:
         super().__init__(broker)
         self.__strong_broker = broker
+
+    async def _direct_status_snapshot(self) -> list[dict[str, str]] | None:
+        broker = self.__strong_broker
+        try:
+            evaluated = await broker._sb._controller._cdp.evaluate(
+                _DIRECT_STATUS_SNAPSHOT_JS
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not evaluated.ok or not evaluated.data or "exceptionDetails" in evaluated.data:
+            return None
+        raw = evaluated.data.get("result", {}).get("value")
+        if not isinstance(raw, str):
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, list):
+            return None
+        statuses: list[dict[str, str]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                return None
+            actor = item.get("actor")
+            post_id = item.get("id")
+            path = item.get("path")
+            if (
+                not isinstance(actor, str)
+                or not isinstance(post_id, str)
+                or not post_id.isdigit()
+                or not isinstance(path, str)
+            ):
+                return None
+            statuses.append({"actor": actor, "id": post_id, "path": path})
+        return statuses
+
+    async def capture_pre_submit_ids(self) -> ActionResult:
+        """Require two consecutive equal direct-status snapshots before submit."""
+
+        broker = self.__strong_broker
+
+        async def operation() -> ActionResult:
+            previous: tuple[str, ...] | None = None
+            for _ in range(20):
+                statuses = await self._direct_status_snapshot()
+                if statuses is None:
+                    return soft_failure(
+                        "pre-submit direct-status baseline evaluation failed",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                current = tuple(sorted({item["id"] for item in statuses}))
+                if previous is not None and current == previous:
+                    return ok_result(data={"status_ids": list(current)})
+                previous = current
+                await asyncio.sleep(0.25)
+            return soft_failure(
+                "pre-submit direct-status baseline did not stabilize",
+                failure_category=FailureCategory.UNKNOWN,
+            )
+
+        return await broker._owned_content(operation)
+
+    async def capture_new_post(
+        self,
+        pre_submit_ids: set[str],
+        *,
+        exclude_ids: set[str] | None = None,
+    ) -> ActionResult:
+        """Require exactly one new direct article-owned status after submit."""
+
+        broker = self.__strong_broker
+        excluded = set(pre_submit_ids) | set(exclude_ids or ())
+
+        async def operation() -> ActionResult:
+            for _ in range(20):
+                statuses = await self._direct_status_snapshot()
+                if statuses is None:
+                    return soft_failure(
+                        "post-submit direct-status capture evaluation failed",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                candidates = [item for item in statuses if item["id"] not in excluded]
+                if len(candidates) > 1:
+                    return soft_failure(
+                        "post-submit status identity is ambiguous: multiple new direct statuses",
+                        failure_category=FailureCategory.UNKNOWN,
+                    )
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    post_url = f"https://x.com{candidate['path']}"
+                    identity = status_url_identity(post_url)
+                    expected = (
+                        candidate["actor"].lstrip("@").casefold(),
+                        candidate["id"],
+                    )
+                    if identity != expected:
+                        return soft_failure(
+                            "post-submit direct timestamp produced a non-canonical status URL",
+                            failure_category=FailureCategory.UNKNOWN,
+                        )
+                    return ok_result(
+                        data={
+                            "post_id": candidate["id"],
+                            "post_url": post_url,
+                            "post_actor": candidate["actor"],
+                            "direct_status_owned": True,
+                        }
+                    )
+                await asyncio.sleep(0.25)
+            return soft_failure(
+                "post-submit evidence did not identify one unique new direct status",
+                failure_category=FailureCategory.UNKNOWN,
+            )
+
+        return await broker._one_shot(operation)
 
     async def verify_post_text(self, post_url: str, normalized_text: str) -> ActionResult:
         identity = status_url_identity(post_url)

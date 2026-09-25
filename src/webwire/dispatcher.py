@@ -203,12 +203,23 @@ class Dispatcher:
         return r
 
     async def stop(self) -> ActionResult:
-        """Stop the session. Does not trip the kill switch."""
-        self._m5_stack = None
-        self._m5_canary_adapters.clear()
-        self._m5_post_text_adapter = None
-        self._broker = None
-        return await self._session.stop()
+        """Stop only after any sibling Dispatcher invocation leaves the browser."""
+        current_task = asyncio.current_task()
+        if current_task is self._invoke_lock_owner:
+            from super_browser.results.types import FailureCategory
+
+            from webwire.envelope import hard_failure
+
+            return hard_failure(
+                "Dispatcher.stop() cannot run from inside an active invocation",
+                failure_category=FailureCategory.SECURITY,
+            )
+        async with self._invoke_lock:
+            self._m5_stack = None
+            self._m5_canary_adapters.clear()
+            self._m5_post_text_adapter = None
+            self._broker = None
+            return await self._session.stop()
 
     # -- invocation ----------------------------------------------------------
 

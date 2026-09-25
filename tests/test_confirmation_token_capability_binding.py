@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from webwire.capabilities.compose_post import ComposePostCapability
+from webwire.capabilities.post_text import PostTextCapability
 from webwire.config import WebWireConfig
 from webwire.envelope import ActionResult, ok_result
 from webwire.journal import Journal
@@ -94,3 +96,33 @@ async def test_confirmation_token_cannot_cross_equal_intent_capabilities(
     assert second.ok is False
     assert second.data["policy"]["blocked_by"] == "capability_mismatch"
     assert live_post.execute_calls == 0
+
+
+async def test_compose_post_token_cannot_authorize_post_text(tmp_path: Path) -> None:
+    kernel = _kernel(tmp_path)
+    compose_shell = ComposePostCapability()
+    live_post = PostTextCapability()
+    broker = object()
+    payload = {"text": "hello"}
+
+    shell_intent = compose_shell.compose(payload, "alice")
+    live_intent = live_post.compose(payload, "alice")
+    assert shell_intent.intent_hash() == live_intent.intent_hash()
+
+    first = await kernel.execute(
+        compose_shell,
+        broker,  # type: ignore[arg-type]
+        payload,
+        actor_identity="alice",
+    )
+    token = first.data["data"]["confirmation_token"]
+
+    second = await kernel.execute(
+        live_post,
+        broker,  # type: ignore[arg-type]
+        {"text": "hello", "confirmation_token": token},
+        actor_identity="alice",
+    )
+
+    assert second.ok is False
+    assert second.data["policy"]["blocked_by"] == "capability_mismatch"

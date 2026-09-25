@@ -309,15 +309,15 @@ class Dispatcher:
                         )
                     else:
                         if name in _M5_ENGAGEMENT_CAPABILITIES:
-                            migrated_capability = self._m5_capability_adapter(
-                                name,
-                                capability,
+                            write_cap = cast(
+                                WriteCapability,
+                                self._m5_capability_adapter(name, capability),
                             )
                         else:
-                            migrated_capability = self._m5_post_text_capability_adapter(
-                                capability
+                            write_cap = cast(
+                                WriteCapability,
+                                self._m5_post_text_capability_adapter(capability),
                             )
-                        write_cap = cast(WriteCapability, migrated_capability)
                         result = await self._write_kernel.execute(
                             write_cap,
                             self._broker,

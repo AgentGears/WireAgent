@@ -117,6 +117,25 @@ async def test_media_migration_denies_without_whoami_before_compose(tmp_path: Pa
     assert dispatcher._m5_media_adapters == {}
 
 
+async def test_delete_migration_denies_without_whoami_before_preview(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    session = _StubSessionManager(cfg)
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+    started = await dispatcher.start()
+    assert started.ok is True
+    assert session.resolved_handle is None
+
+    result = await dispatcher.invoke(
+        "delete_post",
+        {"post_url": "https://x.com/u/status/123", "target_post_id": "123"},
+    )
+
+    assert result.ok is False
+    assert result.failure_category.value == "security"
+    assert "whoami-resolved actor identity" in result.error.message
+    assert dispatcher._m5_delete_adapter is None
+
+
 def test_all_six_media_names_are_in_migrated_dispatcher_set() -> None:
     expected = {
         "post_photo",
@@ -128,6 +147,11 @@ def test_all_six_media_names_are_in_migrated_dispatcher_set() -> None:
     }
     assert dispatcher_module._M5_MEDIA_CAPABILITIES == expected
     assert expected <= dispatcher_module._M5_MIGRATED_CAPABILITIES
+
+
+def test_delete_is_in_migrated_dispatcher_set() -> None:
+    assert dispatcher_module._M5_DELETE_CAPABILITY == "delete_post"
+    assert "delete_post" in dispatcher_module._M5_MIGRATED_CAPABILITIES
 
 
 async def test_migrated_canary_denies_if_live_stack_disappears(tmp_path: Path) -> None:
@@ -232,6 +256,30 @@ async def test_quote_confirmation_caches_dedicated_m5_adapter(
     assert dispatcher._registry.get("quote_post") is original
 
 
+async def test_delete_confirmation_caches_dedicated_m5_adapter(
+    tmp_path: Path,
+) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    session = _StubSessionManager(cfg)
+    session.set_resolved_handle("@actor")
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+    started = await dispatcher.start()
+    assert started.ok is True
+    original = dispatcher._registry.get("delete_post")
+    assert original is not None
+
+    result = await dispatcher.invoke(
+        "delete_post",
+        {"post_url": "https://x.com/u/status/123", "target_post_id": "123"},
+    )
+
+    assert result.ok is True
+    assert result.data["policy"]["verdict"] == "confirmation_required"
+    assert dispatcher._m5_delete_adapter is not None
+    assert dispatcher._m5_delete_adapter is not original
+    assert dispatcher._registry.get("delete_post") is original
+
+
 async def test_media_adapter_cache_is_per_capability_and_cleared_on_reinstall(
     tmp_path: Path,
 ) -> None:
@@ -282,6 +330,24 @@ async def test_stack_reinstall_clears_quote_adapter(tmp_path: Path) -> None:
     dispatcher._install_m5_live_stack(session.sb)
 
     assert dispatcher._m5_quote_adapter is None
+
+
+async def test_stack_reinstall_clears_delete_adapter(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    session = _StubSessionManager(cfg)
+    session.set_resolved_handle("@actor")
+    dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
+    started = await dispatcher.start()
+    assert started.ok is True
+    capability = dispatcher._registry.get("delete_post")
+    assert capability is not None
+
+    adapter = dispatcher._m5_delete_capability_adapter(capability)
+    assert adapter is dispatcher._m5_delete_adapter
+
+    dispatcher._install_m5_live_stack(session.sb)
+
+    assert dispatcher._m5_delete_adapter is None
 
 
 async def test_start_fails_closed_when_live_stack_build_fails(

@@ -21,6 +21,8 @@ from webwire.safety.m5_authority_factory import (
     build_live_m5_write_broker,
     build_live_scoped_authority_broker,
 )
+from webwire.safety.m5_delete_evidence import M5LeasedDeleteEvidenceReader
+from webwire.safety.m5_delete_executor import M5DeleteExecutor
 from webwire.safety.m5_effect_executor import M5EffectExecutor
 from webwire.safety.m5_evidence_reader import M5LeasedEvidenceReader
 from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
@@ -44,11 +46,13 @@ class M5LiveExecutionStack:
     execution_runtime: M5ExecutionRuntime
     evidence_reader: M5LeasedEvidenceReader
     media_evidence_reader: M5LeasedMediaEvidenceReader
+    delete_evidence_reader: M5LeasedDeleteEvidenceReader
     effect_executor: M5EffectExecutor
     post_text_executor: M5PostTextExecutor
     reply_executor: M5ReplyExecutor
     quote_executor: M5QuoteExecutor
     media_executor: M5MediaExecutor
+    delete_executor: M5DeleteExecutor
 
 
 def build_live_m5_execution_stack(
@@ -81,6 +85,7 @@ def build_live_m5_execution_stack(
     )
     evidence_reader = M5LeasedEvidenceReader(write_broker)
     media_evidence_reader = M5LeasedMediaEvidenceReader(write_broker)
+    delete_evidence_reader = M5LeasedDeleteEvidenceReader(write_broker)
     effect_executor = M5EffectExecutor(
         runtime=execution_runtime,
         evidence_reader=evidence_reader,
@@ -102,6 +107,10 @@ def build_live_m5_execution_stack(
         content_evidence=evidence_reader,
         media_evidence=media_evidence_reader,
     )
+    delete_executor = M5DeleteExecutor(
+        runtime=execution_runtime,
+        evidence_reader=delete_evidence_reader,
+    )
     return M5LiveExecutionStack(
         read_broker=read_broker,
         write_broker=write_broker,
@@ -109,9 +118,11 @@ def build_live_m5_execution_stack(
         execution_runtime=execution_runtime,
         evidence_reader=evidence_reader,
         media_evidence_reader=media_evidence_reader,
+        delete_evidence_reader=delete_evidence_reader,
         effect_executor=effect_executor,
         post_text_executor=post_text_executor,
         reply_executor=reply_executor,
         quote_executor=quote_executor,
         media_executor=media_executor,
+        delete_executor=delete_executor,
     )

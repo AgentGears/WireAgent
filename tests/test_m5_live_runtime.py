@@ -17,6 +17,7 @@ from webwire.safety.m5_effect_executor import M5EffectExecutor
 from webwire.safety.m5_evidence_reader import M5LeasedEvidenceReader
 from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
 from webwire.safety.m5_live_runtime import build_live_m5_execution_stack
+from webwire.safety.m5_post_text_executor import M5PostTextExecutor
 from webwire.safety.scoped_authority import ScopedAuthorityBroker, ScopedAuthorityDenied
 
 
@@ -46,10 +47,15 @@ def test_live_stack_uses_one_shared_authority_root(tmp_path: Path) -> None:
     assert isinstance(stack.execution_runtime, M5ExecutionRuntime)
     assert isinstance(stack.evidence_reader, M5LeasedEvidenceReader)
     assert isinstance(stack.effect_executor, M5EffectExecutor)
+    assert isinstance(stack.post_text_executor, M5PostTextExecutor)
     assert stack.write_broker._kill is kill
     assert gateway._kill is kill
     assert stack.execution_runtime._gateway is gateway
     assert stack.execution_runtime._scoped is stack.scoped_authority
+    assert stack.effect_executor._runtime is stack.execution_runtime
+    assert stack.post_text_executor._runtime is stack.execution_runtime
+    assert stack.effect_executor._evidence is stack.evidence_reader
+    assert stack.post_text_executor._evidence is stack.evidence_reader
 
 
 def test_repeated_live_stack_for_same_facade_shares_browser_lease_state(

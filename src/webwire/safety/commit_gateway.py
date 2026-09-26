@@ -11,12 +11,14 @@ exactly-once claim is made.
 
 from __future__ import annotations
 
+import os
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Iterator, Optional
 
 from webwire.safety.effect_ledger import (
     EffectLedger,
@@ -139,6 +141,14 @@ class EffectPermit:
         return self._use.consumed_at
 
 
+@dataclass
+class _LifecycleState:
+    """Shared same-path M5 lifecycle ownership inside the supported process."""
+
+    lock: Any
+    live_effect_attempts: dict[str, EffectAttempt]
+
+
 class CommitGateway:
     """The M5 process-local commit-authority boundary.
 
@@ -159,7 +169,30 @@ class CommitGateway:
     preflight and the authority transition. External hot-file state is refreshed
     callback-free again immediately before mint/consume because an external
     process cannot participate in the Python state lock.
+
+    M6 reconciliation reuses this same re-entrant protocol lock as its canonical
+    lifecycle fence. REQUIRED attempts are registered before reservation I/O and
+    remain live-owned until a terminal M5 outcome is established. All gateway
+    instances targeting the same normalized EffectLedger path share the lock and
+    ownership map, so a sibling instance cannot hide an in-process live owner.
+    This is intentionally process-local; M6 makes no cross-process claim.
     """
+
+    _lifecycle_states_guard: ClassVar[Any] = threading.Lock()
+    _lifecycle_states: ClassVar[dict[str, _LifecycleState]] = {}
+
+    @classmethod
+    def _lifecycle_state_for_ledger(cls, ledger: EffectLedger) -> _LifecycleState:
+        key = os.path.normcase(str(ledger.path.resolve(strict=False)))
+        with cls._lifecycle_states_guard:
+            state = cls._lifecycle_states.get(key)
+            if state is None:
+                state = _LifecycleState(
+                    lock=threading.RLock(),
+                    live_effect_attempts={},
+                )
+                cls._lifecycle_states[key] = state
+            return state
 
     def __init__(
         self,
@@ -181,7 +214,9 @@ class CommitGateway:
         self._permit_ttl = permit_ttl_seconds
         self._issued_permits: dict[str, EffectPermit] = {}
         self._issued_attempts: dict[str, EffectAttempt] = {}
-        self._protocol_lock = threading.RLock()
+        lifecycle_state = self._lifecycle_state_for_ledger(ledger)
+        self._live_effect_attempts = lifecycle_state.live_effect_attempts
+        self._protocol_lock = lifecycle_state.lock
         # Revocation is safety-critical. If delivery is pending, the kill
         # execution fence stays closed even if an earlier listener reset the
         # live kill flag before this callback runs.
@@ -190,6 +225,56 @@ class CommitGateway:
     @property
     def authorization_epoch(self) -> int:
         return self._epoch.current
+
+    @property
+    def ledger(self) -> EffectLedger:
+        """Return the canonical EffectLedger owned by this gateway."""
+        return self._ledger
+
+    @contextmanager
+    def reconciliation_lifecycle_fence(self) -> Iterator[None]:
+        """Hold canonical M5 attempt ownership stable for reconciliation.
+
+        The coordinator acquires the publication fence before entering this
+        lifecycle fence. Normal M5 gateway paths never acquire the publication
+        fence, so this does not introduce a reverse lock order.
+        """
+        with self._protocol_lock:
+            yield
+
+    def _register_live_effect_attempt(self, attempt: EffectAttempt) -> None:
+        existing = self._live_effect_attempts.get(attempt.effect_id)
+        if existing is not None and existing is not attempt:
+            raise GatewayStateError(
+                f"effect_id {attempt.effect_id!r} already has a different live attempt"
+            )
+        self._live_effect_attempts[attempt.effect_id] = attempt
+
+    def _retire_live_effect_attempt(self, attempt: EffectAttempt) -> None:
+        existing = self._live_effect_attempts.get(attempt.effect_id)
+        if existing is None:
+            return
+        if existing is not attempt:
+            raise GatewayStateError(
+                f"effect_id {attempt.effect_id!r} live-attempt ownership changed"
+            )
+        if attempt.state in (AttemptState.PREPARING, AttemptState.RESERVED):
+            raise GatewayStateError(
+                f"cannot retire nonterminal live attempt in state {attempt.state.value}"
+            )
+        self._live_effect_attempts.pop(attempt.effect_id, None)
+
+    def live_attempt_owns_effect(self, effect_id: str) -> bool:
+        """Return canonical registered ownership under the protocol fence.
+
+        Registration itself is authoritative. Ownership is retired only by the
+        gateway's terminalization paths, never inferred away from the mutable
+        EffectAttempt state by a diagnostic read.
+        """
+        if not isinstance(effect_id, str) or not effect_id:
+            raise ValueError("effect_id must be a non-empty string")
+        with self._protocol_lock:
+            return effect_id in self._live_effect_attempts
 
     def _policy_for(self, intent: WriteIntent) -> EffectPolicy:
         try:
@@ -266,6 +351,7 @@ class CommitGateway:
             except EffectLedgerError as exc:
                 raise GatewayDenied(failure_reason, str(exc)) from exc
         attempt.mark_no_effect_after_authority()
+        self._retire_live_effect_attempt(attempt)
         self._evict_permit(permit)
 
     def close_unconsumed_permit_no_effect(
@@ -402,6 +488,7 @@ class CommitGateway:
         except EffectLedgerError as exc:
             raise GatewayDenied("prepermit_close_failed", str(exc)) from exc
         attempt.mark_no_effect_after_authority()
+        self._retire_live_effect_attempt(attempt)
 
     def authorize_commit(
         self,
@@ -446,6 +533,11 @@ class CommitGateway:
                             fenced = policy.durability is DurabilityPolicy.REQUIRED
 
                             if fenced:
+                                # Register ownership before reservation I/O. A
+                                # failed append may still leave visible/durable
+                                # RESERVED evidence, and the same attempt may be
+                                # retried later in this process.
+                                self._register_live_effect_attempt(attempt)
                                 # Latch before I/O: append_durable can write bytes
                                 # and still report failure during fsync.
                                 attempt.begin_reservation(grant)
@@ -729,6 +821,7 @@ class CommitGateway:
                     f"could not persist confirmed outcome: {exc}"
                 ) from exc
             attempt.mark_effect_confirmed()
+            self._retire_live_effect_attempt(attempt)
             self._evict_permit(permit)
 
     def record_effect_unknown(
@@ -754,4 +847,5 @@ class CommitGateway:
                     f"could not persist unknown outcome: {exc}"
                 ) from exc
             attempt.mark_effect_unknown()
+            self._retire_live_effect_attempt(attempt)
             self._evict_permit(permit)

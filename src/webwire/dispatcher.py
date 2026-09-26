@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from webwire.safety.m5_post_text_adapter import M5PostTextCapabilityAdapter
     from webwire.safety.m5_quote_adapter import M5QuoteCapabilityAdapter
     from webwire.safety.m5_reply_adapter import M5ReplyCapabilityAdapter
+    from webwire.safety.reconciliation_operator import ReconciliationOperatorSession
     from webwire.safety.write_kernel import WriteCapability
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class Dispatcher:
             DEFAULT_REGISTRY,
             DedupeStore,
             EffectLedger,
+            ReconciliationCoordinator,
             RecoveryGuard,
             TokenBucket,
             WriteKernel,
@@ -148,6 +150,17 @@ class Dispatcher:
             journal=self._journal,
             write_broker_factory=_make_write_broker,
             recovery_guard=self._m5_recovery,
+        )
+
+        # M6 reconciliation is local bookkeeping authority, not a Dispatcher
+        # capability. Compose it at the same process authority root so terminal
+        # reconciliation advances the exact ConfirmationState that WriteKernel
+        # uses for pending human-confirmation tokens, while sharing the canonical
+        # M5 CommitGateway lifecycle and composite RecoveryGuard.
+        self._m6_reconciliation = ReconciliationCoordinator(
+            recovery_guard=self._m5_recovery,
+            confirmation_state=self._write_kernel.confirmation_state,
+            commit_gateway=self._m5_gateway,
         )
         self._register_defaults()
 
@@ -499,6 +512,18 @@ class Dispatcher:
     @property
     def session_manager(self) -> SessionManager:
         return self._session
+
+    def create_reconciliation_operator_session(
+        self,
+        operator_id: str,
+    ) -> "ReconciliationOperatorSession":
+        """Create local M6 operator workflow on this runtime's exact authority state."""
+        from webwire.safety.reconciliation_operator import ReconciliationOperatorSession
+
+        return ReconciliationOperatorSession(
+            coordinator=self._m6_reconciliation,
+            operator_id=operator_id,
+        )
 
     # -- internals -----------------------------------------------------------
 

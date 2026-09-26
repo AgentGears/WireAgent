@@ -22,10 +22,10 @@ from typing import Any, Optional
 class RiskTier(StrEnum):
     """Derived policy tiers from RiskMeta dimensions. Per review Q4 — bookmark
     and like are NOT the same tier (bookmark is private; like is public engagement)."""
-    PRIVATE_REVERSIBLE = "private_reversible"                # bookmark
-    PUBLIC_REVERSIBLE_ENGAGEMENT = "public_reversible_engagement"  # like, follow
-    PUBLIC_AMPLIFYING_REVERSIBLE = "public_amplifying_reversible"  # repost/retweet
-    PUBLIC_CONTENT_IRREVERSIBLE = "public_content_irreversible"    # post, reply, quote
+    PRIVATE_REVERSIBLE = "private_reversible"
+    PUBLIC_REVERSIBLE_ENGAGEMENT = "public_reversible_engagement"
+    PUBLIC_AMPLIFYING_REVERSIBLE = "public_amplifying_reversible"
+    PUBLIC_CONTENT_IRREVERSIBLE = "public_content_irreversible"
 
 
 class Visibility(StrEnum):
@@ -36,33 +36,26 @@ class Visibility(StrEnum):
 
 class Reversibility(StrEnum):
     REVERSIBLE = "reversible"
-    COMPENSATABLE = "compensatable"  # can delete, but side effects persist
+    COMPENSATABLE = "compensatable"
     IRREVERSIBLE = "irreversible"
 
 
 class Amplification(StrEnum):
     NONE = "none"
-    ENGAGEMENT_SIGNAL = "engagement_signal"  # like, follow
-    BROADCAST = "broadcast"                   # repost, post
+    ENGAGEMENT_SIGNAL = "engagement_signal"
+    BROADCAST = "broadcast"
 
 
 @dataclass(frozen=True)
 class RiskMeta:
-    """Multi-dimensional risk metadata for an action type. The RiskTier is
-    derived from these dimensions, not hardcoded per action."""
+    """Multi-dimensional risk metadata for an action type."""
     visibility: Visibility
     reversibility: Reversibility
     amplification: Amplification
-    content_creation: bool = False  # creates user content (post/reply) vs signal (like)
+    content_creation: bool = False
     residual_side_effects: tuple[str, ...] = ()
 
     def derive_tier(self) -> RiskTier:
-        """Derive the policy tier from the metadata dimensions.
-
-        Order matters: content_creation is the strongest signal (posts/replies/
-        quotes are the highest-risk tier), checked before amplification, because
-        a post is both content_creation AND broadcast but should land in the
-        IRREVERSIBLE tier, not the AMPLIFYING one."""
         if self.content_creation:
             return RiskTier.PUBLIC_CONTENT_IRREVERSIBLE
         if self.amplification == Amplification.BROADCAST:
@@ -76,7 +69,7 @@ class RiskMeta:
 
 @dataclass(frozen=True)
 class CompensationMeta:
-    """Per-action compensation metadata. NEVER called 'undo' for public actions."""
+    """Per-action compensation metadata. Public compensation is not true undo."""
     supports_compensation: bool
     compensation_action: Optional[str] = None
     residual_side_effects: tuple[str, ...] = ()
@@ -128,16 +121,22 @@ class ConfirmationToken:
     intent_hash: str
     risk_tier: RiskTier
     created_at: float = field(default_factory=time.time)
-    expires_at: float = 0.0  # diagnostic wall-clock expiry only
+    expires_at: float = 0.0
     consumed: bool = False
     capability_name: str = ""
     confirmation_epoch: int = 0
     authority_created_at: float = 0.0
     authority_expires_at: float = 0.0
 
-    def is_expired(self, authority_now: float) -> bool:
-        """Diagnostic comparison for an explicit monotonic sample, never authority."""
-        return authority_now >= self.authority_expires_at
+    def is_expired(self, authority_now: Optional[float] = None) -> bool:
+        """Diagnostic monotonic comparison; ConfirmationState owns authority.
+
+        The optional argument is retained for source compatibility. Kernel and
+        coordinator authority never use this carrier helper; they sample their
+        configured monotonic clock under the confirmation-state fence.
+        """
+        t = time.monotonic() if authority_now is None else authority_now
+        return t >= self.authority_expires_at
 
 
 class PolicyVerdict(StrEnum):
@@ -155,14 +154,12 @@ class PolicyDecision:
     risk_tier: RiskTier
     intent_hash: str
     confirmation_token: Optional[ConfirmationToken] = None
-    blocked_by: Optional[str] = None  # kill_switch | dedupe | token_bucket | reconciliation_required | stale_confirmation_epoch | expired_token | intent_mismatch | capability_mismatch | consumed_token
+    blocked_by: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         token = d.get("confirmation_token")
         if isinstance(token, dict):
-            # Monotonic values are process-relative authority internals, not a
-            # caller-facing timestamp contract. Keep epoch + wall diagnostics.
             token.pop("authority_created_at", None)
             token.pop("authority_expires_at", None)
         return d

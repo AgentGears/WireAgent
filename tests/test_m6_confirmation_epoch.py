@@ -94,6 +94,30 @@ def _kernel(tmp_path: Path, state: ConfirmationState) -> WriteKernel:
     )
 
 
+def _consume_epoch_race(
+    state: ConfirmationState,
+    token_str: str,
+    barrier: threading.Barrier,
+    outcome: list[str | None],
+) -> None:
+    barrier.wait()
+    _, blocked = state.validate_and_consume(
+        token_str,
+        intent_hash="intent",
+        risk_tier=RiskTier.PUBLIC_REVERSIBLE_ENGAGEMENT,
+        capability_name="like",
+    )
+    outcome.append(blocked)
+
+
+def _advance_epoch_race(
+    state: ConfirmationState,
+    barrier: threading.Barrier,
+) -> None:
+    barrier.wait()
+    state.advance_epoch()
+
+
 def test_issue_captures_epoch_and_separates_wall_diagnostics_from_authority() -> None:
     mono = _Clock(50.0)
     wall = _Clock(5_000.0)
@@ -227,22 +251,14 @@ def test_consume_vs_epoch_advance_has_one_synchronized_order() -> None:
         barrier = threading.Barrier(3)
         outcome: list[str | None] = []
 
-        def consume() -> None:
-            barrier.wait()
-            _, blocked = state.validate_and_consume(
-                token.token,
-                intent_hash="intent",
-                risk_tier=RiskTier.PUBLIC_REVERSIBLE_ENGAGEMENT,
-                capability_name="like",
-            )
-            outcome.append(blocked)
-
-        def advance() -> None:
-            barrier.wait()
-            state.advance_epoch()
-
-        consume_thread = threading.Thread(target=consume)
-        advance_thread = threading.Thread(target=advance)
+        consume_thread = threading.Thread(
+            target=_consume_epoch_race,
+            args=(state, token.token, barrier, outcome),
+        )
+        advance_thread = threading.Thread(
+            target=_advance_epoch_race,
+            args=(state, barrier),
+        )
         consume_thread.start()
         advance_thread.start()
         barrier.wait()

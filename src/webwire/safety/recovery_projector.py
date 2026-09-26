@@ -259,10 +259,10 @@ class RecoveryProjector:
 
         projected: list[CompositeRecoveryProjection] = []
         for effect_id, last in last_by_effect.items():
-            reconciliation = reconciliation_by_effect.get(effect_id)
+            terminal_reconciliation = reconciliation_by_effect.get(effect_id)
             disposition = self._disposition(
                 last=last,
-                reconciliation=reconciliation,
+                reconciliation=terminal_reconciliation,
             )
             projected.append(
                 CompositeRecoveryProjection(
@@ -275,7 +275,7 @@ class RecoveryProjector:
                     ),
                     first_record=first_by_effect[effect_id],
                     last_record=last,
-                    reconciliation=reconciliation,
+                    reconciliation=terminal_reconciliation,
                 )
             )
 

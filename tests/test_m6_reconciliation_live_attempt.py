@@ -103,19 +103,23 @@ def _evidence() -> dict[str, object]:
     }
 
 
-def _authority(effect_id: str) -> ReconciliationAuthority:
+def _authority(
+    coordinator: ReconciliationCoordinator,
+    effect_id: str,
+) -> ReconciliationAuthority:
     evidence = _evidence()
-    return ReconciliationAuthority(
+    return coordinator._mint_operator_authority(
         effect_id=effect_id,
         verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
         evidence_hash=canonical_evidence_hash(evidence),
         operator_id="operator-local",
+        ttl_seconds=120.0,
         monotonic_clock=lambda: 10.0,
         authority_id_factory=lambda: "auth-live",
     )
 
 
-def test_reserved_live_attempt_blocks_reconciliation_until_terminal_outcome(
+def test_reserved_live_attempt_blocks_display_and_resolution_until_terminal_outcome(
     tmp_path: Path,
 ) -> None:
     intent, grant, attempt, gateway, coordinator = _gateway_stack(tmp_path)
@@ -123,11 +127,15 @@ def test_reserved_live_attempt_blocks_reconciliation_until_terminal_outcome(
     assert gateway.live_attempt_owns_effect(attempt.effect_id) is True
 
     with pytest.raises(ReconciliationDenied) as exc_info:
+        coordinator.describe_target(attempt.effect_id)
+    assert exc_info.value.reason == "live_attempt_owned"
+
+    with pytest.raises(ReconciliationDenied) as exc_info:
         coordinator.resolve(
             attempt.effect_id,
             ReconciliationVerdict.CONFIRMED_EFFECT,
             _evidence(),
-            _authority(attempt.effect_id),
+            _authority(coordinator, attempt.effect_id),
         )
     assert exc_info.value.reason == "live_attempt_owned"
 
@@ -151,7 +159,7 @@ def test_reserved_live_attempt_blocks_reconciliation_until_terminal_outcome(
         attempt.effect_id,
         ReconciliationVerdict.CONFIRMED_EFFECT,
         _evidence(),
-        _authority(attempt.effect_id),
+        _authority(coordinator, attempt.effect_id),
     )
     assert result.record.effect_id == attempt.effect_id
     assert result.record.verdict is ReconciliationVerdict.CONFIRMED_EFFECT
@@ -188,6 +196,41 @@ def test_reservation_io_failure_retains_live_ownership_before_permit_mint(
             attempt.effect_id,
             ReconciliationVerdict.CONFIRMED_EFFECT,
             _evidence(),
-            _authority(attempt.effect_id),
+            _authority(coordinator, attempt.effect_id),
+        )
+    assert exc_info.value.reason == "live_attempt_owned"
+
+
+def test_same_path_sibling_gateway_cannot_hide_runtime_live_owner(tmp_path: Path) -> None:
+    intent, grant, attempt, runtime_gateway, _runtime_coordinator = _gateway_stack(tmp_path)
+    runtime_gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
+
+    cfg = WebWireConfig(state_dir=tmp_path)
+    sibling_effects = EffectLedger(path=cfg.effects_path())
+    sibling_gateway = CommitGateway(
+        ledger=sibling_effects,
+        kill_switch=KillSwitch(cfg),
+        authorization_epoch=AuthorizationEpoch(),
+    )
+    reconciliations = ReconciliationLedger(path=cfg.reconciliations_path())
+    sibling_guard = RecoveryGuard(
+        sibling_effects,
+        reconciliation_ledger=reconciliations,
+    )
+    sibling_coordinator = ReconciliationCoordinator(
+        recovery_guard=sibling_guard,
+        confirmation_state=ConfirmationState(),
+        commit_gateway=sibling_gateway,
+        reconciliation_id_factory=lambda: "rec-sibling",
+        timestamp_factory=lambda: "2026-09-26T19:02:00+00:00",
+    )
+
+    assert sibling_gateway.live_attempt_owns_effect(attempt.effect_id) is True
+    with pytest.raises(ReconciliationDenied) as exc_info:
+        sibling_coordinator.resolve(
+            attempt.effect_id,
+            ReconciliationVerdict.CONFIRMED_EFFECT,
+            _evidence(),
+            _authority(sibling_coordinator, attempt.effect_id),
         )
     assert exc_info.value.reason == "live_attempt_owned"

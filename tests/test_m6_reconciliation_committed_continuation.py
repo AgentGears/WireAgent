@@ -58,6 +58,25 @@ def _coordinator(
     )
 
 
+def test_same_path_coordinator_rejects_second_confirmation_epoch(tmp_path: Path) -> None:
+    cfg = WebWireConfig(state_dir=tmp_path)
+    canonical = ConfirmationState()
+    _coordinator(
+        cfg,
+        confirmation_state=canonical,
+        reconciliation_id="rec-canonical",
+        timestamp="2026-09-26T21:18:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="share one ConfirmationState"):
+        _coordinator(
+            cfg,
+            confirmation_state=ConfirmationState(),
+            reconciliation_id="rec-second-epoch",
+            timestamp="2026-09-26T21:18:01+00:00",
+        )
+
+
 def test_clean_failure_pins_exact_fact_across_same_path_coordinators(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -78,10 +97,10 @@ def test_clean_failure_pins_exact_fact_across_same_path_coordinators(
     )
     effects.append_durable(raw)
 
-    original_confirmations = ConfirmationState()
+    confirmations = ConfirmationState()
     original = _coordinator(
         cfg,
-        confirmation_state=original_confirmations,
+        confirmation_state=confirmations,
         reconciliation_id="rec-original",
         timestamp="2026-09-26T21:21:00+00:00",
     )
@@ -127,7 +146,7 @@ def test_clean_failure_pins_exact_fact_across_same_path_coordinators(
     assert authority_a.committed is True
     assert authority_a.committed_record is frozen
     assert authority_a.consumed is False
-    assert original_confirmations.current_epoch == 1
+    assert confirmations.current_epoch == 1
     assert original.recovery_guard.reconciliation_ledger.read_authoritative() == []
 
     # Once persistence starts, the operator workflow may not stage a replacement
@@ -136,14 +155,12 @@ def test_clean_failure_pins_exact_fact_across_same_path_coordinators(
         original.describe_target(raw.effect_id)
     assert exc_info.value.reason == "committed_resolution_in_progress"
 
-    # A separately constructed same-path coordinator has its own protocol key and
-    # confirmation state, but it shares the process-local committed continuation
-    # domain. A fresh authority for a contradictory fact must not replace the
-    # already-started resolution merely because the clean failure left no row.
-    competing_confirmations = ConfirmationState()
+    # A separately constructed same-path coordinator may have its own protocol
+    # key, but it must share the one canonical confirmation epoch. Its fresh
+    # contradictory authority still cannot replace the already-started fact.
     sibling = _coordinator(
         cfg,
-        confirmation_state=competing_confirmations,
+        confirmation_state=confirmations,
         reconciliation_id="rec-competing",
         timestamp="2026-09-26T21:22:00+00:00",
     )
@@ -167,7 +184,7 @@ def test_clean_failure_pins_exact_fact_across_same_path_coordinators(
         )
 
     assert exc_info.value.reason == "committed_resolution_in_progress"
-    assert competing_confirmations.current_epoch == 0
+    assert confirmations.current_epoch == 1
     assert authority_b.committed is False
     assert sibling.recovery_guard.reconciliation_ledger.read_authoritative() == []
 
@@ -185,7 +202,7 @@ def test_clean_failure_pins_exact_fact_across_same_path_coordinators(
     assert resolution.record.reconciliation_id == "rec-original"
     assert resolution.record.verdict is ReconciliationVerdict.CONFIRMED_EFFECT
     assert resolution.record.evidence_hash == canonical_evidence_hash(evidence_a)
-    assert original_confirmations.current_epoch == 2
+    assert confirmations.current_epoch == 2
     assert authority_a.consumed is True
     records = original.recovery_guard.reconciliation_ledger.read_authoritative()
     assert records == [resolution.record]

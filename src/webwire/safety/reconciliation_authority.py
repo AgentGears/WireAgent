@@ -1,13 +1,21 @@
 """M6 ephemeral operator authority for one terminal reconciliation fact.
 
-ReconciliationAuthority is process-local safety authority.  It is bound to one
+ReconciliationAuthority is process-local safety authority. It is bound to one
 (effect, verdict, evidence hash, operator) tuple, uses monotonic elapsed time
 before persistence starts, and can never mint ordinary execution authority.
 
 Once the coordinator starts persistence it commits this authority to one exact
-frozen ReconciliationRecord.  TTL expiry after that point cannot change or
+frozen ReconciliationRecord. TTL expiry after that point cannot change or
 cancel the already-approved fact; only exact-fact re-drive/re-durability is
 allowed until known durable success or process termination.
+
+Lifecycle transitions are additionally bound to the coordinator that minted the
+authority. The protocol key is deliberately private to that coordinator: callers
+may inspect the returned authority, but ordinary code cannot synthetically mark
+it committed/consumed or manufacture a separately constructed authority that a
+different coordinator will accept. As elsewhere in the safety models this is an
+engineering boundary against accidental/API-level bypass, not a sandbox against
+hostile Python reflection.
 
 Source of truth: ``docs/M6_DESIGN.md`` §§10-12 and invariants 11-14.
 """
@@ -50,8 +58,10 @@ class ReconciliationAuthorityError(RuntimeError):
 class ReconciliationAuthority:
     """One process-local, monotonic-TTL authority bound to one resolution.
 
-    Public properties are diagnostic carrier data only.  Commitment and
-    consumption state remain private and synchronized by ``_lock``.
+    Public properties are diagnostic carrier data only. Commitment and
+    consumption state remain private and synchronized by ``_lock``. Lifecycle
+    methods are coordinator-internal and require the exact protocol key supplied
+    when the authority was minted.
     """
 
     def __init__(
@@ -61,6 +71,7 @@ class ReconciliationAuthority:
         verdict: ReconciliationVerdict,
         evidence_hash: str,
         operator_id: str,
+        _protocol_key: object,
         ttl_seconds: float = DEFAULT_RECONCILIATION_AUTHORITY_TTL_S,
         monotonic_clock: Callable[[], float] = time.monotonic,
         authority_id_factory: Callable[[], str] = lambda: secrets.token_urlsafe(16),
@@ -81,6 +92,8 @@ class ReconciliationAuthority:
             raise ValueError("evidence_hash must be lowercase SHA-256 hexadecimal")
         if not isinstance(operator_id, str) or not operator_id:
             raise ValueError("operator_id must be a non-empty string")
+        if _protocol_key is None:
+            raise ValueError("_protocol_key is required")
         try:
             ttl = float(ttl_seconds)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -92,6 +105,7 @@ class ReconciliationAuthority:
         self._verdict = verdict
         self._evidence_hash = evidence_hash
         self._operator_id = operator_id
+        self.__protocol_key = _protocol_key
         self._clock = monotonic_clock
         self._lock = threading.RLock()
         self._last_clock_sample: Optional[float] = None
@@ -178,6 +192,10 @@ class ReconciliationAuthority:
         self._last_clock_sample = value
         return value
 
+    def _require_protocol_key(self, protocol_key: object) -> None:
+        if protocol_key is not self.__protocol_key:
+            raise ReconciliationAuthorityError("authority_protocol_mismatch")
+
     def _require_binding(
         self,
         *,
@@ -192,20 +210,22 @@ class ReconciliationAuthority:
         if evidence_hash != self._evidence_hash:
             raise ReconciliationAuthorityError("evidence_hash_mismatch")
 
-    def validate_start(
+    def _validate_start(
         self,
         *,
+        protocol_key: object,
         effect_id: str,
         verdict: ReconciliationVerdict,
         evidence_hash: str,
     ) -> Optional[ReconciliationRecord]:
-        """Validate authority for a persistence attempt.
+        """Coordinator-internal validation for one persistence attempt.
 
         Returns the exact frozen record when persistence had already started.
         In that committed state TTL is deliberately no longer consulted; the
         caller may only continue that same immutable fact.
         """
         with self._lock:
+            self._require_protocol_key(protocol_key)
             self._require_binding(
                 effect_id=effect_id,
                 verdict=verdict,
@@ -225,16 +245,22 @@ class ReconciliationAuthority:
         left: ReconciliationRecord,
         right: ReconciliationRecord,
     ) -> bool:
-        # Commitment freezes the complete record, including timestamp.  The
+        # Commitment freezes the complete record, including timestamp. The
         # ledger's timestamp-excluding exact-re-durability comparison is a lower
         # storage-layer compatibility rule and must not weaken authority binding.
         return left.to_jsonl() == right.to_jsonl()
 
-    def commit(self, record: ReconciliationRecord) -> ReconciliationRecord:
-        """Commit this authority to one exact fact immediately before I/O."""
+    def _commit_for_persistence(
+        self,
+        record: ReconciliationRecord,
+        *,
+        protocol_key: object,
+    ) -> ReconciliationRecord:
+        """Coordinator-internal commitment immediately before durability I/O."""
         if not isinstance(record, ReconciliationRecord):
             raise TypeError("record must be a ReconciliationRecord")
         with self._lock:
+            self._require_protocol_key(protocol_key)
             self._require_binding(
                 effect_id=record.effect_id,
                 verdict=record.verdict,
@@ -251,11 +277,17 @@ class ReconciliationAuthority:
                 raise ReconciliationAuthorityError("committed_fact_mismatch")
             return self._committed_record
 
-    def consume(self, record: ReconciliationRecord) -> None:
-        """Permanently consume authority after known durable success."""
+    def _consume_after_durable(
+        self,
+        record: ReconciliationRecord,
+        *,
+        protocol_key: object,
+    ) -> None:
+        """Coordinator-internal permanent consume after known durable success."""
         if not isinstance(record, ReconciliationRecord):
             raise TypeError("record must be a ReconciliationRecord")
         with self._lock:
+            self._require_protocol_key(protocol_key)
             committed = self._committed_record
             if committed is None:
                 raise ReconciliationAuthorityError("authority_not_committed")

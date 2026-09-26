@@ -12,12 +12,14 @@ from webwire.safety import (
     EffectLedger,
     EffectLedgerRecord,
     EffectState,
+    ReconciliationAuthority,
     ReconciliationCoordinator,
     ReconciliationLedger,
     ReconciliationOperatorError,
     ReconciliationOperatorSession,
     ReconciliationVerdict,
     RecoveryGuard,
+    canonical_evidence_hash,
 )
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.execution_models import AuthorizationEpoch
@@ -93,6 +95,7 @@ def test_prepare_is_read_only_and_does_not_mint_authority(tmp_path: Path) -> Non
     assert proposal.confirmation_text.startswith(
         "CONFIRM fx-operator CONFIRMED_EFFECT "
     )
+    assert proposal.evidence_hash == canonical_evidence_hash(proposal.evidence)
     assert reconciliations.read_authoritative() == []
     assert guard.require_clear("remote-actor|like|post|123|", refresh=False) is not None
 
@@ -110,6 +113,7 @@ def test_proposal_evidence_is_detached_from_caller_mutation(tmp_path: Path) -> N
     evidence["basis"] = "mutated-after-display"
     detached = proposal.evidence
     assert detached["basis"] == "local-operator-inspection"
+    assert canonical_evidence_hash(detached) == proposal.evidence_hash
     detached["basis"] = "mutated-copy"
     assert proposal.evidence["basis"] == "local-operator-inspection"
 
@@ -183,13 +187,12 @@ def test_unconfirmed_proposal_cannot_resolve(tmp_path: Path) -> None:
         evidence_summary="Observed target absence with domain proof.",
     )
 
-    from webwire.safety import ReconciliationAuthority
-
     rogue = ReconciliationAuthority(
         effect_id=proposal.effect_id,
         verdict=proposal.verdict,
         evidence_hash=proposal.evidence_hash,
         operator_id="local-admin",
+        _protocol_key=object(),
         monotonic_clock=lambda: 10.0,
     )
     with pytest.raises(ReconciliationOperatorError) as exc_info:

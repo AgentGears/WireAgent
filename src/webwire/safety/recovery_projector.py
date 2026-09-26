@@ -4,10 +4,10 @@ M5 effect history remains canonical and immutable. M6 reconciliation history is
 orthogonal evidence that may remove only one unresolved recovery contribution.
 This module joins both durable histories without rewriting either ledger.
 
-Authoritative callers use :class:`ReconciliationPublicationFence` around the
-whole read -> join -> publication transaction. The fence is process-local and
-shared by normalized safety-ledger path pair so independently constructed guard
-objects for one recovery domain cannot publish across one another.
+Every :class:`RecoveryProjector` is publication-fenced, including direct calls.
+The fence is process-local and shared by normalized safety-ledger path pair so
+independently constructed projectors/guards for one recovery domain cannot use
+accidentally independent locks.
 
 Source of truth: ``docs/M6_DESIGN.md`` §§11, 13-15.
 """
@@ -77,42 +77,37 @@ class CompositeRecoveryProjection:
 class ReconciliationPublicationFence:
     """Process-local ordering fence shared by one pair of safety ledgers.
 
-    The later ReconciliationCoordinator and the authoritative RecoveryGuard use
-    this same re-entrant lock. Sharing is keyed by normalized ledger paths rather
-    than object identity so separately constructed objects for the same recovery
-    domain still serialize publication.
+    Construction always names the two canonical ledgers. The underlying lock is
+    selected from a normalized-path registry, so there is no public standalone
+    constructor path that can accidentally bypass domain sharing.
     """
 
     _registry_guard: ClassVar[Any] = threading.Lock()
     _locks: ClassVar[dict[tuple[str, str], Any]] = {}
 
-    def __init__(self, lock: Optional[Any] = None) -> None:
-        self._lock = lock if lock is not None else threading.RLock()
-
-    @staticmethod
-    def _normalize(path: Path) -> str:
-        return os.path.normcase(str(path.resolve(strict=False)))
-
-    @classmethod
-    def shared_for_ledgers(
-        cls,
+    def __init__(
+        self,
         effect_ledger: EffectLedger,
         reconciliation_ledger: ReconciliationLedger,
-    ) -> "ReconciliationPublicationFence":
+    ) -> None:
         if not isinstance(effect_ledger, EffectLedger):
             raise TypeError("effect_ledger must be an EffectLedger")
         if not isinstance(reconciliation_ledger, ReconciliationLedger):
             raise TypeError("reconciliation_ledger must be a ReconciliationLedger")
         key = (
-            cls._normalize(effect_ledger.path),
-            cls._normalize(reconciliation_ledger.path),
+            self._normalize(effect_ledger.path),
+            self._normalize(reconciliation_ledger.path),
         )
-        with cls._registry_guard:
-            lock = cls._locks.get(key)
+        with self._registry_guard:
+            lock = self._locks.get(key)
             if lock is None:
                 lock = threading.RLock()
-                cls._locks[key] = lock
-        return cls(lock)
+                self._locks[key] = lock
+        self._lock = lock
+
+    @staticmethod
+    def _normalize(path: Path) -> str:
+        return os.path.normcase(str(path.resolve(strict=False)))
 
     def __enter__(self) -> "ReconciliationPublicationFence":
         self._lock.acquire()
@@ -120,11 +115,6 @@ class ReconciliationPublicationFence:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self._lock.release()
-
-    @property
-    def lock(self) -> Any:
-        """Expose the shared primitive for lock-identity/concurrency tests only."""
-        return self._lock
 
 
 _LINEAGE_FIELDS = (
@@ -158,6 +148,10 @@ class RecoveryProjector:
             raise TypeError("RecoveryProjector requires a ReconciliationLedger")
         self._effect_ledger = effect_ledger
         self._reconciliation_ledger = reconciliation_ledger
+        self._publication_fence = ReconciliationPublicationFence(
+            effect_ledger,
+            reconciliation_ledger,
+        )
 
     @property
     def effect_ledger(self) -> EffectLedger:
@@ -166,6 +160,10 @@ class RecoveryProjector:
     @property
     def reconciliation_ledger(self) -> ReconciliationLedger:
         return self._reconciliation_ledger
+
+    @property
+    def publication_fence(self) -> ReconciliationPublicationFence:
+        return self._publication_fence
 
     @staticmethod
     def _validate_reconciliation_lineage(
@@ -219,13 +217,17 @@ class RecoveryProjector:
         )
 
     def project(self) -> list[CompositeRecoveryProjection]:
-        """Return one complete joined snapshot or fail closed.
+        """Return one publication-fenced complete joined snapshot or fail closed.
 
         ``ReconciliationLedger.read_authoritative`` is intentionally used rather
         than a raw parse. In the current process it refuses a local durability
         ambiguity latch; after restart it re-establishes surviving file and
         parent-directory durability before any reconciliation can clear recovery.
         """
+        with self._publication_fence:
+            return self._project_under_fence()
+
+    def _project_under_fence(self) -> list[CompositeRecoveryProjection]:
         effect_records = self._effect_ledger.read_records()
         reconciliation_records = self._reconciliation_ledger.read_authoritative()
 

@@ -95,6 +95,8 @@ def test_prepare_is_read_only_and_does_not_mint_authority(tmp_path: Path) -> Non
     assert proposal.confirmation_text.startswith(
         "CONFIRM fx-operator CONFIRMED_EFFECT "
     )
+    assert proposal.confirmation_text.endswith(" local-admin")
+    assert proposal.evidence_hash in proposal.confirmation_text
     assert proposal.evidence_hash == canonical_evidence_hash(proposal.evidence)
     assert reconciliations.read_authoritative() == []
     assert guard.require_clear("remote-actor|like|post|123|", refresh=False) is not None

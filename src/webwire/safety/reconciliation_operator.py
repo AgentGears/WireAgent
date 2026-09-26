@@ -1,10 +1,10 @@
 """Narrow local M6 operator workflow for terminal reconciliation.
 
 This is intentionally not a Dispatcher capability and exposes no browser
-mutation surface.  It stages a read-only target plus operator-supplied evidence,
+mutation surface. It stages a read-only target plus operator-supplied evidence,
 displays an exact verdict/evidence binding, requires explicit same-session text
-confirmation, then mints one short-lived ReconciliationAuthority for the
-coordinator.
+confirmation, then asks the coordinator to mint one short-lived
+ReconciliationAuthority bound to that coordinator's protocol domain.
 
 Browser-backed evidence collection remains an action-specific read-only adapter;
 this workflow never turns a failed observation into CONFIRMED_NO_EFFECT.
@@ -164,9 +164,7 @@ class ReconciliationOperatorSession:
         proposal_id = self._proposal_id_factory()
         if not isinstance(proposal_id, str) or not proposal_id:
             raise ReconciliationOperatorError("proposal_id_invalid")
-        confirmation_text = (
-            f"CONFIRM {effect_id} {verdict.value} {evidence_hash}"
-        )
+        confirmation_text = f"CONFIRM {effect_id} {verdict.value} {evidence_hash}"
         first = target.first_record
         proposal = ReconciliationProposal(
             proposal_id=proposal_id,
@@ -208,7 +206,7 @@ class ReconciliationOperatorSession:
             if confirmation_text != proposal.confirmation_text:
                 raise ReconciliationOperatorError("confirmation_mismatch")
             if state.authority is None:
-                state.authority = ReconciliationAuthority(
+                state.authority = self._coordinator._mint_operator_authority(
                     effect_id=proposal.effect_id,
                     verdict=proposal.verdict,
                     evidence_hash=proposal.evidence_hash,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from webwire.config import WebWireConfig
 from webwire.safety import (
     ConfirmationState,
     EffectLedger,
@@ -18,6 +19,9 @@ from webwire.safety import (
     ReconciliationVerdict,
     RecoveryGuard,
 )
+from webwire.safety.commit_gateway import CommitGateway
+from webwire.safety.execution_models import AuthorizationEpoch
+from webwire.safety.kill_switch import KillSwitch
 
 
 def _evidence() -> dict[str, object]:
@@ -33,8 +37,9 @@ def _session(tmp_path: Path) -> tuple[
     ReconciliationLedger,
     RecoveryGuard,
 ]:
-    effects = EffectLedger(path=tmp_path / "effects.ndjson")
-    reconciliations = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
+    cfg = WebWireConfig(state_dir=tmp_path)
+    effects = EffectLedger(cfg)
+    reconciliations = ReconciliationLedger(path=cfg.reconciliations_path())
     raw = EffectLedgerRecord(
         effect_id="fx-operator",
         semantic_key="remote-actor|like|post|123|",
@@ -50,9 +55,15 @@ def _session(tmp_path: Path) -> tuple[
     effects.append_durable(raw)
     guard = RecoveryGuard(effects, reconciliation_ledger=reconciliations)
     guard.hydrate()
+    gateway = CommitGateway(
+        ledger=effects,
+        kill_switch=KillSwitch(cfg),
+        authorization_epoch=AuthorizationEpoch(),
+    )
     coordinator = ReconciliationCoordinator(
         recovery_guard=guard,
         confirmation_state=ConfirmationState(),
+        commit_gateway=gateway,
         reconciliation_id_factory=lambda: "rec-operator",
         timestamp_factory=lambda: "2026-09-26T19:21:00+00:00",
     )
@@ -172,8 +183,6 @@ def test_unconfirmed_proposal_cannot_resolve(tmp_path: Path) -> None:
         evidence_summary="Observed target absence with domain proof.",
     )
 
-    # A separately manufactured object is insufficient: the session must have
-    # minted the exact authority after explicit confirmation.
     from webwire.safety import ReconciliationAuthority
 
     rogue = ReconciliationAuthority(

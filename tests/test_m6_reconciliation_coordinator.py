@@ -92,13 +92,14 @@ def _stack(tmp_path: Path) -> tuple[
 
 
 def _authority(
+    coordinator: ReconciliationCoordinator,
     evidence: dict[str, object],
     *,
     clock: _Clock | None = None,
     effect_id: str = "fx-1",
     verdict: ReconciliationVerdict = ReconciliationVerdict.CONFIRMED_EFFECT,
 ) -> ReconciliationAuthority:
-    return ReconciliationAuthority(
+    return coordinator._mint_operator_authority(
         effect_id=effect_id,
         verdict=verdict,
         evidence_hash=canonical_evidence_hash(evidence),
@@ -125,7 +126,7 @@ def test_resolve_appends_fact_advances_epoch_and_clears_only_recovery_gate(
         risk_tier=RiskTier.PRIVATE_REVERSIBLE,
         capability_name="bookmark",
     )
-    authority = _authority(evidence)
+    authority = _authority(coordinator, evidence)
 
     resolution = coordinator.resolve(
         raw.effect_id,
@@ -165,7 +166,7 @@ def test_settled_raw_effect_is_denied_before_epoch_advance(tmp_path: Path) -> No
     effects, _reconciliations, _guard, confirmations, coordinator = _stack(tmp_path)
     effects.append_durable(_effect(state=EffectState.EFFECT_CONFIRMED))
     evidence = _evidence()
-    authority = _authority(evidence)
+    authority = _authority(coordinator, evidence)
 
     with pytest.raises(ReconciliationDenied) as exc_info:
         coordinator.resolve(
@@ -187,7 +188,7 @@ def test_existing_terminal_reconciliation_denies_fresh_authority_before_epoch(
     raw = _effect()
     effects.append_durable(raw)
     evidence = _evidence()
-    first_authority = _authority(evidence)
+    first_authority = _authority(coordinator, evidence)
     coordinator.resolve(
         raw.effect_id,
         ReconciliationVerdict.CONFIRMED_EFFECT,
@@ -196,7 +197,7 @@ def test_existing_terminal_reconciliation_denies_fresh_authority_before_epoch(
     )
     assert confirmations.current_epoch == 1
 
-    fresh = _authority(evidence)
+    fresh = _authority(coordinator, evidence)
     with pytest.raises(ReconciliationDenied) as exc_info:
         coordinator.resolve(
             raw.effect_id,
@@ -221,7 +222,7 @@ def test_clean_persistence_failure_commits_exact_fact_and_retry_survives_ttl(
     guard.hydrate()
     evidence = _evidence()
     clock = _Clock()
-    authority = _authority(evidence, clock=clock)
+    authority = _authority(coordinator, evidence, clock=clock)
     real_append = reconciliations.append_durable
     calls = 0
 
@@ -281,12 +282,50 @@ def test_clean_persistence_failure_commits_exact_fact_and_retry_survives_ttl(
     assert denied_reason == "stale_confirmation_epoch"
 
 
+def test_foreign_direct_authority_cannot_bypass_operator_confirmation(
+    tmp_path: Path,
+) -> None:
+    effects, reconciliations, guard, confirmations, coordinator = _stack(tmp_path)
+    raw = _effect()
+    effects.append_durable(raw)
+    guard.hydrate()
+    evidence = _evidence()
+    foreign = ReconciliationAuthority(
+        effect_id=raw.effect_id,
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence_hash=canonical_evidence_hash(evidence),
+        operator_id="operator-local",
+        _protocol_key=object(),
+        ttl_seconds=5.0,
+        monotonic_clock=_Clock(),
+        authority_id_factory=lambda: "foreign-auth",
+    )
+
+    with pytest.raises(ReconciliationDenied) as exc_info:
+        coordinator.resolve(
+            raw.effect_id,
+            ReconciliationVerdict.CONFIRMED_EFFECT,
+            evidence,
+            foreign,
+        )
+
+    assert exc_info.value.reason == "authority_protocol_mismatch"
+    assert confirmations.current_epoch == 0
+    assert foreign.committed is False
+    assert reconciliations.read_authoritative() == []
+    assert guard.require_clear(raw.semantic_key, refresh=False) is not None
+
+
 def test_authority_binding_mismatch_cannot_advance_epoch(tmp_path: Path) -> None:
     effects, _reconciliations, _guard, confirmations, coordinator = _stack(tmp_path)
     raw = _effect()
     effects.append_durable(raw)
     evidence = _evidence()
-    authority = _authority(evidence, verdict=ReconciliationVerdict.CONFIRMED_NO_EFFECT)
+    authority = _authority(
+        coordinator,
+        evidence,
+        verdict=ReconciliationVerdict.CONFIRMED_NO_EFFECT,
+    )
 
     with pytest.raises(ReconciliationDenied) as exc_info:
         coordinator.resolve(

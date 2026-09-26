@@ -1,12 +1,12 @@
-"""Write-safety kernel data models (Phase 0b).
+"""Write-safety kernel data models (Phase 0b / M6 confirmation hardening).
 
-The hardened design (review conversation 6a4fb320) centers on:
+The hardened design centers on:
 - WriteIntent: declarative description of what a write WILL do. Policy evaluates
   on intent, before any browser mutation.
 - RiskMeta: multi-dimensional risk metadata (visibility, reversibility,
   amplification, etc.) from which a RiskTier is derived.
-- ConfirmationToken: bound to one capability and one immutable intent hash; not
-  a bare boolean and not transferable across equal-intent capability surfaces.
+- ConfirmationToken: bound to one capability, immutable intent hash, M6
+  confirmation epoch, and monotonic authority lifetime.
 - PolicyDecision: the policy stage's verdict (allow/deny/dry_run/confirmation_required).
 """
 
@@ -126,21 +126,33 @@ class WriteIntent:
 
 @dataclass
 class ConfirmationToken:
-    """Bound to one capability + immutable intent hash. Single-use, expiring."""
+    """Ephemeral confirmation authority bound to intent, capability, epoch and TTL.
+
+    ``created_at`` and ``expires_at`` are wall-clock diagnostics retained for API
+    compatibility. Authority uses only ``confirmation_epoch`` and the monotonic
+    ``authority_*`` fields. A directly constructed token with the default
+    authority deadline of ``0.0`` is therefore invalid/expired until a trusted
+    confirmation-state issuer populates it.
+    """
 
     token: str
     intent_hash: str
     risk_tier: RiskTier
     created_at: float = field(default_factory=time.time)
-    expires_at: float = 0.0  # set by kernel; default 0 = invalid until set
+    expires_at: float = 0.0  # diagnostic wall-clock expiry only
     consumed: bool = False
     # Appended after the legacy fields so positional construction retains its
     # historical meaning. Kernel-issued tokens always populate this binding.
     capability_name: str = ""
+    # M6 authority fields. Epoch is process-local; authority times are monotonic.
+    confirmation_epoch: int = 0
+    authority_created_at: float = 0.0
+    authority_expires_at: float = 0.0
 
-    def is_expired(self, now: Optional[float] = None) -> bool:
-        t = now if now is not None else time.time()
-        return t >= self.expires_at
+    def is_expired(self, authority_now: Optional[float] = None) -> bool:
+        """Return monotonic authority expiry; wall-clock values are diagnostic only."""
+        t = authority_now if authority_now is not None else time.monotonic()
+        return t >= self.authority_expires_at
 
 
 class PolicyVerdict(StrEnum):
@@ -160,7 +172,7 @@ class PolicyDecision:
     # Set when verdict == CONFIRMATION_REQUIRED.
     confirmation_token: Optional[ConfirmationToken] = None
     # Set when verdict == DENY (which gate blocked).
-    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "unknown_action" | "risk_meta_mismatch" | "reconciliation_required" | "expired_token" | "intent_mismatch" | "capability_mismatch" | "consumed_token"
+    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "unknown_action" | "risk_meta_mismatch" | "reconciliation_required" | "stale_confirmation_epoch" | "expired_token" | "intent_mismatch" | "capability_mismatch" | "consumed_token"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

@@ -41,6 +41,13 @@ from webwire.safety.reconciliation_ledger import (
     ReconciliationVerdict,
     canonical_evidence_hash,
 )
+from webwire.safety.recovery_guard import (
+    RecoveryBlock,
+    RecoveryEffect,
+    RecoveryGuard,
+    RecoveryGuardUnavailable,
+    RecoveryStatus,
+)
 from webwire.safety.recovery_projector import (
     CompositeRecoveryProjection,
     ReconciliationPublicationFence,
@@ -48,13 +55,6 @@ from webwire.safety.recovery_projector import (
     RecoveryProjector,
     RecoveryProjectorCorruptError,
     RecoveryProjectorError,
-)
-from webwire.safety.recovery_guard import (
-    RecoveryBlock,
-    RecoveryEffect,
-    RecoveryGuard,
-    RecoveryGuardUnavailable,
-    RecoveryStatus,
 )
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
 from webwire.safety.scoped_authority import (

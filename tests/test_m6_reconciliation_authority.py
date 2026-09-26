@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from webwire.safety import (
@@ -128,15 +126,12 @@ def test_committed_authority_rejects_changed_complete_fact() -> None:
     record = _record()
     authority.commit(record)
 
-    changed_timestamp = replace(
-        record,
-        timestamp="2026-09-26T18:02:00+00:00",
-    )
+    changed_timestamp = _record(timestamp="2026-09-26T18:02:00+00:00")
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
         authority.commit(changed_timestamp)
     assert exc_info.value.reason == "committed_fact_mismatch"
 
-    changed_id = replace(record, reconciliation_id="rec-2")
+    changed_id = _record(reconciliation_id="rec-2")
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
         authority.commit(changed_id)
     assert exc_info.value.reason == "committed_fact_mismatch"

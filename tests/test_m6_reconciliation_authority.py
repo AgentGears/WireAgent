@@ -12,6 +12,8 @@ from webwire.safety import (
     canonical_evidence_hash,
 )
 
+_PROTOCOL_KEY = object()
+
 
 class _Clock:
     def __init__(self, value: float = 10.0) -> None:
@@ -61,9 +63,19 @@ def _authority(clock: _Clock, *, ttl: float = 5.0) -> ReconciliationAuthority:
         verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
         evidence_hash=canonical_evidence_hash(evidence),
         operator_id="operator-local",
+        _protocol_key=_PROTOCOL_KEY,
         ttl_seconds=ttl,
         monotonic_clock=clock,
         authority_id_factory=lambda: "auth-1",
+    )
+
+
+def _validate(authority: ReconciliationAuthority, *, effect_id: str = "fx-1"):
+    return authority._validate_start(
+        protocol_key=_PROTOCOL_KEY,
+        effect_id=effect_id,
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence_hash=canonical_evidence_hash(_evidence()),
     )
 
 
@@ -73,11 +85,7 @@ def test_uncommitted_authority_expires_on_monotonic_clock() -> None:
     clock.value = 15.0
 
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
-        authority.validate_start(
-            effect_id="fx-1",
-            verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
-            evidence_hash=canonical_evidence_hash(_evidence()),
-        )
+        _validate(authority)
 
     assert exc_info.value.reason == "authority_expired"
     assert authority.committed is False
@@ -89,13 +97,25 @@ def test_authority_binding_mismatch_denies_before_commit() -> None:
     authority = _authority(clock)
 
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
-        authority.validate_start(
-            effect_id="different",
+        _validate(authority, effect_id="different")
+
+    assert exc_info.value.reason == "effect_mismatch"
+
+
+def test_authority_lifecycle_rejects_wrong_protocol_key() -> None:
+    clock = _Clock()
+    authority = _authority(clock)
+
+    with pytest.raises(ReconciliationAuthorityError) as exc_info:
+        authority._validate_start(
+            protocol_key=object(),
+            effect_id="fx-1",
             verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
             evidence_hash=canonical_evidence_hash(_evidence()),
         )
 
-    assert exc_info.value.reason == "effect_mismatch"
+    assert exc_info.value.reason == "authority_protocol_mismatch"
+    assert authority.committed is False
 
 
 def test_committed_exact_fact_survives_later_ttl_expiry() -> None:
@@ -103,19 +123,11 @@ def test_committed_exact_fact_survives_later_ttl_expiry() -> None:
     authority = _authority(clock)
     record = _record()
 
-    assert authority.validate_start(
-        effect_id="fx-1",
-        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
-        evidence_hash=record.evidence_hash,
-    ) is None
-    authority.commit(record)
+    assert _validate(authority) is None
+    authority._commit_for_persistence(record, protocol_key=_PROTOCOL_KEY)
 
     clock.value = 10_000.0
-    assert authority.validate_start(
-        effect_id="fx-1",
-        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
-        evidence_hash=record.evidence_hash,
-    ) is record
+    assert _validate(authority) is record
     assert authority.committed_record is record
     assert authority.consumed is False
 
@@ -124,16 +136,19 @@ def test_committed_authority_rejects_changed_complete_fact() -> None:
     clock = _Clock()
     authority = _authority(clock)
     record = _record()
-    authority.commit(record)
+    authority._commit_for_persistence(record, protocol_key=_PROTOCOL_KEY)
 
     changed_timestamp = _record(timestamp="2026-09-26T18:02:00+00:00")
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
-        authority.commit(changed_timestamp)
+        authority._commit_for_persistence(
+            changed_timestamp,
+            protocol_key=_PROTOCOL_KEY,
+        )
     assert exc_info.value.reason == "committed_fact_mismatch"
 
     changed_id = _record(reconciliation_id="rec-2")
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
-        authority.commit(changed_id)
+        authority._commit_for_persistence(changed_id, protocol_key=_PROTOCOL_KEY)
     assert exc_info.value.reason == "committed_fact_mismatch"
 
 
@@ -141,16 +156,12 @@ def test_consumed_authority_can_never_be_reused() -> None:
     clock = _Clock()
     authority = _authority(clock)
     record = _record()
-    authority.commit(record)
-    authority.consume(record)
+    authority._commit_for_persistence(record, protocol_key=_PROTOCOL_KEY)
+    authority._consume_after_durable(record, protocol_key=_PROTOCOL_KEY)
 
     assert authority.consumed is True
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
-        authority.validate_start(
-            effect_id="fx-1",
-            verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
-            evidence_hash=record.evidence_hash,
-        )
+        _validate(authority)
     assert exc_info.value.reason == "authority_consumed"
 
 
@@ -160,10 +171,6 @@ def test_authority_clock_regression_fails_closed() -> None:
     clock.value = 19.0
 
     with pytest.raises(ReconciliationAuthorityError) as exc_info:
-        authority.validate_start(
-            effect_id="fx-1",
-            verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
-            evidence_hash=canonical_evidence_hash(_evidence()),
-        )
+        _validate(authority)
 
     assert exc_info.value.reason == "authority_clock_regressed"

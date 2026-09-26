@@ -21,16 +21,12 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from webwire.safety.effect_ledger import EffectLedger, EffectLedgerError, EffectState
-from webwire.safety.reconciliation_ledger import (
-    ReconciliationLedger,
-    ReconciliationLedgerError,
-)
+from webwire.safety.effect_ledger import EffectLedger, EffectState
+from webwire.safety.reconciliation_ledger import ReconciliationLedger
 from webwire.safety.recovery_projector import (
     CompositeRecoveryProjection,
     ReconciliationPublicationFence,
     RecoveryProjector,
-    RecoveryProjectorError,
 )
 
 __all__ = [
@@ -91,27 +87,21 @@ class RecoveryGuard:
         ledger: EffectLedger,
         *,
         reconciliation_ledger: Optional[ReconciliationLedger] = None,
-        publication_fence: Optional[ReconciliationPublicationFence] = None,
     ) -> None:
         if not isinstance(ledger, EffectLedger):
             raise TypeError("RecoveryGuard requires an EffectLedger")
-        sibling_reconciliation = reconciliation_ledger or ReconciliationLedger(
-            path=ledger.path.parent / "reconciliations.ndjson"
+        sibling_reconciliation = (
+            reconciliation_ledger
+            if reconciliation_ledger is not None
+            else ReconciliationLedger(path=ledger.path.parent / "reconciliations.ndjson")
         )
         if not isinstance(sibling_reconciliation, ReconciliationLedger):
             raise TypeError("reconciliation_ledger must be a ReconciliationLedger")
 
-        fence = publication_fence or ReconciliationPublicationFence.shared_for_ledgers(
-            ledger,
-            sibling_reconciliation,
-        )
-        if not isinstance(fence, ReconciliationPublicationFence):
-            raise TypeError("publication_fence must be a ReconciliationPublicationFence")
-
         self._ledger = ledger
         self._reconciliation_ledger = sibling_reconciliation
         self._projector = RecoveryProjector(ledger, sibling_reconciliation)
-        self._publication_fence = fence
+        self._publication_fence = self._projector.publication_fence
         self._lock = threading.RLock()
         self._blocks: dict[str, RecoveryBlock] = {}
         self._hydrated = False
@@ -151,13 +141,12 @@ class RecoveryGuard:
         """
         with self._publication_fence:
             try:
+                # RecoveryProjector also acquires this same domain fence so a
+                # direct projector call cannot bypass ordering. RLock re-entry
+                # here is deliberate: this outer hold extends through publication.
                 projection = self._projector.project()
                 blocks = self._blocks_from_projection(projection)
-            except (
-                EffectLedgerError,
-                ReconciliationLedgerError,
-                RecoveryProjectorError,
-            ) as exc:
+            except Exception as exc:  # noqa: BLE001 - safety boundary fails closed
                 with self._lock:
                     self._blocks = {}
                     self._hydrated = True

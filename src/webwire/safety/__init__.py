@@ -48,6 +48,14 @@ from webwire.safety.recovery_guard import (
     RecoveryGuardUnavailable,
     RecoveryStatus,
 )
+from webwire.safety.recovery_projector import (
+    CompositeRecoveryProjection,
+    ReconciliationPublicationFence,
+    RecoveryDisposition,
+    RecoveryProjector,
+    RecoveryProjectorCorruptError,
+    RecoveryProjectorError,
+)
 from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
 from webwire.safety.scoped_authority import (
     AuthorizedEffect,
@@ -108,6 +116,12 @@ __all__ = [
     "ReconciliationRecord",
     "ReconciliationVerdict",
     "canonical_evidence_hash",
+    "CompositeRecoveryProjection",
+    "ReconciliationPublicationFence",
+    "RecoveryDisposition",
+    "RecoveryProjector",
+    "RecoveryProjectorError",
+    "RecoveryProjectorCorruptError",
     "RecoveryGuard",
     "RecoveryGuardUnavailable",
     "RecoveryBlock",

@@ -63,8 +63,6 @@ class RiskMeta:
         quotes are the highest-risk tier), checked before amplification, because
         a post is both content_creation AND broadcast but should land in the
         IRREVERSIBLE tier, not the AMPLIFYING one."""
-        # Content creation (post/reply/quote) is always the highest tier, even
-        # if technically compensatable — deletion is not true undo.
         if self.content_creation:
             return RiskTier.PUBLIC_CONTENT_IRREVERSIBLE
         if self.amplification == Amplification.BROADCAST:
@@ -73,34 +71,27 @@ class RiskMeta:
             return RiskTier.PUBLIC_REVERSIBLE_ENGAGEMENT
         if self.visibility == Visibility.PRIVATE and self.reversibility == Reversibility.REVERSIBLE:
             return RiskTier.PRIVATE_REVERSIBLE
-        # Conservative default: treat unknown combinations as the highest risk.
         return RiskTier.PUBLIC_CONTENT_IRREVERSIBLE
 
 
 @dataclass(frozen=True)
 class CompensationMeta:
-    """Per-action compensation metadata. NEVER called 'undo' for public actions
-    (review final rec #5) — deletion is compensation, not true undo."""
+    """Per-action compensation metadata. NEVER called 'undo' for public actions."""
     supports_compensation: bool
-    compensation_action: Optional[str] = None  # e.g. "unlike", "remove_bookmark", "delete_post"
+    compensation_action: Optional[str] = None
     residual_side_effects: tuple[str, ...] = ()
 
 
 @dataclass
 class WriteIntent:
-    """Declarative description of what a write WILL do. Produced by compose().
-    The kernel evaluates policy on this BEFORE any browser mutation."""
-    action_type: str                    # e.g. "like", "bookmark", "post"
-    target_type: str                    # e.g. "post", "user"
-    target_id: str                      # e.g. post_id or handle
+    """Declarative description of what a write WILL do. Produced by compose()."""
+    action_type: str
+    target_type: str
+    target_id: str
     risk_meta: RiskMeta
     compensation: CompensationMeta
-    # Semantic variant for dedupe (review Q3): e.g. reply text hash, or "" for toggles.
     semantic_variant: str = ""
-    # Arbitrary action-specific payload (e.g. post text for compose, but NOT for like).
     payload: dict[str, Any] = field(default_factory=dict)
-    # The actor identity (whoami handle) — included in dedupe key so multi-account
-    # doesn't collide (though Phase 0b is single-account).
     actor_identity: Optional[str] = None
 
     def dedupe_key(self) -> str:
@@ -108,9 +99,7 @@ class WriteIntent:
         return f"{self.actor_identity or '?'}|{self.action_type}|{self.target_type}|{self.target_id}|{self.semantic_variant}"
 
     def intent_hash(self) -> str:
-        """Stable hash of the full intent for confirmation-token binding (review Q1).
-        Canonicalizes the intent fields so a materially different intent produces
-        a different hash."""
+        """Stable hash of the full intent for confirmation-token binding."""
         canonical = "|".join([
             self.action_type,
             self.target_type,
@@ -126,13 +115,13 @@ class WriteIntent:
 
 @dataclass
 class ConfirmationToken:
-    """Ephemeral confirmation authority bound to intent, capability, epoch and TTL.
+    """Ephemeral confirmation carrier bound to intent, capability, epoch and TTL.
 
     ``created_at`` and ``expires_at`` are wall-clock diagnostics retained for API
-    compatibility. Authority uses only ``confirmation_epoch`` and the monotonic
-    ``authority_*`` fields. A directly constructed token with the default
-    authority deadline of ``0.0`` is therefore invalid/expired until a trusted
-    confirmation-state issuer populates it.
+    compatibility. ``authority_*`` values are process-relative monotonic values
+    mirrored for internal diagnostics/tests; only ``ConfirmationState`` owns and
+    validates canonical authority. Mutating this object never mutates canonical
+    pending authority.
     """
 
     token: str
@@ -141,18 +130,14 @@ class ConfirmationToken:
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0  # diagnostic wall-clock expiry only
     consumed: bool = False
-    # Appended after the legacy fields so positional construction retains its
-    # historical meaning. Kernel-issued tokens always populate this binding.
     capability_name: str = ""
-    # M6 authority fields. Epoch is process-local; authority times are monotonic.
     confirmation_epoch: int = 0
     authority_created_at: float = 0.0
     authority_expires_at: float = 0.0
 
-    def is_expired(self, authority_now: Optional[float] = None) -> bool:
-        """Return monotonic authority expiry; wall-clock values are diagnostic only."""
-        t = authority_now if authority_now is not None else time.monotonic()
-        return t >= self.authority_expires_at
+    def is_expired(self, authority_now: float) -> bool:
+        """Diagnostic comparison for an explicit monotonic sample, never authority."""
+        return authority_now >= self.authority_expires_at
 
 
 class PolicyVerdict(StrEnum):
@@ -169,11 +154,15 @@ class PolicyDecision:
     reason: str
     risk_tier: RiskTier
     intent_hash: str
-    # Set when verdict == CONFIRMATION_REQUIRED.
     confirmation_token: Optional[ConfirmationToken] = None
-    # Set when verdict == DENY (which gate blocked).
-    blocked_by: Optional[str] = None  # "kill_switch" | "dedupe" | "token_bucket" | "risk_tier" | "unknown_action" | "risk_meta_mismatch" | "reconciliation_required" | "stale_confirmation_epoch" | "expired_token" | "intent_mismatch" | "capability_mismatch" | "consumed_token"
+    blocked_by: Optional[str] = None  # kill_switch | dedupe | token_bucket | reconciliation_required | stale_confirmation_epoch | expired_token | intent_mismatch | capability_mismatch | consumed_token
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
+        token = d.get("confirmation_token")
+        if isinstance(token, dict):
+            # Monotonic values are process-relative authority internals, not a
+            # caller-facing timestamp contract. Keep epoch + wall diagnostics.
+            token.pop("authority_created_at", None)
+            token.pop("authority_expires_at", None)
         return d

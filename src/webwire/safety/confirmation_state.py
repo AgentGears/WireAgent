@@ -21,7 +21,11 @@ from typing import Any, Optional
 
 from webwire.safety.models import ConfirmationToken, RiskTier
 
-__all__ = ["ConfirmationState"]
+__all__ = ["ConfirmationState", "ConfirmationStateError"]
+
+
+class ConfirmationStateError(RuntimeError):
+    """Confirmation authority could not be sampled or maintained safely."""
 
 
 @dataclass
@@ -85,12 +89,16 @@ class ConfirmationState:
         try:
             value = float(self._monotonic_clock())
         except (TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError("confirmation authority clock returned an invalid value") from exc
+            raise ConfirmationStateError(
+                "confirmation authority clock returned an invalid value"
+            ) from exc
         if not math.isfinite(value):
-            raise RuntimeError("confirmation authority clock returned a non-finite value")
+            raise ConfirmationStateError(
+                "confirmation authority clock returned a non-finite value"
+            )
         previous = self._last_authority_sample
         if previous is not None and value < previous:
-            raise RuntimeError("confirmation authority clock regressed")
+            raise ConfirmationStateError("confirmation authority clock regressed")
         self._last_authority_sample = value
         return value
 
@@ -99,9 +107,13 @@ class ConfirmationState:
         try:
             value = float(self._wall_clock())
         except (TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError("confirmation wall clock returned an invalid value") from exc
+            raise ConfirmationStateError(
+                "confirmation wall clock returned an invalid value"
+            ) from exc
         if not math.isfinite(value):
-            raise RuntimeError("confirmation wall clock returned a non-finite value")
+            raise ConfirmationStateError(
+                "confirmation wall clock returned a non-finite value"
+            )
         return value
 
     def advance_epoch(self) -> int:
@@ -132,18 +144,27 @@ class ConfirmationState:
             if not isinstance(token_str, str) or not token_str:
                 raise ValueError("token_factory must return a non-empty string")
             if token_str in self._pending:
-                raise RuntimeError("token_factory produced a duplicate confirmation token")
+                raise ConfirmationStateError(
+                    "token_factory produced a duplicate confirmation token"
+                )
 
             authority_expires_at = authority_now + self._ttl_seconds
             if not math.isfinite(authority_expires_at):
-                raise RuntimeError("confirmation authority deadline is non-finite")
+                raise ConfirmationStateError(
+                    "confirmation authority deadline is non-finite"
+                )
+            wall_expires_at = wall_now + self._ttl_seconds
+            if not math.isfinite(wall_expires_at):
+                raise ConfirmationStateError(
+                    "confirmation wall-clock diagnostic deadline is non-finite"
+                )
 
             token = ConfirmationToken(
                 token=token_str,
                 intent_hash=intent_hash,
                 risk_tier=risk_tier,
                 created_at=wall_now,
-                expires_at=wall_now + self._ttl_seconds,
+                expires_at=wall_expires_at,
                 capability_name=capability_name,
                 confirmation_epoch=self._epoch,
                 authority_created_at=authority_now,
@@ -201,3 +222,8 @@ class ConfirmationState:
             pending.consumed = True
             token.consumed = True  # compatibility/diagnostic mirror; not authority
             return token, None
+
+    def _diagnostic_pending_tokens(self) -> dict[str, ConfirmationToken]:
+        """Return a snapshot for legacy tests/diagnostics; never mutation authority."""
+        with self._lock:
+            return {key: pending.token for key, pending in self._pending.items()}

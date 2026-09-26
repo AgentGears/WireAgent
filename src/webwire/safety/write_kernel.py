@@ -7,7 +7,7 @@ broker directly for mutations.
 Hardened design:
 - Q1: confirmation tokens bind one capability + immutable intent hash (NOT bare confirm=True).
 - Q2: per-action + global token bucket.
-- Q3: semantic dedupe, journal-hydrated.
+- Q3: semantic dedupe.
 - Q4: multi-dimensional risk metadata, 4 derived tiers.
 - M6: confirmation authority is epoch-bound, monotonic-TTL, and synchronized
   through one process-local ConfirmationState fence.
@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 from webwire.envelope import ActionResult, ok_result
 from webwire.journal import Journal
-from webwire.safety.confirmation_state import ConfirmationState
+from webwire.safety.confirmation_state import ConfirmationState, ConfirmationStateError
 from webwire.safety.dedupe import DedupeStore
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import (
@@ -42,14 +42,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["WriteKernel", "WriteCapability", "PreviewResult"]
 
-_CONFIRM_TTL_S = 300.0  # confirmation tokens expire after 5 min
+_CONFIRM_TTL_S = 300.0
 _RECOVERY_GUARD_EXEMPT_CAPABILITIES = frozenset({"compose_post"})
 
 
 @dataclass
 class StateTransition:
-    """Formal state-transition record. Records the delta this invocation created,
-    so compensation reverses THIS invocation's delta, not merely final state."""
+    """Formal state-transition record for compensation reasoning."""
     pre_state: Optional[str] = None
     intended_state: Optional[str] = None
     post_state: Optional[str] = None
@@ -127,8 +126,13 @@ class WriteKernel:
 
     @property
     def confirmation_state(self) -> ConfirmationState:
-        """The exact process-local confirmation authority used by this kernel."""
+        """The exact process-local confirmation state for later coordinator sharing."""
         return self._confirmation_state
+
+    @property
+    def _pending_tokens(self) -> dict[str, ConfirmationToken]:
+        """Legacy diagnostic snapshot; mutating it cannot mutate token authority."""
+        return self._confirmation_state._diagnostic_pending_tokens()
 
     async def execute(
         self,
@@ -146,12 +150,6 @@ class WriteKernel:
         Second call (confirmation_token present): validates and atomically consumes
         capability-, intent-, epoch-, and monotonic-TTL-bound authority before
         execute→journal→verify.
-
-        Layer 6 checks durable unresolved semantic replay before any browser-
-        capable preview. The only exemption is the named ``compose_post`` shell,
-        whose execution contract has no remote mutation. The transitional
-        ``enforce_recovery_guard`` keyword is accepted for Dispatcher source
-        compatibility but cannot grant an exemption to any other capability.
         """
         trace: dict[str, Any] = {"action": write_cap.name, "stages": []}
 
@@ -177,8 +175,7 @@ class WriteKernel:
         }
         trace["stages"].append("intent_created")
 
-        # 2b. Registry gate: policy runs on registry truth, not self-declared
-        # metadata. A mismatch is drift or a downgrade attempt and fails closed.
+        # 2b. Registry gate: policy runs on registry truth, not self-declared metadata.
         reg_entry = self._risk.get(intent.action_type)
         if reg_entry is None:
             trace["stages"].append("denied:unknown_action")
@@ -204,9 +201,7 @@ class WriteKernel:
                 blocked_by="risk_meta_mismatch",
             ), trace, None)
 
-        # 2c. Durable recovery gate. compose() is declarative; preview() may
-        # navigate. Refresh authoritative composite recovery on every guarded
-        # write. The exemption is an internal allowlist, not caller controlled.
+        # 2c. Durable composite recovery gate before any browser-capable preview.
         recovery_exempt = write_cap.name in _RECOVERY_GUARD_EXEMPT_CAPABILITIES
         if enforce_recovery_guard is False and not recovery_exempt:
             trace["recovery_exemption_ignored"] = True
@@ -274,8 +269,6 @@ class WriteKernel:
                     },
                 )
 
-        # 3. Policy evaluation (before preview — cheap gates first).
-
         # 3a. Token bucket.
         allowed, reason = self._bucket.acquire(intent.action_type, risk_tier)
         if not allowed:
@@ -307,10 +300,21 @@ class WriteKernel:
         preview = await write_cap.preview(intent, broker)
         trace["preview"] = preview.summary
 
-        # 5. Confirmation gate (capability + intent + epoch + monotonic TTL bound).
+        # 5. Confirmation gate.
         provided_token = input.get("confirmation_token")
         if provided_token is None:
-            token = self._issue_token(intent, write_cap.name)
+            try:
+                token = self._issue_token(intent, write_cap.name)
+            except ConfirmationStateError as exc:
+                logger.error("confirmation authority unavailable during issue: %r", exc)
+                trace["stages"].append("denied:confirmation_state_unavailable")
+                return self._finish(PolicyDecision(
+                    verdict=PolicyVerdict.DENY,
+                    reason="confirmation authority state is unavailable",
+                    risk_tier=risk_tier,
+                    intent_hash=intent.intent_hash(),
+                    blocked_by="confirmation_state_unavailable",
+                ), trace, None)
             trace["stages"].append("confirmation_required")
             return self._finish(PolicyDecision(
                 verdict=PolicyVerdict.CONFIRMATION_REQUIRED,
@@ -330,9 +334,7 @@ class WriteKernel:
                 "expires_at": token.expires_at,
             })
 
-        # Second phase: final validation and consumption are one synchronized
-        # authority operation. The monotonic expiry clock is sampled inside that
-        # operation, after all preceding preview/policy work has completed.
+        # Final validation + consumption are one synchronized authority operation.
         decision = self._validate_token(
             provided_token,
             intent,
@@ -343,9 +345,7 @@ class WriteKernel:
             return self._finish(decision, trace, None)
         trace["stages"].append("confirmed")
 
-        # 6. Execute. Construct a WriteBroker (narrow write surface) for the
-        # execute + verify stages. Preview used the ReadOnlyBroker; execute
-        # uses the WriteBroker — only reachable after confirmation.
+        # 6. Execute after confirmation consumption.
         write_broker = self._write_broker_factory() if self._write_broker_factory else broker
         trace["stages"].append("execute_attempted")
         exec_result = await write_cap.execute(intent, write_broker)
@@ -354,14 +354,12 @@ class WriteKernel:
         exec_data = exec_result.data if isinstance(exec_result.data, dict) else {}
         side_effect_free = exec_data.get("dry_run") is True
         if (exec_result.ok or exec_data.get("public_side_effect") is True) and not side_effect_free:
-            # Record clean success and uncertain visible side effects in dedupe.
-            # A declared side-effect-free execute records nothing.
             self._dedupe.record(semantic_key)
             trace["dedupe_recorded"] = True
         else:
             trace["dedupe_recorded"] = False
 
-        # 7. Journal — record the full pipeline trace.
+        # 7. Journal trace marker.
         trace["stages"].append("journalled")
 
         # 8. Verify only after successful execute.
@@ -379,14 +377,11 @@ class WriteKernel:
             risk_tier=risk_tier, intent_hash=intent.intent_hash(),
         ), trace, exec_result.data)
 
-    # -- internals -----------------------------------------------------------
-
     def _issue_token(
         self,
         intent: WriteIntent,
         capability_name: str,
     ) -> ConfirmationToken:
-        """Issue synchronized authority bound to current epoch and monotonic TTL."""
         return self._confirmation_state.issue(
             intent_hash=intent.intent_hash(),
             risk_tier=intent.risk_tier(),
@@ -400,13 +395,23 @@ class WriteKernel:
         *,
         capability_name: str,
     ) -> Optional[PolicyDecision]:
-        """Atomically validate+consume confirmation authority or return DENY."""
-        token, blocked_by = self._confirmation_state.validate_and_consume(
-            provided_token,
-            intent_hash=intent.intent_hash(),
-            risk_tier=intent.risk_tier(),
-            capability_name=capability_name,
-        )
+        try:
+            token, blocked_by = self._confirmation_state.validate_and_consume(
+                provided_token,
+                intent_hash=intent.intent_hash(),
+                risk_tier=intent.risk_tier(),
+                capability_name=capability_name,
+            )
+        except ConfirmationStateError as exc:
+            logger.error("confirmation authority unavailable during consume: %r", exc)
+            return PolicyDecision(
+                verdict=PolicyVerdict.DENY,
+                reason="confirmation authority state is unavailable",
+                risk_tier=intent.risk_tier(),
+                intent_hash=intent.intent_hash(),
+                blocked_by="confirmation_state_unavailable",
+            )
+
         if blocked_by is None:
             return None
 
@@ -440,7 +445,6 @@ class WriteKernel:
     def _finish(
         self, decision: PolicyDecision, trace: dict, data: Any,
     ) -> ActionResult:
-        """Build the final ActionResult with policy decision + trace."""
         result_data = {
             "policy": decision.to_dict(),
             "trace": trace,
@@ -453,7 +457,6 @@ class WriteKernel:
             return ok_result(data=result_data)
         if decision.verdict == PolicyVerdict.DRY_RUN:
             return ok_result(data=result_data)
-        # DENY — carry policy decision + trace so callers can see blocked_by.
         from super_browser.results import ActionError, ErrorCategory, action_result
         r = action_result(
             ok=False,

@@ -202,7 +202,7 @@ def test_reservation_io_failure_retains_live_ownership_before_permit_mint(
 
 
 def test_same_path_sibling_gateway_cannot_hide_runtime_live_owner(tmp_path: Path) -> None:
-    intent, grant, attempt, runtime_gateway, _runtime_coordinator = _gateway_stack(tmp_path)
+    intent, grant, attempt, runtime_gateway, runtime_coordinator = _gateway_stack(tmp_path)
     runtime_gateway.authorize_commit(grant=grant, attempt=attempt, intent=intent)
 
     cfg = WebWireConfig(state_dir=tmp_path)
@@ -219,7 +219,7 @@ def test_same_path_sibling_gateway_cannot_hide_runtime_live_owner(tmp_path: Path
     )
     sibling_coordinator = ReconciliationCoordinator(
         recovery_guard=sibling_guard,
-        confirmation_state=ConfirmationState(),
+        confirmation_state=runtime_coordinator.confirmation_state,
         commit_gateway=sibling_gateway,
         reconciliation_id_factory=lambda: "rec-sibling",
         timestamp_factory=lambda: "2026-09-26T19:02:00+00:00",

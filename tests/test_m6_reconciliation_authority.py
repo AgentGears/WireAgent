@@ -102,6 +102,18 @@ def test_authority_binding_mismatch_denies_before_commit() -> None:
     assert exc_info.value.reason == "effect_mismatch"
 
 
+def test_authority_hash_binding_rejects_signed_hex() -> None:
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        ReconciliationAuthority(
+            effect_id="fx-1",
+            verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+            evidence_hash="+" + ("0" * 63),
+            operator_id="operator-local",
+            _protocol_key=_PROTOCOL_KEY,
+            monotonic_clock=_Clock(),
+        )
+
+
 def test_authority_lifecycle_rejects_wrong_protocol_key() -> None:
     clock = _Clock()
     authority = _authority(clock)

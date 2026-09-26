@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from webwire.config import WebWireConfig
 from webwire.safety import (
     ConfirmationState,
     EffectLedger,
@@ -22,6 +23,9 @@ from webwire.safety import (
     RiskTier,
     canonical_evidence_hash,
 )
+from webwire.safety.commit_gateway import CommitGateway
+from webwire.safety.execution_models import AuthorizationEpoch
+from webwire.safety.kill_switch import KillSwitch
 
 
 class _Clock:
@@ -67,13 +71,20 @@ def _stack(tmp_path: Path) -> tuple[
     ConfirmationState,
     ReconciliationCoordinator,
 ]:
-    effects = EffectLedger(path=tmp_path / "effects.ndjson")
-    reconciliations = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
+    cfg = WebWireConfig(state_dir=tmp_path)
+    effects = EffectLedger(cfg)
+    reconciliations = ReconciliationLedger(path=cfg.reconciliations_path())
     guard = RecoveryGuard(effects, reconciliation_ledger=reconciliations)
     confirmations = ConfirmationState()
+    gateway = CommitGateway(
+        ledger=effects,
+        kill_switch=KillSwitch(cfg),
+        authorization_epoch=AuthorizationEpoch(),
+    )
     coordinator = ReconciliationCoordinator(
         recovery_guard=guard,
         confirmation_state=confirmations,
+        commit_gateway=gateway,
         reconciliation_id_factory=lambda: "rec-1",
         timestamp_factory=lambda: "2026-09-26T18:01:00+00:00",
     )
@@ -194,8 +205,6 @@ def test_existing_terminal_reconciliation_denies_fresh_authority_before_epoch(
             fresh,
         )
 
-    # Composite truth has already settled the raw target, so the raw target-state
-    # check wins before any attempt to mint replacement reconciliation authority.
     assert exc_info.value.reason in {"invalid_target_state", "already_reconciled"}
     assert confirmations.current_epoch == 1
     assert fresh.committed is False
@@ -246,7 +255,7 @@ def test_clean_persistence_failure_commits_exact_fact_and_retry_survives_ttl(
         risk_tier=RiskTier.PRIVATE_REVERSIBLE,
         capability_name="bookmark",
     )
-    clock.value = 100.0  # committed authority may outlive its pre-start TTL
+    clock.value = 100.0
 
     resolution = coordinator.resolve(
         raw.effect_id,

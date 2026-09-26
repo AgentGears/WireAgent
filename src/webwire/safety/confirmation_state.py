@@ -2,23 +2,39 @@
 
 The confirmation state is the single synchronization domain for human-confirmation
 runtime authority. It owns the process-local epoch, pending token store, monotonic
-authority clock, and final consume-time validation. Wall-clock timestamps remain
-diagnostic only.
+authority clock, and final consume-time validation. Wall-clock timestamps and the
+returned token object are diagnostic/carrier surfaces only; canonical authority is
+held privately by this state.
 
 Source of truth: ``docs/M6_DESIGN.md`` §11.1 and acceptance R14/R15/R40/R47/R48.
 """
 
 from __future__ import annotations
 
+import math
 import secrets
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from webwire.safety.models import ConfirmationToken, RiskTier
 
 __all__ = ["ConfirmationState"]
+
+
+@dataclass
+class _PendingAuthority:
+    """Canonical private authority; never reconstructed from mutable token fields."""
+
+    token: ConfirmationToken
+    intent_hash: str
+    risk_tier: RiskTier
+    capability_name: str
+    confirmation_epoch: int
+    authority_expires_at: float
+    consumed: bool = False
 
 
 class ConfirmationState:
@@ -38,15 +54,21 @@ class ConfirmationState:
         wall_clock: Optional[Callable[[], float]] = None,
         token_factory: Optional[Callable[[], str]] = None,
     ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
-        self._ttl_seconds = float(ttl_seconds)
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("ttl_seconds must be a finite positive number") from exc
+        if not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError("ttl_seconds must be a finite positive number")
+
+        self._ttl_seconds = ttl
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._wall_clock = wall_clock or time.time
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(16))
         self._lock = threading.RLock()
         self._epoch = 0
-        self._pending: dict[str, ConfirmationToken] = {}
+        self._pending: dict[str, _PendingAuthority] = {}
+        self._last_authority_sample: Optional[float] = None
 
     @property
     def current_epoch(self) -> int:
@@ -57,6 +79,30 @@ class ConfirmationState:
     @property
     def ttl_seconds(self) -> float:
         return self._ttl_seconds
+
+    def _sample_authority_locked(self) -> float:
+        """Sample a finite, non-regressing monotonic authority clock under lock."""
+        try:
+            value = float(self._monotonic_clock())
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("confirmation authority clock returned an invalid value") from exc
+        if not math.isfinite(value):
+            raise RuntimeError("confirmation authority clock returned a non-finite value")
+        previous = self._last_authority_sample
+        if previous is not None and value < previous:
+            raise RuntimeError("confirmation authority clock regressed")
+        self._last_authority_sample = value
+        return value
+
+    def _sample_wall_locked(self) -> float:
+        """Sample finite wall-clock provenance; wall-clock ordering is not authority."""
+        try:
+            value = float(self._wall_clock())
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("confirmation wall clock returned an invalid value") from exc
+        if not math.isfinite(value):
+            raise RuntimeError("confirmation wall clock returned a non-finite value")
+        return value
 
     def advance_epoch(self) -> int:
         """Synchronously revoke every token issued under an older epoch."""
@@ -80,13 +126,17 @@ class ConfirmationState:
             raise TypeError("risk_tier must be a RiskTier")
 
         with self._lock:
-            authority_now = float(self._monotonic_clock())
-            wall_now = float(self._wall_clock())
+            authority_now = self._sample_authority_locked()
+            wall_now = self._sample_wall_locked()
             token_str = self._token_factory()
             if not isinstance(token_str, str) or not token_str:
                 raise ValueError("token_factory must return a non-empty string")
             if token_str in self._pending:
                 raise RuntimeError("token_factory produced a duplicate confirmation token")
+
+            authority_expires_at = authority_now + self._ttl_seconds
+            if not math.isfinite(authority_expires_at):
+                raise RuntimeError("confirmation authority deadline is non-finite")
 
             token = ConfirmationToken(
                 token=token_str,
@@ -97,9 +147,16 @@ class ConfirmationState:
                 capability_name=capability_name,
                 confirmation_epoch=self._epoch,
                 authority_created_at=authority_now,
-                authority_expires_at=authority_now + self._ttl_seconds,
+                authority_expires_at=authority_expires_at,
             )
-            self._pending[token_str] = token
+            self._pending[token_str] = _PendingAuthority(
+                token=token,
+                intent_hash=intent_hash,
+                risk_tier=risk_tier,
+                capability_name=capability_name,
+                confirmation_epoch=self._epoch,
+                authority_expires_at=authority_expires_at,
+            )
             return token
 
     def validate_and_consume(
@@ -117,33 +174,30 @@ class ConfirmationState:
         sample is therefore the actual authority consume boundary, not an earlier
         preview/policy timestamp.
 
-        Returns ``(token, None)`` on success or ``(token-or-None, blocked_by)`` on
-        denial. Unknown tokens deliberately retain the historical
-        ``consumed_token`` denial code.
+        Canonical comparison uses only the private ``_PendingAuthority`` record;
+        mutating the returned ``ConfirmationToken`` object cannot extend lifetime,
+        change epoch/bindings, or resurrect consumed authority.
         """
         with self._lock:
-            token = self._pending.get(token_str) if isinstance(token_str, str) else None
-            authority_now = float(self._monotonic_clock())
+            pending = self._pending.get(token_str) if isinstance(token_str, str) else None
+            authority_now = self._sample_authority_locked()
 
-            if token is None:
+            if pending is None:
                 return None, "consumed_token"
-            if token.confirmation_epoch != self._epoch:
+            token = pending.token
+            if pending.confirmation_epoch != self._epoch:
                 return token, "stale_confirmation_epoch"
-            if token.is_expired(authority_now):
+            if authority_now >= pending.authority_expires_at:
                 return token, "expired_token"
-            if token.consumed:
+            if pending.consumed:
                 return token, "consumed_token"
-            if token.capability_name != capability_name:
+            if pending.capability_name != capability_name:
                 return token, "capability_mismatch"
-            if token.intent_hash != intent_hash:
+            if pending.intent_hash != intent_hash:
                 return token, "intent_mismatch"
-            if token.risk_tier != risk_tier:
+            if pending.risk_tier != risk_tier:
                 return token, "intent_mismatch"
 
-            token.consumed = True
+            pending.consumed = True
+            token.consumed = True  # compatibility/diagnostic mirror; not authority
             return token, None
-
-    def diagnostic_token(self, token_str: str) -> Optional[ConfirmationToken]:
-        """Return a pending token object for diagnostics/tests, never authority."""
-        with self._lock:
-            return self._pending.get(token_str)

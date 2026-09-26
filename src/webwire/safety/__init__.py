@@ -33,6 +33,20 @@ from webwire.safety.models import (
     Visibility,
     WriteIntent,
 )
+from webwire.safety.reconciliation_authority import (
+    DEFAULT_RECONCILIATION_AUTHORITY_TTL_S,
+    ReconciliationAuthority,
+    ReconciliationAuthorityError,
+)
+from webwire.safety.reconciliation_coordinator import (
+    ReconciliationCoordinator,
+    ReconciliationCoordinatorError,
+    ReconciliationDenied,
+    ReconciliationPersistenceError,
+    ReconciliationPublicationError,
+    ReconciliationResolution,
+    ReconciliationTarget,
+)
 from webwire.safety.reconciliation_ledger import (
     ReconciliationLedger,
     ReconciliationLedgerAmbiguousError,
@@ -41,6 +55,11 @@ from webwire.safety.reconciliation_ledger import (
     ReconciliationRecord,
     ReconciliationVerdict,
     canonical_evidence_hash,
+)
+from webwire.safety.reconciliation_operator import (
+    ReconciliationOperatorError,
+    ReconciliationOperatorSession,
+    ReconciliationProposal,
 )
 from webwire.safety.recovery_guard import (
     RecoveryBlock,
@@ -118,6 +137,19 @@ __all__ = [
     "ReconciliationRecord",
     "ReconciliationVerdict",
     "canonical_evidence_hash",
+    "DEFAULT_RECONCILIATION_AUTHORITY_TTL_S",
+    "ReconciliationAuthority",
+    "ReconciliationAuthorityError",
+    "ReconciliationCoordinator",
+    "ReconciliationCoordinatorError",
+    "ReconciliationDenied",
+    "ReconciliationPersistenceError",
+    "ReconciliationPublicationError",
+    "ReconciliationResolution",
+    "ReconciliationTarget",
+    "ReconciliationOperatorError",
+    "ReconciliationOperatorSession",
+    "ReconciliationProposal",
     "CompositeRecoveryProjection",
     "ReconciliationPublicationFence",
     "RecoveryDisposition",

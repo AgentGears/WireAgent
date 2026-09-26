@@ -137,14 +137,18 @@ class ReconciliationCoordinator:
               -> RecoveryGuard publication/cache lock
 
     A coordinator cannot be constructed without the CommitGateway that owns the
-    M5 lifecycle domain for this EffectLedger. Even an offline/exclusive operator
-    process creates that gateway; it simply has no live owners. Making the fence
-    mandatory prevents an exported coordinator API from silently bypassing the
-    frozen ``live_attempt_owned`` rejection rule.
+    M5 lifecycle domain for this EffectLedger. CommitGateway shares that lifecycle
+    domain by normalized ledger path, so a sibling gateway in the same process
+    cannot hide a live owner. Independent processes remain outside M6's claim.
 
     The gateway lifecycle fence is held for the whole resolution protocol. Once
     it reports no owner, the target effect cannot later resume an old in-process
     M5 attempt before reconciliation publication completes.
+
+    ReconciliationAuthority lifecycle transitions are keyed to this coordinator.
+    Only the private operator-confirmation mint path creates an authority that
+    this coordinator will accept; a separately constructed authority cannot
+    bypass the explicit local operator workflow through ``resolve()``.
     """
 
     def __init__(
@@ -179,6 +183,7 @@ class ReconciliationCoordinator:
         self._reconciliation_id_factory = reconciliation_id_factory
         self._timestamp_factory = timestamp_factory
         self._protocol_lock = threading.RLock()
+        self.__authority_protocol_key = object()
 
     @property
     def recovery_guard(self) -> RecoveryGuard:
@@ -191,6 +196,34 @@ class ReconciliationCoordinator:
     @property
     def commit_gateway(self) -> CommitGateway:
         return self._gateway
+
+    def _mint_operator_authority(
+        self,
+        *,
+        effect_id: str,
+        verdict: ReconciliationVerdict,
+        evidence_hash: str,
+        operator_id: str,
+        ttl_seconds: float,
+        monotonic_clock: Callable[[], float],
+        authority_id_factory: Callable[[], str] = lambda: secrets.token_urlsafe(16),
+    ) -> ReconciliationAuthority:
+        """Mint a coordinator-bound authority after operator confirmation.
+
+        This is intentionally private. ReconciliationOperatorSession is the
+        supported caller and invokes it only after exact same-session human
+        confirmation of the frozen proposal.
+        """
+        return ReconciliationAuthority(
+            effect_id=effect_id,
+            verdict=verdict,
+            evidence_hash=evidence_hash,
+            operator_id=operator_id,
+            _protocol_key=self.__authority_protocol_key,
+            ttl_seconds=ttl_seconds,
+            monotonic_clock=monotonic_clock,
+            authority_id_factory=authority_id_factory,
+        )
 
     def list_targets(self) -> tuple[ReconciliationTarget, ...]:
         """Return read-only unresolved composite targets for operator display."""
@@ -210,7 +243,7 @@ class ReconciliationCoordinator:
         """Return one displayable target, denying any current live owner.
 
         Operator confirmation must not be staged against evidence that predates
-        completion of the same in-process M5 attempt.  Use the same lock order as
+        completion of the same in-process M5 attempt. Use the same lock order as
         terminal resolution so a live owner cannot disappear/reappear across the
         target snapshot.
         """
@@ -347,7 +380,16 @@ class ReconciliationCoordinator:
                     except (TypeError, ValueError) as exc:
                         raise ReconciliationDenied("invalid_evidence", str(exc)) from exc
 
-                    if not operator_authority.committed:
+                    # Fresh starts and known-clean committed retries establish a
+                    # complete authoritative reconciliation history before any
+                    # authority use. A locally ambiguous committed retry is the
+                    # one exception: the ledger intentionally blocks ordinary
+                    # reads until exact-fact re-durability succeeds.
+                    skip_history_read = (
+                        operator_authority.committed
+                        and self._reconciliation_ledger.durability_ambiguous
+                    )
+                    if not skip_history_read:
                         try:
                             existing = self._reconciliation_ledger.read_authoritative()
                         except ReconciliationLedgerError as exc:
@@ -359,7 +401,8 @@ class ReconciliationCoordinator:
                             raise ReconciliationDenied("already_reconciled", effect_id)
 
                     try:
-                        committed_record = operator_authority.validate_start(
+                        committed_record = operator_authority._validate_start(
+                            protocol_key=self.__authority_protocol_key,
                             effect_id=effect_id,
                             verdict=verdict,
                             evidence_hash=evidence_hash,
@@ -383,7 +426,10 @@ class ReconciliationCoordinator:
                     confirmation_epoch = self._confirmation_state.advance_epoch()
 
                     try:
-                        record = operator_authority.commit(record)
+                        record = operator_authority._commit_for_persistence(
+                            record,
+                            protocol_key=self.__authority_protocol_key,
+                        )
                     except ReconciliationAuthorityError as exc:
                         raise ReconciliationCoordinatorError(
                             f"authority commitment failed after epoch advance: {exc}"
@@ -402,7 +448,10 @@ class ReconciliationCoordinator:
                         ) from exc
 
                     try:
-                        operator_authority.consume(record)
+                        operator_authority._consume_after_durable(
+                            record,
+                            protocol_key=self.__authority_protocol_key,
+                        )
                     except ReconciliationAuthorityError as exc:
                         raise ReconciliationCoordinatorError(
                             f"durable fact could not consume operator authority: {exc}"

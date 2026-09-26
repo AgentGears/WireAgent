@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from webwire.safety import (
     EffectLedgerRecord,
     EffectState,
     ReconciliationLedger,
+    ReconciliationLedgerError,
     ReconciliationRecord,
     ReconciliationVerdict,
     RecoveryDisposition,
@@ -330,7 +332,7 @@ def test_locally_ambiguous_reconciliation_never_becomes_projection_authority(
         real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", fail_once)
-    with pytest.raises(Exception, match="append failed"):
+    with pytest.raises(ReconciliationLedgerError, match="append failed"):
         reconciliations.append_durable(reconciliation)
     assert reconciliations.durability_ambiguous is True
 
@@ -368,13 +370,64 @@ def test_startup_reconciliation_redurability_failure_makes_guard_unavailable(
     assert guard.status().available is False
 
 
-def test_same_paths_share_one_publication_fence_primitive(tmp_path: Path) -> None:
-    effects_a = EffectLedger(path=tmp_path / "effects.ndjson")
-    effects_b = EffectLedger(path=tmp_path / "effects.ndjson")
-    reconciliations_a = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
-    reconciliations_b = ReconciliationLedger(path=tmp_path / "reconciliations.ndjson")
+class _BlockingReconciliationLedger(ReconciliationLedger):
+    def __init__(self, *, path: Path) -> None:
+        super().__init__(path=path)
+        self.entered = threading.Event()
+        self.release = threading.Event()
 
-    first = RecoveryGuard(effects_a, reconciliation_ledger=reconciliations_a)
-    second = RecoveryGuard(effects_b, reconciliation_ledger=reconciliations_b)
+    def read_authoritative(self) -> list[ReconciliationRecord]:
+        self.entered.set()
+        assert self.release.wait(timeout=2.0)
+        return super().read_authoritative()
 
-    assert first.publication_fence.lock is second.publication_fence.lock
+
+class _ProbeReconciliationLedger(ReconciliationLedger):
+    def __init__(self, *, path: Path) -> None:
+        super().__init__(path=path)
+        self.entered = threading.Event()
+
+    def read_authoritative(self) -> list[ReconciliationRecord]:
+        self.entered.set()
+        return super().read_authoritative()
+
+
+def test_same_recovery_domain_guards_share_publication_serialization(
+    tmp_path: Path,
+) -> None:
+    effect_path = tmp_path / "effects.ndjson"
+    reconciliation_path = tmp_path / "reconciliations.ndjson"
+    blocking = _BlockingReconciliationLedger(path=reconciliation_path)
+    probe = _ProbeReconciliationLedger(path=reconciliation_path)
+    first = RecoveryGuard(
+        EffectLedger(path=effect_path),
+        reconciliation_ledger=blocking,
+    )
+    second = RecoveryGuard(
+        EffectLedger(path=effect_path),
+        reconciliation_ledger=probe,
+    )
+    errors: list[BaseException] = []
+
+    def refresh(guard: RecoveryGuard) -> None:
+        try:
+            guard.refresh()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=refresh, args=(first,))
+    first_thread.start()
+    assert blocking.entered.wait(timeout=2.0)
+
+    second_thread = threading.Thread(target=refresh, args=(second,))
+    second_thread.start()
+    assert probe.entered.wait(timeout=0.05) is False
+
+    blocking.release.set()
+    first_thread.join(timeout=2.0)
+    second_thread.join(timeout=2.0)
+
+    assert errors == []
+    assert first_thread.is_alive() is False
+    assert second_thread.is_alive() is False
+    assert probe.entered.is_set()

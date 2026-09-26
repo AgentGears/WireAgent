@@ -15,11 +15,15 @@ import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.confirmation_state import ConfirmationState
-from webwire.safety.effect_ledger import EffectLedgerRecord, EffectState
+from webwire.safety.effect_ledger import (
+    EffectLedgerError,
+    EffectLedgerRecord,
+    EffectState,
+)
 from webwire.safety.reconciliation_authority import (
     ReconciliationAuthority,
     ReconciliationAuthorityError,
@@ -133,7 +137,7 @@ class ReconciliationCoordinator:
               -> ledger/path locks
               -> RecoveryGuard publication/cache lock
 
-    The gateway lifecycle fence is held for the whole resolution protocol.  Once
+    The gateway lifecycle fence is held for the whole resolution protocol. Once
     it reports no owner, the target effect cannot later resume an old in-process
     M5 attempt before reconciliation publication completes.
     """
@@ -156,8 +160,9 @@ class ReconciliationCoordinator:
         if commit_gateway is not None and not isinstance(commit_gateway, CommitGateway):
             raise TypeError("commit_gateway must be a CommitGateway or None")
         if commit_gateway is not None:
-            if commit_gateway.ledger.path.resolve(strict=False) != recovery_guard.ledger.path.resolve(
-                strict=False
+            if (
+                commit_gateway.ledger.path.resolve(strict=False)
+                != recovery_guard.ledger.path.resolve(strict=False)
             ):
                 raise ValueError("commit_gateway and recovery_guard EffectLedger paths differ")
 
@@ -258,7 +263,7 @@ class ReconciliationCoordinator:
         effect_id: str,
         verdict: ReconciliationVerdict,
         evidence_hash: str,
-        evidence: dict[str, object],
+        evidence: dict[str, Any],
         authority: ReconciliationAuthority,
     ) -> ReconciliationRecord:
         reconciliation_id = self._reconciliation_id_factory()
@@ -295,7 +300,7 @@ class ReconciliationCoordinator:
         self,
         effect_id: str,
         verdict: ReconciliationVerdict,
-        evidence: dict[str, object],
+        evidence: dict[str, Any],
         operator_authority: ReconciliationAuthority,
     ) -> ReconciliationResolution:
         """Resolve one unresolved effect using the frozen M6 ordering protocol."""
@@ -305,10 +310,6 @@ class ReconciliationCoordinator:
             raise ReconciliationDenied("invalid_verdict")
         if not isinstance(operator_authority, ReconciliationAuthority):
             raise ReconciliationDenied("operator_authority_missing")
-        try:
-            evidence_hash = canonical_evidence_hash(evidence)
-        except (TypeError, ValueError) as exc:
-            raise ReconciliationDenied("invalid_evidence", str(exc)) from exc
 
         lifecycle_fence = (
             self._gateway.reconciliation_lifecycle_fence()
@@ -328,8 +329,37 @@ class ReconciliationCoordinator:
                     # Effect history is always re-read before a persistence attempt.
                     # A committed retry therefore cannot ride changed/missing M5
                     # lineage merely because its operator authority survived.
-                    effect_records = self._effect_ledger.read_records()
+                    try:
+                        effect_records = self._effect_ledger.read_records()
+                    except EffectLedgerError as exc:
+                        raise ReconciliationDenied(
+                            "effect_history_unavailable",
+                            str(exc),
+                        ) from exc
                     first, _last = self._history_target(effect_records, effect_id)
+
+                    # Evidence is pure caller data, but canonicalization belongs
+                    # after target capture in the frozen protocol so the exact
+                    # displayed target is the one being bound.
+                    try:
+                        evidence_hash = canonical_evidence_hash(evidence)
+                    except (TypeError, ValueError) as exc:
+                        raise ReconciliationDenied("invalid_evidence", str(exc)) from exc
+
+                    # For a fresh authority, establish authoritative reconciliation
+                    # history before consulting operator authority. A committed
+                    # same-process retry deliberately bypasses this read because a
+                    # local ambiguity latch permits only exact-fact re-durability.
+                    if not operator_authority.committed:
+                        try:
+                            existing = self._reconciliation_ledger.read_authoritative()
+                        except ReconciliationLedgerError as exc:
+                            raise ReconciliationDenied(
+                                "reconciliation_history_unavailable",
+                                str(exc),
+                            ) from exc
+                        if any(record.effect_id == effect_id for record in existing):
+                            raise ReconciliationDenied("already_reconciled", effect_id)
 
                     try:
                         committed_record = operator_authority.validate_start(
@@ -341,11 +371,6 @@ class ReconciliationCoordinator:
                         raise ReconciliationDenied(exc.reason, exc.detail) from exc
 
                     if committed_record is None:
-                        # Ordinary starts require authoritative reconciliation history
-                        # to be clean and to contain no prior terminal fact.
-                        existing = self._reconciliation_ledger.read_authoritative()
-                        if any(record.effect_id == effect_id for record in existing):
-                            raise ReconciliationDenied("already_reconciled", effect_id)
                         record = self._new_record(
                             first=first,
                             effect_id=effect_id,

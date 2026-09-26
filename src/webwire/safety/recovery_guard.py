@@ -1,14 +1,18 @@
-"""Layer-6 replay denial from durable M5 recovery truth.
+"""M6 replay denial from joined durable effect + reconciliation truth.
 
-``RecoveryGuard`` turns the canonical :class:`EffectLedger` recovery projection
-into an enforced semantic replay gate. It never reconciles or rewrites ledger
-history: unresolved ``RESERVED`` and ``EFFECT_UNKNOWN`` facts remain durable
-uncertainty until a future evidence-bearing reconciliation design resolves them.
+``RecoveryGuard`` remains the enforced semantic replay gate used by WriteKernel,
+but its authority is now a complete composite snapshot from both safety ledgers.
+M5 ``EffectLedger.recovery_projection()`` remains a diagnostic/helper API only.
 
-The guard is hydrated at Dispatcher startup and refreshed before every supported
-M5 mutation policy pass. Refresh is intentional: an effect can become durably
-unknown while the current process survives, so restart-only hydration would
-leave a same-process replay window.
+Authoritative refresh is ordered by ``ReconciliationPublicationFence``. Ledger
+reads and composite validation occur before the guard publication/cache lock is
+acquired, preserving the frozen M6 lock order:
+
+    publication fence -> ledger/path locks -> guard publication/cache lock
+
+No source history is rewritten. A terminal reconciliation can remove only the
+matching unresolved recovery contribution after the reconciliation row is known
+durable and lineage-valid.
 """
 
 from __future__ import annotations
@@ -17,11 +21,16 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from webwire.safety.effect_ledger import (
-    EffectLedger,
-    EffectLedgerError,
-    EffectState,
-    RecoveryProjection,
+from webwire.safety.effect_ledger import EffectLedger, EffectLedgerError, EffectState
+from webwire.safety.reconciliation_ledger import (
+    ReconciliationLedger,
+    ReconciliationLedgerError,
+)
+from webwire.safety.recovery_projector import (
+    CompositeRecoveryProjection,
+    ReconciliationPublicationFence,
+    RecoveryProjector,
+    RecoveryProjectorError,
 )
 
 __all__ = [
@@ -34,7 +43,7 @@ __all__ = [
 
 
 class RecoveryGuardUnavailable(RuntimeError):
-    """Recovery authority could not be established from the EffectLedger."""
+    """Composite recovery authority could not be established safely."""
 
 
 @dataclass(frozen=True)
@@ -70,18 +79,39 @@ class RecoveryStatus:
 
 
 class RecoveryGuard:
-    """Deny exact semantic replay while durable uncertainty exists.
+    """Deny exact semantic replay while composite durable uncertainty exists.
 
-    A guard instance is process-local, but its authority comes only from the
-    fsync-backed EffectLedger. Any ledger read/corruption failure makes the guard
-    unavailable and therefore fail-closed; stale cached state is never treated
-    as proof that a semantic key is clear.
+    A guard instance is process-local. Its authority comes only from a complete,
+    validated ``RecoveryProjector`` snapshot. Failure or ambiguity in either
+    safety ledger discards cached clear authority and makes mutation fail closed.
     """
 
-    def __init__(self, ledger: EffectLedger) -> None:
+    def __init__(
+        self,
+        ledger: EffectLedger,
+        *,
+        reconciliation_ledger: Optional[ReconciliationLedger] = None,
+        publication_fence: Optional[ReconciliationPublicationFence] = None,
+    ) -> None:
         if not isinstance(ledger, EffectLedger):
             raise TypeError("RecoveryGuard requires an EffectLedger")
+        sibling_reconciliation = reconciliation_ledger or ReconciliationLedger(
+            path=ledger.path.parent / "reconciliations.ndjson"
+        )
+        if not isinstance(sibling_reconciliation, ReconciliationLedger):
+            raise TypeError("reconciliation_ledger must be a ReconciliationLedger")
+
+        fence = publication_fence or ReconciliationPublicationFence.shared_for_ledgers(
+            ledger,
+            sibling_reconciliation,
+        )
+        if not isinstance(fence, ReconciliationPublicationFence):
+            raise TypeError("publication_fence must be a ReconciliationPublicationFence")
+
         self._ledger = ledger
+        self._reconciliation_ledger = sibling_reconciliation
+        self._projector = RecoveryProjector(ledger, sibling_reconciliation)
+        self._publication_fence = fence
         self._lock = threading.RLock()
         self._blocks: dict[str, RecoveryBlock] = {}
         self._hydrated = False
@@ -90,42 +120,60 @@ class RecoveryGuard:
 
     @property
     def ledger(self) -> EffectLedger:
+        """Canonical M5 effect ledger retained for compatibility/diagnostics."""
         return self._ledger
 
+    @property
+    def reconciliation_ledger(self) -> ReconciliationLedger:
+        return self._reconciliation_ledger
+
+    @property
+    def projector(self) -> RecoveryProjector:
+        return self._projector
+
+    @property
+    def publication_fence(self) -> ReconciliationPublicationFence:
+        return self._publication_fence
+
     def hydrate(self) -> RecoveryStatus:
-        """Establish startup recovery truth from the canonical ledger."""
+        """Establish startup recovery truth from both canonical safety ledgers."""
         return self.refresh()
 
     def refresh(self) -> RecoveryStatus:
-        """Replace the cache from one validated ledger recovery projection.
+        """Publish one complete, publication-fenced composite recovery snapshot.
 
-        The full read -> projection -> publication sequence is serialized under
-        the guard lock. Without that ordering, two concurrent refreshes could
-        publish snapshots out of order and let an older clear view overwrite a
-        newer unresolved one.
-
-        The ledger validates syntax, lineage, and state history before returning
-        a projection. If that read fails, cached blocks are discarded as
-        authority and the guard remains unavailable until a later refresh can
-        establish a fresh trustworthy projection.
+        The publication fence spans both durable reads, composite validation,
+        and cache publication. Crucially, the guard cache lock is acquired only
+        *after* ledger/path locks have been released by the projector. This
+        preserves the M6 lock order needed by the later reconciliation
+        coordinator and prevents an older clear snapshot from overtaking a newer
+        blocked/unavailable publication.
         """
-        with self._lock:
+        with self._publication_fence:
             try:
-                projection = self._ledger.recovery_projection()
-            except EffectLedgerError as exc:
-                self._blocks = {}
-                self._hydrated = True
-                self._available = False
-                self._error = f"{type(exc).__name__}: {exc}"
+                projection = self._projector.project()
+                blocks = self._blocks_from_projection(projection)
+            except (
+                EffectLedgerError,
+                ReconciliationLedgerError,
+                RecoveryProjectorError,
+            ) as exc:
+                with self._lock:
+                    self._blocks = {}
+                    self._hydrated = True
+                    self._available = False
+                    self._error = f"{type(exc).__name__}: {exc}"
                 raise RecoveryGuardUnavailable(
-                    "M5 recovery state could not be established from the EffectLedger"
+                    "M6 composite recovery state could not be established from "
+                    "the safety ledgers"
                 ) from exc
 
-            self._blocks = self._blocks_from_projection(projection)
-            self._hydrated = True
-            self._available = True
-            self._error = None
-            return self._status_locked()
+            with self._lock:
+                self._blocks = blocks
+                self._hydrated = True
+                self._available = True
+                self._error = None
+                return self._status_locked()
 
     def require_clear(
         self,
@@ -135,9 +183,10 @@ class RecoveryGuard:
     ) -> Optional[RecoveryBlock]:
         """Return a replay block for ``semantic_key`` or ``None`` when clear.
 
-        By default every check refreshes from durable truth before answering.
-        Callers may disable refresh only when they already hold a fresh startup
-        snapshot and no mutation can have appended a newer ledger fact.
+        By default every check refreshes from composite durable truth before
+        answering. Callers may disable refresh only when they already hold a
+        fresh authoritative snapshot and no relevant mutation can have advanced
+        either safety history.
         """
         if not isinstance(semantic_key, str) or not semantic_key:
             raise ValueError("semantic_key must be a non-empty string")
@@ -146,7 +195,8 @@ class RecoveryGuard:
         with self._lock:
             if not self._hydrated or not self._available:
                 raise RecoveryGuardUnavailable(
-                    "M5 recovery state is unavailable; mutation must fail closed"
+                    "M6 composite recovery state is unavailable; mutation must "
+                    "fail closed"
                 )
             return self._blocks.get(semantic_key)
 
@@ -172,17 +222,22 @@ class RecoveryGuard:
 
     @staticmethod
     def _blocks_from_projection(
-        projection: list[RecoveryProjection],
+        projection: list[CompositeRecoveryProjection],
     ) -> dict[str, RecoveryBlock]:
         grouped: dict[str, list[RecoveryEffect]] = {}
         for item in projection:
             if not item.unresolved:
                 continue
+            effective_state = (
+                EffectState.EFFECT_UNKNOWN
+                if item.raw_state is EffectState.RESERVED
+                else item.raw_state
+            )
             grouped.setdefault(item.semantic_key, []).append(
                 RecoveryEffect(
                     effect_id=item.effect_id,
                     raw_state=item.raw_state,
-                    effective_state=item.effective_state,
+                    effective_state=effective_state,
                 )
             )
 

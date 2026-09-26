@@ -389,6 +389,7 @@ class ReconciliationCoordinator:
                         operator_authority.committed
                         and self._reconciliation_ledger.durability_ambiguous
                     )
+                    existing: Optional[list[ReconciliationRecord]] = None
                     if not skip_history_read:
                         try:
                             existing = self._reconciliation_ledger.read_authoritative()
@@ -422,6 +423,19 @@ class ReconciliationCoordinator:
                     else:
                         record = committed_record
                         self._require_frozen_lineage(first=first, record=record)
+
+                    # A random/id-factory collision is a known invalid proposal,
+                    # not a persistence event. Detect it while the authoritative
+                    # history is already in hand, before invalidating confirmations
+                    # or committing the authority to an impossible retry.
+                    if existing is not None and any(
+                        persisted.reconciliation_id == record.reconciliation_id
+                        for persisted in existing
+                    ):
+                        raise ReconciliationDenied(
+                            "reconciliation_id_collision",
+                            record.reconciliation_id,
+                        )
 
                     confirmation_epoch = self._confirmation_state.advance_epoch()
 

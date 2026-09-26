@@ -41,6 +41,7 @@ __all__ = [
 ]
 
 DEFAULT_RECONCILIATION_AUTHORITY_TTL_S = 120.0
+_HEX_LOWER = frozenset("0123456789abcdef")
 
 
 class ReconciliationAuthorityError(RuntimeError):
@@ -80,15 +81,11 @@ class ReconciliationAuthority:
             raise ValueError("effect_id must be a non-empty string")
         if not isinstance(verdict, ReconciliationVerdict):
             raise ValueError("verdict must be a ReconciliationVerdict")
-        if not isinstance(evidence_hash, str) or len(evidence_hash) != 64:
-            raise ValueError("evidence_hash must be lowercase SHA-256 hexadecimal")
-        try:
-            int(evidence_hash, 16)
-        except ValueError as exc:
-            raise ValueError(
-                "evidence_hash must be lowercase SHA-256 hexadecimal"
-            ) from exc
-        if evidence_hash.lower() != evidence_hash:
+        if (
+            not isinstance(evidence_hash, str)
+            or len(evidence_hash) != 64
+            or any(char not in _HEX_LOWER for char in evidence_hash)
+        ):
             raise ValueError("evidence_hash must be lowercase SHA-256 hexadecimal")
         if not isinstance(operator_id, str) or not operator_id:
             raise ValueError("operator_id must be a non-empty string")

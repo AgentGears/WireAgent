@@ -1,5 +1,6 @@
 """Safety subsystem — kill switch, write kernel, and effect controls."""
 
+from webwire.safety.confirmation_state import ConfirmationState
 from webwire.safety.dedupe import DedupeStore
 from webwire.safety.effect_ledger import (
     EffectLedger,
@@ -90,6 +91,7 @@ __all__ = [
     "DedupeStore",
     "CompensationMeta",
     "ConfirmationToken",
+    "ConfirmationState",
     "PolicyDecision",
     "PolicyVerdict",
     "Visibility",

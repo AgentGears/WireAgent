@@ -150,17 +150,29 @@ class ReconciliationOperatorSession:
 
         target = self._coordinator.describe_target(effect_id)
         try:
-            evidence_hash = canonical_evidence_hash(evidence)
-        except (TypeError, ValueError) as exc:
+            # First validate the caller-owned object without coercion, then
+            # serialize the exact snapshot that will be retained. Re-hashing the
+            # detached copy ensures the displayed authority binding and retained
+            # evidence are one fact even if caller mutation races preparation.
+            initial_hash = canonical_evidence_hash(evidence)
+            evidence_json = json.dumps(
+                evidence,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            frozen_evidence = json.loads(evidence_json)
+            if not isinstance(frozen_evidence, dict):
+                raise ValueError("evidence must serialize to a JSON object")
+            evidence_hash = canonical_evidence_hash(frozen_evidence)
+        except (TypeError, ValueError, RuntimeError) as exc:
             raise ReconciliationOperatorError("invalid_evidence", str(exc)) from exc
+        if evidence_hash != initial_hash:
+            raise ReconciliationOperatorError(
+                "evidence_changed_during_prepare",
+                "caller evidence changed while the proposal was being frozen",
+            )
 
-        # canonical_evidence_hash has already proved strict portable JSON.
-        evidence_json = json.dumps(
-            evidence,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
         proposal_id = self._proposal_id_factory()
         if not isinstance(proposal_id, str) or not proposal_id:
             raise ReconciliationOperatorError("proposal_id_invalid")

@@ -176,7 +176,9 @@ class ReconciliationOperatorSession:
         proposal_id = self._proposal_id_factory()
         if not isinstance(proposal_id, str) or not proposal_id:
             raise ReconciliationOperatorError("proposal_id_invalid")
-        confirmation_text = f"CONFIRM {effect_id} {verdict.value} {evidence_hash}"
+        confirmation_text = (
+            f"CONFIRM {effect_id} {verdict.value} {evidence_hash} {self._operator_id}"
+        )
         first = target.first_record
         proposal = ReconciliationProposal(
             proposal_id=proposal_id,

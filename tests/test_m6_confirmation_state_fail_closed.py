@@ -103,3 +103,28 @@ async def test_regressing_authority_clock_becomes_security_denial_before_execute
     assert second.data["policy"]["blocked_by"] == "confirmation_state_unavailable"
     assert "denied:confirmation_state_unavailable" in second.data["trace"]["stages"]
     assert cap.execute_calls == 0
+
+
+async def test_invalid_issue_binding_becomes_security_denial_before_execute(
+    tmp_path: Path,
+) -> None:
+    state = ConfirmationState(
+        monotonic_clock=_Clock(10.0),
+        wall_clock=_Clock(1_000.0),
+        token_factory=lambda: "token-1",
+    )
+    kernel = _kernel(tmp_path, state)
+    cap = _LikeCapability()
+    cap.name = ""
+
+    result = await kernel.execute(
+        cap,
+        object(),  # type: ignore[arg-type]
+        {"post_id": "1"},
+        actor_identity="alice",
+    )
+
+    assert result.ok is False
+    assert result.data["policy"]["blocked_by"] == "confirmation_state_unavailable"
+    assert "denied:confirmation_state_unavailable" in result.data["trace"]["stages"]
+    assert cap.execute_calls == 0

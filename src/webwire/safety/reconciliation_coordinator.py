@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import secrets
 import threading
-from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -132,10 +131,16 @@ class ReconciliationCoordinator:
 
         publication fence
           -> coordinator protocol lock
-            -> CommitGateway lifecycle fence (when present)
+            -> canonical CommitGateway lifecycle fence
               -> ConfirmationState fence (inside advance_epoch)
               -> ledger/path locks
               -> RecoveryGuard publication/cache lock
+
+    A coordinator cannot be constructed without the CommitGateway that owns the
+    M5 lifecycle domain for this EffectLedger. Even an offline/exclusive operator
+    process creates that gateway; it simply has no live owners. Making the fence
+    mandatory prevents an exported coordinator API from silently bypassing the
+    frozen ``live_attempt_owned`` rejection rule.
 
     The gateway lifecycle fence is held for the whole resolution protocol. Once
     it reports no owner, the target effect cannot later resume an old in-process
@@ -147,7 +152,7 @@ class ReconciliationCoordinator:
         *,
         recovery_guard: RecoveryGuard,
         confirmation_state: ConfirmationState,
-        commit_gateway: Optional[CommitGateway] = None,
+        commit_gateway: CommitGateway,
         reconciliation_id_factory: Callable[[], str] = lambda: secrets.token_urlsafe(16),
         timestamp_factory: Callable[[], str] = lambda: datetime.now(
             timezone.utc
@@ -157,14 +162,13 @@ class ReconciliationCoordinator:
             raise TypeError("recovery_guard must be a RecoveryGuard")
         if not isinstance(confirmation_state, ConfirmationState):
             raise TypeError("confirmation_state must be a ConfirmationState")
-        if commit_gateway is not None and not isinstance(commit_gateway, CommitGateway):
-            raise TypeError("commit_gateway must be a CommitGateway or None")
-        if commit_gateway is not None:
-            if (
-                commit_gateway.ledger.path.resolve(strict=False)
-                != recovery_guard.ledger.path.resolve(strict=False)
-            ):
-                raise ValueError("commit_gateway and recovery_guard EffectLedger paths differ")
+        if not isinstance(commit_gateway, CommitGateway):
+            raise TypeError("commit_gateway must be the canonical CommitGateway")
+        if (
+            commit_gateway.ledger.path.resolve(strict=False)
+            != recovery_guard.ledger.path.resolve(strict=False)
+        ):
+            raise ValueError("commit_gateway and recovery_guard EffectLedger paths differ")
 
         self._guard = recovery_guard
         self._effect_ledger = recovery_guard.ledger
@@ -185,7 +189,7 @@ class ReconciliationCoordinator:
         return self._confirmation_state
 
     @property
-    def commit_gateway(self) -> Optional[CommitGateway]:
+    def commit_gateway(self) -> CommitGateway:
         return self._gateway
 
     def list_targets(self) -> tuple[ReconciliationTarget, ...]:
@@ -311,19 +315,10 @@ class ReconciliationCoordinator:
         if not isinstance(operator_authority, ReconciliationAuthority):
             raise ReconciliationDenied("operator_authority_missing")
 
-        lifecycle_fence = (
-            self._gateway.reconciliation_lifecycle_fence()
-            if self._gateway is not None
-            else nullcontext()
-        )
-
         with self._publication_fence:
             with self._protocol_lock:
-                with lifecycle_fence:
-                    if (
-                        self._gateway is not None
-                        and self._gateway.live_attempt_owns_effect(effect_id)
-                    ):
+                with self._gateway.reconciliation_lifecycle_fence():
+                    if self._gateway.live_attempt_owns_effect(effect_id):
                         raise ReconciliationDenied("live_attempt_owned", effect_id)
 
                     # Effect history is always re-read before a persistence attempt.

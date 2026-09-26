@@ -265,17 +265,16 @@ class CommitGateway:
         self._live_effect_attempts.pop(attempt.effect_id, None)
 
     def live_attempt_owns_effect(self, effect_id: str) -> bool:
-        """Return canonical live ownership under the gateway protocol fence."""
+        """Return canonical registered ownership under the protocol fence.
+
+        Registration itself is authoritative. Ownership is retired only by the
+        gateway's terminalization paths, never inferred away from the mutable
+        EffectAttempt state by a diagnostic read.
+        """
         if not isinstance(effect_id, str) or not effect_id:
             raise ValueError("effect_id must be a non-empty string")
         with self._protocol_lock:
-            attempt = self._live_effect_attempts.get(effect_id)
-            if attempt is None:
-                return False
-            if attempt.state in (AttemptState.PREPARING, AttemptState.RESERVED):
-                return True
-            self._retire_live_effect_attempt(attempt)
-            return False
+            return effect_id in self._live_effect_attempts
 
     def _policy_for(self, intent: WriteIntent) -> EffectPolicy:
         try:

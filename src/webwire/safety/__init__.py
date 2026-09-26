@@ -41,6 +41,14 @@ from webwire.safety.reconciliation_ledger import (
     ReconciliationVerdict,
     canonical_evidence_hash,
 )
+from webwire.safety.recovery_projector import (
+    CompositeRecoveryProjection,
+    ReconciliationPublicationFence,
+    RecoveryDisposition,
+    RecoveryProjector,
+    RecoveryProjectorCorruptError,
+    RecoveryProjectorError,
+)
 from webwire.safety.recovery_guard import (
     RecoveryBlock,
     RecoveryEffect,
@@ -108,6 +116,12 @@ __all__ = [
     "ReconciliationRecord",
     "ReconciliationVerdict",
     "canonical_evidence_hash",
+    "CompositeRecoveryProjection",
+    "ReconciliationPublicationFence",
+    "RecoveryDisposition",
+    "RecoveryProjector",
+    "RecoveryProjectorError",
+    "RecoveryProjectorCorruptError",
     "RecoveryGuard",
     "RecoveryGuardUnavailable",
     "RecoveryBlock",

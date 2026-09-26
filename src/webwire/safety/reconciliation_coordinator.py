@@ -207,23 +207,35 @@ class ReconciliationCoordinator:
         )
 
     def describe_target(self, effect_id: str) -> ReconciliationTarget:
-        """Return one read-only composite target or deny unknown/settled effects."""
+        """Return one displayable target, denying any current live owner.
+
+        Operator confirmation must not be staged against evidence that predates
+        completion of the same in-process M5 attempt.  Use the same lock order as
+        terminal resolution so a live owner cannot disappear/reappear across the
+        target snapshot.
+        """
         if not isinstance(effect_id, str) or not effect_id:
             raise ReconciliationDenied("invalid_effect_id")
-        projection = self._guard.projector.project()
-        for item in projection:
-            if item.effect_id == effect_id:
-                if not item.unresolved:
-                    raise ReconciliationDenied(
-                        "invalid_target_state",
-                        item.disposition.value,
-                    )
-                return ReconciliationTarget(
-                    effect_id=item.effect_id,
-                    first_record=item.first_record,
-                    last_record=item.last_record,
-                    projection=item,
-                )
+        with self._publication_fence:
+            with self._protocol_lock:
+                with self._gateway.reconciliation_lifecycle_fence():
+                    if self._gateway.live_attempt_owns_effect(effect_id):
+                        raise ReconciliationDenied("live_attempt_owned", effect_id)
+                    projection = self._guard.projector.project()
+                    for item in projection:
+                        if item.effect_id != effect_id:
+                            continue
+                        if not item.unresolved:
+                            raise ReconciliationDenied(
+                                "invalid_target_state",
+                                item.disposition.value,
+                            )
+                        return ReconciliationTarget(
+                            effect_id=item.effect_id,
+                            first_record=item.first_record,
+                            last_record=item.last_record,
+                            projection=item,
+                        )
         raise ReconciliationDenied("unknown_effect_id", effect_id)
 
     @staticmethod
@@ -321,9 +333,6 @@ class ReconciliationCoordinator:
                     if self._gateway.live_attempt_owns_effect(effect_id):
                         raise ReconciliationDenied("live_attempt_owned", effect_id)
 
-                    # Effect history is always re-read before a persistence attempt.
-                    # A committed retry therefore cannot ride changed/missing M5
-                    # lineage merely because its operator authority survived.
                     try:
                         effect_records = self._effect_ledger.read_records()
                     except EffectLedgerError as exc:
@@ -333,18 +342,11 @@ class ReconciliationCoordinator:
                         ) from exc
                     first, _last = self._history_target(effect_records, effect_id)
 
-                    # Evidence is pure caller data, but canonicalization belongs
-                    # after target capture in the frozen protocol so the exact
-                    # displayed target is the one being bound.
                     try:
                         evidence_hash = canonical_evidence_hash(evidence)
                     except (TypeError, ValueError) as exc:
                         raise ReconciliationDenied("invalid_evidence", str(exc)) from exc
 
-                    # For a fresh authority, establish authoritative reconciliation
-                    # history before consulting operator authority. A committed
-                    # same-process retry deliberately bypasses this read because a
-                    # local ambiguity latch permits only exact-fact re-durability.
                     if not operator_authority.committed:
                         try:
                             existing = self._reconciliation_ledger.read_authoritative()
@@ -375,15 +377,9 @@ class ReconciliationCoordinator:
                             authority=operator_authority,
                         )
                     else:
-                        # A started persistence attempt is authority-bound to the
-                        # complete frozen record; never manufacture a new id/time.
                         record = committed_record
                         self._require_frozen_lineage(first=first, record=record)
 
-                    # Every persistence/re-durability attempt advances the epoch.
-                    # This includes retries: confirmations issued after an earlier
-                    # failed attempt must not survive the retry that may finally
-                    # publish recovery-clear truth.
                     confirmation_epoch = self._confirmation_state.advance_epoch()
 
                     try:
@@ -405,8 +401,6 @@ class ReconciliationCoordinator:
                             detail=str(exc),
                         ) from exc
 
-                    # Durable success permanently consumes the operator authority
-                    # before recovery-clear publication.
                     try:
                         operator_authority.consume(record)
                     except ReconciliationAuthorityError as exc:

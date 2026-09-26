@@ -129,20 +129,27 @@ class ConfirmationState:
         risk_tier: RiskTier,
         capability_name: str,
     ) -> ConfirmationToken:
-        """Mint and store one token bound to the current epoch and monotonic TTL."""
+        """Mint and store one token bound to the current epoch and monotonic TTL.
+
+        Runtime issuance failures use one operational exception type so callers can
+        fail closed without depending on the particular invalid authority input or
+        token-factory failure that made issuance unavailable.
+        """
         if not intent_hash:
-            raise ValueError("intent_hash must be non-empty")
+            raise ConfirmationStateError("intent_hash must be non-empty")
         if not capability_name:
-            raise ValueError("capability_name must be non-empty")
+            raise ConfirmationStateError("capability_name must be non-empty")
         if not isinstance(risk_tier, RiskTier):
-            raise TypeError("risk_tier must be a RiskTier")
+            raise ConfirmationStateError("risk_tier must be a RiskTier")
 
         with self._lock:
             authority_now = self._sample_authority_locked()
             wall_now = self._sample_wall_locked()
             token_str = self._token_factory()
             if not isinstance(token_str, str) or not token_str:
-                raise ValueError("token_factory must return a non-empty string")
+                raise ConfirmationStateError(
+                    "token_factory must return a non-empty string"
+                )
             if token_str in self._pending:
                 raise ConfirmationStateError(
                     "token_factory produced a duplicate confirmation token"

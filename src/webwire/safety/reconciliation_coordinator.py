@@ -135,9 +135,10 @@ class _CommittedResolution:
 
 @dataclass
 class _ProtocolPathState:
-    """Same-path coordinator serialization and clean-failure continuation state."""
+    """Same-path protocol serialization and process-local authority state."""
 
     lock: Any
+    confirmation_state: ConfirmationState
     committed_by_effect: dict[str, _CommittedResolution]
 
 
@@ -158,12 +159,13 @@ class ReconciliationCoordinator:
     domain by normalized ledger path, so a sibling gateway in the same process
     cannot hide a live owner. Independent processes remain outside M6's claim.
 
-    The coordinator protocol lock and committed-fact continuation map are also
-    shared by the normalized EffectLedger/ReconciliationLedger path pair. Once
-    persistence starts, a clean or ambiguous failure therefore pins that effect
-    to the exact authority/fact across same-path coordinator instances until
-    known durable success or process restart. A fresh authority cannot replace an
-    already-started same-process resolution merely because no row is visible yet.
+    The coordinator protocol lock, confirmation-state identity, and committed-
+    fact continuation map are shared by the normalized EffectLedger/
+    ReconciliationLedger path pair. Same-path coordinators therefore cannot
+    create a second confirmation epoch that would leave the active WriteKernel's
+    pending tokens valid. Once persistence starts, a clean or ambiguous failure
+    also pins that effect to the exact authority/fact until known durable success
+    or process restart.
 
     The gateway lifecycle fence is held for the whole resolution protocol. Once
     it reports no owner, the target effect cannot later resume an old in-process
@@ -179,7 +181,11 @@ class ReconciliationCoordinator:
     _protocol_states: ClassVar[dict[tuple[str, str], _ProtocolPathState]] = {}
 
     @classmethod
-    def _protocol_state_for_guard(cls, guard: RecoveryGuard) -> _ProtocolPathState:
+    def _protocol_state_for_guard(
+        cls,
+        guard: RecoveryGuard,
+        confirmation_state: ConfirmationState,
+    ) -> _ProtocolPathState:
         key = (
             os.path.normcase(str(guard.ledger.path.resolve(strict=False))),
             os.path.normcase(
@@ -191,9 +197,15 @@ class ReconciliationCoordinator:
             if state is None:
                 state = _ProtocolPathState(
                     lock=threading.RLock(),
+                    confirmation_state=confirmation_state,
                     committed_by_effect={},
                 )
                 cls._protocol_states[key] = state
+            elif state.confirmation_state is not confirmation_state:
+                raise ValueError(
+                    "same-path reconciliation coordinators must share one "
+                    "ConfirmationState"
+                )
             return state
 
     def __init__(
@@ -219,15 +231,18 @@ class ReconciliationCoordinator:
         ):
             raise ValueError("commit_gateway and recovery_guard EffectLedger paths differ")
 
+        protocol_state = self._protocol_state_for_guard(
+            recovery_guard,
+            confirmation_state,
+        )
         self._guard = recovery_guard
         self._effect_ledger = recovery_guard.ledger
         self._reconciliation_ledger = recovery_guard.reconciliation_ledger
         self._publication_fence = recovery_guard.publication_fence
-        self._confirmation_state = confirmation_state
+        self._confirmation_state = protocol_state.confirmation_state
         self._gateway = commit_gateway
         self._reconciliation_id_factory = reconciliation_id_factory
         self._timestamp_factory = timestamp_factory
-        protocol_state = self._protocol_state_for_guard(recovery_guard)
         self._protocol_lock = protocol_state.lock
         self._committed_by_effect = protocol_state.committed_by_effect
         self.__authority_protocol_key = object()
@@ -358,7 +373,10 @@ class ReconciliationCoordinator:
                 )
 
     @staticmethod
-    def _same_frozen_fact(left: ReconciliationRecord, right: ReconciliationRecord) -> bool:
+    def _same_frozen_fact(
+        left: ReconciliationRecord,
+        right: ReconciliationRecord,
+    ) -> bool:
         return left.to_jsonl() == right.to_jsonl()
 
     def _new_record(

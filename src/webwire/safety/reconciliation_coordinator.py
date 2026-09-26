@@ -10,11 +10,12 @@ Source of truth: ``docs/M6_DESIGN.md`` §§10-16 and acceptance R3-R45.
 
 from __future__ import annotations
 
+import os
 import secrets
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Optional
 
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.confirmation_state import ConfirmationState
@@ -124,6 +125,22 @@ class ReconciliationResolution:
     recovery_status: RecoveryStatus
 
 
+@dataclass(frozen=True)
+class _CommittedResolution:
+    """Process-local pin for one fact whose persistence has already started."""
+
+    record: ReconciliationRecord
+    authority: ReconciliationAuthority
+
+
+@dataclass
+class _ProtocolPathState:
+    """Same-path coordinator serialization and clean-failure continuation state."""
+
+    lock: Any
+    committed_by_effect: dict[str, _CommittedResolution]
+
+
 class ReconciliationCoordinator:
     """Serialize one M6 terminal reconciliation protocol at a time.
 
@@ -141,6 +158,13 @@ class ReconciliationCoordinator:
     domain by normalized ledger path, so a sibling gateway in the same process
     cannot hide a live owner. Independent processes remain outside M6's claim.
 
+    The coordinator protocol lock and committed-fact continuation map are also
+    shared by the normalized EffectLedger/ReconciliationLedger path pair. Once
+    persistence starts, a clean or ambiguous failure therefore pins that effect
+    to the exact authority/fact across same-path coordinator instances until
+    known durable success or process restart. A fresh authority cannot replace an
+    already-started same-process resolution merely because no row is visible yet.
+
     The gateway lifecycle fence is held for the whole resolution protocol. Once
     it reports no owner, the target effect cannot later resume an old in-process
     M5 attempt before reconciliation publication completes.
@@ -150,6 +174,27 @@ class ReconciliationCoordinator:
     this coordinator will accept; a separately constructed authority cannot
     bypass the explicit local operator workflow through ``resolve()``.
     """
+
+    _protocol_states_guard: ClassVar[Any] = threading.Lock()
+    _protocol_states: ClassVar[dict[tuple[str, str], _ProtocolPathState]] = {}
+
+    @classmethod
+    def _protocol_state_for_guard(cls, guard: RecoveryGuard) -> _ProtocolPathState:
+        key = (
+            os.path.normcase(str(guard.ledger.path.resolve(strict=False))),
+            os.path.normcase(
+                str(guard.reconciliation_ledger.path.resolve(strict=False))
+            ),
+        )
+        with cls._protocol_states_guard:
+            state = cls._protocol_states.get(key)
+            if state is None:
+                state = _ProtocolPathState(
+                    lock=threading.RLock(),
+                    committed_by_effect={},
+                )
+                cls._protocol_states[key] = state
+            return state
 
     def __init__(
         self,
@@ -182,7 +227,9 @@ class ReconciliationCoordinator:
         self._gateway = commit_gateway
         self._reconciliation_id_factory = reconciliation_id_factory
         self._timestamp_factory = timestamp_factory
-        self._protocol_lock = threading.RLock()
+        protocol_state = self._protocol_state_for_guard(recovery_guard)
+        self._protocol_lock = protocol_state.lock
+        self._committed_by_effect = protocol_state.committed_by_effect
         self.__authority_protocol_key = object()
 
     @property
@@ -243,9 +290,9 @@ class ReconciliationCoordinator:
         """Return one displayable target, denying any current live owner.
 
         Operator confirmation must not be staged against evidence that predates
-        completion of the same in-process M5 attempt. Use the same lock order as
-        terminal resolution so a live owner cannot disappear/reappear across the
-        target snapshot.
+        completion of the same in-process M5 attempt. A same-process committed
+        persistence continuation also owns the target until it completes; a new
+        proposal cannot replace that already-started immutable fact.
         """
         if not isinstance(effect_id, str) or not effect_id:
             raise ReconciliationDenied("invalid_effect_id")
@@ -254,6 +301,11 @@ class ReconciliationCoordinator:
                 with self._gateway.reconciliation_lifecycle_fence():
                     if self._gateway.live_attempt_owns_effect(effect_id):
                         raise ReconciliationDenied("live_attempt_owned", effect_id)
+                    if effect_id in self._committed_by_effect:
+                        raise ReconciliationDenied(
+                            "committed_resolution_in_progress",
+                            effect_id,
+                        )
                     projection = self._guard.projector.project()
                     for item in projection:
                         if item.effect_id != effect_id:
@@ -304,6 +356,10 @@ class ReconciliationCoordinator:
                     "committed_fact_mismatch",
                     f"canonical lineage field {field_name} changed",
                 )
+
+    @staticmethod
+    def _same_frozen_fact(left: ReconciliationRecord, right: ReconciliationRecord) -> bool:
+        return left.to_jsonl() == right.to_jsonl()
 
     def _new_record(
         self,
@@ -401,6 +457,13 @@ class ReconciliationCoordinator:
                         if any(record.effect_id == effect_id for record in existing):
                             raise ReconciliationDenied("already_reconciled", effect_id)
 
+                    tracked = self._committed_by_effect.get(effect_id)
+                    if tracked is not None and tracked.authority is not operator_authority:
+                        raise ReconciliationDenied(
+                            "committed_resolution_in_progress",
+                            effect_id,
+                        )
+
                     try:
                         committed_record = operator_authority._validate_start(
                             protocol_key=self.__authority_protocol_key,
@@ -412,6 +475,10 @@ class ReconciliationCoordinator:
                         raise ReconciliationDenied(exc.reason, exc.detail) from exc
 
                     if committed_record is None:
+                        if tracked is not None:
+                            raise ReconciliationCoordinatorError(
+                                "tracked committed resolution has uncommitted authority"
+                            )
                         record = self._new_record(
                             first=first,
                             effect_id=effect_id,
@@ -421,6 +488,14 @@ class ReconciliationCoordinator:
                             authority=operator_authority,
                         )
                     else:
+                        if tracked is None:
+                            raise ReconciliationCoordinatorError(
+                                "committed authority is missing coordinator continuation state"
+                            )
+                        if not self._same_frozen_fact(tracked.record, committed_record):
+                            raise ReconciliationCoordinatorError(
+                                "committed authority fact differs from coordinator continuation state"
+                            )
                         record = committed_record
                         self._require_frozen_lineage(first=first, record=record)
 
@@ -449,6 +524,20 @@ class ReconciliationCoordinator:
                             f"authority commitment failed after epoch advance: {exc}"
                         ) from exc
 
+                    tracked = self._committed_by_effect.get(effect_id)
+                    if tracked is None:
+                        self._committed_by_effect[effect_id] = _CommittedResolution(
+                            record=record,
+                            authority=operator_authority,
+                        )
+                    elif (
+                        tracked.authority is not operator_authority
+                        or not self._same_frozen_fact(tracked.record, record)
+                    ):
+                        raise ReconciliationCoordinatorError(
+                            "committed continuation state changed after epoch advance"
+                        )
+
                     try:
                         self._reconciliation_ledger.append_durable(record)
                     except ReconciliationLedgerError as exc:
@@ -470,6 +559,17 @@ class ReconciliationCoordinator:
                         raise ReconciliationCoordinatorError(
                             f"durable fact could not consume operator authority: {exc}"
                         ) from exc
+
+                    tracked = self._committed_by_effect.get(effect_id)
+                    if (
+                        tracked is None
+                        or tracked.authority is not operator_authority
+                        or not self._same_frozen_fact(tracked.record, record)
+                    ):
+                        raise ReconciliationCoordinatorError(
+                            "durable fact lost coordinator continuation state"
+                        )
+                    self._committed_by_effect.pop(effect_id, None)
 
                     try:
                         status = self._guard.refresh()

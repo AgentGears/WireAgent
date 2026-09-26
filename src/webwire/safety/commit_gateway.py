@@ -11,13 +11,14 @@ exactly-once claim is made.
 
 from __future__ import annotations
 
+import os
 import secrets
 import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, ClassVar, Iterator, Optional
 
 from webwire.safety.effect_ledger import (
     EffectLedger,
@@ -140,6 +141,14 @@ class EffectPermit:
         return self._use.consumed_at
 
 
+@dataclass
+class _LifecycleState:
+    """Shared same-path M5 lifecycle ownership inside the supported process."""
+
+    lock: Any
+    live_effect_attempts: dict[str, EffectAttempt]
+
+
 class CommitGateway:
     """The M5 process-local commit-authority boundary.
 
@@ -163,9 +172,27 @@ class CommitGateway:
 
     M6 reconciliation reuses this same re-entrant protocol lock as its canonical
     lifecycle fence. REQUIRED attempts are registered before reservation I/O and
-    remain live-owned until a terminal M5 outcome is established. This closes the
-    interval where reservation bytes may exist before an EffectPermit is minted.
+    remain live-owned until a terminal M5 outcome is established. All gateway
+    instances targeting the same normalized EffectLedger path share the lock and
+    ownership map, so a sibling instance cannot hide an in-process live owner.
+    This is intentionally process-local; M6 makes no cross-process claim.
     """
+
+    _lifecycle_states_guard: ClassVar[Any] = threading.Lock()
+    _lifecycle_states: ClassVar[dict[str, _LifecycleState]] = {}
+
+    @classmethod
+    def _lifecycle_state_for_ledger(cls, ledger: EffectLedger) -> _LifecycleState:
+        key = os.path.normcase(str(ledger.path.resolve(strict=False)))
+        with cls._lifecycle_states_guard:
+            state = cls._lifecycle_states.get(key)
+            if state is None:
+                state = _LifecycleState(
+                    lock=threading.RLock(),
+                    live_effect_attempts={},
+                )
+                cls._lifecycle_states[key] = state
+            return state
 
     def __init__(
         self,
@@ -187,8 +214,9 @@ class CommitGateway:
         self._permit_ttl = permit_ttl_seconds
         self._issued_permits: dict[str, EffectPermit] = {}
         self._issued_attempts: dict[str, EffectAttempt] = {}
-        self._live_effect_attempts: dict[str, EffectAttempt] = {}
-        self._protocol_lock = threading.RLock()
+        lifecycle_state = self._lifecycle_state_for_ledger(ledger)
+        self._live_effect_attempts = lifecycle_state.live_effect_attempts
+        self._protocol_lock = lifecycle_state.lock
         # Revocation is safety-critical. If delivery is pending, the kill
         # execution fence stays closed even if an earlier listener reset the
         # live kill flag before this callback runs.

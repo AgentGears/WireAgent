@@ -77,6 +77,7 @@ def test_reserved_attempt_with_live_grant_is_not_auto_abandoned(
     assert attempt.state.value == "reserved"
     assert grant.state is GrantState.ACTIVE
     assert gateway.live_attempt_owns_effect(attempt.effect_id) is True
+    assert gateway.settle_dead_prepermit_owner_for_reconciliation(attempt.effect_id) is True
     assert attempt.state.value == "reserved"
     assert grant.state is GrantState.ACTIVE
     assert [record.state for record in effects.read_records()] == [EffectState.RESERVED]

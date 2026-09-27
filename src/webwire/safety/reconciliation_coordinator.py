@@ -225,10 +225,13 @@ class ReconciliationCoordinator:
             raise TypeError("confirmation_state must be a ConfirmationState")
         if not isinstance(commit_gateway, CommitGateway):
             raise TypeError("commit_gateway must be the canonical CommitGateway")
-        if (
-            commit_gateway.ledger.path.resolve(strict=False)
-            != recovery_guard.ledger.path.resolve(strict=False)
-        ):
+        gateway_effect_path = os.path.normcase(
+            str(commit_gateway.ledger.path.resolve(strict=False))
+        )
+        guard_effect_path = os.path.normcase(
+            str(recovery_guard.ledger.path.resolve(strict=False))
+        )
+        if gateway_effect_path != guard_effect_path:
             raise ValueError("commit_gateway and recovery_guard EffectLedger paths differ")
 
         protocol_state = self._protocol_state_for_guard(

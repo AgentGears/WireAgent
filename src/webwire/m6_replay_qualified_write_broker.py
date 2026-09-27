@@ -36,11 +36,13 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
                 post_id,
                 "m6-layer7-like-state",
             )
+            + "function visible(el){return !!(el&&el.isConnected&&el.getClientRects().length);}"
             + "var like=art.querySelector(\"[data-testid='like']\");"
             + "var unlike=art.querySelector(\"[data-testid='unlike']\");"
-            + "if(like&&unlike)return 'unknown';"
-            + "if(unlike)return 'liked';"
-            + "if(like)return 'not_liked';"
+            + "var hasLike=visible(like),hasUnlike=visible(unlike);"
+            + "if(hasLike&&hasUnlike)return 'unknown';"
+            + "if(hasUnlike)return 'liked';"
+            + "if(hasLike)return 'not_liked';"
             + "return 'unknown';})()"
         )
 
@@ -48,8 +50,9 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
         """Read one target's directional like state conservatively.
 
         A short bounded hydration window tolerates selector appearance after
-        navigation.  Contradictory selectors are never positive state evidence;
-        if no single direction becomes observable, the result remains unknown.
+        navigation. Contradictory, hidden, or disconnected selectors are never
+        positive state evidence; if no single visible direction becomes
+        observable, the result remains unknown.
         """
 
         if (guarded := self._guard()) is not None:
@@ -89,10 +92,12 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
                 post_id,
                 f"m6-layer7-like-click-{expected}",
             )
+            + "function visible(el){return !!(el&&el.isConnected&&el.getClientRects().length);}"
             + f"var expected=art.querySelector(\"[data-testid='{expected}']\");"
             + f"var opposite=art.querySelector(\"[data-testid='{opposite}']\");"
-            + "if(expected&&opposite)return 'ambiguous';"
-            + "if(!expected)return 'stale';"
+            + "var hasExpected=visible(expected),hasOpposite=visible(opposite);"
+            + "if(hasExpected&&hasOpposite)return 'ambiguous';"
+            + "if(!hasExpected)return 'stale';"
             + "expected.click();return 'clicked';})()"
         )
 

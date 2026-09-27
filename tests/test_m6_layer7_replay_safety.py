@@ -45,7 +45,9 @@ class _CDP:
     async def evaluate(self, expr: str) -> ActionResult:
         if "m6-layer7-like-state:123" in expr:
             assert "getClientRects().length" in expr
-            assert "hasLike&&hasUnlike" in expr
+            assert "closest('article')===art" in expr
+            assert "likes.length===1&&unlikes.length===0" in expr
+            assert "unlikes.length===1&&likes.length===0" in expr
             state = self.page.next_probe_state()
             self.page.events.append(f"probe:{state}")
             value = state if state in {"liked", "not_liked"} else "unknown"
@@ -53,13 +55,14 @@ class _CDP:
 
         if "m6-layer7-like-click-like:123" in expr:
             assert "getClientRects().length" in expr
-            assert "hasExpected&&hasOpposite" in expr
+            assert "closest('article')===art" in expr
+            assert "expected.length!==1||opposite.length!==0" in expr
             self.page.events.append(f"click_attempt:like:{self.page.state}")
             if self.page.state == "not_liked":
                 self.page.state = "liked"
                 self.page.events.append("click:like")
                 value = "clicked"
-            elif self.page.state == "both":
+            elif self.page.state in {"both", "duplicate_like", "nested_like"}:
                 value = "ambiguous"
             else:
                 value = "stale"
@@ -67,13 +70,14 @@ class _CDP:
 
         if "m6-layer7-like-click-unlike:123" in expr:
             assert "getClientRects().length" in expr
-            assert "hasExpected&&hasOpposite" in expr
+            assert "closest('article')===art" in expr
+            assert "expected.length!==1||opposite.length!==0" in expr
             self.page.events.append(f"click_attempt:unlike:{self.page.state}")
             if self.page.state == "liked":
                 self.page.state = "not_liked"
                 self.page.events.append("click:unlike")
                 value = "clicked"
-            elif self.page.state == "both":
+            elif self.page.state in {"both", "duplicate_unlike", "nested_unlike"}:
                 value = "ambiguous"
             else:
                 value = "stale"
@@ -161,9 +165,21 @@ async def test_already_satisfied_direction_is_zero_gate_zero_mutation(
     assert not any(event.startswith("click_attempt:") for event in page.events)
 
 
-@pytest.mark.parametrize("state", ["both", "neither", "hidden_like", "hidden_unlike"])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "both",
+        "neither",
+        "hidden_like",
+        "hidden_unlike",
+        "nested_like",
+        "nested_unlike",
+        "duplicate_like",
+        "duplicate_unlike",
+    ],
+)
 @pytest.mark.parametrize("method", ["click_like", "click_unlike"])
-async def test_ambiguous_missing_or_hidden_controls_fail_before_commit(
+async def test_non_authoritative_controls_fail_before_commit(
     tmp_path: Path,
     state: str,
     method: str,
@@ -218,6 +234,10 @@ async def test_hydration_transition_is_bounded_and_uses_conclusive_direction(
         ("click_unlike", "liked", "both"),
         ("click_like", "not_liked", "hidden_like"),
         ("click_unlike", "liked", "hidden_unlike"),
+        ("click_like", "not_liked", "nested_like"),
+        ("click_unlike", "liked", "nested_unlike"),
+        ("click_like", "not_liked", "duplicate_like"),
+        ("click_unlike", "liked", "duplicate_unlike"),
     ],
 )
 async def test_state_change_after_gate_never_falls_through_to_wrong_direction(

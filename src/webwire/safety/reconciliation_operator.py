@@ -142,13 +142,18 @@ class ReconciliationOperatorSession:
         evidence: dict[str, Any],
         evidence_summary: str,
     ) -> ReconciliationProposal:
-        """Freeze one displayed proposal without minting terminal authority."""
+        """Freeze one displayed proposal without minting terminal authority.
+
+        Entering the resolution workflow may first perform gateway-owned safety
+        bookkeeping for an authority-dead pre-permit owner. Display-only list/show
+        operations never perform that settlement.
+        """
         if not isinstance(verdict, ReconciliationVerdict):
             raise ReconciliationOperatorError("invalid_verdict")
         if not isinstance(evidence_summary, str) or not evidence_summary.strip():
             raise ReconciliationOperatorError("evidence_summary_missing")
 
-        target = self._coordinator.describe_target(effect_id)
+        target = self._coordinator.prepare_resolution_target(effect_id)
         try:
             # First validate the caller-owned object without coercion, then
             # serialize the exact snapshot that will be retained. Re-hashing the

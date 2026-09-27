@@ -465,7 +465,8 @@ class EffectLedger:
 
             if text and not text.endswith("\n"):
                 raise EffectLedgerCorruptError(
-                    "effect ledger has a torn tail without terminal newline"
+                    "effect ledger torn tail is not valid JSON record framing: "
+                    "missing terminal newline"
                 )
             lines = text.splitlines()
 

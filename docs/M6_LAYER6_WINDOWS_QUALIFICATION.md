@@ -1,7 +1,7 @@
 # M6 Layer 6 — Windows Durability Qualification
 
 ```text
-Status: FIRST-PASS FINDINGS FROZEN — IMPLEMENTATION / PLATFORM EVIDENCE PENDING
+Status: PLATFORM EVIDENCE GREEN — CLOSE-OUT REVIEW / EXACT-HEAD REVALIDATION PENDING
 Baseline: e1e3eeb679cf54b5707c88b0e82e3db4a04d9319
 Scope: M6_DESIGN.md §17, R46, invariant 34, build-order layer 6
 ```
@@ -94,26 +94,105 @@ Windows.
 No stronger production mechanism is introduced in Layer 6 unless platform
 evidence requires one.
 
-## Planned evidence
+## Implemented corrections and qualification surface
 
-A dedicated Windows qualification suite will be added and run under CPython
-3.11 and 3.12. It will be intentionally ledger-focused rather than claiming the
-entire browser runtime is Windows-qualified. The normal Ubuntu CI remains the
-full regression/lint/type gate.
+The Layer-6 candidate makes only the production changes falsified by the first
+pass:
 
-Planned Windows assertions include:
+- `EffectLedger` same-path lock identity now uses the same
+  `os.path.normcase(str(path.resolve(strict=False)))` rule as the M6 safety
+  domain registries;
+- a non-empty EffectLedger file without the canonical terminal newline is
+  corruption rather than authoritative complete history;
+- invalid UTF-8 is classified as `EffectLedgerCorruptError`.
 
-1. both ledgers create nested state paths and survive a fresh interpreter;
-2. real `os.fsync()` succeeds on the writable descriptors WireAgent uses;
-3. injected file-flush failure cannot become success; exact retry re-durabilizes
-   the same fact without duplication;
-4. startup ReconciliationLedger authority performs its writable-handle flush;
-5. case-variant same-file paths share one EffectLedger lock / one M6 path state;
-6. terminal-newline and UTF-8 corruption fail closed;
-7. a durable reconciliation survives process restart and yields the same clear
-   composite recovery truth;
-8. the evidence report records runner OS, Python version, filesystem-facing
-   behavior, and the Windows parent-directory claim ceiling.
+CI now retains the normal full Ubuntu Python 3.11/3.12 test + Ruff + mypy gate
+and adds a dedicated `windows-latest` Python 3.11/3.12 safety-ledger matrix. The
+Windows matrix is deliberately focused on both ledgers and the frozen R46
+contract rather than claiming the browser runtime as a whole is Windows
+qualified.
+
+The platform suite directly or through the existing durability regressions
+covers:
+
+1. nested state-directory/file creation for both ledgers;
+2. actual Windows `os.fsync()` on writable file descriptors used by the ledger
+   durability protocol;
+3. injected append/fsync ambiguity followed by exact-fact re-durability without
+   duplicate authority;
+4. shared ReconciliationLedger ambiguity state across same-path objects;
+5. startup writable-handle re-durability before a surviving reconciliation row
+   may clear recovery;
+6. case-variant same-file identity for both EffectLedger and
+   ReconciliationLedger process-local domains;
+7. terminal-newline, invalid-UTF-8, malformed-tail, lineage, and schema
+   corruption fail-closed behavior;
+8. a durable reconciliation surviving a fresh Python process and yielding the
+   same clear composite recovery result;
+9. an explicit assertion that the parent-directory fsync hook is a no-op on the
+   tested Windows implementation rather than evidence of a directory flush.
+
+## Platform evidence
+
+The first platform run, CI #454, proved the job was executing on a real Windows
+host but found one diagnostic-compatibility regression: an existing corrupt-tail
+test expected the phrase `not valid JSON` while the new stricter framing check
+reported `torn tail`. The safety behavior was already fail-closed. The message
+was made backward-compatible without weakening the new terminal-newline rule,
+and the matrix was changed to `fail-fast: false` so both Python versions retain
+diagnostic evidence independently.
+
+Candidate `71b365d18d6e6d07462e758e42f176f71a4e9c7b` then passed CI #457:
+
+```text
+Windows host: Microsoft Windows Server 2025, 10.0.26100 Datacenter
+Runner image: windows-2025-vs2026, image version 20260922.246.2
+
+CPython 3.11.9 / MSC v.1938 x64
+  os.name      = nt
+  sys.platform = win32
+  focused safety-ledger suite: 147 passed
+
+CPython 3.12.10 / MSC v.1943 x64
+  os.name      = nt
+  sys.platform = win32
+  focused safety-ledger suite: 147 passed
+
+Ubuntu full regression gate, Python 3.11.16
+  936 passed, 6 Windows-only skipped
+  Ruff clean
+  mypy clean across 84 source files
+
+Ubuntu full regression gate, Python 3.12.14
+  936 passed, 6 Windows-only skipped
+  Ruff clean
+  mypy clean across 84 source files
+```
+
+This is actual target-platform evidence for the tested GitHub-hosted Windows
+Server 2025 / CPython combinations. Close-out documentation changes after this
+candidate require another exact-head four-job CI run before review/merge.
+
+## Qualified claim ceiling
+
+Layer 6 supports the following bounded statement and no stronger one:
+
+> On the tested GitHub-hosted Windows Server 2025 runners, CPython 3.11.9 and
+> 3.12.10 successfully execute WireAgent's file-handle append/fsync,
+> exact-fact re-durability, startup reconciliation re-durability, normalized
+> same-path coordination, corruption fail-closed, and fresh-process recovery
+> protocol for the two safety ledgers.
+
+The evidence does **not** establish:
+
+- a portable parent-directory fsync/FlushFileBuffers guarantee through the
+  Python APIs used here;
+- bypass of all OS, controller, device, or storage-stack caches;
+- equivalent semantics on SMB/NFS/network-backed or otherwise different
+  filesystems;
+- cross-process writer linearizability;
+- browser-runtime Windows qualification beyond the safety-ledger scope tested;
+- distributed exactly-once behavior.
 
 ## Review discipline
 

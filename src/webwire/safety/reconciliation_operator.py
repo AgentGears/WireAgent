@@ -96,9 +96,13 @@ class ReconciliationOperatorSession:
     """One local interactive operator session.
 
     Confirmation is intentionally exact and session-scoped. Repeating the exact
-    confirmation returns the same authority object rather than minting parallel
-    authorities for one human approval. Persistence failure therefore retries
-    through the coordinator with the same committed authority/frozen fact.
+    confirmation returns the same live/committed authority object rather than
+    minting parallel authorities for one human approval. If an uncommitted
+    authority expires before persistence begins, that expired object is discarded
+    only after the coordinator reports ``authority_expired``; the frozen proposal
+    remains and requires a fresh explicit confirmation before a replacement
+    authority can be minted. Persistence failure after commitment always retries
+    through the same committed authority/frozen fact regardless of TTL.
     """
 
     def __init__(
@@ -268,7 +272,22 @@ class ReconciliationOperatorSession:
             with self._lock:
                 state.resolved = True
             raise
-        except ReconciliationDenied:
+        except ReconciliationDenied as exc:
+            # Expiry before persistence is terminal for this authority but not
+            # for the immutable proposal. M6 §10.1 requires fresh operator
+            # confirmation. Drop only the exact uncommitted expired authority so
+            # a subsequent confirm_resolution() is a new explicit confirmation
+            # and mints a new short-lived authority. Never replace a committed
+            # authority: TTL no longer applies once persistence starts.
+            if exc.reason == "authority_expired" and not authority.committed:
+                with self._lock:
+                    current = self._proposals.get(proposal_id)
+                    if (
+                        current is state
+                        and not current.resolved
+                        and current.authority is authority
+                    ):
+                        current.authority = None
             raise
         else:
             with self._lock:

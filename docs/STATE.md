@@ -12,22 +12,19 @@
 - **What it is:** Personal, single-user, local-only browser-native X/Twitter
   capability layer for AI agents, built on the user's Super-Browser SDK.
 - **Framing:** AI proposes, human approves, scoped authority executes, durable
-  effect evidence governs replay. The invocation journal is audit evidence, not
-  mutation authority.
+  effect evidence governs replay; evidence-bearing operator reconciliation may
+  later resolve durable uncertainty without rewriting the original effect fact.
 
 ## Current version
 
-**v0.3 stabilized live path + M5 effect-transaction boundary complete.**
+**v0.3 stabilized live path + M5 effect-transaction boundary complete + M6
+reconciliation Layers 1–5 implemented/qualified.**
 
-Canonical M5 runtime baseline after the full build order:
+Canonical M5 runtime baseline after the full M5 build order:
 
 ```text
 m5_runtime_baseline = 0c62402ae01b50d7662b3978cbf2bee4109aa035
 ```
-
-That SHA is the PR #8 Layer-7 squash containing the completed M5 runtime. Later
-documentation-only commits may advance `main` without changing this runtime
-baseline.
 
 M5 status:
 
@@ -43,6 +40,23 @@ M5 status:
 
 Normative M5 contract: `docs/M5_DESIGN.md`. Final Layer-7 boundary and evidence:
 `docs/M5_LAYER7_PLAN.md`.
+
+M6 builds orthogonal reconciliation history and qualification on top of the M5
+transaction boundary. The first four implementation layers are merged on main:
+
+```text
+1. ReconciliationRecord + ReconciliationLedger             MERGED  PR #11  ec077eaeacf9f5928f32276eba102f5848682236
+2. Composite RecoveryProjector + publication fence          MERGED  PR #12  cc3aac43f2085c6338dffaec465a129b1da317f1
+3. Confirmation epoch + monotonic confirmation authority    MERGED  PR #13  4bbca5e2f8b2388336c8274c5de45fd16595e2da
+4. ReconciliationAuthority + coordinator/operator workflow  MERGED  PR #14  0f40959ea74fe8f8ddeb77c5474512c5bccb9c18
+5. Fault/restart/corruption/concurrency qualification       QUALIFIED  PR #15 candidate
+6. Windows durability qualification                         NEXT
+7. Evidence-driven replay-safety qualification              PLANNED
+```
+
+Normative M6 contract: `docs/M6_DESIGN.md`. Layer 5 is qualification, not a new
+feature layer: production code changes only if fault/restart/concurrency evidence
+falsifies an existing invariant.
 
 ## Architecture invariants — do not violate
 
@@ -96,13 +110,43 @@ Normative M5 contract: `docs/M5_DESIGN.md`. Final Layer-7 boundary and evidence:
     corruption fails closed. Exact-fact retry may re-fsync but may not rewrite
     contradictory history.
 18. **Invocation journal is audit-only.** Journal content must not create, clear,
-    dedupe, rate-limit, approve, recover, or authorize a mutation.
+    dedupe, rate-limit, approve, recover, reconcile, or authorize a mutation.
 19. **Dedupe TTL and token-bucket budgets are process-local defense in depth.**
     Restart resets those in-memory windows. A future cross-restart budget/dedupe
     requirement needs a dedicated durable policy store, not best-effort audit
     data.
 20. **Same-process least authority is not a hostile-code sandbox.** Untrusted
     extensions require stronger process/OS isolation and no raw-browser escape.
+21. **Historical uncertainty is immutable.** M6 never changes M5 `RESERVED` or
+    `EFFECT_UNKNOWN` history into a different M5 outcome; reconciliation is a
+    separate append-only evidence-bearing history.
+22. **Reconciliation evidence is not reconciliation authority.** Read/evidence
+    collection may inspect and propose; only explicit local operator authority
+    can commit one terminal reconciliation verdict.
+23. **Reconciliation lineage is exact.** Every terminal reconciliation binds to
+    one existing effect id and its canonical first-record semantic/action/intent/
+    policy/actor/target lineage plus a canonical evidence hash.
+24. **Visible bytes are not automatically durable authority.** Ambiguous
+    reconciliation append durability keeps recovery unavailable until exact-fact
+    re-durability succeeds; fresh-process startup re-establishes current file
+    durability before trusting a surviving reconciliation file.
+25. **Reconciliation publication and confirmation revocation are ordered.** The
+    process-local publication fence plus confirmation epoch ensures no old token
+    can become usable merely because reconciliation cleared recovery.
+26. **Reconciliation clears only recovery uncertainty.** Kill, policy, actor/
+    target binding, rate limits, dedupe, fresh confirmation, grant/permit rules,
+    and all other independent gates remain authoritative.
+27. **Old execution authority never resumes.** Reconciliation does not restore or
+    reconstruct an old ApprovalGrant, EffectPermit, confirmation token, claim, or
+    M5 attempt. Any future mutation is a fresh normal invocation.
+28. **Terminal reconciliation is unique in M6.** A second contradictory terminal
+    verdict is corruption, not latest-row-wins or silent supersession.
+29. **M6 authority and writer coordination remain process-local.** Same-path
+    objects share canonical in-process fences/registries; concurrent independent
+    processes are outside the current claim.
+30. **Qualification claims stay bounded.** Ubuntu CI fault/restart/concurrency
+    evidence does not establish Windows filesystem durability or justify a
+    like/unlike replay-policy promotion; those are separate Layers 6 and 7.
 
 ## M5 — completed transaction boundary
 
@@ -129,14 +173,57 @@ Key current facts:
   EffectLedger.
 - `CommitGateway` performs final kill/policy/epoch/grant/TTL validation and owns
   permit lifecycle/outcome recording.
-- Layer 4 scoped authorities expose only the approved semantic mutation surface.
-- Layer 5 migrated bookmark/like, text, reply, quote, media, and delete writes
-  through that boundary and disabled supported legacy mutation fallback.
-- Layer 6 RecoveryGuard turns unresolved durable effect facts into enforced
-  pre-browser semantic replay denial; it refreshes within the same process as
-  well as at startup.
-- Layer 7 removes the last journal-to-safety-state data path. The journal remains
-  best-effort invocation evidence with redaction/rotation.
+- Scoped authorities expose only the approved semantic mutation surface.
+- Capability migration routes bookmark/like, text, reply, quote, media, and
+  delete writes through that boundary and disables supported legacy mutation
+  fallback.
+- RecoveryGuard turns unresolved durable effect facts into enforced pre-browser
+  semantic replay denial and refreshes within the same process as well as at
+  startup.
+- The invocation journal has no safety-state input role. It remains best-effort
+  audit evidence with redaction/rotation.
+
+## M6 — evidence-bearing reconciliation boundary
+
+The current recovery authority path is:
+
+```text
+EffectLedger (immutable M5 history)
+       +
+ReconciliationLedger (terminal evidence-bearing reconciliation)
+       |
+       v
+RecoveryProjector
+       |
+       v
+RecoveryGuard
+       |
+       +--> unresolved -> block matching semantic replay
+       +--> terminally reconciled -> clear only this recovery contribution
+```
+
+Terminal local reconciliation is ordered as:
+
+```text
+publication fence
+  -> coordinator protocol lock
+  -> canonical CommitGateway lifecycle fence
+  -> validate target + operator authority
+  -> advance confirmation epoch
+  -> commit authority to exact frozen fact
+  -> append/re-durable ReconciliationLedger fact
+  -> consume reconciliation authority
+  -> refresh/publish RecoveryGuard composite projection
+```
+
+Layer-5 qualification now adds genuine fresh-process crash/restart coverage and
+integrated publication/concurrency tests rather than treating object
+reconstruction inside one pytest interpreter as equivalent to process death.
+The candidate explicitly exercises durable reconciliation followed by a hard
+process exit before guard publication, startup re-durability success/failure,
+clean no-row persistence failure across restart, competing terminal verdicts,
+write-vs-reconciliation publication orderings, journal non-authority, and
+reconciliation-fact retention.
 
 ## Phase plan
 
@@ -153,6 +240,13 @@ Key current facts:
 | M5 L5 | concrete capability migration | MERGED — PR #6 |
 | M5 L6 | RecoveryGuard startup/refresh enforcement | MERGED — PR #7 |
 | M5 L7 | invocation journal becomes audit-only | MERGED — PR #8 |
+| M6 L1 | ReconciliationRecord + durable ReconciliationLedger | MERGED — PR #11 |
+| M6 L2 | composite RecoveryProjector + publication fence | MERGED — PR #12 |
+| M6 L3 | confirmation epoch + monotonic token authority | MERGED — PR #13 |
+| M6 L4 | reconciliation authority + coordinator/operator workflow | MERGED — PR #14 |
+| M6 L5 | crash/fault/restart/corruption/concurrency qualification | QUALIFIED — PR #15 candidate |
+| M6 L6 | Windows durability qualification for both safety ledgers | NEXT |
+| M6 L7 | evidence-driven replay-safety qualification | PLANNED |
 
 ## Capabilities
 
@@ -172,12 +266,16 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 | Surface | Role | Durability / authority |
 |---|---|---|
-| `.webwire/effects.ndjson` | M5 effect facts | fsync-backed; authoritative; fail-closed |
-| `RecoveryGuard` | unresolved semantic replay denial | derived from EffectLedger; enforcement |
-| ApprovalGrant / EffectPermit | process-local approval/execution authority | ephemeral, fenced, monotonic TTL |
+| `.webwire/effects.ndjson` | immutable M5 effect facts | fsync-backed; authoritative; fail-closed |
+| `.webwire/reconciliations.ndjson` | M6 terminal reconciliation facts | fsync-backed; append-only; exact-fact re-durability; fail-closed |
+| `RecoveryProjector` | validates/joins effect + reconciliation histories | derived authority projection; contradiction fails closed |
+| `RecoveryGuard` | unresolved semantic replay denial | composite derived enforcement; publication-fenced |
+| `ReconciliationAuthority` | exact local operator-authorized terminal fact | ephemeral; monotonic TTL; single-use/committed continuation semantics |
+| `ConfirmationState` | human-confirmation authority + epoch | ephemeral; monotonic TTL; process-local synchronized revocation |
+| ApprovalGrant / EffectPermit | M5 approval/execution authority | ephemeral, fenced, monotonic TTL |
 | DedupeStore | repeated semantic-write suppression | process-local only |
 | TokenBucket | per-action/global circuit breaker | process-local only |
-| `.webwire/journal.ndjson` | invocation audit / diagnostics | best-effort output only |
+| `.webwire/journal.ndjson` | invocation audit / diagnostics | best-effort output only; zero recovery/reconciliation authority |
 | `.webwire/session.json` | cookie/session convenience | never actor authority |
 
 ## Broker / authority surfaces
@@ -188,21 +286,29 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 | `DownloadBroker` | bounded local filesystem output |
 | scoped M5 authorities | approved semantic mutation ports |
 | M5 scoped/live write broker internals | canonical permit-consume mutation seams |
+| `ReconciliationOperatorSession` | local proposal/confirmation/reconciliation workflow |
+| `ReconciliationCoordinator` | canonical local terminal reconciliation ordering |
 | legacy raw WriteBroker path | unavailable from supported Dispatcher migration path |
 
 ## Module map — selected
 
 | File | Role |
 |---|---|
-| `dispatcher.py` | invocation entry + M5 live routing |
+| `dispatcher.py` | invocation entry + M5 live routing + local M6 operator-session composition |
 | `journal.py` | best-effort audit-only NDJSON journal |
 | `safety/write_kernel.py` | confirmation/policy shell + recovery gate integration |
+| `safety/confirmation_state.py` | process-local confirmation epoch + monotonic token authority |
 | `safety/effect_policy.py` | replay/durability/effect-scope policy |
-| `safety/effect_ledger.py` | durable effect safety ledger |
+| `safety/effect_ledger.py` | durable M5 effect safety ledger |
 | `safety/execution_models.py` | ApprovalGrant / EffectAttempt state machines |
-| `safety/commit_gateway.py` | EffectPermit mint/consume/outcome boundary |
+| `safety/commit_gateway.py` | EffectPermit lifecycle + canonical live-attempt ownership/fence |
 | `safety/scoped_authority.py` | least-authority semantic ports |
-| `safety/recovery_guard.py` | restart + same-process unresolved replay enforcement |
+| `safety/reconciliation_ledger.py` | durable M6 reconciliation fact model/ledger |
+| `safety/recovery_projector.py` | exact cross-ledger reconciliation projection |
+| `safety/recovery_guard.py` | composite restart + same-process unresolved replay enforcement |
+| `safety/reconciliation_authority.py` | ephemeral operator reconciliation authority |
+| `safety/reconciliation_coordinator.py` | terminal reconciliation protocol ordering |
+| `safety/reconciliation_operator.py` | local human proposal/confirmation workflow |
 | `safety/m5_live_runtime.py` | coherent live M5 execution stack |
 | `safety/dedupe.py` | process-local semantic dedupe |
 | `safety/token_bucket.py` | process-local write circuit breaker |
@@ -210,21 +316,32 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## Known gaps / open items
 
-- [ ] **Reconciliation semantics:** `EFFECT_UNKNOWN` remains terminal historical
-  evidence; future resolution needs explicit evidence-bearing semantics rather
-  than overwrite.
-- [ ] **Cross-process EffectLedger/browser coordination:** current safety contract
-  is single-process.
+- [ ] **Cross-process effect/reconciliation/browser coordination:** the current
+  safety contract is intentionally single-process. Concurrent independent
+  recovery/runtime processes are unsupported.
+- [ ] **Windows durability qualification:** current CI evidence is Ubuntu; M6
+  Layer 6 must qualify both safety ledgers on the target Windows platform and
+  keep claims bounded to what the platform evidence supports.
+- [ ] **Like/unlike replay-safety proof:** remains conservative
+  `UNKNOWN`/`REQUIRED` pending broker-level state-preserving evidence; M6 Layer 7
+  may investigate but does not presume promotion.
+- [ ] **Terminal reconciliation correction/supersession:** M6 intentionally has
+  one terminal verdict and no silent edit/latest-row-wins semantics. Corrective
+  history would require a future explicit design.
+- [ ] **Automatic negative proof:** no generic missing-selector/404/timeout/empty
+  read may authorize `CONFIRMED_NO_EFFECT`; accepted action-specific proof
+  predicates require separate evidence and authority design.
+- [ ] **Same-process authority-root reconstruction:** replacing an entire
+  Dispatcher/ConfirmationState authority root on the identical ledger paths
+  inside one still-running Python process is not currently qualified. The
+  supported topology is one canonical authority root per process/path domain.
 - [ ] **External kill-file strict atomicity:** final-boundary re-observation is
   implemented; a non-cooperating external writer cannot share the Python lock.
-- [ ] **Windows durability runner evidence:** behavior is modeled/tested but CI
-  currently runs Ubuntu.
-- [ ] **Like/unlike BEST_EFFORT proof:** remain `UNKNOWN`/`REQUIRED` pending
-  broker-level state-preserving evidence comparable to bookmark.
 - [ ] reply_photo URL-capture gap.
 - [ ] Phase 1b edge cases need real fixtures.
 - [ ] Screenshot capture is plumbed but not implemented.
-- [ ] No CLI yet.
+- [ ] No general CLI yet; reconciliation exposes a narrow local operator API,
+  not a generic workflow/CLI framework.
 - [ ] Cookie-only persistence remains fragile.
 - [ ] Profile display_name extraction remains unreliable.
 - [ ] Future follow/unfollow and analytics work.
@@ -238,6 +355,41 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-09-27 — M6 Layer 5 qualification candidate (PR #15).** Started from
+  exact merged Layer-4 baseline `0f40959ea74fe8f8ddeb77c5474512c5bccb9c18`.
+  Maintainer-first review found that existing restart/startup tests reconstructed
+  Python objects in one interpreter rather than proving process-death semantics;
+  that R39 lacked an integrated WriteKernel ↔ reconciliation publication race;
+  and that R25 journal non-authority / R44 retention lacked direct Layer-5
+  acceptance regressions. The candidate adds real subprocess restart/crash
+  qualification, including an `os._exit()` cut after known-durable
+  reconciliation but before guard publication, startup re-durability
+  success/failure, fresh-confirmation recovery after a clean no-row failure,
+  integrated publication-order races, competing verdict concurrency, forged
+  journal non-authority, and durable reconciliation retention. Review of the
+  first green candidate also caught a vacuous restart assertion: it observed an
+  empty fresh ConfirmationState without first proving a pending token existed.
+  The restart scenario now explicitly creates a pre-reconciliation token and
+  verifies that the recorded token cannot authorize in the fresh process. CI on
+  the qualification candidate has reached **931 tests** with Python 3.11/3.12,
+  Ruff clean, and mypy clean across 84 source files; exact-head revalidation is
+  repeated after each review-driven correction.
+- **2026-09-27 — M6 Layer 4 merged (PR #14).** Squash merge
+  `0f40959ea74fe8f8ddeb77c5474512c5bccb9c18`. Added explicit local operator
+  `ReconciliationAuthority`, terminal `ReconciliationCoordinator`, narrow
+  operator workflow, canonical same-process live-attempt ownership, exact
+  committed-fact continuation, and review-driven hardening before merge.
+- **2026-09-26 — M6 Layer 3 merged (PR #13).** Squash merge
+  `4bbca5e2f8b2388336c8274c5de45fd16595e2da`. Added synchronized confirmation
+  epoch invalidation and monotonic confirmation-token authority semantics.
+- **2026-09-26 — M6 Layer 2 merged (PR #12).** Squash merge
+  `cc3aac43f2085c6338dffaec465a129b1da317f1`. Added the composite
+  RecoveryProjector/RecoveryGuard model and process-local reconciliation
+  publication fence while preserving immutable M5 EffectState history.
+- **2026-09-26 — M6 Layer 1 merged (PR #11).** Squash merge
+  `ec077eaeacf9f5928f32276eba102f5848682236`. Added the strict
+  ReconciliationRecord model, canonical evidence hash, and fsync-backed
+  append-only ReconciliationLedger with exact-fact durability semantics.
 - **2026-09-25 — M5 complete; L7 merged (PR #8).** Final Layer-7 candidate
   `390967d96f87cdb483334bd8a2120629312df3f4`; CI #366 green on Python
   3.11/3.12 with **765 tests** on Python 3.11, Ruff clean, and mypy clean across

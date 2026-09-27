@@ -1,6 +1,6 @@
 """M6 Layer-7 live broker qualification for like/unlike replay behavior.
 
-This class deliberately does not promote replay policy.  It strengthens the
+This class deliberately does not promote replay policy. It strengthens the
 supported live broker path so the directional DOM state used by like/unlike is
 fail-closed under contradictory/hydrating selectors and is revalidated at the
 post-authority click seam.
@@ -30,6 +30,24 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
     _LIKE_HYDRATION_INTERVAL_SECONDS = 0.25
 
     @staticmethod
+    def _direct_visible_controls_js(testid: str, variable: str) -> str:
+        """Build JS that collects visible controls owned by the target article.
+
+        A quoted/nested article is not the approved target. Multiple visible
+        controls in the same direction are also ambiguous rather than allowing
+        querySelector ordering to choose authority accidentally.
+        """
+
+        return (
+            f"var {variable}=[];"
+            f"var {variable}Nodes=art.querySelectorAll(\"[data-testid='{testid}']\");"
+            f"for(var {variable}i=0;{variable}i<{variable}Nodes.length;{variable}i++){{"
+            f"var {variable}El={variable}Nodes[{variable}i];"
+            f"if({variable}El.closest('article')===art&&visible({variable}El))"
+            f"{variable}.push({variable}El);}}"
+        )
+
+    @staticmethod
     def _like_state_expr(post_id: str) -> str:
         return (
             M6ReplayQualifiedWriteBroker._target_article_prefix(
@@ -37,12 +55,10 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
                 "m6-layer7-like-state",
             )
             + "function visible(el){return !!(el&&el.isConnected&&el.getClientRects().length);}"
-            + "var like=art.querySelector(\"[data-testid='like']\");"
-            + "var unlike=art.querySelector(\"[data-testid='unlike']\");"
-            + "var hasLike=visible(like),hasUnlike=visible(unlike);"
-            + "if(hasLike&&hasUnlike)return 'unknown';"
-            + "if(hasUnlike)return 'liked';"
-            + "if(hasLike)return 'not_liked';"
+            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js("like", "likes")
+            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js("unlike", "unlikes")
+            + "if(likes.length===1&&unlikes.length===0)return 'not_liked';"
+            + "if(unlikes.length===1&&likes.length===0)return 'liked';"
             + "return 'unknown';})()"
         )
 
@@ -50,9 +66,9 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
         """Read one target's directional like state conservatively.
 
         A short bounded hydration window tolerates selector appearance after
-        navigation. Contradictory, hidden, or disconnected selectors are never
-        positive state evidence; if no single visible direction becomes
-        observable, the result remains unknown.
+        navigation. Contradictory, hidden, disconnected, nested, or duplicate
+        controls are never positive state evidence; if exactly one direct visible
+        direction does not become observable, the result remains unknown.
         """
 
         if (guarded := self._guard()) is not None:
@@ -93,12 +109,12 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
                 f"m6-layer7-like-click-{expected}",
             )
             + "function visible(el){return !!(el&&el.isConnected&&el.getClientRects().length);}"
-            + f"var expected=art.querySelector(\"[data-testid='{expected}']\");"
-            + f"var opposite=art.querySelector(\"[data-testid='{opposite}']\");"
-            + "var hasExpected=visible(expected),hasOpposite=visible(opposite);"
-            + "if(hasExpected&&hasOpposite)return 'ambiguous';"
-            + "if(!hasExpected)return 'stale';"
-            + "expected.click();return 'clicked';})()"
+            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js(expected, "expected")
+            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js(opposite, "opposite")
+            + "if(expected.length!==1||opposite.length!==0){"
+            + "if(expected.length||opposite.length)return 'ambiguous';"
+            + "return 'stale';}"
+            + "expected[0].click();return 'clicked';})()"
         )
 
     async def _click_target_control(

@@ -75,6 +75,7 @@ def test_r20_r34_durable_reconciliation_survives_process_crash_before_publicatio
     assert restarted["blocked"] is False
     assert restarted["reconciliation_count"] == 1
     assert restarted["pending_confirmation_count"] == 0
+    assert restarted["old_confirmation_reason"] == "consumed_token"
 
 
 def test_r36_fresh_process_startup_redurabilizes_surviving_reconciliation(

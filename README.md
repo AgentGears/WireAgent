@@ -3,7 +3,7 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation Layers 1–5 complete/qualified.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, and an audit-only invocation journal. M6 Layer 6 Windows durability qualification and Layer 7 replay-safety qualification remain separate follow-on work.
+**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation Layers 1–6 complete/qualified.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, an audit-only invocation journal, and both safety-ledger durability paths qualified on actual GitHub-hosted Windows Server 2025 runners for CPython 3.11/3.12. M6 Layer 7 replay-safety qualification remains separate follow-on work.
 
 ## Framing
 
@@ -40,7 +40,9 @@ pip install -e ".[browser]"    # + the Super-Browser SDK for live runs
 bash scripts/check.sh           # the gate: pytest + ruff + mypy
 ```
 
-CI (GitHub Actions, Python 3.11/3.12) runs the same three steps on every push.
+CI runs the full pytest + Ruff + mypy gate on Ubuntu with Python 3.11/3.12 and a
+separate Windows Python 3.11/3.12 durability qualification matrix for the two
+safety ledgers and their restart/re-durability boundary.
 
 ## Install (editable, local)
 
@@ -145,6 +147,12 @@ commit-authority boundaries; leaves the browser intact. External trip: create
   exposed bytes without established durability cannot clear recovery merely
   because the bytes are visible. Exact-fact re-durability or fresh-process
   startup durability establishment is required before the fact is trusted.
+- **Windows safety-ledger qualification is bounded.** On the tested GitHub-hosted
+  Windows Server 2025 runners, CPython 3.11/3.12 passes the ledger append/fsync,
+  exact-fact re-durability, startup re-durability, normalized same-path identity,
+  corruption fail-closed, and fresh-process recovery qualification. This is not
+  a portable parent-directory-fsync, storage-hardware, network-filesystem, or
+  cross-process linearizability claim.
 - **Old authority does not cross reconciliation.** Reconciliation advances the
   confirmation epoch before persistence starts, does not revive M5 grants or
   permits, and restart reconstructs recovery only from durable histories — not
@@ -171,10 +179,13 @@ writer coordination, browser ownership, publication fencing, and confirmation
 authority remain supported as **single-process** contracts. M6 does not provide
 a remote reconciliation service, automatic model-authorized terminal verdicts,
 terminal-verdict correction/supersession, or cryptographic protection against a
-hostile local filesystem user. Windows durability qualification remains M6
-Layer 6, and like/unlike replay-safety promotion remains evidence-dependent
-Layer 7 work.
+hostile local filesystem user. Layer-6 Windows evidence is limited to the tested
+GitHub-hosted Windows Server 2025 / CPython safety-ledger environment and does not
+establish portable directory-entry, hardware-cache, network-filesystem, or whole
+browser-runtime durability. Like/unlike replay-safety promotion remains
+evidence-dependent Layer 7 work.
 
 See `docs/M5_DESIGN.md` for the frozen M5 transaction contract,
 `docs/M6_DESIGN.md` for the normative reconciliation/qualification contract,
-and `docs/STATE.md` for the living project record.
+`docs/M6_LAYER6_WINDOWS_QUALIFICATION.md` for the bounded Windows evidence, and
+`docs/STATE.md` for the living project record.

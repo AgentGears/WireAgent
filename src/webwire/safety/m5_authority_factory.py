@@ -25,6 +25,7 @@ from typing import Any, Optional
 from webwire.config import WebWireConfig
 from webwire.m5_leased_read_broker import M5LeasedReadBroker
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
+from webwire.m6_replay_qualified_write_broker import M6ReplayQualifiedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectPolicyRegistry
 from webwire.safety.kill_switch import KillSwitch
@@ -89,9 +90,9 @@ def build_live_m5_write_broker(
     super_browser: Any,
     kill_switch: KillSwitch,
 ) -> M5LeasedWriteBroker:
-    """Build the supported live v3 broker without mutating the SDK facade."""
+    """Build the supported live v3 broker with Layer-7 engagement hardening."""
 
-    return M5LeasedWriteBroker(_live_facade(super_browser), kill_switch)
+    return M6ReplayQualifiedWriteBroker(_live_facade(super_browser), kill_switch)
 
 
 def build_live_scoped_authority_broker(

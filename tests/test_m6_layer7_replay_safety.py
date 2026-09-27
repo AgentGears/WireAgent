@@ -1,7 +1,7 @@
 """M6 Layer-7 evidence-driven like/unlike replay-safety qualification.
 
 These tests qualify the concrete supported live broker mechanics required by
-M6_DESIGN.md §18.  They intentionally do not promote policy: DOM convergence
+M6_DESIGN.md §18. They intentionally do not promote policy: DOM convergence
 cannot establish absence of residual server/platform engagement effects.
 """
 
@@ -44,12 +44,16 @@ class _CDP:
 
     async def evaluate(self, expr: str) -> ActionResult:
         if "m6-layer7-like-state:123" in expr:
+            assert "getClientRects().length" in expr
+            assert "hasLike&&hasUnlike" in expr
             state = self.page.next_probe_state()
             self.page.events.append(f"probe:{state}")
             value = state if state in {"liked", "not_liked"} else "unknown"
             return ok_result(data={"result": {"value": value}})
 
         if "m6-layer7-like-click-like:123" in expr:
+            assert "getClientRects().length" in expr
+            assert "hasExpected&&hasOpposite" in expr
             self.page.events.append(f"click_attempt:like:{self.page.state}")
             if self.page.state == "not_liked":
                 self.page.state = "liked"
@@ -62,6 +66,8 @@ class _CDP:
             return ok_result(data={"result": {"value": value}})
 
         if "m6-layer7-like-click-unlike:123" in expr:
+            assert "getClientRects().length" in expr
+            assert "hasExpected&&hasOpposite" in expr
             self.page.events.append(f"click_attempt:unlike:{self.page.state}")
             if self.page.state == "liked":
                 self.page.state = "not_liked"
@@ -155,9 +161,9 @@ async def test_already_satisfied_direction_is_zero_gate_zero_mutation(
     assert not any(event.startswith("click_attempt:") for event in page.events)
 
 
-@pytest.mark.parametrize("state", ["both", "neither"])
+@pytest.mark.parametrize("state", ["both", "neither", "hidden_like", "hidden_unlike"])
 @pytest.mark.parametrize("method", ["click_like", "click_unlike"])
-async def test_ambiguous_or_missing_directional_controls_fail_before_commit(
+async def test_ambiguous_missing_or_hidden_controls_fail_before_commit(
     tmp_path: Path,
     state: str,
     method: str,
@@ -210,6 +216,8 @@ async def test_hydration_transition_is_bounded_and_uses_conclusive_direction(
         ("click_unlike", "liked", "not_liked"),
         ("click_like", "not_liked", "both"),
         ("click_unlike", "liked", "both"),
+        ("click_like", "not_liked", "hidden_like"),
+        ("click_unlike", "liked", "hidden_unlike"),
     ],
 )
 async def test_state_change_after_gate_never_falls_through_to_wrong_direction(

@@ -3,7 +3,7 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation Layers 1–6 complete/qualified.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, an audit-only invocation journal, and both safety-ledger durability paths qualified on actual GitHub-hosted Windows Server 2025 runners for CPython 3.11/3.12. M6 Layer 7 replay-safety qualification remains separate follow-on work.
+**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation and qualification Layers 1–7 implemented/qualified.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, both safety-ledger durability paths qualified on actual GitHub-hosted Windows Server 2025 runners for CPython 3.11/3.12, and Layer-7 like/unlike broker/evidence mechanics qualified without making an unsupported replay-policy promotion. Like/unlike deliberately remain `ReplaySemantics.UNKNOWN` / `DurabilityPolicy.REQUIRED` because absence of residual public-engagement side effects has not been established.
 
 ## Framing
 
@@ -153,6 +153,15 @@ commit-authority boundaries; leaves the browser intact. External trip: create
   corruption fail-closed, and fresh-process recovery qualification. This is not
   a portable parent-directory-fsync, storage-hardware, network-filesystem, or
   cross-process linearizability claim.
+- **Like/unlike qualification is deliberately split from replay-policy truth.**
+  The supported live broker/evidence path now fails closed on contradictory,
+  missing, hidden, disabled, nested, duplicate, hydrating, or stale directional
+  controls; already-satisfied state is zero-mutation; the requested direction is
+  revalidated at the exact post-authority click seam; terminal like evidence uses
+  the same qualified state reader under the browser lease. None of that proves
+  that repeated public engagement has no notification, callback, analytics,
+  counter, or other service-side residual effect, so like/unlike remain
+  `UNKNOWN` / `REQUIRED` rather than being downgraded to `BEST_EFFORT`.
 - **Old authority does not cross reconciliation.** Reconciliation advances the
   confirmation epoch before persistence starts, does not revive M5 grants or
   permits, and restart reconstructs recovery only from durable histories — not
@@ -182,10 +191,14 @@ terminal-verdict correction/supersession, or cryptographic protection against a
 hostile local filesystem user. Layer-6 Windows evidence is limited to the tested
 GitHub-hosted Windows Server 2025 / CPython safety-ledger environment and does not
 establish portable directory-entry, hardware-cache, network-filesystem, or whole
-browser-runtime durability. Like/unlike replay-safety promotion remains
-evidence-dependent Layer 7 work.
+browser-runtime durability. Layer-7 qualifies the tested local broker/evidence
+mechanics only; it does not establish platform-side replay safety for public
+engagement and therefore does not promote like/unlike from `UNKNOWN` /
+`REQUIRED`.
 
 See `docs/M5_DESIGN.md` for the frozen M5 transaction contract,
 `docs/M6_DESIGN.md` for the normative reconciliation/qualification contract,
-`docs/M6_LAYER6_WINDOWS_QUALIFICATION.md` for the bounded Windows evidence, and
-`docs/STATE.md` for the living project record.
+`docs/M6_LAYER6_WINDOWS_QUALIFICATION.md` for the bounded Windows evidence,
+`docs/M6_LAYER7_REPLAY_SAFETY_QUALIFICATION.md` for the replay-safety
+qualification result and claim ceiling, and `docs/STATE.md` for the living
+project record.

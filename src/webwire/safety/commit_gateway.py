@@ -142,11 +142,23 @@ class EffectPermit:
 
 
 @dataclass
+class _LiveEffectOwner:
+    """Canonical same-process ownership for one REQUIRED pre/permit lifecycle."""
+
+    attempt: EffectAttempt
+    grant: ApprovalGrant
+    snapshot: _IntentSnapshot
+    policy_binding: str
+    permit_minted: bool = False
+    closure_reason: Optional[str] = None
+
+
+@dataclass
 class _LifecycleState:
     """Shared same-path M5 lifecycle ownership inside the supported process."""
 
     lock: Any
-    live_effect_attempts: dict[str, EffectAttempt]
+    live_effect_attempts: dict[str, _LiveEffectOwner]
 
 
 class CommitGateway:
@@ -242,19 +254,69 @@ class CommitGateway:
         with self._protocol_lock:
             yield
 
-    def _register_live_effect_attempt(self, attempt: EffectAttempt) -> None:
+    def _register_live_effect_attempt(
+        self,
+        attempt: EffectAttempt,
+        *,
+        grant: ApprovalGrant,
+        snapshot: _IntentSnapshot,
+        policy_binding: str,
+    ) -> None:
         existing = self._live_effect_attempts.get(attempt.effect_id)
-        if existing is not None and existing is not attempt:
+        if existing is not None:
+            if existing.attempt is not attempt:
+                raise GatewayStateError(
+                    f"effect_id {attempt.effect_id!r} already has a different live attempt"
+                )
+            if (
+                existing.grant is not grant
+                or existing.snapshot != snapshot
+                or existing.policy_binding != policy_binding
+            ):
+                raise GatewayStateError(
+                    f"effect_id {attempt.effect_id!r} live-attempt lineage changed"
+                )
+            return
+        self._live_effect_attempts[attempt.effect_id] = _LiveEffectOwner(
+            attempt=attempt,
+            grant=grant,
+            snapshot=snapshot,
+            policy_binding=policy_binding,
+        )
+
+    def _live_owner_for_attempt(self, attempt: EffectAttempt) -> _LiveEffectOwner:
+        owner = self._live_effect_attempts.get(attempt.effect_id)
+        if owner is None or owner.attempt is not attempt:
             raise GatewayStateError(
-                f"effect_id {attempt.effect_id!r} already has a different live attempt"
+                f"effect_id {attempt.effect_id!r} lost canonical live-attempt ownership"
             )
-        self._live_effect_attempts[attempt.effect_id] = attempt
+        return owner
+
+    def _set_live_effect_closure_reason(
+        self,
+        attempt: EffectAttempt,
+        reason: str,
+    ) -> str:
+        owner = self._live_owner_for_attempt(attempt)
+        if owner.permit_minted:
+            raise GatewayStateError("cannot prepermit-close an exposed EffectPermit")
+        if owner.closure_reason is None:
+            owner.closure_reason = reason
+        return owner.closure_reason
+
+    def _mark_live_effect_permit_minted(self, attempt: EffectAttempt) -> None:
+        owner = self._live_owner_for_attempt(attempt)
+        if owner.closure_reason is not None:
+            raise GatewayStateError("cannot mint permit after prepermit closure began")
+        if owner.permit_minted:
+            raise GatewayStateError("EffectPermit already exposed for live attempt")
+        owner.permit_minted = True
 
     def _retire_live_effect_attempt(self, attempt: EffectAttempt) -> None:
         existing = self._live_effect_attempts.get(attempt.effect_id)
         if existing is None:
             return
-        if existing is not attempt:
+        if existing.attempt is not attempt:
             raise GatewayStateError(
                 f"effect_id {attempt.effect_id!r} live-attempt ownership changed"
             )
@@ -264,16 +326,143 @@ class CommitGateway:
             )
         self._live_effect_attempts.pop(attempt.effect_id, None)
 
-    def live_attempt_owns_effect(self, effect_id: str) -> bool:
-        """Return canonical registered ownership under the protocol fence.
+    @staticmethod
+    def _reservation_record(
+        *,
+        grant: ApprovalGrant,
+        attempt: EffectAttempt,
+        snapshot: _IntentSnapshot,
+        policy_binding: str,
+    ) -> EffectLedgerRecord:
+        return EffectLedgerRecord(
+            effect_id=attempt.effect_id,
+            semantic_key=snapshot.semantic_key,
+            state=EffectState.RESERVED,
+            action_type=snapshot.action_type,
+            intent_hash=snapshot.intent_hash,
+            policy_binding=policy_binding,
+            actor_id=snapshot.actor_id,
+            target_type=snapshot.target_type,
+            target_id=snapshot.target_id,
+            details={
+                "attempt_id": attempt.attempt_id,
+                "grant_id": grant.grant_id,
+            },
+        )
 
-        Registration itself is authoritative. Ownership is retired only by the
-        gateway's terminalization paths, never inferred away from the mutable
-        EffectAttempt state by a diagnostic read.
+    def _retire_dead_prepermit_owner_if_possible(self, effect_id: str) -> None:
+        """Durably retire authority-dead owners before reconciliation blocks forever.
+
+        A REQUIRED reservation may fail after I/O starts but before a permit is
+        minted. If its grant later becomes terminal, the attempt cannot ever
+        resume, yet the reservation latch forbids a clean in-memory NO_EFFECT.
+        Re-establish the exact reservation durability first, then append one
+        durable NO_EFFECT closure. If any durability step fails, ownership stays
+        registered and reconciliation remains conservatively blocked.
+
+        A RESERVED owner with no exposed permit is also safe to close: reservation
+        durability was already established, while no external mutation authority
+        ever left the gateway. Exposed permits are never auto-closed here.
+        """
+        owner = self._live_effect_attempts.get(effect_id)
+        if owner is None or owner.permit_minted:
+            return
+
+        attempt = owner.attempt
+        grant = owner.grant
+
+        if attempt.state is AttemptState.RESERVED:
+            reason = self._set_live_effect_closure_reason(
+                attempt,
+                "prepermit_authority_abandoned",
+            )
+            try:
+                self._close_reserved_before_permit(
+                    grant=grant,
+                    attempt=attempt,
+                    snapshot=owner.snapshot,
+                    policy_binding=owner.policy_binding,
+                    reason=reason,
+                )
+            except GatewayDenied:
+                # Keep ownership so the exact same closure can be retried.
+                return
+            return
+
+        if attempt.state is not AttemptState.PREPARING or not attempt.reservation_started:
+            return
+
+        dead_reason: Optional[str] = None
+        try:
+            with grant.claim_fence(attempt.attempt_id):
+                with self._epoch.fence() as current_epoch:
+                    try:
+                        grant.validate_live(
+                            intent_hash=owner.snapshot.intent_hash,
+                            actor_id=owner.snapshot.actor_id,
+                            policy_binding=owner.policy_binding,
+                            authorization_epoch=current_epoch,
+                        )
+                    except GrantClaimDenied as exc:
+                        if grant.state in (
+                            GrantState.EXPIRED,
+                            GrantState.REVOKED,
+                            GrantState.SPENT,
+                        ):
+                            dead_reason = exc.reason
+                        else:
+                            return
+                    else:
+                        return
+
+                assert dead_reason is not None
+                reason = self._set_live_effect_closure_reason(
+                    attempt,
+                    f"{dead_reason}_before_permit",
+                )
+                try:
+                    self._ledger.append_durable(
+                        self._reservation_record(
+                            grant=grant,
+                            attempt=attempt,
+                            snapshot=owner.snapshot,
+                            policy_binding=owner.policy_binding,
+                        )
+                    )
+                except EffectLedgerError:
+                    # Reservation may still be ambiguous; retain ownership and
+                    # retry the exact RESERVED fact on the next lifecycle check.
+                    return
+                attempt.mark_reserved(grant)
+                try:
+                    self._close_reserved_before_permit(
+                        grant=grant,
+                        attempt=attempt,
+                        snapshot=owner.snapshot,
+                        policy_binding=owner.policy_binding,
+                        reason=reason,
+                    )
+                except GatewayDenied:
+                    # RESERVED is now durable, but NO_EFFECT closure is not yet
+                    # known durable. Preserve ownership/reason for exact retry.
+                    return
+        except GrantClaimDenied:
+            # Lost claim ownership is an invariant failure from this registry's
+            # perspective. Do not infer NO_EFFECT; leave the safety block intact.
+            return
+
+    def live_attempt_owns_effect(self, effect_id: str) -> bool:
+        """Return canonical live ownership after safe dead-authority retirement.
+
+        Registration is authoritative. Before reporting a block, the gateway may
+        durably retire a pre-permit owner that provably cannot resume and never
+        exposed an EffectPermit. Any failure to establish durable NO_EFFECT keeps
+        the owner registered and therefore keeps reconciliation fail-closed.
         """
         if not isinstance(effect_id, str) or not effect_id:
             raise ValueError("effect_id must be a non-empty string")
         with self._protocol_lock:
+            self._retire_dead_prepermit_owner_if_possible(effect_id)
             return effect_id in self._live_effect_attempts
 
     def _policy_for(self, intent: WriteIntent) -> EffectPolicy:
@@ -520,13 +709,19 @@ class CommitGateway:
                         binding = policy.binding_hash()
                         epoch = self._epoch.current
                         with grant.claim_fence(attempt.attempt_id):
-                            self._validate_grant_identity(
-                                grant,
-                                attempt,
-                                snapshot,
-                                binding,
-                                epoch,
-                            )
+                            try:
+                                self._validate_grant_identity(
+                                    grant,
+                                    attempt,
+                                    snapshot,
+                                    binding,
+                                    epoch,
+                                )
+                            except GatewayDenied:
+                                self._retire_dead_prepermit_owner_if_possible(
+                                    attempt.effect_id
+                                )
+                                raise
 
                             effect_id = attempt.effect_id
                             semantic_key = snapshot.semantic_key
@@ -537,24 +732,20 @@ class CommitGateway:
                                 # failed append may still leave visible/durable
                                 # RESERVED evidence, and the same attempt may be
                                 # retried later in this process.
-                                self._register_live_effect_attempt(attempt)
+                                self._register_live_effect_attempt(
+                                    attempt,
+                                    grant=grant,
+                                    snapshot=snapshot,
+                                    policy_binding=binding,
+                                )
                                 # Latch before I/O: append_durable can write bytes
                                 # and still report failure during fsync.
                                 attempt.begin_reservation(grant)
-                                record = EffectLedgerRecord(
-                                    effect_id=effect_id,
-                                    semantic_key=semantic_key,
-                                    state=EffectState.RESERVED,
-                                    action_type=snapshot.action_type,
-                                    intent_hash=snapshot.intent_hash,
+                                record = self._reservation_record(
+                                    grant=grant,
+                                    attempt=attempt,
+                                    snapshot=snapshot,
                                     policy_binding=binding,
-                                    actor_id=snapshot.actor_id,
-                                    target_type=snapshot.target_type,
-                                    target_id=snapshot.target_id,
-                                    details={
-                                        "attempt_id": attempt.attempt_id,
-                                        "grant_id": grant.grant_id,
-                                    },
                                 )
                                 try:
                                     self._ledger.append_durable(record)
@@ -615,16 +806,22 @@ class CommitGateway:
                                             )
                                             self._issued_permits[permit.permit_id] = permit
                                             self._issued_attempts[permit.permit_id] = attempt
+                                            if fenced:
+                                                self._mark_live_effect_permit_minted(attempt)
                                             return permit
 
                             if kill_blocked_at_mint:
                                 if fenced and attempt.state is AttemptState.RESERVED:
+                                    reason = self._set_live_effect_closure_reason(
+                                        attempt,
+                                        "kill_switch_before_permit",
+                                    )
                                     self._close_reserved_before_permit(
                                         grant=grant,
                                         attempt=attempt,
                                         snapshot=snapshot,
                                         policy_binding=binding,
-                                        reason="kill_switch_before_permit",
+                                        reason=reason,
                                     )
                                 else:
                                     attempt.mark_no_effect_after_authority()
@@ -632,12 +829,16 @@ class CommitGateway:
 
                             assert grant_error is not None
                             if fenced and attempt.state is AttemptState.RESERVED:
+                                reason = self._set_live_effect_closure_reason(
+                                    attempt,
+                                    f"{grant_error.reason}_before_permit",
+                                )
                                 self._close_reserved_before_permit(
                                     grant=grant,
                                     attempt=attempt,
                                     snapshot=snapshot,
                                     policy_binding=binding,
-                                    reason=f"{grant_error.reason}_before_permit",
+                                    reason=reason,
                                 )
                             else:
                                 # BEST_EFFORT has no durable precommit fact;

@@ -30,12 +30,28 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
     _LIKE_HYDRATION_INTERVAL_SECONDS = 0.25
 
     @staticmethod
-    def _direct_visible_controls_js(testid: str, variable: str) -> str:
-        """Build JS that collects visible controls owned by the target article.
+    def _authoritative_control_predicate_js() -> str:
+        """Return a conservative DOM predicate for mutation/state authority."""
 
-        A quoted/nested article is not the approved target. Multiple visible
-        controls in the same direction are also ambiguous rather than allowing
-        querySelector ordering to choose authority accidentally.
+        return (
+            "function authoritative(el){"
+            "if(!(el&&el.isConnected&&el.getClientRects().length))return false;"
+            "var s=getComputedStyle(el);"
+            "if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'"
+            "||s.pointerEvents==='none')return false;"
+            "if(el.getAttribute('aria-hidden')==='true'||el.getAttribute('aria-disabled')==='true')"
+            "return false;"
+            "if(el.matches&&el.matches(':disabled'))return false;"
+            "return true;}"
+        )
+
+    @staticmethod
+    def _direct_authoritative_controls_js(testid: str, variable: str) -> str:
+        """Collect authoritative controls owned directly by the target article.
+
+        A quoted/nested article is not the approved target. Multiple usable
+        controls in the same direction are ambiguous rather than allowing DOM
+        ordering to choose authority accidentally.
         """
 
         return (
@@ -43,7 +59,7 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
             f"var {variable}Nodes=art.querySelectorAll(\"[data-testid='{testid}']\");"
             f"for(var {variable}i=0;{variable}i<{variable}Nodes.length;{variable}i++){{"
             f"var {variable}El={variable}Nodes[{variable}i];"
-            f"if({variable}El.closest('article')===art&&visible({variable}El))"
+            f"if({variable}El.closest('article')===art&&authoritative({variable}El))"
             f"{variable}.push({variable}El);}}"
         )
 
@@ -54,9 +70,9 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
                 post_id,
                 "m6-layer7-like-state",
             )
-            + "function visible(el){return !!(el&&el.isConnected&&el.getClientRects().length);}"
-            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js("like", "likes")
-            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js("unlike", "unlikes")
+            + M6ReplayQualifiedWriteBroker._authoritative_control_predicate_js()
+            + M6ReplayQualifiedWriteBroker._direct_authoritative_controls_js("like", "likes")
+            + M6ReplayQualifiedWriteBroker._direct_authoritative_controls_js("unlike", "unlikes")
             + "if(likes.length===1&&unlikes.length===0)return 'not_liked';"
             + "if(unlikes.length===1&&likes.length===0)return 'liked';"
             + "return 'unknown';})()"
@@ -66,9 +82,10 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
         """Read one target's directional like state conservatively.
 
         A short bounded hydration window tolerates selector appearance after
-        navigation. Contradictory, hidden, disconnected, nested, or duplicate
-        controls are never positive state evidence; if exactly one direct visible
-        direction does not become observable, the result remains unknown.
+        navigation. Contradictory, hidden, disabled, disconnected, nested, or
+        duplicate controls are never positive state evidence; if exactly one
+        direct authoritative direction does not become observable, the result
+        remains unknown.
         """
 
         if (guarded := self._guard()) is not None:
@@ -108,9 +125,9 @@ class M6ReplayQualifiedWriteBroker(M5LeasedWriteBroker):
                 post_id,
                 f"m6-layer7-like-click-{expected}",
             )
-            + "function visible(el){return !!(el&&el.isConnected&&el.getClientRects().length);}"
-            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js(expected, "expected")
-            + M6ReplayQualifiedWriteBroker._direct_visible_controls_js(opposite, "opposite")
+            + M6ReplayQualifiedWriteBroker._authoritative_control_predicate_js()
+            + M6ReplayQualifiedWriteBroker._direct_authoritative_controls_js(expected, "expected")
+            + M6ReplayQualifiedWriteBroker._direct_authoritative_controls_js(opposite, "opposite")
             + "if(expected.length!==1||opposite.length!==0){"
             + "if(expected.length||opposite.length)return 'ambiguous';"
             + "return 'stale';}"

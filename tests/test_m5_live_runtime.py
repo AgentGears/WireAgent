@@ -9,6 +9,7 @@ import pytest
 from webwire.config import WebWireConfig
 from webwire.m5_leased_read_broker import M5LeasedReadBroker
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
+from webwire.m6_replay_qualified_write_broker import M6ReplayQualifiedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_ledger import EffectLedger
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
@@ -28,6 +29,7 @@ from webwire.safety.m5_media_executor import M5MediaExecutor
 from webwire.safety.m5_post_text_executor import M5PostTextExecutor
 from webwire.safety.m5_quote_executor import M5QuoteExecutor
 from webwire.safety.m5_reply_executor import M5ReplyExecutor
+from webwire.safety.m6_replay_qualified_evidence import M6ReplayQualifiedEvidenceReader
 from webwire.safety.scoped_authority import ScopedAuthorityBroker, ScopedAuthorityDenied
 
 
@@ -54,10 +56,12 @@ def test_live_stack_uses_one_shared_authority_root(tmp_path: Path) -> None:
 
     assert isinstance(stack.read_broker, M5LeasedReadBroker)
     assert isinstance(stack.write_broker, M5LeasedWriteBroker)
+    assert isinstance(stack.write_broker, M6ReplayQualifiedWriteBroker)
     assert isinstance(stack.scoped_authority, ScopedAuthorityBroker)
     assert isinstance(stack.execution_runtime, M5ExecutionRuntime)
     assert isinstance(stack.evidence_reader, M5ActorBoundEvidenceReader)
     assert isinstance(stack.evidence_reader, M5LeasedEvidenceReader)
+    assert isinstance(stack.evidence_reader, M6ReplayQualifiedEvidenceReader)
     assert isinstance(stack.media_evidence_reader, M5LeasedMediaEvidenceReader)
     assert isinstance(stack.delete_evidence_reader, M5LeasedDeleteEvidenceReader)
     assert isinstance(stack.effect_executor, M5EffectExecutor)

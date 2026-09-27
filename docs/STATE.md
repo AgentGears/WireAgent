@@ -18,7 +18,7 @@
 ## Current version
 
 **v0.3 stabilized live path + M5 effect-transaction boundary complete + M6
-reconciliation Layers 1–6 implemented/qualified.**
+reconciliation/qualification Layers 1–7 implemented/qualified.**
 
 Canonical M5 runtime baseline after the full M5 build order:
 
@@ -50,15 +50,20 @@ transaction boundary:
 3. Confirmation epoch + monotonic confirmation authority    MERGED     PR #13  4bbca5e2f8b2388336c8274c5de45fd16595e2da
 4. ReconciliationAuthority + coordinator/operator workflow  MERGED     PR #14  0f40959ea74fe8f8ddeb77c5474512c5bccb9c18
 5. Fault/restart/corruption/concurrency qualification       MERGED     PR #15  e1e3eeb679cf54b5707c88b0e82e3db4a04d9319
-6. Windows durability qualification                         QUALIFIED  PR #16 candidate
-7. Evidence-driven replay-safety qualification              PLANNED
+6. Windows durability qualification                         MERGED     PR #16  7b1bf7ee044ba653371e44d4abac7f7254b2c14d
+7. Evidence-driven replay-safety qualification              QUALIFIED  PR #17
 ```
 
-Normative M6 contract: `docs/M6_DESIGN.md`. Layer 5 and Layer 6 are qualification
-layers: production code changes only when the target-platform/fault evidence
-falsifies an existing invariant. Layer 6 found and corrected three EffectLedger
+Normative M6 contract: `docs/M6_DESIGN.md`. Layers 5–7 are qualification layers:
+production code changes only where target-platform/fault/broker evidence
+falsifies an existing invariant. Layer 6 corrected three EffectLedger
 portability/corruption defects while keeping the Windows persistence claim
-strictly bounded to the environment and primitives actually tested.
+strictly bounded to the environment and primitives actually tested. Layer 7
+qualified the supported like/unlike broker and terminal-evidence mechanics but
+did **not** qualify a replay-policy promotion: like/unlike deliberately remain
+`ReplaySemantics.UNKNOWN` / `DurabilityPolicy.REQUIRED` because repository
+broker/DOM evidence cannot establish absence of residual public-engagement
+service effects.
 
 ## Architecture invariants — do not violate
 
@@ -79,11 +84,15 @@ strictly bounded to the environment and primitives actually tested.
    re-observed at final authority boundaries without claiming impossible
    cross-process linearization.
 7. **Risk, semantic authority, replay behavior, and durability are independent.**
-   SAFE replay classifications require concrete broker-level evidence.
+   SAFE replay classifications require concrete broker-level evidence and any
+   stronger service-side replay claim must be separately established.
 8. **Writes are semantic and directional.** State-set operations must not
-   collapse into unsafe toggles. Bookmark/remove-bookmark are proven directional;
-   like/unlike remain conservative `UNKNOWN`/`REQUIRED` until equivalent broker
-   evidence exists.
+   collapse into unsafe toggles. Bookmark/remove-bookmark are proven directional.
+   Layer 7 qualifies the supported like/unlike directional broker/evidence
+   mechanics under tested ambiguity/hydration/staleness/ownership cases, but the
+   public-engagement replay classification remains conservative
+   `UNKNOWN`/`REQUIRED` because no evidence establishes absence of residual
+   platform effects.
 9. **One M5 attempt owns one stable effect identity.** Ambiguous durability retry
    re-addresses the same fact; reservation-start latching forbids false clean
    release after durable I/O may have begun.
@@ -148,10 +157,12 @@ strictly bounded to the environment and primitives actually tested.
     processes are outside the current claim.
 30. **Qualification claims stay bounded.** Layer-6 evidence establishes the two
     safety-ledger protocol on the tested GitHub-hosted Windows Server 2025 /
-    CPython 3.11/3.12 environment. It does not establish portable directory-entry
-    durability, arbitrary storage-stack semantics, whole-browser Windows
-    qualification, cross-process linearizability, or a like/unlike replay-policy
-    promotion.
+    CPython 3.11/3.12 environment but not portable storage semantics or
+    cross-process linearizability. Layer-7 evidence establishes the supported
+    live broker/terminal-evidence directional mechanics for like/unlike under the
+    tested DOM and browser-lease cases, but not absence of notifications,
+    callbacks, analytics, counters, or other service-side residual effects and
+    therefore not a `SAFE_STATE_SET` / `BEST_EFFORT` promotion.
 
 ## M5 — completed transaction boundary
 
@@ -232,6 +243,15 @@ identity, corruption/torn-tail fail-closed behavior, and fresh-process composite
 recovery. The parent-directory hook remains an explicit Windows no-op; no
 portable directory-fsync or broader storage-stack guarantee is claimed.
 
+Layer-7 qualification hardens the supported live like/unlike path around a
+qualified direct-target directional-state reader/click seam and a matching
+terminal like-evidence reader. Contradictory, missing, hidden, disabled, nested,
+duplicate, hydrating, and stale controls are fail-closed under the tested cases;
+already-satisfied requests are zero-mutation; composer ownership blocks competing
+navigation. This qualifies the local broker/evidence mechanics only. The effect
+policy remains `UNKNOWN` / `REQUIRED` because external public-engagement residual
+side effects are not established absent.
+
 ## Phase plan
 
 | Phase | Scope | Status |
@@ -252,8 +272,8 @@ portable directory-fsync or broader storage-stack guarantee is claimed.
 | M6 L3 | confirmation epoch + monotonic token authority | MERGED — PR #13 |
 | M6 L4 | reconciliation authority + coordinator/operator workflow | MERGED — PR #14 |
 | M6 L5 | crash/fault/restart/corruption/concurrency qualification | MERGED — PR #15 |
-| M6 L6 | Windows durability qualification for both safety ledgers | QUALIFIED — PR #16 candidate |
-| M6 L7 | evidence-driven replay-safety qualification | PLANNED |
+| M6 L6 | Windows durability qualification for both safety ledgers | MERGED — PR #16 |
+| M6 L7 | evidence-driven replay-safety qualification | QUALIFIED — PR #17 |
 
 ## Capabilities
 
@@ -292,6 +312,8 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 | `ReadOnlyBroker` / leased read broker | coordinated browser reads/evidence |
 | `DownloadBroker` | bounded local filesystem output |
 | scoped M5 authorities | approved semantic mutation ports |
+| `M6ReplayQualifiedWriteBroker` | supported live like/unlike directional state/click hardening while preserving M5 scoped authority |
+| `M6ReplayQualifiedEvidenceReader` | supported terminal like-state evidence using the same qualified semantics under the browser lease |
 | M5 scoped/live write broker internals | canonical permit-consume mutation seams |
 | `ReconciliationOperatorSession` | local proposal/confirmation/reconciliation workflow |
 | `ReconciliationCoordinator` | canonical local terminal reconciliation ordering |
@@ -303,6 +325,7 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 |---|---|
 | `dispatcher.py` | invocation entry + M5 live routing + local M6 operator-session composition |
 | `journal.py` | best-effort audit-only NDJSON journal |
+| `m6_replay_qualified_write_broker.py` | Layer-7 qualified live like/unlike target-state and exact-click seam |
 | `safety/write_kernel.py` | confirmation/policy shell + recovery gate integration |
 | `safety/confirmation_state.py` | process-local confirmation epoch + monotonic token authority |
 | `safety/effect_policy.py` | replay/durability/effect-scope policy |
@@ -310,13 +333,14 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 | `safety/execution_models.py` | ApprovalGrant / EffectAttempt state machines |
 | `safety/commit_gateway.py` | EffectPermit lifecycle + canonical live-attempt ownership/fence |
 | `safety/scoped_authority.py` | least-authority semantic ports |
+| `safety/m6_replay_qualified_evidence.py` | Layer-7 terminal like evidence under qualified broker semantics |
 | `safety/reconciliation_ledger.py` | durable M6 reconciliation fact model/ledger |
 | `safety/recovery_projector.py` | exact cross-ledger reconciliation projection |
 | `safety/recovery_guard.py` | composite restart + same-process unresolved replay enforcement |
 | `safety/reconciliation_authority.py` | ephemeral operator reconciliation authority |
 | `safety/reconciliation_coordinator.py` | terminal reconciliation protocol ordering |
 | `safety/reconciliation_operator.py` | local human proposal/confirmation workflow |
-| `safety/m5_live_runtime.py` | coherent live M5 execution stack |
+| `safety/m5_live_runtime.py` | coherent live M5 execution stack, including Layer-7 qualified engagement evidence |
 | `safety/dedupe.py` | process-local semantic dedupe |
 | `safety/token_bucket.py` | process-local write circuit breaker |
 | `safety/kill_switch.py` | generation-based kill + critical revocation fence |
@@ -326,9 +350,10 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 - [ ] **Cross-process effect/reconciliation/browser coordination:** the current
   safety contract is intentionally single-process. Concurrent independent
   recovery/runtime processes are unsupported.
-- [ ] **Like/unlike replay-safety proof:** remains conservative
-  `UNKNOWN`/`REQUIRED` pending broker-level state-preserving evidence; M6 Layer 7
-  may investigate but does not presume promotion.
+- [ ] **External like/unlike residual-effect proof:** M6 Layer 7 completed the
+  broker/evidence qualification but intentionally retained `UNKNOWN`/`REQUIRED`.
+  Promotion requires new evidence that repeated public engagement causes no
+  additional meaningful service-side effect; DOM convergence is insufficient.
 - [ ] **Terminal reconciliation correction/supersession:** M6 intentionally has
   one terminal verdict and no silent edit/latest-row-wins semantics. Corrective
   history would require a future explicit design.
@@ -359,6 +384,37 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-09-27 — M6 Layer 7 replay-safety qualification (PR #17).** Started from
+  exact merged Layer-6 baseline `7b1bf7ee044ba653371e44d4abac7f7254b2c14d`.
+  The frozen maintainer-first pass found the inherited target-state reader could
+  misclassify simultaneous like/unlike controls, required direct stale/hydration
+  and browser-lease evidence, and established a claim blocker: repository DOM
+  behavior cannot prove absence of notification/callback/analytics/counter or
+  other public-engagement residual effects. The supported live path now uses
+  `M6ReplayQualifiedWriteBroker` plus `M6ReplayQualifiedEvidenceReader` with
+  direct-target control ownership, bounded hydration, exact directional
+  cardinality, conservative visibility/disabled checks, exact post-authority
+  revalidation, no opposite/page-global fallback, and equivalent terminal
+  like-state verification under the browser lease. A distinct adversarial pass
+  found and corrected four integration/authority defects: hidden/disconnected
+  raw selector authority (R01), nested/duplicate DOM-order authority (R02),
+  CSS-hidden/disabled control authority (R03), and terminal like evidence
+  bypassing the qualified reader after permit consumption (R04). CI #473 on
+  post-adversarial code head `055130d15d54f9945a4f7c639d7138b79f19b795`
+  passed **984 tests, 6 Windows-only skipped** on Ubuntu Python 3.11.16 and
+  3.12.14, Ruff clean, mypy clean across 86 source files; the Windows Layer-6
+  durability matrix remained green with 147 focused tests on Python 3.11.9 and
+  the Python 3.12 job green. Qualification result: local broker/evidence
+  directional mechanics qualified, external replay-policy promotion **not**
+  qualified; like/unlike remain `ReplaySemantics.UNKNOWN` /
+  `DurabilityPolicy.REQUIRED`.
+- **2026-09-27 — M6 Layer 6 merged (PR #16).** Reviewed head
+  `7e34deb35fe33124382576657d0c16a2ee18533c` passed final exact-head CI #461;
+  PR #16 squash-merged as `7b1bf7ee044ba653371e44d4abac7f7254b2c14d`
+  with an identical reviewed/merged tree. Layer 6 qualified both safety ledgers
+  on actual Windows Server 2025 / CPython 3.11/3.12 while retaining explicit
+  parent-directory, storage-stack, network-filesystem, whole-browser, and
+  cross-process claim ceilings.
 - **2026-09-27 — M6 Layer 6 Windows durability qualification candidate (PR #16).**
   Started from exact merged Layer-5 baseline
   `e1e3eeb679cf54b5707c88b0e82e3db4a04d9319`. The frozen maintainer-first

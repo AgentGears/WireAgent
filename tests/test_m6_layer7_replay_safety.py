@@ -22,6 +22,7 @@ from webwire.safety.effect_policy import (
 )
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.m5_authority_factory import build_live_m5_write_broker
+from webwire.safety.m6_replay_qualified_evidence import M6ReplayQualifiedEvidenceReader
 
 URL = "https://x.com/actor/status/123"
 
@@ -277,6 +278,33 @@ async def test_state_change_after_gate_never_falls_through_to_wrong_direction(
     assert page.state == changed
     assert not any(event in {"click:like", "click:unlike"} for event in page.events)
     assert any(event.startswith("click_attempt:") for event in page.events)
+
+
+async def test_terminal_like_evidence_uses_same_qualified_state_reader(tmp_path: Path) -> None:
+    page = _LikePage("both")
+    broker = _broker(tmp_path, page)
+    evidence = M6ReplayQualifiedEvidenceReader(broker)
+
+    result = await evidence.read_like_state(URL)
+
+    assert result.ok
+    assert (result.data or {}).get("like_state") == "unknown"
+    assert len([event for event in page.events if event.startswith("probe:")]) == 4
+    assert not any(event.startswith("click_attempt:") for event in page.events)
+
+
+async def test_active_content_owner_blocks_terminal_like_evidence_before_navigation(
+    tmp_path: Path,
+) -> None:
+    page = _LikePage("liked")
+    broker = _broker(tmp_path, page)
+    evidence = M6ReplayQualifiedEvidenceReader(broker)
+    broker._m5_write_state.content_owner = "different-content-owner"
+
+    result = await evidence.read_like_state(URL)
+
+    assert not result.ok
+    assert page.events == []
 
 
 async def test_active_content_owner_blocks_engagement_before_navigation(tmp_path: Path) -> None:

@@ -40,6 +40,7 @@ from webwire.safety.execution_models import (
     EffectAttempt,
     GrantClaimDenied,
     GrantState,
+    GrantStateError,
 )
 from webwire.safety.kill_switch import KillSwitch
 from webwire.safety.models import WriteIntent
@@ -446,12 +447,9 @@ class CommitGateway:
         try:
             with grant.claim_fence(attempt.attempt_id):
                 attempt.mark_reserved(grant)
-        except (GrantClaimDenied, Exception) as exc:
-            # `mark_reserved` should be infallible for the canonical owner after
-            # reservation durability succeeds. Fail closed instead of inferring
-            # a terminal state if internal lineage was corrupted.
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
+        except (GrantClaimDenied, GrantStateError):
+            # Durable RESERVED exists but local lifecycle lineage cannot be
+            # advanced safely. Keep ownership so reconciliation remains blocked.
             return
         try:
             self._close_reserved_before_permit(

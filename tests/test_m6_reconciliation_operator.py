@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,7 @@ def _evidence() -> dict[str, object]:
 def _session(
     tmp_path: Path,
     *,
-    monotonic_clock: object | None = None,
+    monotonic_clock: Callable[[], float] | None = None,
     authority_ttl_seconds: float = 120.0,
 ) -> tuple[
     ReconciliationOperatorSession,
@@ -80,7 +81,7 @@ def _session(
         coordinator=coordinator,
         operator_id="local-admin",
         proposal_id_factory=lambda: "proposal-1",
-        monotonic_clock=clock,  # type: ignore[arg-type]
+        monotonic_clock=clock,
         authority_ttl_seconds=authority_ttl_seconds,
     )
     return session, reconciliations, guard

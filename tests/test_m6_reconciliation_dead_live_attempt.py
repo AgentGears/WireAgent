@@ -10,6 +10,7 @@ import pytest
 from webwire.config import WebWireConfig
 from webwire.safety import EffectLedger, EffectState, WriteIntent
 from webwire.safety.commit_gateway import CommitGateway, GatewayDenied
+from webwire.safety.confirmation_state import ConfirmationState
 from webwire.safety.effect_ledger import EffectLedgerError
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
 from webwire.safety.execution_models import (
@@ -20,6 +21,16 @@ from webwire.safety.execution_models import (
     GrantState,
 )
 from webwire.safety.kill_switch import KillSwitch
+from webwire.safety.reconciliation_coordinator import (
+    ReconciliationCoordinator,
+    ReconciliationDenied,
+)
+from webwire.safety.reconciliation_ledger import (
+    ReconciliationLedger,
+    ReconciliationVerdict,
+)
+from webwire.safety.reconciliation_operator import ReconciliationOperatorSession
+from webwire.safety.recovery_guard import RecoveryGuard
 from webwire.safety.risk_registry import DEFAULT_REGISTRY
 
 
@@ -90,6 +101,36 @@ def _stack(
     return cfg, intent, grant, attempt, effects, epoch, gateway
 
 
+def _operator_session(
+    cfg: WebWireConfig,
+    effects: EffectLedger,
+    gateway: CommitGateway,
+) -> ReconciliationOperatorSession:
+    reconciliations = ReconciliationLedger(path=cfg.reconciliations_path())
+    guard = RecoveryGuard(effects, reconciliation_ledger=reconciliations)
+    coordinator = ReconciliationCoordinator(
+        recovery_guard=guard,
+        confirmation_state=ConfirmationState(),
+        commit_gateway=gateway,
+        reconciliation_id_factory=lambda: "rec-dead-owner",
+        timestamp_factory=lambda: "2026-09-27T08:30:00+00:00",
+    )
+    return ReconciliationOperatorSession(
+        coordinator=coordinator,
+        operator_id="local-admin",
+        proposal_id_factory=lambda: "proposal-dead-owner",
+        monotonic_clock=lambda: 10.0,
+    )
+
+
+def _evidence() -> dict[str, object]:
+    return {
+        "basis": "local-operator-inspection",
+        "observed_at": "2026-09-27T08:29:00+00:00",
+        "observations": [{"kind": "state", "value": "absent"}],
+    }
+
+
 def _fail_first_reservation_fsync(
     monkeypatch: pytest.MonkeyPatch,
     gateway: CommitGateway,
@@ -132,7 +173,11 @@ def test_expired_grant_after_reservation_failure_closes_no_effect_and_retires(
     assert gateway.live_attempt_owns_effect(attempt.effect_id) is True
     clock.value = 11.0
 
-    assert gateway.live_attempt_owns_effect(attempt.effect_id) is False
+    # Observation is deliberately side-effect-free even though authority is now
+    # expired by time. Explicit reconciliation settlement owns the mutation.
+    assert gateway.live_attempt_owns_effect(attempt.effect_id) is True
+    assert grant.state is GrantState.ACTIVE
+    assert gateway.settle_dead_prepermit_owner_for_reconciliation(attempt.effect_id) is False
     assert grant.state is GrantState.EXPIRED
     assert attempt.state.value == "no_effect"
     records = effects.read_records()
@@ -161,9 +206,12 @@ def test_sibling_gateway_uses_originating_epoch_for_dead_owner_retirement(
     assert grant.state is GrantState.ACTIVE
 
     # Revocation in the originating epoch domain permanently kills retry
-    # authority; the sibling may then safely drive the exact durable closure.
+    # authority. Observation remains read-only; explicit settlement drives the
+    # exact durable closure under the original epoch domain.
     epoch.bump()
-    assert sibling.live_attempt_owns_effect(attempt.effect_id) is False
+    assert sibling.live_attempt_owns_effect(attempt.effect_id) is True
+    assert grant.state is GrantState.ACTIVE
+    assert sibling.settle_dead_prepermit_owner_for_reconciliation(attempt.effect_id) is False
     assert grant.state is GrantState.REVOKED
     assert [record.state for record in effects.read_records()] == [
         EffectState.RESERVED,
@@ -186,6 +234,7 @@ def test_minted_unconsumed_permit_is_never_auto_retired_by_live_owner_check(
     )
 
     assert sibling.live_attempt_owns_effect(attempt.effect_id) is True
+    assert sibling.settle_dead_prepermit_owner_for_reconciliation(attempt.effect_id) is True
     assert permit.consumed is False
     assert attempt.state.value == "reserved"
     assert [record.state for record in effects.read_records()] == [EffectState.RESERVED]
@@ -221,6 +270,7 @@ def test_failed_no_effect_report_retries_exact_closure_without_duplicate(
 
     # The fact may already be durable, but the gateway did not receive success;
     # ownership therefore remains conservative until exact re-durability wins.
+    assert gateway.settle_dead_prepermit_owner_for_reconciliation(attempt.effect_id) is True
     assert gateway.live_attempt_owns_effect(attempt.effect_id) is True
     assert failed_after_durable is True
     first_history = effects.read_records()
@@ -232,9 +282,57 @@ def test_failed_no_effect_report_retries_exact_closure_without_duplicate(
     assert closure_reason == "expired_before_permit"
 
     monkeypatch.setattr(effects, "append_durable", real_append)
+    assert gateway.settle_dead_prepermit_owner_for_reconciliation(attempt.effect_id) is False
     assert gateway.live_attempt_owns_effect(attempt.effect_id) is False
 
     final_history = effects.read_records()
     assert len(final_history) == 2
     assert final_history[-1].state is EffectState.NO_EFFECT
     assert final_history[-1].details["reason"] == closure_reason
+
+
+def test_show_target_is_read_only_then_resolution_preparation_settles_dead_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    cfg, intent, grant, attempt, effects, _epoch, gateway = _stack(
+        tmp_path,
+        grant_clock=clock,
+        grant_ttl_seconds=1.0,
+    )
+    _fail_first_reservation_fsync(monkeypatch, gateway, grant, attempt, intent)
+    clock.value = 11.0
+    session = _operator_session(cfg, effects, gateway)
+
+    before_bytes = effects.path.read_bytes() if effects.path.exists() else None
+    before_state = attempt.state
+
+    with pytest.raises(ReconciliationDenied) as show_exc:
+        session.show_target(attempt.effect_id)
+    assert show_exc.value.reason == "live_attempt_owned"
+
+    after_bytes = effects.path.read_bytes() if effects.path.exists() else None
+    assert after_bytes == before_bytes
+    assert attempt.state is before_state
+    assert grant.state is GrantState.ACTIVE
+    assert gateway.live_attempt_owns_effect(attempt.effect_id) is True
+
+    # Preparing an actual resolution is the explicit mutating lifecycle entry.
+    # It first proves/durably records NO_EFFECT, so no reconciliation proposal is
+    # needed for this effect afterward.
+    with pytest.raises(ReconciliationDenied) as prepare_exc:
+        session.prepare_resolution(
+            effect_id=attempt.effect_id,
+            verdict=ReconciliationVerdict.CONFIRMED_NO_EFFECT,
+            evidence=_evidence(),
+            evidence_summary="No external mutation authority was ever exposed.",
+        )
+    assert prepare_exc.value.reason == "invalid_target_state"
+    assert gateway.live_attempt_owns_effect(attempt.effect_id) is False
+    assert grant.state is GrantState.EXPIRED
+    assert attempt.state.value == "no_effect"
+    assert [record.state for record in effects.read_records()] == [
+        EffectState.RESERVED,
+        EffectState.NO_EFFECT,
+    ]

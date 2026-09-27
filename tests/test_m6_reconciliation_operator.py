@@ -1,0 +1,258 @@
+"""M6 Layer-4 explicit local operator workflow regressions."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from webwire.config import WebWireConfig
+from webwire.safety import (
+    ConfirmationState,
+    EffectLedger,
+    EffectLedgerRecord,
+    EffectState,
+    ReconciliationAuthority,
+    ReconciliationCoordinator,
+    ReconciliationDenied,
+    ReconciliationLedger,
+    ReconciliationOperatorError,
+    ReconciliationOperatorSession,
+    ReconciliationVerdict,
+    RecoveryGuard,
+    canonical_evidence_hash,
+)
+from webwire.safety.commit_gateway import CommitGateway
+from webwire.safety.execution_models import AuthorizationEpoch
+from webwire.safety.kill_switch import KillSwitch
+
+
+def _evidence() -> dict[str, object]:
+    return {
+        "basis": "local-operator-inspection",
+        "observed_at": "2026-09-26T19:20:00+00:00",
+        "observations": [{"kind": "state", "value": "present"}],
+    }
+
+
+def _session(
+    tmp_path: Path,
+    *,
+    monotonic_clock: Callable[[], float] | None = None,
+    authority_ttl_seconds: float = 120.0,
+) -> tuple[
+    ReconciliationOperatorSession,
+    ReconciliationLedger,
+    RecoveryGuard,
+]:
+    cfg = WebWireConfig(state_dir=tmp_path)
+    effects = EffectLedger(cfg)
+    reconciliations = ReconciliationLedger(path=cfg.reconciliations_path())
+    raw = EffectLedgerRecord(
+        effect_id="fx-operator",
+        semantic_key="remote-actor|like|post|123|",
+        state=EffectState.EFFECT_UNKNOWN,
+        action_type="like",
+        intent_hash="intent-operator",
+        policy_binding="policy-operator",
+        actor_id="remote-actor",
+        target_type="post",
+        target_id="123",
+        timestamp="2026-09-26T19:19:00+00:00",
+    )
+    effects.append_durable(raw)
+    guard = RecoveryGuard(effects, reconciliation_ledger=reconciliations)
+    guard.hydrate()
+    gateway = CommitGateway(
+        ledger=effects,
+        kill_switch=KillSwitch(cfg),
+        authorization_epoch=AuthorizationEpoch(),
+    )
+    coordinator = ReconciliationCoordinator(
+        recovery_guard=guard,
+        confirmation_state=ConfirmationState(),
+        commit_gateway=gateway,
+        reconciliation_id_factory=lambda: "rec-operator",
+        timestamp_factory=lambda: "2026-09-26T19:21:00+00:00",
+    )
+    clock = monotonic_clock if monotonic_clock is not None else (lambda: 10.0)
+    session = ReconciliationOperatorSession(
+        coordinator=coordinator,
+        operator_id="local-admin",
+        proposal_id_factory=lambda: "proposal-1",
+        monotonic_clock=clock,
+        authority_ttl_seconds=authority_ttl_seconds,
+    )
+    return session, reconciliations, guard
+
+
+def test_prepare_is_read_only_and_does_not_mint_authority(tmp_path: Path) -> None:
+    session, reconciliations, guard = _session(tmp_path)
+
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence=_evidence(),
+        evidence_summary="Observed the target state directly.",
+    )
+
+    assert proposal.effect_id == "fx-operator"
+    assert proposal.actor_id == "remote-actor"
+    assert proposal.operator_id == "local-admin"
+    assert proposal.actor_id != proposal.operator_id
+    assert proposal.confirmation_text.startswith(
+        "CONFIRM fx-operator CONFIRMED_EFFECT "
+    )
+    assert proposal.confirmation_text.endswith(" local-admin")
+    assert proposal.evidence_hash in proposal.confirmation_text
+    assert proposal.evidence_hash == canonical_evidence_hash(proposal.evidence)
+    assert reconciliations.read_authoritative() == []
+    assert guard.require_clear("remote-actor|like|post|123|", refresh=False) is not None
+
+
+def test_proposal_evidence_is_detached_from_caller_mutation(tmp_path: Path) -> None:
+    session, _reconciliations, _guard = _session(tmp_path)
+    evidence = _evidence()
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence=evidence,
+        evidence_summary="Observed target state.",
+    )
+
+    evidence["basis"] = "mutated-after-display"
+    detached = proposal.evidence
+    assert detached["basis"] == "local-operator-inspection"
+    assert canonical_evidence_hash(detached) == proposal.evidence_hash
+    detached["basis"] = "mutated-copy"
+    assert proposal.evidence["basis"] == "local-operator-inspection"
+
+
+def test_exact_same_session_confirmation_mints_one_authority(tmp_path: Path) -> None:
+    session, _reconciliations, _guard = _session(tmp_path)
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence=_evidence(),
+        evidence_summary="Observed target state.",
+    )
+
+    with pytest.raises(ReconciliationOperatorError) as exc_info:
+        session.confirm_resolution(
+            proposal.proposal_id,
+            confirmation_text="yes",
+        )
+    assert exc_info.value.reason == "confirmation_mismatch"
+
+    authority = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+    repeated = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+
+    assert repeated is authority
+    assert authority.effect_id == proposal.effect_id
+    assert authority.verdict is proposal.verdict
+    assert authority.evidence_hash == proposal.evidence_hash
+    assert authority.operator_id == "local-admin"
+
+
+def test_expired_uncommitted_authority_requires_fresh_confirmation(
+    tmp_path: Path,
+) -> None:
+    now = [10.0]
+    session, reconciliations, guard = _session(
+        tmp_path,
+        monotonic_clock=lambda: now[0],
+        authority_ttl_seconds=1.0,
+    )
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence=_evidence(),
+        evidence_summary="Observed target state.",
+    )
+    expired = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+    now[0] = 11.0
+
+    with pytest.raises(ReconciliationDenied) as exc_info:
+        session.resolve(proposal.proposal_id, authority=expired)
+    assert exc_info.value.reason == "authority_expired"
+    assert expired.committed is False
+    assert reconciliations.read_authoritative() == []
+
+    # M6 §10.1: expiry before persistence requires a fresh explicit operator
+    # confirmation. The immutable proposal/evidence may remain, but the expired
+    # authority cannot be reused or silently refreshed.
+    fresh = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+    assert fresh is not expired
+    assert fresh.effect_id == expired.effect_id
+    assert fresh.verdict is expired.verdict
+    assert fresh.evidence_hash == expired.evidence_hash
+    assert fresh.operator_id == expired.operator_id
+
+    resolution = session.resolve(proposal.proposal_id, authority=fresh)
+    assert resolution.record.reconciliation_id == "rec-operator"
+    assert fresh.consumed is True
+    assert len(reconciliations.read_authoritative()) == 1
+    assert guard.require_clear("remote-actor|like|post|123|", refresh=False) is None
+
+
+def test_confirmed_proposal_resolves_exact_fact_and_is_single_use(tmp_path: Path) -> None:
+    session, reconciliations, guard = _session(tmp_path)
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence=_evidence(),
+        evidence_summary="Observed target state.",
+    )
+    authority = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+
+    resolution = session.resolve(proposal.proposal_id, authority=authority)
+
+    assert resolution.record.reconciliation_id == "rec-operator"
+    assert resolution.record.operator_id == "local-admin"
+    assert resolution.record.actor_id == "remote-actor"
+    assert resolution.record.evidence_hash == proposal.evidence_hash
+    assert authority.consumed is True
+    assert len(reconciliations.read_authoritative()) == 1
+    assert guard.require_clear("remote-actor|like|post|123|", refresh=False) is None
+
+    with pytest.raises(ReconciliationOperatorError) as exc_info:
+        session.resolve(proposal.proposal_id, authority=authority)
+    assert exc_info.value.reason == "proposal_resolved"
+
+
+def test_unconfirmed_proposal_cannot_resolve(tmp_path: Path) -> None:
+    session, _reconciliations, _guard = _session(tmp_path)
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_NO_EFFECT,
+        evidence=_evidence(),
+        evidence_summary="Observed target absence with domain proof.",
+    )
+
+    rogue = ReconciliationAuthority(
+        effect_id=proposal.effect_id,
+        verdict=proposal.verdict,
+        evidence_hash=proposal.evidence_hash,
+        operator_id="local-admin",
+        _protocol_key=object(),
+        monotonic_clock=lambda: 10.0,
+    )
+    with pytest.raises(ReconciliationOperatorError) as exc_info:
+        session.resolve(proposal.proposal_id, authority=rogue)
+    assert exc_info.value.reason == "proposal_not_confirmed"

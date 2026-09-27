@@ -356,6 +356,31 @@ class CommitGateway:
             },
         )
 
+    @staticmethod
+    def _owner_authority_dead_reason(owner: _LiveEffectOwner) -> Optional[str]:
+        grant = owner.grant
+        try:
+            with grant.claim_fence(owner.attempt.attempt_id):
+                with owner.authorization_epoch.fence() as current_epoch:
+                    try:
+                        grant.validate_live(
+                            intent_hash=owner.snapshot.intent_hash,
+                            actor_id=owner.snapshot.actor_id,
+                            policy_binding=owner.policy_binding,
+                            authorization_epoch=current_epoch,
+                        )
+                    except GrantClaimDenied as exc:
+                        if grant.state in (
+                            GrantState.EXPIRED,
+                            GrantState.REVOKED,
+                            GrantState.SPENT,
+                        ):
+                            return exc.reason
+                        return None
+                    return None
+        except GrantClaimDenied:
+            return None
+
     def _retire_dead_prepermit_owner_if_possible(self, effect_id: str) -> None:
         """Durably retire authority-dead owners before reconciliation blocks forever.
 
@@ -366,9 +391,11 @@ class CommitGateway:
         durable NO_EFFECT closure. If any durability step fails, ownership stays
         registered and reconciliation remains conservatively blocked.
 
-        A RESERVED owner with no exposed permit is also safe to close: reservation
-        durability was already established, while no external mutation authority
-        ever left the gateway. Exposed permits are never auto-closed here.
+        Once pre-permit closure has begun (for example, kill or liveness denial),
+        the exact closure may continue even if the grant itself is still ACTIVE.
+        Otherwise a still-live RESERVED owner remains a live attempt and cannot be
+        abandoned merely because reconciliation asked whether it owns the effect.
+        Exposed permits are never auto-closed here.
         """
         owner = self._live_effect_attempts.get(effect_id)
         if owner is None or owner.permit_minted:
@@ -376,12 +403,17 @@ class CommitGateway:
 
         attempt = owner.attempt
         grant = owner.grant
-
-        if attempt.state is AttemptState.RESERVED:
+        reason = owner.closure_reason
+        if reason is None:
+            dead_reason = self._owner_authority_dead_reason(owner)
+            if dead_reason is None:
+                return
             reason = self._set_live_effect_closure_reason(
                 attempt,
-                "prepermit_authority_abandoned",
+                f"{dead_reason}_before_permit",
             )
+
+        if attempt.state is AttemptState.RESERVED:
             try:
                 self._close_reserved_before_permit(
                     grant=grant,
@@ -398,63 +430,40 @@ class CommitGateway:
         if attempt.state is not AttemptState.PREPARING or not attempt.reservation_started:
             return
 
-        dead_reason: Optional[str] = None
+        try:
+            self._ledger.append_durable(
+                self._reservation_record(
+                    grant=grant,
+                    attempt=attempt,
+                    snapshot=owner.snapshot,
+                    policy_binding=owner.policy_binding,
+                )
+            )
+        except EffectLedgerError:
+            # Reservation may still be ambiguous; retain ownership and retry the
+            # exact RESERVED fact on the next lifecycle check.
+            return
         try:
             with grant.claim_fence(attempt.attempt_id):
-                with owner.authorization_epoch.fence() as current_epoch:
-                    try:
-                        grant.validate_live(
-                            intent_hash=owner.snapshot.intent_hash,
-                            actor_id=owner.snapshot.actor_id,
-                            policy_binding=owner.policy_binding,
-                            authorization_epoch=current_epoch,
-                        )
-                    except GrantClaimDenied as exc:
-                        if grant.state in (
-                            GrantState.EXPIRED,
-                            GrantState.REVOKED,
-                            GrantState.SPENT,
-                        ):
-                            dead_reason = exc.reason
-                        else:
-                            return
-                    else:
-                        return
-
-                assert dead_reason is not None
-                reason = self._set_live_effect_closure_reason(
-                    attempt,
-                    f"{dead_reason}_before_permit",
-                )
-                try:
-                    self._ledger.append_durable(
-                        self._reservation_record(
-                            grant=grant,
-                            attempt=attempt,
-                            snapshot=owner.snapshot,
-                            policy_binding=owner.policy_binding,
-                        )
-                    )
-                except EffectLedgerError:
-                    # Reservation may still be ambiguous; retain ownership and
-                    # retry the exact RESERVED fact on the next lifecycle check.
-                    return
                 attempt.mark_reserved(grant)
-                try:
-                    self._close_reserved_before_permit(
-                        grant=grant,
-                        attempt=attempt,
-                        snapshot=owner.snapshot,
-                        policy_binding=owner.policy_binding,
-                        reason=reason,
-                    )
-                except GatewayDenied:
-                    # RESERVED is now durable, but NO_EFFECT closure is not yet
-                    # known durable. Preserve ownership/reason for exact retry.
-                    return
-        except GrantClaimDenied:
-            # Lost claim ownership is an invariant failure from this registry's
-            # perspective. Do not infer NO_EFFECT; leave the safety block intact.
+        except (GrantClaimDenied, Exception) as exc:
+            # `mark_reserved` should be infallible for the canonical owner after
+            # reservation durability succeeds. Fail closed instead of inferring
+            # a terminal state if internal lineage was corrupted.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            return
+        try:
+            self._close_reserved_before_permit(
+                grant=grant,
+                attempt=attempt,
+                snapshot=owner.snapshot,
+                policy_binding=owner.policy_binding,
+                reason=reason,
+            )
+        except GatewayDenied:
+            # RESERVED is now durable, but NO_EFFECT closure is not yet known
+            # durable. Preserve ownership/reason for exact retry.
             return
 
     def live_attempt_owns_effect(self, effect_id: str) -> bool:

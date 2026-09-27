@@ -14,6 +14,7 @@ from webwire.safety import (
     EffectState,
     ReconciliationAuthority,
     ReconciliationCoordinator,
+    ReconciliationDenied,
     ReconciliationLedger,
     ReconciliationOperatorError,
     ReconciliationOperatorSession,
@@ -34,7 +35,12 @@ def _evidence() -> dict[str, object]:
     }
 
 
-def _session(tmp_path: Path) -> tuple[
+def _session(
+    tmp_path: Path,
+    *,
+    monotonic_clock: object | None = None,
+    authority_ttl_seconds: float = 120.0,
+) -> tuple[
     ReconciliationOperatorSession,
     ReconciliationLedger,
     RecoveryGuard,
@@ -69,11 +75,13 @@ def _session(tmp_path: Path) -> tuple[
         reconciliation_id_factory=lambda: "rec-operator",
         timestamp_factory=lambda: "2026-09-26T19:21:00+00:00",
     )
+    clock = monotonic_clock if monotonic_clock is not None else (lambda: 10.0)
     session = ReconciliationOperatorSession(
         coordinator=coordinator,
         operator_id="local-admin",
         proposal_id_factory=lambda: "proposal-1",
-        monotonic_clock=lambda: 10.0,
+        monotonic_clock=clock,  # type: ignore[arg-type]
+        authority_ttl_seconds=authority_ttl_seconds,
     )
     return session, reconciliations, guard
 
@@ -150,6 +158,53 @@ def test_exact_same_session_confirmation_mints_one_authority(tmp_path: Path) -> 
     assert authority.verdict is proposal.verdict
     assert authority.evidence_hash == proposal.evidence_hash
     assert authority.operator_id == "local-admin"
+
+
+def test_expired_uncommitted_authority_requires_fresh_confirmation(
+    tmp_path: Path,
+) -> None:
+    now = [10.0]
+    session, reconciliations, guard = _session(
+        tmp_path,
+        monotonic_clock=lambda: now[0],
+        authority_ttl_seconds=1.0,
+    )
+    proposal = session.prepare_resolution(
+        effect_id="fx-operator",
+        verdict=ReconciliationVerdict.CONFIRMED_EFFECT,
+        evidence=_evidence(),
+        evidence_summary="Observed target state.",
+    )
+    expired = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+    now[0] = 11.0
+
+    with pytest.raises(ReconciliationDenied) as exc_info:
+        session.resolve(proposal.proposal_id, authority=expired)
+    assert exc_info.value.reason == "authority_expired"
+    assert expired.committed is False
+    assert reconciliations.read_authoritative() == []
+
+    # M6 §10.1: expiry before persistence requires a fresh explicit operator
+    # confirmation. The immutable proposal/evidence may remain, but the expired
+    # authority cannot be reused or silently refreshed.
+    fresh = session.confirm_resolution(
+        proposal.proposal_id,
+        confirmation_text=proposal.confirmation_text,
+    )
+    assert fresh is not expired
+    assert fresh.effect_id == expired.effect_id
+    assert fresh.verdict is expired.verdict
+    assert fresh.evidence_hash == expired.evidence_hash
+    assert fresh.operator_id == expired.operator_id
+
+    resolution = session.resolve(proposal.proposal_id, authority=fresh)
+    assert resolution.record.reconciliation_id == "rec-operator"
+    assert fresh.consumed is True
+    assert len(reconciliations.read_authoritative()) == 1
+    assert guard.require_clear("remote-actor|like|post|123|", refresh=False) is None
 
 
 def test_confirmed_proposal_resolves_exact_fact_and_is_single_use(tmp_path: Path) -> None:

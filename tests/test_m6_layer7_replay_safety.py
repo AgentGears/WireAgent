@@ -42,10 +42,19 @@ class _CDP:
     def __init__(self, page: _LikePage) -> None:
         self.page = page
 
+    @staticmethod
+    def _assert_authority_predicate(expr: str) -> None:
+        assert "getClientRects().length" in expr
+        assert "getComputedStyle(el)" in expr
+        assert "visibility==='hidden'" in expr
+        assert "pointerEvents==='none'" in expr
+        assert "aria-disabled" in expr
+        assert "matches(':disabled')" in expr
+        assert "closest('article')===art" in expr
+
     async def evaluate(self, expr: str) -> ActionResult:
         if "m6-layer7-like-state:123" in expr:
-            assert "getClientRects().length" in expr
-            assert "closest('article')===art" in expr
+            self._assert_authority_predicate(expr)
             assert "likes.length===1&&unlikes.length===0" in expr
             assert "unlikes.length===1&&likes.length===0" in expr
             state = self.page.next_probe_state()
@@ -54,8 +63,7 @@ class _CDP:
             return ok_result(data={"result": {"value": value}})
 
         if "m6-layer7-like-click-like:123" in expr:
-            assert "getClientRects().length" in expr
-            assert "closest('article')===art" in expr
+            self._assert_authority_predicate(expr)
             assert "expected.length!==1||opposite.length!==0" in expr
             self.page.events.append(f"click_attempt:like:{self.page.state}")
             if self.page.state == "not_liked":
@@ -69,8 +77,7 @@ class _CDP:
             return ok_result(data={"result": {"value": value}})
 
         if "m6-layer7-like-click-unlike:123" in expr:
-            assert "getClientRects().length" in expr
-            assert "closest('article')===art" in expr
+            self._assert_authority_predicate(expr)
             assert "expected.length!==1||opposite.length!==0" in expr
             self.page.events.append(f"click_attempt:unlike:{self.page.state}")
             if self.page.state == "liked":
@@ -172,6 +179,10 @@ async def test_already_satisfied_direction_is_zero_gate_zero_mutation(
         "neither",
         "hidden_like",
         "hidden_unlike",
+        "css_hidden_like",
+        "css_hidden_unlike",
+        "disabled_like",
+        "disabled_unlike",
         "nested_like",
         "nested_unlike",
         "duplicate_like",
@@ -234,6 +245,10 @@ async def test_hydration_transition_is_bounded_and_uses_conclusive_direction(
         ("click_unlike", "liked", "both"),
         ("click_like", "not_liked", "hidden_like"),
         ("click_unlike", "liked", "hidden_unlike"),
+        ("click_like", "not_liked", "css_hidden_like"),
+        ("click_unlike", "liked", "css_hidden_unlike"),
+        ("click_like", "not_liked", "disabled_like"),
+        ("click_unlike", "liked", "disabled_unlike"),
         ("click_like", "not_liked", "nested_like"),
         ("click_unlike", "liked", "nested_unlike"),
         ("click_like", "not_liked", "duplicate_like"),

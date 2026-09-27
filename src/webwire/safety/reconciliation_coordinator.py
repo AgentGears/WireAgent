@@ -304,42 +304,66 @@ class ReconciliationCoordinator:
             if item.unresolved
         )
 
-    def describe_target(self, effect_id: str) -> ReconciliationTarget:
-        """Return one displayable target, denying any current live owner.
+    def _describe_target_locked(self, effect_id: str) -> ReconciliationTarget:
+        """Describe a target while publication/protocol/lifecycle fences are held."""
+        if self._gateway.live_attempt_owns_effect(effect_id):
+            raise ReconciliationDenied("live_attempt_owned", effect_id)
+        if effect_id in self._committed_by_effect:
+            raise ReconciliationDenied(
+                "committed_resolution_in_progress",
+                effect_id,
+            )
+        projection = self._guard.projector.project()
+        for item in projection:
+            if item.effect_id != effect_id:
+                continue
+            if not item.unresolved:
+                raise ReconciliationDenied(
+                    "invalid_target_state",
+                    item.disposition.value,
+                )
+            return ReconciliationTarget(
+                effect_id=item.effect_id,
+                first_record=item.first_record,
+                last_record=item.last_record,
+                projection=item,
+            )
+        raise ReconciliationDenied("unknown_effect_id", effect_id)
 
-        Operator confirmation must not be staged against evidence that predates
-        completion of the same in-process M5 attempt. A same-process committed
-        persistence continuation also owns the target until it completes; a new
-        proposal cannot replace that already-started immutable fact.
+    def describe_target(self, effect_id: str) -> ReconciliationTarget:
+        """Return one displayable target without mutating M5 lifecycle history.
+
+        Read-only list/show/inspect paths may observe live ownership but must not
+        refresh grant liveness, append NO_EFFECT, or terminalize an M5 attempt.
+        A same-process committed persistence continuation also owns the target
+        until it completes.
         """
         if not isinstance(effect_id, str) or not effect_id:
             raise ReconciliationDenied("invalid_effect_id")
         with self._publication_fence:
             with self._protocol_lock:
                 with self._gateway.reconciliation_lifecycle_fence():
-                    if self._gateway.live_attempt_owns_effect(effect_id):
+                    return self._describe_target_locked(effect_id)
+
+    def prepare_resolution_target(self, effect_id: str) -> ReconciliationTarget:
+        """Enter the mutating resolution workflow and settle dead pre-permit owners.
+
+        Unlike display-only ``describe_target()``, resolution preparation may
+        perform gateway-owned lifecycle bookkeeping. A provably authority-dead
+        owner is durably closed as NO_EFFECT before a proposal can be staged.
+        If closure cannot be proven/durable, live ownership remains and the
+        resolution fails closed.
+        """
+        if not isinstance(effect_id, str) or not effect_id:
+            raise ReconciliationDenied("invalid_effect_id")
+        with self._publication_fence:
+            with self._protocol_lock:
+                with self._gateway.reconciliation_lifecycle_fence():
+                    if self._gateway.settle_dead_prepermit_owner_for_reconciliation(
+                        effect_id
+                    ):
                         raise ReconciliationDenied("live_attempt_owned", effect_id)
-                    if effect_id in self._committed_by_effect:
-                        raise ReconciliationDenied(
-                            "committed_resolution_in_progress",
-                            effect_id,
-                        )
-                    projection = self._guard.projector.project()
-                    for item in projection:
-                        if item.effect_id != effect_id:
-                            continue
-                        if not item.unresolved:
-                            raise ReconciliationDenied(
-                                "invalid_target_state",
-                                item.disposition.value,
-                            )
-                        return ReconciliationTarget(
-                            effect_id=item.effect_id,
-                            first_record=item.first_record,
-                            last_record=item.last_record,
-                            projection=item,
-                        )
-        raise ReconciliationDenied("unknown_effect_id", effect_id)
+                    return self._describe_target_locked(effect_id)
 
     @staticmethod
     def _history_target(
@@ -440,7 +464,9 @@ class ReconciliationCoordinator:
         with self._publication_fence:
             with self._protocol_lock:
                 with self._gateway.reconciliation_lifecycle_fence():
-                    if self._gateway.live_attempt_owns_effect(effect_id):
+                    if self._gateway.settle_dead_prepermit_owner_for_reconciliation(
+                        effect_id
+                    ):
                         raise ReconciliationDenied("live_attempt_owned", effect_id)
 
                     try:

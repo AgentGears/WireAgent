@@ -247,7 +247,7 @@ class EffectLedger:
 
     @classmethod
     def _lock_for_path(cls, path: Path) -> Any:
-        key = str(path.resolve(strict=False))
+        key = os.path.normcase(str(path.resolve(strict=False)))
         with cls._path_locks_guard:
             lock = cls._path_locks.get(key)
             if lock is None:
@@ -445,17 +445,30 @@ class EffectLedger:
 
         Unlike the audit journal, malformed content and impossible histories
         are not skipped. Losing or contradicting a safety fact could permit
-        replay, so corruption fails closed.
+        replay, so corruption fails closed. A non-empty file must end at the
+        canonical NDJSON record boundary; complete JSON without the terminal
+        newline is still a torn append and cannot be trusted.
         """
         with self._lock:
             if not self._path.exists():
                 return []
             try:
-                lines = self._path.read_text(encoding="utf-8").splitlines()
+                text = self._path.read_text(encoding="utf-8")
+            except UnicodeError as exc:
+                raise EffectLedgerCorruptError(
+                    "effect ledger is not valid UTF-8"
+                ) from exc
             except OSError as exc:
                 raise EffectLedgerError(
                     f"effect ledger read failed: {exc!r}"
                 ) from exc
+
+            if text and not text.endswith("\n"):
+                raise EffectLedgerCorruptError(
+                    "effect ledger torn tail is not valid JSON record framing: "
+                    "missing terminal newline"
+                )
+            lines = text.splitlines()
 
             records: list[EffectLedgerRecord] = []
             for lineno, line in enumerate(lines, start=1):

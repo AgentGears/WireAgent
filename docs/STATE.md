@@ -18,7 +18,7 @@
 ## Current version
 
 **v0.3 stabilized live path + M5 effect-transaction boundary complete + M6
-reconciliation Layers 1–5 implemented/qualified.**
+reconciliation Layers 1–6 implemented/qualified.**
 
 Canonical M5 runtime baseline after the full M5 build order:
 
@@ -42,21 +42,23 @@ Normative M5 contract: `docs/M5_DESIGN.md`. Final Layer-7 boundary and evidence:
 `docs/M5_LAYER7_PLAN.md`.
 
 M6 builds orthogonal reconciliation history and qualification on top of the M5
-transaction boundary. The first four implementation layers are merged on main:
+transaction boundary:
 
 ```text
-1. ReconciliationRecord + ReconciliationLedger             MERGED  PR #11  ec077eaeacf9f5928f32276eba102f5848682236
-2. Composite RecoveryProjector + publication fence          MERGED  PR #12  cc3aac43f2085c6338dffaec465a129b1da317f1
-3. Confirmation epoch + monotonic confirmation authority    MERGED  PR #13  4bbca5e2f8b2388336c8274c5de45fd16595e2da
-4. ReconciliationAuthority + coordinator/operator workflow  MERGED  PR #14  0f40959ea74fe8f8ddeb77c5474512c5bccb9c18
-5. Fault/restart/corruption/concurrency qualification       QUALIFIED  PR #15 candidate
-6. Windows durability qualification                         NEXT
+1. ReconciliationRecord + ReconciliationLedger             MERGED     PR #11  ec077eaeacf9f5928f32276eba102f5848682236
+2. Composite RecoveryProjector + publication fence          MERGED     PR #12  cc3aac43f2085c6338dffaec465a129b1da317f1
+3. Confirmation epoch + monotonic confirmation authority    MERGED     PR #13  4bbca5e2f8b2388336c8274c5de45fd16595e2da
+4. ReconciliationAuthority + coordinator/operator workflow  MERGED     PR #14  0f40959ea74fe8f8ddeb77c5474512c5bccb9c18
+5. Fault/restart/corruption/concurrency qualification       MERGED     PR #15  e1e3eeb679cf54b5707c88b0e82e3db4a04d9319
+6. Windows durability qualification                         QUALIFIED  PR #16 candidate
 7. Evidence-driven replay-safety qualification              PLANNED
 ```
 
-Normative M6 contract: `docs/M6_DESIGN.md`. Layer 5 is qualification, not a new
-feature layer: production code changes only if fault/restart/concurrency evidence
-falsifies an existing invariant.
+Normative M6 contract: `docs/M6_DESIGN.md`. Layer 5 and Layer 6 are qualification
+layers: production code changes only when the target-platform/fault evidence
+falsifies an existing invariant. Layer 6 found and corrected three EffectLedger
+portability/corruption defects while keeping the Windows persistence claim
+strictly bounded to the environment and primitives actually tested.
 
 ## Architecture invariants — do not violate
 
@@ -144,9 +146,12 @@ falsifies an existing invariant.
 29. **M6 authority and writer coordination remain process-local.** Same-path
     objects share canonical in-process fences/registries; concurrent independent
     processes are outside the current claim.
-30. **Qualification claims stay bounded.** Ubuntu CI fault/restart/concurrency
-    evidence does not establish Windows filesystem durability or justify a
-    like/unlike replay-policy promotion; those are separate Layers 6 and 7.
+30. **Qualification claims stay bounded.** Layer-6 evidence establishes the two
+    safety-ledger protocol on the tested GitHub-hosted Windows Server 2025 /
+    CPython 3.11/3.12 environment. It does not establish portable directory-entry
+    durability, arbitrary storage-stack semantics, whole-browser Windows
+    qualification, cross-process linearizability, or a like/unlike replay-policy
+    promotion.
 
 ## M5 — completed transaction boundary
 
@@ -216,14 +221,16 @@ publication fence
   -> refresh/publish RecoveryGuard composite projection
 ```
 
-Layer-5 qualification now adds genuine fresh-process crash/restart coverage and
+Layer-5 qualification adds genuine fresh-process crash/restart coverage and
 integrated publication/concurrency tests rather than treating object
 reconstruction inside one pytest interpreter as equivalent to process death.
-The candidate explicitly exercises durable reconciliation followed by a hard
-process exit before guard publication, startup re-durability success/failure,
-clean no-row persistence failure across restart, competing terminal verdicts,
-write-vs-reconciliation publication orderings, journal non-authority, and
-reconciliation-fact retention.
+Layer-6 qualification adds actual Windows Server 2025 runs for both safety
+ledgers. On CPython 3.11.9 and 3.12.10, the focused Windows suite qualifies
+nested path creation, writable-handle `os.fsync`, exact-fact re-durability,
+startup reconciliation re-durability, ambiguity handling, normalized same-path
+identity, corruption/torn-tail fail-closed behavior, and fresh-process composite
+recovery. The parent-directory hook remains an explicit Windows no-op; no
+portable directory-fsync or broader storage-stack guarantee is claimed.
 
 ## Phase plan
 
@@ -244,8 +251,8 @@ reconciliation-fact retention.
 | M6 L2 | composite RecoveryProjector + publication fence | MERGED — PR #12 |
 | M6 L3 | confirmation epoch + monotonic token authority | MERGED — PR #13 |
 | M6 L4 | reconciliation authority + coordinator/operator workflow | MERGED — PR #14 |
-| M6 L5 | crash/fault/restart/corruption/concurrency qualification | QUALIFIED — PR #15 candidate |
-| M6 L6 | Windows durability qualification for both safety ledgers | NEXT |
+| M6 L5 | crash/fault/restart/corruption/concurrency qualification | MERGED — PR #15 |
+| M6 L6 | Windows durability qualification for both safety ledgers | QUALIFIED — PR #16 candidate |
 | M6 L7 | evidence-driven replay-safety qualification | PLANNED |
 
 ## Capabilities
@@ -319,9 +326,6 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 - [ ] **Cross-process effect/reconciliation/browser coordination:** the current
   safety contract is intentionally single-process. Concurrent independent
   recovery/runtime processes are unsupported.
-- [ ] **Windows durability qualification:** current CI evidence is Ubuntu; M6
-  Layer 6 must qualify both safety ledgers on the target Windows platform and
-  keep claims bounded to what the platform evidence supports.
 - [ ] **Like/unlike replay-safety proof:** remains conservative
   `UNKNOWN`/`REQUIRED` pending broker-level state-preserving evidence; M6 Layer 7
   may investigate but does not presume promotion.
@@ -355,25 +359,36 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
-- **2026-09-27 — M6 Layer 5 qualification candidate (PR #15).** Started from
-  exact merged Layer-4 baseline `0f40959ea74fe8f8ddeb77c5474512c5bccb9c18`.
-  Maintainer-first review found that existing restart/startup tests reconstructed
-  Python objects in one interpreter rather than proving process-death semantics;
-  that R39 lacked an integrated WriteKernel ↔ reconciliation publication race;
-  and that R25 journal non-authority / R44 retention lacked direct Layer-5
-  acceptance regressions. The candidate adds real subprocess restart/crash
-  qualification, including an `os._exit()` cut after known-durable
-  reconciliation but before guard publication, startup re-durability
-  success/failure, fresh-confirmation recovery after a clean no-row failure,
-  integrated publication-order races, competing verdict concurrency, forged
-  journal non-authority, and durable reconciliation retention. Review of the
-  first green candidate also caught a vacuous restart assertion: it observed an
-  empty fresh ConfirmationState without first proving a pending token existed.
-  The restart scenario now explicitly creates a pre-reconciliation token and
-  verifies that the recorded token cannot authorize in the fresh process. CI on
-  the qualification candidate has reached **931 tests** with Python 3.11/3.12,
-  Ruff clean, and mypy clean across 84 source files; exact-head revalidation is
-  repeated after each review-driven correction.
+- **2026-09-27 — M6 Layer 6 Windows durability qualification candidate (PR #16).**
+  Started from exact merged Layer-5 baseline
+  `e1e3eeb679cf54b5707c88b0e82e3db4a04d9319`. The frozen maintainer-first
+  review found: no actual Windows CI evidence; EffectLedger same-path lock
+  identity missing `normcase`; EffectLedger accepting a complete JSON record
+  without the append protocol's terminal newline; invalid UTF-8 escaping the
+  ledger-corruption exception contract; and a required Windows claim ceiling
+  because the parent-directory fsync hook is intentionally a no-op. The
+  candidate corrects the three production defects and adds actual
+  `windows-latest` CPython 3.11/3.12 qualification. CI #457 on candidate
+  `71b365d18d6e6d07462e758e42f176f71a4e9c7b` is green: Windows Server 2025
+  (10.0.26100, `windows-2025-vs2026`) ran **147 focused safety-ledger tests** on
+  both Python 3.11.9 and 3.12.10; the Ubuntu full gate ran **936 passed, 6
+  Windows-only skipped** on both Python 3.11.16 and 3.12.14, with Ruff clean and
+  mypy clean across 84 source files. The qualified claim is limited to the
+  tested file-handle fsync/re-durability/restart/corruption/path-identity
+  protocol; it does not claim portable directory-entry durability, arbitrary
+  storage-stack semantics, whole-browser Windows qualification, or
+  cross-process linearizability. Close-out documentation is revalidated again
+  at exact head before review/merge.
+- **2026-09-27 — M6 Layer 5 merged (PR #15).** Final qualification head
+  `0b4eca6646fc7c95af45bdc960c2dc3d4c9c450f`; CI #452 green on Python
+  3.11/3.12 with **933 tests**, Ruff clean, and mypy clean across 84 source files.
+  The maintainer-first/exact-head review added genuine subprocess restart/crash
+  qualification, integrated R39 publication races, direct R25/R44 acceptance
+  evidence, a real pre-crash pending-token proof, and same-path sibling
+  coordinator serialization/confirmation-domain qualification. No independent
+  Codex/GitWire action was exposed, so the frozen-design fallback was a distinct
+  recorded adversarial second pass with zero additional production findings.
+  Squash merge: `e1e3eeb679cf54b5707c88b0e82e3db4a04d9319`.
 - **2026-09-27 — M6 Layer 4 merged (PR #14).** Squash merge
   `0f40959ea74fe8f8ddeb77c5474512c5bccb9c18`. Added explicit local operator
   `ReconciliationAuthority`, terminal `ReconciliationCoordinator`, narrow

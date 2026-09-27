@@ -13,6 +13,13 @@ import os
 import sys
 from pathlib import Path
 
+# Match tests/conftest.py when CI installs WireAgent with --no-deps.  A fresh
+# Python process does not execute pytest conftest hooks before importing webwire.
+try:
+    import super_browser  # noqa: F401
+except ImportError:  # pragma: no cover - CI-only subprocess path
+    sys.path.insert(0, str(Path(__file__).parent / "stubs"))
+
 from webwire.config import WebWireConfig
 from webwire.safety import (
     ConfirmationState,
@@ -164,7 +171,11 @@ def probe_guard(state_dir: Path) -> None:
     guard = RecoveryGuard(EffectLedger(cfg))
     status = guard.hydrate()
     block = guard.require_clear(_SEMANTIC_KEY, refresh=False)
-    effective_states = [] if block is None else [item.effective_state.value for item in block.effects]
+    effective_states = (
+        []
+        if block is None
+        else [item.effective_state.value for item in block.effects]
+    )
     new_confirmations = ConfirmationState()
     _emit(
         {

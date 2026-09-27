@@ -13,10 +13,10 @@ from typing import Any, Optional
 from webwire.config import WebWireConfig
 from webwire.m5_leased_read_broker import M5LeasedReadBroker
 from webwire.m5_leased_write_broker import M5LeasedWriteBroker
+from webwire.m6_replay_qualified_write_broker import M6ReplayQualifiedWriteBroker
 from webwire.safety.commit_gateway import CommitGateway
 from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES, EffectPolicyRegistry
 from webwire.safety.kill_switch import KillSwitch
-from webwire.safety.m5_actor_bound_evidence import M5ActorBoundEvidenceReader
 from webwire.safety.m5_actor_bound_media_executor import M5ActorBoundMediaExecutor
 from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
 from webwire.safety.m5_authority_factory import (
@@ -34,6 +34,7 @@ from webwire.safety.m5_media_executor import M5MediaExecutor
 from webwire.safety.m5_post_text_executor import M5PostTextExecutor
 from webwire.safety.m5_quote_executor import M5QuoteExecutor
 from webwire.safety.m5_reply_executor import M5ReplyExecutor
+from webwire.safety.m6_replay_qualified_evidence import M6ReplayQualifiedEvidenceReader
 from webwire.safety.scoped_authority import ScopedAuthorityBroker
 
 __all__ = ["M5LiveExecutionStack", "build_live_m5_execution_stack"]
@@ -76,6 +77,8 @@ def build_live_m5_execution_stack(
     write_broker = build_live_m5_write_broker(super_browser, kill_switch)
     if read_broker._m5_write_state is not write_broker._m5_write_state:
         raise RuntimeError("live M5 read/write brokers do not share browser lease state")
+    if not isinstance(write_broker, M6ReplayQualifiedWriteBroker):
+        raise RuntimeError("live M5 stack requires the Layer-7 qualified write broker")
     scoped_authority = build_live_scoped_authority_broker(
         write_broker,
         commit_gateway,
@@ -86,10 +89,11 @@ def build_live_m5_execution_stack(
         commit_gateway=commit_gateway,
         policies=policies,
     )
-    # Supported live content verification is actor-bound.  The generic reader
-    # remains available to isolated tests, but live post/media confirmation must
-    # prove direct status ownership and return the observed actor.
-    evidence_reader = M5ActorBoundEvidenceReader(write_broker)
+    # Supported live content verification is actor-bound. The Layer-7 reader
+    # preserves that evidence surface and additionally routes like-state terminal
+    # evidence through the same qualified directional-state semantics used by the
+    # mutation broker. Generic Layer-5 readers remain available to isolated tests.
+    evidence_reader = M6ReplayQualifiedEvidenceReader(write_broker)
     media_evidence_reader = M5LeasedMediaEvidenceReader(write_broker)
     delete_evidence_reader = M5LeasedDeleteEvidenceReader(write_broker)
     effect_executor = M5EffectExecutor(

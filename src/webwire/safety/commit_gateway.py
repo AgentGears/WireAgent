@@ -465,12 +465,25 @@ class CommitGateway:
             return
 
     def live_attempt_owns_effect(self, effect_id: str) -> bool:
-        """Return canonical live ownership after safe dead-authority retirement.
+        """Return canonical registered live ownership without lifecycle mutation.
 
-        Registration is authoritative. Before reporting a block, the gateway may
-        durably retire a pre-permit owner that provably cannot resume and never
-        exposed an EffectPermit. Any failure to establish durable NO_EFFECT keeps
-        the owner registered and therefore keeps reconciliation fail-closed.
+        This observer is safe for read-only operator display. It does not refresh
+        grant liveness, write either safety ledger, or terminalize an attempt.
+        Explicit reconciliation preparation/resolution may separately request
+        dead pre-permit settlement through the method below.
+        """
+        if not isinstance(effect_id, str) or not effect_id:
+            raise ValueError("effect_id must be a non-empty string")
+        with self._protocol_lock:
+            return effect_id in self._live_effect_attempts
+
+    def settle_dead_prepermit_owner_for_reconciliation(self, effect_id: str) -> bool:
+        """Explicitly attempt durable retirement of an authority-dead live owner.
+
+        Returns whether canonical live ownership remains after the attempt. This
+        is intentionally mutating lifecycle maintenance and must not be called by
+        read-only list/show/inspect paths. Any inability to prove and durably
+        record NO_EFFECT leaves ownership registered and therefore fail-closed.
         """
         if not isinstance(effect_id, str) or not effect_id:
             raise ValueError("effect_id must be a non-empty string")

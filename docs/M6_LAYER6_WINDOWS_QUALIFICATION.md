@@ -1,7 +1,7 @@
 # M6 Layer 6 — Windows Durability Qualification
 
 ```text
-Status: PLATFORM EVIDENCE GREEN — CLOSE-OUT REVIEW / EXACT-HEAD REVALIDATION PENDING
+Status: ADVERSARIAL FINDING RECONCILED — FINAL EXACT-HEAD REVALIDATION PENDING
 Baseline: e1e3eeb679cf54b5707c88b0e82e3db4a04d9319
 Scope: M6_DESIGN.md §17, R46, invariant 34, build-order layer 6
 ```
@@ -169,9 +169,48 @@ Ubuntu full regression gate, Python 3.12.14
   mypy clean across 84 source files
 ```
 
-This is actual target-platform evidence for the tested GitHub-hosted Windows
-Server 2025 / CPython combinations. Close-out documentation changes after this
-candidate require another exact-head four-job CI run before review/merge.
+Close-out documentation was then added. Exact-head CI #460 on
+`2b9c1b6624b3ff05051f1fdbe600b478aa5b36b6` revalidated that complete candidate
+with all four jobs green and the same evidence counts:
+
+```text
+Windows Server 2025 / windows-2025-vs2026
+  CPython 3.11.9: 147 passed
+  CPython 3.12.10: 147 passed
+
+Ubuntu 24.04
+  CPython 3.11.16: 936 passed, 6 Windows-only skipped; Ruff clean; mypy clean
+  CPython 3.12.14: 936 passed, 6 Windows-only skipped; Ruff clean; mypy clean
+```
+
+## Distinct adversarial second pass
+
+No general Codex/GitWire correctness-review integration was exposed by the
+available review/plugin surface, so the `M6_DESIGN.md` §21 fallback was invoked
+only after CI #460 was green. The pass independently reopened the exact diff from
+Layer-5 baseline through `2b9c1b...`, including:
+
+- actual Windows execution versus simulated `os.name` branches;
+- EffectLedger and ReconciliationLedger case-normalized same-path identity;
+- writable-handle append/fsync and exact-fact re-durability;
+- ReconciliationLedger ambiguity latching and startup re-durability;
+- complete-JSON torn-tail and invalid-UTF-8 fail-closed behavior;
+- genuine fresh-interpreter restart recovery;
+- Windows parent-directory no-op behavior and every documented claim ceiling;
+- CI matrix completeness and the documentation's distinction between the
+  safety-ledger qualification and whole-browser/runtime qualification.
+
+### L6-R01 — close-out evidence status drift — corrected
+
+The implementation/platform candidate itself remained sound, but the
+qualification document still said exact-head revalidation was pending after CI
+#460 had already completed successfully and recorded only the earlier CI #457
+candidate. This was a documentation/evidence-ledger defect, not a production
+safety defect. This revision records CI #460 explicitly and moves the document
+to the final exact-head revalidation gate required after the review-driven
+correction.
+
+No additional production-code defect was found in this adversarial pass.
 
 ## Qualified claim ceiling
 
@@ -209,6 +248,7 @@ maintainer-first exhaustive review
 → pinned merge
 ```
 
-If no independent review integration is exposed, the design-approved fallback is
-a distinct recorded adversarial second pass after exact-head platform CI. That
-fallback is not assumed approval and must be recorded explicitly.
+Because the distinct adversarial pass produced the documentation-only L6-R01
+correction above, the resulting new head must pass the same four-job Ubuntu +
+Windows matrix before the review can be recorded as closed and the PR can be
+pinned for merge.

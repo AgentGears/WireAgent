@@ -20,8 +20,9 @@ try:
 except ImportError:  # pragma: no cover - CI-only subprocess path
     sys.path.insert(0, str(Path(__file__).parent / "stubs"))
 
-from webwire.config import WebWireConfig
-from webwire.safety import (
+# These imports intentionally follow the subprocess dependency bootstrap above.
+from webwire.config import WebWireConfig  # noqa: E402
+from webwire.safety import (  # noqa: E402
     ConfirmationState,
     EffectLedger,
     EffectLedgerRecord,
@@ -35,10 +36,10 @@ from webwire.safety import (
     RecoveryGuardUnavailable,
     canonical_evidence_hash,
 )
-from webwire.safety.commit_gateway import CommitGateway
-from webwire.safety.execution_models import AuthorizationEpoch
-from webwire.safety.kill_switch import KillSwitch
-from webwire.safety.reconciliation_ledger import ReconciliationLedgerError
+from webwire.safety.commit_gateway import CommitGateway  # noqa: E402
+from webwire.safety.execution_models import AuthorizationEpoch  # noqa: E402
+from webwire.safety.kill_switch import KillSwitch  # noqa: E402
+from webwire.safety.reconciliation_ledger import ReconciliationLedgerError  # noqa: E402
 
 _EFFECT_ID = "fx-layer5-restart"
 _SEMANTIC_KEY = "actor|like|post|layer5-restart|"

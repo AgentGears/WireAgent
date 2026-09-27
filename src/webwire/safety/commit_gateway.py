@@ -149,6 +149,7 @@ class _LiveEffectOwner:
     grant: ApprovalGrant
     snapshot: _IntentSnapshot
     policy_binding: str
+    authorization_epoch: AuthorizationEpoch
     permit_minted: bool = False
     closure_reason: Optional[str] = None
 
@@ -276,12 +277,17 @@ class CommitGateway:
                 raise GatewayStateError(
                     f"effect_id {attempt.effect_id!r} live-attempt lineage changed"
                 )
+            if existing.authorization_epoch is not self._epoch:
+                raise GatewayStateError(
+                    f"effect_id {attempt.effect_id!r} authorization epoch domain changed"
+                )
             return
         self._live_effect_attempts[attempt.effect_id] = _LiveEffectOwner(
             attempt=attempt,
             grant=grant,
             snapshot=snapshot,
             policy_binding=policy_binding,
+            authorization_epoch=self._epoch,
         )
 
     def _live_owner_for_attempt(self, attempt: EffectAttempt) -> _LiveEffectOwner:
@@ -395,7 +401,7 @@ class CommitGateway:
         dead_reason: Optional[str] = None
         try:
             with grant.claim_fence(attempt.attempt_id):
-                with self._epoch.fence() as current_epoch:
+                with owner.authorization_epoch.fence() as current_epoch:
                     try:
                         grant.validate_live(
                             intent_hash=owner.snapshot.intent_hash,
@@ -708,6 +714,15 @@ class CommitGateway:
                     with policy_fence as policy:
                         binding = policy.binding_hash()
                         epoch = self._epoch.current
+                        existing_owner = self._live_effect_attempts.get(attempt.effect_id)
+                        if (
+                            existing_owner is not None
+                            and existing_owner.attempt is attempt
+                            and existing_owner.authorization_epoch is not self._epoch
+                        ):
+                            raise GatewayStateError(
+                                f"effect_id {attempt.effect_id!r} authorization epoch domain changed"
+                            )
                         with grant.claim_fence(attempt.attempt_id):
                             try:
                                 self._validate_grant_identity(
@@ -804,10 +819,10 @@ class CommitGateway:
                                                 issued_at=mint_now,
                                                 expires_at=mint_now + self._permit_ttl,
                                             )
-                                            self._issued_permits[permit.permit_id] = permit
-                                            self._issued_attempts[permit.permit_id] = attempt
                                             if fenced:
                                                 self._mark_live_effect_permit_minted(attempt)
+                                            self._issued_permits[permit.permit_id] = permit
+                                            self._issued_attempts[permit.permit_id] = attempt
                                             return permit
 
                             if kill_blocked_at_mint:

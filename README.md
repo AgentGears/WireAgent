@@ -3,12 +3,13 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.3 — M5 effect-transaction boundary Layers 1–7 complete and merged.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable unresolved-effect replay enforcement through RecoveryGuard, and an audit-only invocation journal.
+**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation Layers 1–5 complete/qualified.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, and an audit-only invocation journal. M6 Layer 6 Windows durability qualification and Layer 7 replay-safety qualification remain separate follow-on work.
 
 ## Framing
 
 > "AI proposes, human approves, system enforces authority, browser executes,
-> durable effect evidence governs replay."
+> durable effect evidence governs replay; operator-authorized evidence resolves
+> durable uncertainty without rewriting history."
 
 Personal, single-user, local-only. Not a product, not multi-tenant.
 
@@ -53,7 +54,10 @@ pip install -e ".[dev]"
 
 Every supported remote write requires a human-approved, capability-bound,
 intent-bound token. A changed capability, target, payload, media, or risk
-binding invalidates the confirmation.
+binding invalidates the confirmation. M6 adds a process-local confirmation
+epoch: terminal reconciliation advances that epoch before reconciliation
+persistence begins, so confirmation authority minted before reconciliation
+cannot cross the recovery boundary afterward.
 
 ```python
 import asyncio
@@ -88,6 +92,24 @@ async def main():
 asyncio.run(main())
 ```
 
+### Local reconciliation workflow
+
+Durable `RESERVED`/`EFFECT_UNKNOWN` history is never rewritten. The supported
+local workflow is created from the running `Dispatcher` authority root, stages a
+bounded evidence-bearing proposal, requires exact human confirmation, and then
+appends one terminal reconciliation fact. A model/evidence collector may inspect
+or propose; it cannot commit recovery truth by itself.
+
+```python
+session = d.create_reconciliation_operator_session("local-admin")
+targets = session.list_targets()
+```
+
+A successful terminal reconciliation clears only the matching recovery
+uncertainty contribution. It does not restore an old grant/permit/confirmation,
+reset dedupe or rate limits, clear the kill switch, or bypass normal policy for a
+future invocation.
+
 ### Kill switch
 
 ```python
@@ -104,42 +126,55 @@ commit-authority boundaries; leaves the browser intact. External trip: create
   surfaces; supported mutations cross scoped M5 authorities rather than a raw
   browser mutation surface.
 - **Capability- and intent-bound confirmation.** Confirmation authority binds the
-  capability plus immutable intent/risk semantics; it is single-use and
-  expiring.
+  capability plus immutable intent/risk semantics; it is single-use, monotonic-
+  TTL bounded, and epoch-revocable.
 - **Registry-gated risk and effect policy.** Unknown actions, risk drift, policy
   drift, actor/target drift, epoch revocation, kill activation, and permit misuse
   fail closed at their respective authority boundaries.
-- **Durable uncertain-effect replay safety.** `.webwire/effects.ndjson` is the
-  fsync-backed M5 EffectLedger. `RecoveryGuard` hydrates unresolved `RESERVED`
-  and `EFFECT_UNKNOWN` semantic keys before browser startup and refreshes before
-  supported M5 writes. Matching automatic replay is denied with reconciliation
-  required.
-- **Process-local budgets and semantic dedupe.** Per-action/global token buckets
-  and the TTL dedupe store remain defense-in-depth controls while the process is
-  alive. Layer 7 no longer rebuilds them from the best-effort audit journal;
-  process restart resets those windows. A future cross-restart budget
-  requirement needs its own durable policy-state contract.
-- **Unknown outcomes are never blindly retried.** Once an external effect is
-  durably uncertain, RecoveryGuard—not a best-effort journal row—owns the
-  restart denial.
+- **Immutable M5 effect history.** `.webwire/effects.ndjson` is the fsync-backed
+  EffectLedger. `EFFECT_UNKNOWN` remains terminal historical effect knowledge;
+  M6 never changes it into success or no-effect.
+- **Orthogonal M6 reconciliation history.** `.webwire/reconciliations.ndjson` is
+  a separate fsync-backed append-only safety ledger. `RecoveryProjector` joins
+  the two histories, validates exact lineage/evidence, and `RecoveryGuard`
+  publishes the composite result under the process-local publication fence.
+- **Unknown outcomes are never blindly retried.** Raw `RESERVED` after restart
+  and `EFFECT_UNKNOWN` block matching semantic replay until an independently
+  authorized terminal reconciliation becomes known durable and published.
+- **Durability ambiguity fails closed.** A reconciliation append that may have
+  exposed bytes without established durability cannot clear recovery merely
+  because the bytes are visible. Exact-fact re-durability or fresh-process
+  startup durability establishment is required before the fact is trusted.
+- **Old authority does not cross reconciliation.** Reconciliation advances the
+  confirmation epoch before persistence starts, does not revive M5 grants or
+  permits, and restart reconstructs recovery only from durable histories — not
+  process-local approval authority.
+- **Process-local budgets and semantic dedupe remain independent.** Per-action/
+  global token buckets and the TTL dedupe store remain defense-in-depth controls
+  while the process is alive. Reconciliation does not refund/reset them.
 - **Invocation journal is audit-only.** `.webwire/journal.ndjson` remains
-  append-only best-effort diagnostics with rotation/redaction. Its write facts
-  (`action_type`, `risk_tier`, `dedupe_key`) are evidence only and do not create
-  commit, recovery, dedupe, or rate-limit authority.
-- **Honest verification.** Confirmation is evidence-bound; ambiguous readback is
-  represented as uncertainty rather than inferred success.
+  append-only best-effort diagnostics with rotation/redaction. Its contents
+  cannot create, clear, dedupe, rate-limit, approve, reconcile, recover, or
+  authorize a mutation.
+- **Honest verification.** Evidence is bounded to what it establishes. Missing
+  selectors, timeouts, 404s, empty reads, and other absence-like observations do
+  not automatically prove `CONFIRMED_NO_EFFECT`.
 
 ## Honest limitations
 
 Pre-alpha software driving X's real DOM: selectors can churn; verification is
 bounded by what the DOM exposes. Sessions are cookie-persistence only and
 `whoami` remains the live actor-identity authority. M5 targets at-most-once
-automatic execution for fenced effects plus explicit reconciliation after
-uncertainty; it does not claim distributed exactly-once semantics. The current
-ledger/browser coordination is single-process, and external hot-file kill
-activation is re-observed at final authority boundaries rather than claimed as
-strict cross-process linearization.
+automatic execution for fenced effects; M6 adds explicit evidence-bearing local
+reconciliation, not distributed exactly-once semantics. Effect/reconciliation
+writer coordination, browser ownership, publication fencing, and confirmation
+authority remain supported as **single-process** contracts. M6 does not provide
+a remote reconciliation service, automatic model-authorized terminal verdicts,
+terminal-verdict correction/supersession, or cryptographic protection against a
+hostile local filesystem user. Windows durability qualification remains M6
+Layer 6, and like/unlike replay-safety promotion remains evidence-dependent
+Layer 7 work.
 
-See `docs/M5_DESIGN.md` for the frozen M5 contract,
-`docs/M5_LAYER7_PLAN.md` for the final migration boundary and close-out evidence,
+See `docs/M5_DESIGN.md` for the frozen M5 transaction contract,
+`docs/M6_DESIGN.md` for the normative reconciliation/qualification contract,
 and `docs/STATE.md` for the living project record.

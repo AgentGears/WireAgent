@@ -39,10 +39,12 @@ from webwire.safety import (  # noqa: E402
 from webwire.safety.commit_gateway import CommitGateway  # noqa: E402
 from webwire.safety.execution_models import AuthorizationEpoch  # noqa: E402
 from webwire.safety.kill_switch import KillSwitch  # noqa: E402
+from webwire.safety.models import RiskTier  # noqa: E402
 from webwire.safety.reconciliation_ledger import ReconciliationLedgerError  # noqa: E402
 
 _EFFECT_ID = "fx-layer5-restart"
 _SEMANTIC_KEY = "actor|like|post|layer5-restart|"
+_OLD_TOKEN_FILE = "old_confirmation_token.txt"
 
 
 def _cfg(state_dir: Path) -> WebWireConfig:
@@ -157,10 +159,16 @@ def crash_after_durable_before_publish(state_dir: Path, verdict_name: str) -> No
         def refresh(self):  # type: ignore[no-untyped-def]
             os._exit(73)
 
-    _, effects, _, _, _, coordinator = _stack(
+    _, effects, _, _, confirmations, coordinator = _stack(
         state_dir,
         guard_type=CrashOnRefreshGuard,
     )
+    old_token = confirmations.issue(
+        intent_hash="intent-layer5-restart",
+        risk_tier=RiskTier.PUBLIC_REVERSIBLE_ENGAGEMENT,
+        capability_name="like",
+    )
+    (state_dir / _OLD_TOKEN_FILE).write_text(old_token.token, encoding="utf-8")
     effects.append_durable(_raw(EffectState.EFFECT_UNKNOWN))
     authority = _authority(coordinator, verdict)
     coordinator.resolve(_EFFECT_ID, verdict, _evidence(), authority)
@@ -178,11 +186,22 @@ def probe_guard(state_dir: Path) -> None:
         else [item.effective_state.value for item in block.effects]
     )
     new_confirmations = ConfirmationState()
+    old_token_path = state_dir / _OLD_TOKEN_FILE
+    old_confirmation_reason = None
+    if old_token_path.exists():
+        old_token = old_token_path.read_text(encoding="utf-8")
+        _, old_confirmation_reason = new_confirmations.validate_and_consume(
+            old_token,
+            intent_hash="intent-layer5-restart",
+            risk_tier=RiskTier.PUBLIC_REVERSIBLE_ENGAGEMENT,
+            capability_name="like",
+        )
     _emit(
         {
             "available": status.available,
             "blocked": block is not None,
             "effective_states": effective_states,
+            "old_confirmation_reason": old_confirmation_reason,
             "pending_confirmation_count": len(
                 new_confirmations._diagnostic_pending_tokens()
             ),

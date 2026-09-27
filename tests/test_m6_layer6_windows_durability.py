@@ -141,6 +141,22 @@ def test_windows_case_variant_effect_paths_share_one_writer_lock(tmp_path: Path)
 
 
 @_WINDOWS_ONLY
+def test_windows_case_variant_reconciliation_paths_share_one_state(
+    tmp_path: Path,
+) -> None:
+    upper = ReconciliationLedger(
+        path=tmp_path / "CaseDomain" / "Reconciliations.ndjson"
+    )
+    lower = ReconciliationLedger(
+        path=tmp_path / "casedomain" / "reconciliations.ndjson"
+    )
+
+    assert os.path.normcase(str(upper.path)) == os.path.normcase(str(lower.path))
+    assert upper._lock is lower._lock
+    assert upper._path_state is lower._path_state
+
+
+@_WINDOWS_ONLY
 def test_windows_both_ledgers_create_nested_paths_and_accept_real_fsync(
     tmp_path: Path,
 ) -> None:

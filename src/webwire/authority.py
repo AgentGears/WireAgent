@@ -118,17 +118,6 @@ class AuthorityOwnerLock:
             cls._registry[owner._identity] = owner
 
     @classmethod
-    def _release_process_domain(cls, owner: "AuthorityOwnerLock") -> None:
-        with cls._registry_guard:
-            current = cls._registry.get(owner._identity)
-            if current is owner:
-                del cls._registry[owner._identity]
-                return
-            raise AuthorityOwnerError(
-                "authority owner registry lost the active domain reservation"
-            )
-
-    @classmethod
     def _rollback_process_domain(cls, owner: "AuthorityOwnerLock") -> None:
         with cls._registry_guard:
             if cls._registry.get(owner._identity) is owner:
@@ -260,24 +249,35 @@ class AuthorityOwnerLock:
                 raise AuthorityStateError("owner lock is not held by this process")
 
             fd = self._fd
-            try:
-                # Deliberately do not issue LOCK_UN/LK_UNLCK first. The frozen
-                # M7 contract makes private-handle close the ownership-release
-                # boundary, avoiding a live open owner handle after OS ownership
-                # has already been dropped.
-                self._close_owner_fd(fd)
-            except OSError as exc:
-                # close(2)/CloseHandle failure leaves descriptor/lock lifetime
-                # uncertain. Preserve the process-local reservation and require
-                # fail-stop process termination instead of guessing ownership.
-                self._release_broken = True
-                raise AuthorityOwnerError(
-                    f"could not close authority owner handle {self._lock_path}: {exc!r}"
-                ) from exc
+            # Couple process-local reservation release to the private-handle
+            # close. Verify registry authority before crossing the OS release
+            # boundary, keep the reservation on close failure, and remove it
+            # only after close succeeds. This prevents a registry inconsistency
+            # from being discovered only after OS ownership is already gone.
+            with self._registry_guard:
+                if self._registry.get(self._identity) is not self:
+                    raise AuthorityOwnerError(
+                        "authority owner registry lost the active domain reservation"
+                    )
+                try:
+                    # Deliberately do not issue LOCK_UN/LK_UNLCK first. The
+                    # frozen M7 contract makes private-handle close the
+                    # ownership-release boundary, avoiding a live open owner
+                    # handle after OS ownership has already been dropped.
+                    self._close_owner_fd(fd)
+                except OSError as exc:
+                    # close(2)/CloseHandle failure leaves descriptor/lock
+                    # lifetime uncertain. Preserve the process-local reservation
+                    # and require fail-stop process termination instead of
+                    # guessing ownership.
+                    self._release_broken = True
+                    raise AuthorityOwnerError(
+                        f"could not close authority owner handle {self._lock_path}: {exc!r}"
+                    ) from exc
 
-            self._fd = None
-            self._owner_pid = None
-            self._release_process_domain(self)
+                self._fd = None
+                self._owner_pid = None
+                del self._registry[self._identity]
 
     def __enter__(self) -> "AuthorityOwnerLock":
         return self.acquire()

@@ -189,26 +189,31 @@ def test_non_contention_os_lock_error_rolls_back_registry(
     successor.release()
 
 
-def test_release_error_keeps_same_process_domain_reserved_fail_closed(
+def test_close_failure_keeps_same_process_domain_reserved_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     state_dir = tmp_path / "state"
     owner = AuthorityOwnerLock(state_dir).acquire()
-    original_unlock = owner._unlock_fd
+    original_close = owner._close_owner_fd
 
-    def fail_unlock(fd: int) -> None:
+    def fail_close(fd: int) -> None:
         del fd
-        raise OSError(errno.EIO, "injected unlock failure")
+        raise OSError(errno.EIO, "injected close failure")
 
-    monkeypatch.setattr(owner, "_unlock_fd", fail_unlock)
-    with pytest.raises(AuthorityOwnerError, match="could not release"):
+    monkeypatch.setattr(owner, "_close_owner_fd", fail_close)
+    with pytest.raises(AuthorityOwnerError, match="could not close"):
         owner.release()
 
+    assert owner.held is False
     with pytest.raises(AuthorityBusyError, match="reserved by this process"):
         AuthorityOwnerLock(state_dir).acquire()
 
-    monkeypatch.setattr(owner, "_unlock_fd", original_unlock)
+    # The injected failure did not actually close the real descriptor; restore
+    # the real close primitive so the test can clean up without weakening the
+    # production fail-stop rule.
+    owner._release_broken = False
+    monkeypatch.setattr(owner, "_close_owner_fd", original_close)
     owner.release()
 
 

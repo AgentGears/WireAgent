@@ -123,7 +123,9 @@ accepted findings were reconciled before implementation. The maintainer then
 re-opened the reconciled exact head and found two additional inherited-contract /
 compatibility gaps (RV15–RV16) before merge. A fresh exact-head Codex review of
 `97e6cc69a375317f74af7fa56f0e8f5d4a1870e3` then found the live-process lock-loss
-gap in RV17; it is reconciled here before another merge gate.
+gap in RV17. The subsequent exact-head Codex review of
+`06bb435a22044b043f085988db4106d2b3867028` found the client/owner media-path
+referent gap in RV18. Both are reconciled before another merge gate.
 
 ### M7-RV01 — instance-id checking alone leaves a shutdown admission race
 
@@ -371,6 +373,35 @@ fatal implementation/platform invariant breach, not a safe `DRAINING` recovery
 path and not authority for a successor. M7 makes no single-owner safety claim for
 that out-of-contract state.
 
+### M7-RV18 — client-local media paths are not owner-local media identity
+
+Codex's exact-head review of `06bb435a22` identified a real file-referent gap in
+Layer 5. The existing media write capabilities accept `image_path` or
+`image_paths`; `post_photo` calls `validate_media_file()` during owner-side compose,
+and multi-image operations call `preflight_manifest()`, which in turn calls the
+same validator. `validate_media_file()` begins with `Path(path).resolve()`, so a
+relative path is interpreted in the **executing owner's** working directory, not
+the IPC client's. A same-named owner-side file could therefore become a different
+attachment than the client intended.
+
+**Correction:** path-backed media writes are not exposed through M7 IPC merely by
+forwarding their existing path payloads. `post_photo`, `post_multi_image`,
+`reply_photo`, `reply_multi_image`, `quote_photo`, and `quote_multi_image` remain
+withheld until a dedicated owner-side **media-ingress contract** is implemented and
+qualified. Raw relative client paths are forbidden. The contract must establish
+one unambiguous owner-side artifact identity before capability compose, using
+ either (a) an owner-approved canonical absolute path within configured ingress
+roots or (b) owner-managed artifact staging/transfer. In either case the owner
+revalidates the exact bytes, digest, MIME/type, size, and existing media policy
+before preview/confirmation; a client-supplied path string alone is never media
+authority. Any staged/reference identity is scoped to the current
+`authority_instance_id`, is not durable execution authority, is not restored after
+owner restart, and is pinned while an admitted mutation still needs it. For
+multi-image operations, every item is transferred/resolved and validated before
+composer/upload work begins, preserving the existing all-or-nothing preflight
+law. If no such ingress contract is implemented, these media write operations are
+explicitly unsupported over M7 IPC rather than silently reinterpreting paths.
+
 No additional architectural contradiction remains after these corrections. The
 design still centralizes authority rather than distributing M5/M6 state.
 
@@ -459,7 +490,9 @@ M7 defines and qualifies:
 16. one deterministic request canonicalization contract;
 17. explicit protocol + exact runtime-build compatibility gating;
 18. fail-stop owner-lock lifetime: no supported live-process ownership-loss
-    transition.
+    transition;
+19. an explicit local-artifact boundary so path-backed media input/output is
+    withheld until its owner-side referent semantics are qualified.
 
 ### 4.2 Out of scope
 
@@ -483,7 +516,9 @@ M7 does **not** provide:
 - compatibility safety against an older pre-M7 binary that ignores ownership;
 - cross-build/mixed-runtime interoperability until separately qualified;
 - lock primitives/filesystems that can revoke ownership from a still-live
-  mutation-capable owner independently of private-handle close/process death.
+  mutation-capable owner independently of private-handle close/process death;
+- implicit translation of a client's CWD-relative/local filesystem path into an
+  owner-side media or output-file identity.
 
 ---
 
@@ -511,6 +546,7 @@ relative state path        != account-global authority domain
 package runtime version    != exact qualified build identity
 protocol/build compatibility != effect authority
 lock-loss diagnostic       != safe takeover authority
+client filesystem path     != owner media artifact identity
 ```
 
 Existing project laws remain unchanged:
@@ -852,7 +888,9 @@ read_search
 
 `whoami` is withheld until Layer 5 because it establishes owner-side actor/session
 authority. `download_image` is withheld until the local-output contract in §18 is
-qualified.
+qualified. Path-backed media writes are also withheld until the media-ingress
+contract in §18 is qualified; Layer 5 may not advertise them by forwarding raw
+`image_path`/`image_paths` values.
 
 ### 10.4 Request envelope
 
@@ -874,6 +912,9 @@ Rules:
 - request id is an opaque high-entropy client identifier;
 - unknown version/operation/schema fails before Dispatcher/recovery invocation;
 - stale instance fails `stale_authority_instance`;
+- file-backed media operations, when later exposed, use a qualified owner-side
+  media artifact/reference schema; raw client-relative filesystem paths are never
+  passed through as capability media identity;
 - client never receives raw SuperBrowser, CommitGateway, EffectLedger,
   ReconciliationLedger, ConfirmationState, or ReconciliationAuthority objects.
 
@@ -1170,7 +1211,60 @@ and rebuilds from durable M5/M6 state.
 
 ---
 
-## 18. Local-output capability boundary
+## 18. Local file/artifact boundary
+
+M7 never assumes that a filesystem path string has the same referent in the IPC
+client and the authority owner. File-backed capability exposure therefore has a
+separate qualification boundary from ordinary JSON capability routing.
+
+### 18.1 Media ingress for path-backed writes
+
+The existing media writes are:
+
+```text
+post_photo
+post_multi_image
+reply_photo
+reply_multi_image
+quote_photo
+quote_multi_image
+```
+
+They are **not** advertised/exposed over M7 IPC until one owner-side media-ingress
+contract is implemented and qualified. Passing existing `image_path` /
+`image_paths` strings through the request envelope is not that contract.
+
+A qualified media-ingress contract must establish all of the following before
+preview/confirmation authority is issued:
+
+- no CWD-relative client path is interpreted in the owner process;
+- artifact identity is owner-side and unambiguous;
+- if canonical-path ingress is selected, the path is absolute, normalized, inside
+  configured owner-approved ingress roots, and revalidated by the owner;
+- if staging/transfer ingress is selected, the owner controls the staging root and
+  binds the staged artifact to the client-declared transfer identity;
+- owner recomputes/validates bytes, SHA-256, MIME/type, size/dimensions, EXIF/media
+  policy, and any existing upload-root restriction before capability compose;
+- the exact artifact/digest bound into preview/confirmation is the artifact later
+  supplied to the existing media compose path;
+- media references are scoped to the current `authority_instance_id`; restart
+  invalidates them and they are never durable M5/M6 execution authority;
+- staged/referenced artifacts needed by admitted mutations are pinned until the
+  existing M5/M6 safe terminal boundary, so client disconnect cannot delete or
+  substitute live media;
+- all items for a multi-image request are resolved/transferred and validated in
+  order before any composer/upload work starts; no valid prefix is uploaded after
+  a later item fails;
+- traversal, symlink/alias, digest mismatch, truncated transfer, unsupported media,
+  and over-limit input fail before preview/token/effect authority;
+- cleanup/retention cannot create replay authority and cannot race an admitted
+  mutation that still references the artifact.
+
+The concrete ingress mechanism is an implementation choice only after these laws
+are preserved and qualified. Until then, media writes are deliberately unsupported
+over M7 IPC; they are not silently reinterpreted against the owner's filesystem.
+
+### 18.2 Local-output capability boundary
 
 `download_image` is not an X mutation but has a local filesystem effect. M7 does
 not silently treat client paths as owner-local paths.
@@ -1236,7 +1330,8 @@ Initial claim ceiling excludes:
 - arbitrary path-alias attacks by hostile local code;
 - cross-build/mixed-runtime IPC until explicitly qualified;
 - any primitive/filesystem capable of releasing ownership while the owner process
-  remains alive and mutation-capable outside controlled post-quiescence close.
+  remains alive and mutation-capable outside controlled post-quiescence close;
+- implicit client-path/owner-path equivalence for media ingress or local output.
 
 Known unsupported network/shared state should fail the production support gate
 where detection is reliable. Where platform APIs cannot conclusively classify the
@@ -1285,10 +1380,17 @@ POSIX IPC permissions remain owner-restricted under the qualified platform
 Windows IPC DACL is restricted and remote client attempt is rejected
 production IPC is not remotely reachable
 no executable deserialization exists
+raw relative client media path is never resolved against owner CWD
+media-backed write is unsupported until qualified ingress exists
+when media ingress exists, owner revalidates exact bytes/digest/type before preview
+media reference/staging identity is owner-instance scoped and dies on restart
+admitted media artifacts remain pinned through the mutation terminal boundary
+multi-image ingress completes validation for every ordered item before composer work
 ```
 
-POSIX sibling-process qualification is also required. No stronger lock/IPC
-portability statement is made than environments and primitives actually tested.
+POSIX sibling-process qualification is also required. No stronger lock/IPC/file-
+artifact portability statement is made than environments and primitives actually
+tested.
 
 ---
 
@@ -1376,6 +1478,14 @@ portability statement is made than environments and primitives actually tested.
     qualified.
 55. M7 inherits the complete M5 and M6 acceptance **and mandatory regression**
     contracts under one owner; range shorthand never narrows inherited safety.
+56. Path-backed media writes are not exposed over IPC until a qualified owner-side
+    media-ingress contract exists; raw client-relative filesystem paths never
+    become owner media identity.
+57. Media artifact/reference authority is process/owner-instance local and
+    non-durable; restart invalidates it, while admitted work pins required media
+    until the safe M5/M6 terminal boundary.
+58. Multi-image IPC ingress preserves the existing all-items-before-any-upload
+    preflight law and ordered digest binding.
 
 ---
 
@@ -1448,6 +1558,11 @@ portability statement is made than environments and primitives actually tested.
 | M7-T63 | Qualified POSIX fork/spawn/exec child survives parent owner death | Child cannot retain/extend/release/use production ownership; successor acquisition follows chosen primitive contract |
 | M7-T64 | Client protocol or exact runtime build id differs from owner | Rejected before request admission under initial M7 compatibility claim |
 | M7-T65 | Qualified owner process remains alive/mutation-capable under supported platform faults without controlled release | OS ownership cannot disappear; any primitive that allows live-process lock loss fails qualification |
+| M7-T66 | Layer-5 client requests photo/multi-image write before media-ingress qualification | Operation not advertised/unsupported; no owner path resolution, preview, token, or effect authority |
+| M7-T67 | Media-enabled IPC receives a relative/raw client filesystem path | Rejected before capability compose; owner CWD is never used to reinterpret it |
+| M7-T68 | Qualified media ingress resolves/stages an artifact | Owner revalidates exact bytes/digest/type/policy before preview and the bound artifact is the one later uploaded |
+| M7-T69 | Media reference exists, then owner changes or client disconnects during admitted mutation | Restart makes old reference stale/no auto-replay; same-owner admitted work keeps required media pinned until safe terminal boundary |
+| M7-T70 | Multi-image ingress contains one invalid/failed item | Entire request fails before composer/upload; order/digests of valid prefix cannot authorize partial media effect |
 
 Mandatory regressions:
 
@@ -1465,6 +1580,8 @@ Mandatory regressions:
 - process restart does not turn token-bucket/dedupe reset into a durable claim;
 - offline reconciliation retains explicit M6 operator confirmation;
 - raw diagnostics outside owner never become mutation authority;
+- media ingress, if exposed, preserves existing immutable attachment digest/
+  manifest binding and all-before-any-upload preflight semantics;
 - qualification uses genuine sibling processes, not two objects in one interpreter.
 
 ---
@@ -1476,8 +1593,8 @@ Mandatory regressions:
 2. AuthoritySession + AuthorityServiceLifecycle + Dispatcher/recovery ownership integration
 3. owner instance identity + startup/shutdown/crash-takeover qualification
 4. local IPC transport + handshake + bounded pure read/health path
-5. whoami authority-establishing read + write + confirmation + reconciliation routing + bounded request table
-6. local-output (`download_image`) IPC contract, only if required for M7 completion/use
+5. whoami authority-establishing read + non-file-backed write + confirmation + reconciliation routing + bounded request table
+6. local artifact boundary: media ingress before any path-backed media write exposure; download_image output contract only if exposed
 7. POSIX multi-process crash/fault/response-loss qualification
 8. Windows Server 2025 multi-process lock/IPC/takeover qualification
 ```
@@ -1513,16 +1630,19 @@ heartbeat stealing before adding a client protocol.
 and `read_search`, so framing, canonical request identity, exact build/protocol
 compatibility, stale-instance, size/backpressure, disconnect, endpoint
 permissions/cleanup, and shutdown semantics are qualified without owner actor-state
-mutation or remote mutation risk. `whoami` and `download_image` remain withheld.
+mutation or remote mutation risk. `whoami`, media-backed writes, and
+`download_image` remain withheld.
 
 **Layer 5** adds `whoami` as an authority-establishing read and routes
-write/confirmation/reconciliation through the existing owner authority root.
-Mutating tasks are decoupled from client connection lifetime and request-table
-entries remain pinned while work is active.
+non-file-backed write/confirmation/reconciliation through the existing owner
+authority root. Mutating tasks are decoupled from client connection lifetime and
+request-table entries remain pinned while work is active. The six media-backed
+write operations remain unsupported over IPC until Layer 6.
 
-**Layer 6** is optional only in milestone ordering, not in correctness if
-`download_image` is exposed over IPC; its output-path contract must be qualified
-before exposure.
+**Layer 6** qualifies local artifact referents. A media-ingress contract is
+mandatory before any path-backed media write is exposed. `download_image` remains
+optional for milestone ordering only if it stays explicitly unsupported over IPC;
+if exposed, its owner-side output-path contract must also be qualified first.
 
 **Layers 7–8** are qualification layers. Production changes occur only when real
 multi-process/platform evidence falsifies a frozen assumption.
@@ -1545,7 +1665,7 @@ M7 is complete only when:
 ✓ controlled release is last and never overtakes admitted mutation work
 ✓ forced process death permits OS-level takeover without stale-lock-file deletion
 ✓ successor never restores old ephemeral confirmation/grant/permit/reconciliation authority
-✓ all production browser reads/writes are owner-routed
+✓ every M7-exposed production browser read/write is owner-routed
 ✓ active-owner recovery is owner-routed; offline recovery acquires same ownership boundary
 ✓ stale-instance, incompatible-protocol, and different-build requests fail before execution
 ✓ local transport uses bounded non-executable serialization and no production TCP listener
@@ -1559,13 +1679,16 @@ M7 is complete only when:
 ✓ client does not automatically replay mutation/reconciliation across owner-instance change
 ✓ lost-response and owner-crash cases fall back to M5/M6 durable truth
 ✓ Layer-4 IPC surface remains pure read/health; whoami enters only with Layer-5 authority qualification
+✓ path-backed media writes stay off IPC until a qualified owner-side media-ingress contract exists
+✓ raw client-relative media paths are never resolved against owner CWD
+✓ any exposed media ingress revalidates/binds exact owner-side bytes and is owner-instance scoped/pinned while in use
 ✓ `download_image` stays off IPC until its local-output contract is explicit
 ✓ all M5 T1–T25 + all M5 mandatory regressions remain unchanged under one owner
 ✓ all M6 R1–R48 + all M6 mandatory regressions remain unchanged under one owner
 ✓ genuine sibling-process crash/takeover tests exist
 ✓ actual Windows Server 2025 ownership/IPC behavior is qualified and claim-bounded
 ✓ hostile-same-user, network-filesystem, cross-build/mixed-runtime, multi-state-root,
-  cross-machine, spontaneous-live-lock-loss, and distributed-exactly-once exclusions remain explicit
+  cross-machine, spontaneous-live-lock-loss, implicit-client-path-equivalence, and distributed-exactly-once exclusions remain explicit
 ```
 
 The bounded M7 claim is:
@@ -1575,11 +1698,14 @@ The bounded M7 claim is:
 > `runtime_build_id`, using an owner-lock primitive whose ownership cannot vanish
 > while the owner remains alive and mutation-capable, admit at most one supported
 > production authority owner at a time. Other processes interact through the
-> owner's local bounded capability/reconciliation boundary or fail busy. After
-> controlled post-quiescence release or owner death, a successor rebuilds authority
-> from durable M5/M6 truth and never resumes old ephemeral execution authority.
+> owner's local bounded capability/reconciliation boundary or fail busy. File-
+> backed capabilities are exposed only after their owner-side artifact referents
+> are explicitly qualified. After controlled post-quiescence release or owner
+> death, a successor rebuilds authority from durable M5/M6 truth and never resumes
+> old ephemeral execution or media-reference authority.
 
 That claim deliberately stops short of automatic hot failover, distributed
 exactly-once execution, hostile-local-process isolation, network-filesystem
 coordination, cross-build/mixed-runtime interoperability, spontaneous live-process
-lock-loss recovery, or global uniqueness across separate state roots.
+lock-loss recovery, implicit client/owner filesystem-path equivalence, or global
+uniqueness across separate state roots.

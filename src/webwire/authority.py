@@ -233,7 +233,10 @@ class AuthorityOwnerLock:
                 raise AuthorityOwnerError(
                     f"could not acquire authority owner lock {self._lock_path}: {exc!r}"
                 ) from exc
-            except Exception:
+            except BaseException:
+                # KeyboardInterrupt/SystemExit during low-level setup must not
+                # strand the canonical in-process domain reservation or a
+                # published descriptor if the caller catches the interruption.
                 if fd is not None:
                     self._close_noexcept(fd)
                 self._fd = None

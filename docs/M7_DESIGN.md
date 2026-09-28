@@ -1,0 +1,1711 @@
+# M7 — Cross-Process Authority & Ownership Boundary
+
+```text
+Status:   DESIGN CANDIDATE — MAINTAINER-FIRST + ADVERSARIAL + INDEPENDENT REVIEW RECONCILED; NO IMPLEMENTATION YET
+Base:     main f3268407167ad39f6be1aa01b4b8dc34cef59da7
+Runtime:  M5 transaction boundary complete; M6 reconciliation/qualification Layers 1–7 complete
+Scope:    same-machine, same-user, multiple cooperating M7-aware WireAgent processes sharing one canonical local state directory;
+          exactly one production authority owner, local IPC clients, crash-safe takeover only after owner release/death
+Change rule: preserve M5/M6 semantics; revise only when implementation evidence, fault injection,
+             platform qualification, or an independently verified review finding falsifies an assumption
+```
+
+This document is normative and self-contained for M7. Build M7 from this file,
+not from review-conversation memory.
+
+`docs/M5_DESIGN.md` remains authoritative for effect transaction semantics.
+`docs/M6_DESIGN.md` remains authoritative for reconciliation, confirmation-epoch,
+composite recovery, and replay-qualification semantics. M7 does not reopen those
+contracts merely because it adds a process boundary around them.
+
+The M7 forcing function is narrow:
+
+> M5/M6 are deliberately safe inside one Python process, but the current process-
+> local locks, confirmation state, browser lease, and publication fences do not
+> coordinate two independent WireAgent runtime/recovery processes that share one
+> state directory.
+
+M7 resolves that forcing function by **centralizing authority**, not by turning
+every M5/M6 primitive into a distributed object.
+
+---
+
+## 1. Maintainer-first source findings
+
+The first pass reviewed the exact M6-complete baseline `f3268407` before choosing
+a mechanism. These are architectural facts at that baseline, not M5/M6 defects.
+
+### M7-F01 — EffectLedger writer coordination is process-local
+
+`EffectLedger` shares one normalized-path `threading.RLock` between same-process
+instances and explicitly excludes independent external writers from its contract.
+Its fsync/history rules are safety-critical, but the NDJSON format is not an
+arbitrary concurrent multi-process writer protocol.
+
+**Consequence:** M7 must not assume that two processes may safely write
+`effects.ndjson` merely because both use `EffectLedger`.
+
+### M7-F02 — ConfirmationState authority is process-local
+
+`ConfirmationState` owns one in-memory epoch, pending-token store, monotonic clock
+sampling domain, and consume fence. M6 intentionally does not persist or
+reconstruct human confirmation authority.
+
+**Consequence:** multiple process-local `ConfirmationState` objects would be
+multiple human-authority roots. M7 keeps one canonical instance in the production
+owner process.
+
+### M7-F03 — M6 reconciliation ordering is process-local
+
+`ReconciliationPublicationFence`, `ReconciliationCoordinator` protocol state,
+CommitGateway lifecycle ownership, and committed-fact continuation are shared by
+normalized paths only inside one process. M6 explicitly excludes independent
+processes.
+
+**Consequence:** a separate recovery process must not append reconciliation while
+a production owner is active. Recovery routes through the owner or becomes the
+exclusive owner after the prior owner exits.
+
+### M7-F04 — browser coordination is process-local
+
+`M5LeasedWriteBroker` attaches an async lease state to one SuperBrowser facade,
+and `Dispatcher` serializes supported invocations because reads and writes share
+that browser. A second process has neither synchronization domain.
+
+**Consequence:** M7 cannot solve only ledger writes. Production browser reads and
+writes must have the same process owner.
+
+### M7-F05 — Dispatcher is already the natural authority root
+
+`Dispatcher` owns the browser session, kill switch, WriteKernel, EffectLedger,
+RecoveryGuard, CommitGateway, live M5 stack, and M6 ReconciliationCoordinator.
+It hydrates recovery before browser startup and serializes supported invocations.
+
+**Consequence:** the least invasive design is one outer process-ownership boundary
+around the existing authority root, not a rewrite of M5/M6 internals.
+
+### M7-F06 — owned browser remains the production path
+
+`SessionManager` defaults to launch/owned mode. Attach mode is explicitly a
+non-production diagnostic path and requires opt-in.
+
+**Consequence:** a successor starts a fresh owned session. It never silently
+attaches to an orphaned browser from the dead owner and calls that production
+authority.
+
+### M7-F07 — M6 names cross-process coordination as the next forcing function
+
+The M6 completion criteria explicitly state that independent runtime/recovery
+processes sharing a state directory create the forcing function for a separate M7
+authority/locking design.
+
+### M7-F08 — time-based takeover is unsafe at this mutation seam
+
+A browser click or X service mutation does not carry a WireAgent fencing token
+that the remote system can reject. A heartbeat/TTL lease that permits takeover
+while the old process is merely paused or hung can therefore create two live
+mutation authorities if the old process wakes.
+
+**Decision:** M7 does not use heartbeat expiry, PID age, lock-file mtime, or wall-
+clock staleness to steal production authority. Availability yields to single-
+owner safety.
+
+---
+
+## 2. Distinct adversarial and independent review reconciliation
+
+The first adversarial pass was performed after the initial design candidate,
+separately from the maintainer-first mechanism selection. Independent GitWire and
+Codex reviews were then run on exact candidate `3c4c68a90dbd7f1aa96542e0428fe98a02057201`.
+The findings below preserve that sequence: maintainer-first discovery remained
+primary, external review was used only after the candidate existed, and all
+accepted findings were reconciled before implementation. The maintainer then
+re-opened the reconciled exact head and found two additional inherited-contract /
+compatibility gaps (RV15–RV16) before merge. A fresh exact-head Codex review of
+`97e6cc69a375317f74af7fa56f0e8f5d4a1870e3` then found the live-process lock-loss
+gap in RV17. The subsequent exact-head Codex review of
+`06bb435a22044b043f085988db4106d2b3867028` found the client/owner media-path
+referent gap in RV18. Both are reconciled before another merge gate.
+
+### M7-RV01 — instance-id checking alone leaves a shutdown admission race
+
+A request can validate the current `authority_instance_id` while controlled
+shutdown is simultaneously beginning. Without one owner-service lifecycle fence,
+the request could be admitted after the service intends to quiesce, or the owner
+lock could be released while work is still in flight.
+
+**Correction:** M7 adds synchronized `AuthorityServiceLifecycle` state:
+
+```text
+STARTING -> READY -> DRAINING -> TERMINAL
+```
+
+Request admission and the `READY -> DRAINING` transition share one lifecycle
+fence. Admission increments an active-request count under that fence. Shutdown
+moves to `DRAINING`, rejects new admissions, waits for admitted work to leave the
+owner execution domain, retires browser/IPC authority, marks the session terminal,
+and releases the OS owner lock last. A hung admitted operation prevents clean
+release; the operator must terminate the owner process for takeover.
+
+### M7-RV02 — mutating client retry across owner replacement needed an explicit law
+
+An old client can reconnect after owner death, learn the successor's new instance
+id, and mechanically resend an old mutating payload. Stale-instance rejection
+alone does not prevent that client behavior.
+
+**Correction:** the M7 client contract forbids automatic mutation/reconciliation
+retry across `authority_instance_id` change. An in-flight mutating request whose
+owner disappears is returned to the caller as transport/owner outcome uncertainty.
+The successor's M5/M6 durable truth is inspected before any genuinely fresh human-
+approved action is created. Read-only operations may be retried after a fresh
+handshake because they do not cross the remote mutation seam.
+
+### M7-RV03 — an OS lock primitive must have stronger semantics than “a file lock”
+
+Some lock APIs have surprising process/descriptor semantics. M7 cannot accept a
+primitive whose ownership can be lost when an unrelated descriptor closes,
+silently inherited into a child process, or asynchronously revoked while the
+owner process remains alive and mutation-capable.
+
+**Correction:** the platform adapter must qualify a dedicated, private owner handle
+whose lock lifetime is tied to that handle/process and whose release behavior is
+not affected by unrelated descriptors. Exec/spawn inheritance is disabled, and
+POSIX fork semantics are qualified separately: no child may retain, extend,
+release, or exercise production ownership after the parent owner dies. Most
+importantly, within the supported local platform/filesystem contract **ownership
+may end only by the owner's deliberate private-handle close after the authority
+root is quiesced, or by OS cleanup after owner process death/termination**. There
+is no qualified lease expiry or spontaneous live-process lock-loss transition.
+The handle remains private to `AuthorityOwnerLock`. A primitive or process-creation
+mode that cannot establish all of these properties is unsupported.
+
+### M7-RV04 — request-cache claims exceeded a bounded cache
+
+A bounded ephemeral request table cannot promise that every request id remains
+recognizable for the whole owner lifetime after eviction.
+
+**Correction:** transport dedupe is explicitly bounded by retention. While a
+completed request entry is retained, same-id/same-canonical-request returns the
+same result and same-id/different-request is rejected. **In-flight request entries
+are never evicted.** An admitted request retains a strong owner-side task/work
+reference until its safe local terminal boundary; capacity pressure rejects or
+backpressures new admission instead of discarding live work. Only completed
+entries are eligible for bounded TTL/LRU/resource eviction. After completed-entry
+eviction there is no transport-level exactly-once claim; M5/M6
+confirmation/effect/recovery authority remains the safety boundary. Request-cache
+eviction can never create permission to replay an external mutation.
+
+### M7-RV05 — client disconnect must not become mutation cancellation
+
+If the socket/task lifetime owns the Dispatcher task, a client disconnect can
+cancel work after mutation authority has crossed, creating unnecessary ambiguity
+or inconsistent transport semantics.
+
+**Correction:** once a mutating or terminal-reconciliation request is admitted,
+its owner-side task is independent of the client connection lifetime. Client
+timeout/disconnect means “response unavailable,” not “operation cancelled.” The
+owner drives the admitted operation to the existing safe M5/M6 terminal boundary
+unless kill/failure semantics inside that boundary decide otherwise. M7 exposes no
+generic remote cancel for an in-flight mutation.
+
+### M7-RV06 — local IPC has its own stale endpoint problem
+
+POSIX Unix-domain socket pathnames can survive an owner crash even though the
+socket is no longer live.
+
+**Correction:** endpoint cleanup/bind happens only after `AuthorityOwnerLock` is
+held. The exclusive owner may remove a stale local IPC rendezvous path before
+binding. IPC pathname existence is never ownership authority. Windows named-pipe
+or equivalent endpoint lifetime is qualified separately.
+
+### M7-RV07 — local-output capabilities need separate IPC path semantics
+
+`download_image` is not an X mutation but writes to local storage. Routing it from
+a client process through an owner changes which process/CWD owns the output path.
+
+**Correction:** M7 Layer 4 initially qualifies pure read/health operations only.
+`download_image` is withheld from IPC until a bounded owner-side output contract
+is specified (for example an owner-defined output root plus returned artifact
+metadata). It must not inherit arbitrary client filesystem paths merely because
+it is classified as a read capability.
+
+### M7-RV08 — the frozen M5 regression range was incomplete
+
+The initial M7 candidate required only M5 T1–T14 even though the normative
+`M5_DESIGN.md` acceptance surface is T1–T25 plus additional mandatory regressions.
+Codex independently identified this omission on candidate `3c4c68a9`.
+
+**Correction:** M7 requires all M5 T1–T25 behavior **and** the additional mandatory
+M5 regression cases to remain unchanged under one owner, alongside the complete
+M6 inherited contract. A future M7 implementation cannot claim completion by
+preserving only a subset of the inherited transaction-boundary contract.
+
+### M7-RV09 — “local Windows named pipe” was not a sufficient local-only contract
+
+A transport named pipe is not accepted merely because it is not TCP. The M7 claim
+is same-machine/same-user, so the concrete Windows adapter must enforce that
+boundary rather than assuming it.
+
+**Correction:** the Windows production IPC primitive must reject remote clients at
+the primitive/configuration level and apply a DACL limited to the intended local
+user/service identity without permissive inherited access. Qualification includes
+a remote-client rejection test and ACL inspection. POSIX IPC must reside under an
+owner-restricted directory/socket permission boundary and may use peer credentials
+where the qualified platform exposes them. A transport that cannot establish the
+same-machine/same-user claim is unsupported.
+
+### M7-RV10 — `whoami` is not a pure observational read in the owner model
+
+`whoami` reads remote identity, but successful Dispatcher handling also marks the
+session authenticated, stores the resolved actor handle used by later write
+authority, and checkpoints session state. Treating it as a generic pure read in
+Layer 4 would blur the staged authority boundary.
+
+**Correction:** Layer 4 IPC initially exposes only `health`, `read`,
+`read_profile`, `read_thread`, and `read_search`. `whoami` is an
+**authority-establishing read** and is withheld until Layer 5, where owner-state
+mutation, session checkpointing, stale-instance checks, and later write-authority
+use are qualified together. `download_image` remains separately withheld by
+M7-RV07.
+
+### M7-RV11 — a CWD-relative state root can create accidental distinct domains
+
+`WebWireConfig.state_dir` currently defaults to relative `.webwire`. M7 correctly
+claims uniqueness per canonical state root, not per remote account, but a relative
+root resolved under different working directories can accidentally create two
+legitimate but distinct authority domains.
+
+**Correction:** production owner startup resolves `state_dir` once to an absolute
+canonical authority-domain path before registry/lock acquisition and exposes that
+exact path in diagnostics/handshake. A relative configured path is allowed but
+must emit a production warning showing the resolved authority domain. Distinct
+resolved roots remain distinct by design; no account-global uniqueness claim is
+introduced.
+
+### M7-RV12 — child-process inheritance needs fork/spawn/exec qualification
+
+“Non-inheritable handle” is sufficient only if the chosen platform/process model
+actually gives the required lock-lifetime behavior. POSIX `fork()` and later
+`exec()`/spawn paths may have different descriptor/lock semantics.
+
+**Correction:** platform qualification explicitly covers the process-creation
+modes WireAgent supports. A child must not retain usable owner authority, keep the
+owner lock alive after parent death, release the parent's ownership, or exercise
+the production authority root. Browser-child and test-helper process creation are
+included. Unsupported fork/spawn modes fail the M7 support claim rather than being
+silently assumed safe.
+
+### M7-RV13 — canonical request identity was underspecified
+
+The retained-request rules depend on “same canonical request,” so every client and
+owner adapter needs one deterministic meaning for equality.
+
+**Correction:** request identity is computed only after strict schema validation as
+one deterministic canonical form over `protocol_version`, `operation`, and the
+schema-normalized `payload`. Object keys are deterministically ordered, array
+order is preserved, non-finite numbers and unsupported values are rejected, and
+schema normalization decides equivalent scalar representation before canonical
+serialization/digesting. `authority_instance_id` and `request_id` are envelope
+routing identity and are not part of canonical payload equality. The exact
+canonicalization function is one owner implementation surface, not per-client
+policy.
+
+### M7-RV14 — mixed-version compatibility needed an explicit gate
+
+The initial handshake carried both `protocol_version` and `runtime_version` but did
+not freeze which field authorizes compatibility.
+
+**Initial correction:** require an exact supported `protocol_version` and an exact
+runtime compatibility gate before request admission rather than inferring
+compatibility from similar schemas. The later exact-head re-open in RV16 tightens
+what qualifies as runtime identity; a human/package version string alone is not
+sufficient.
+
+### M7-RV15 — the inherited M6 mandatory regression surface was also incomplete
+
+The reconciled candidate required all M6 R1–R48 but did not explicitly inherit the
+**additional mandatory regressions** listed after the R1–R48 table in
+`docs/M6_DESIGN.md` §20. Those cases cover canonical evidence hashing, strict JSON
+identity, same-path writer serialization, publication non-regression, monotonic
+operator/confirmation clocks, clean-no-row restart behavior, journal
+non-authority, and preservation of M5 kill/epoch/policy/permit semantics.
+
+**Correction:** M7 requires **all M6 R1–R48 plus every additional mandatory M6
+regression in §20**, just as it requires all M5 T1–T25 plus M5's additional
+mandatory regressions. Inherited safety contracts are carried forward whole, not
+by table range alone.
+
+### M7-RV16 — package/runtime version is not exact build identity
+
+The exact-head re-open verified that WireAgent's package version remains `0.3.0`
+across many source commits. Therefore equality of `runtime_version` cannot prove
+that two M7 processes execute the same qualified runtime artifact. Two different
+commits could both truthfully advertise `0.3.0`.
+
+**Correction:** initial M7 production IPC carries a separate opaque
+`runtime_build_id` that identifies the exact qualified WireAgent runtime artifact
+or source build. The implementation may use an embedded exact source revision or
+a deterministic build/artifact digest, but **must not** derive this identity from
+the human package version alone. Owner and client must match both the supported
+`protocol_version` and exact `runtime_build_id` before request admission.
+`runtime_version` remains useful diagnostic provenance only. If a production build
+cannot establish a stable exact build identity, it does not carry the initial M7
+qualified IPC claim. A later compatibility design may deliberately permit
+different build ids under a new qualified compatibility contract; M7 does not
+infer that safety.
+
+### M7-RV17 — live-process ownership loss cannot be recovered by draining
+
+Codex's fresh exact-head review of `97e6cc69a3` identified a real split-brain gap
+in the prior §9.4. If the OS lock were already gone while the old process remained
+alive, a successor could acquire and start while admitted old-process mutation
+work continued under `DRAINING`. Terminalizing the old session cannot revoke
+browser/effect authority that already crossed its final boundary.
+
+**Correction:** M7 removes live-process ownership loss as a supported lifecycle
+transition. Under a qualified `AuthorityOwnerLock`, ownership may cease only after
+controlled shutdown has quiesced all mutation-capable owner work and deliberately
+closes the private owner handle, or when the owner process dies/terminates and the
+OS releases it. An adapter/platform/filesystem whose lock can expire, be revoked,
+or otherwise disappear while the process remains alive and mutation-capable is
+**unsupported**. An impossible-handle-loss diagnostic in a qualified runtime is a
+fatal implementation/platform invariant breach, not a safe `DRAINING` recovery
+path and not authority for a successor. M7 makes no single-owner safety claim for
+that out-of-contract state.
+
+### M7-RV18 — client-local media paths are not owner-local media identity
+
+Codex's exact-head review of `06bb435a22` identified a real file-referent gap in
+Layer 5. The existing media write capabilities accept `image_path` or
+`image_paths`; `post_photo` calls `validate_media_file()` during owner-side compose,
+and multi-image operations call `preflight_manifest()`, which in turn calls the
+same validator. `validate_media_file()` begins with `Path(path).resolve()`, so a
+relative path is interpreted in the **executing owner's** working directory, not
+the IPC client's. A same-named owner-side file could therefore become a different
+attachment than the client intended.
+
+**Correction:** path-backed media writes are not exposed through M7 IPC merely by
+forwarding their existing path payloads. `post_photo`, `post_multi_image`,
+`reply_photo`, `reply_multi_image`, `quote_photo`, and `quote_multi_image` remain
+withheld until a dedicated owner-side **media-ingress contract** is implemented and
+qualified. Raw relative client paths are forbidden. The contract must establish
+one unambiguous owner-side artifact identity before capability compose, using
+either (a) an owner-approved canonical absolute path within configured ingress
+roots or (b) owner-managed artifact staging/transfer. In either case the owner
+revalidates the exact bytes, digest, MIME/type, size, and existing media policy
+before preview/confirmation; a client-supplied path string alone is never media
+authority. Any staged/reference identity is scoped to the current
+`authority_instance_id`, is not durable execution authority, is not restored after
+owner restart, and is pinned while an admitted mutation still needs it. For
+multi-image operations, every item is transferred/resolved and validated before
+composer/upload work begins, preserving the existing all-or-nothing preflight
+law. If no such ingress contract is implemented, these media write operations are
+explicitly unsupported over M7 IPC rather than silently reinterpreting paths.
+
+No additional architectural contradiction remains after these corrections. The
+design still centralizes authority rather than distributing M5/M6 state.
+
+---
+
+## 3. Architecture decision — one authority process, many local clients
+
+The supported production topology is:
+
+```text
+             local client A
+                  |
+             local client B
+                  |
+             CLI / agent / UI
+                  |
+                  v
+        +-----------------------+
+        |   AuthorityService    |
+        |   one owner process   |
+        |                       |
+        | AuthorityOwnerLock    |
+        | AuthoritySession      |
+        | ServiceLifecycle      |
+        | Dispatcher            |
+        | M5 + M6 authority     |
+        +-----------+-----------+
+                    |
+          +---------+----------+
+          |                    |
+          v                    v
+    owned browser       safety ledgers
+                       effects.ndjson
+                       reconciliations.ndjson
+```
+
+Only the active owner process may perform supported production browser operations
+or safety-ledger mutations. Other M7-aware processes are local clients. If the
+local IPC service is unavailable/disabled, a second process fails
+`authority_busy`; it does not create a second authority root.
+
+This is a **single-writer / single-browser-owner architecture**, not consensus.
+
+### 3.1 Why centralize instead of adding cross-process locks everywhere
+
+M5/M6 already have a coherent authority root and carefully ordered internal
+locks. Adding unrelated OS locks to EffectLedger, ReconciliationLedger,
+ConfirmationState, RecoveryGuard, CommitGateway, browser leases, and operator
+workflow would create new lock orders and still could not fence the remote
+browser/X mutation seam.
+
+M7 therefore adds one outer law:
+
+```text
+AuthorityOwnerLock — held for the entire production authority lifetime
+    -> existing Dispatcher / M5 / M6 lock orders remain unchanged
+```
+
+Within this supported topology, one process owner means the existing process-
+local M5/M6 synchronization remains canonical inner synchronization.
+
+---
+
+## 4. Scope and non-goals
+
+### 4.1 In scope
+
+M7 defines and qualifies:
+
+1. one cross-process authority domain per canonical local WireAgent state dir;
+2. a non-expiring OS-held `AuthorityOwnerLock` for that domain;
+3. one process-local terminal `AuthoritySession` per acquisition;
+4. one synchronized `AuthorityServiceLifecycle` for admission/drain/termination;
+5. one fresh random `authority_instance_id` per successful acquisition;
+6. owner acquisition before authoritative recovery or browser startup;
+7. owner release only after supported browser/mutation authority is quiesced;
+8. local IPC client access without raw browser/ledger/gateway surfaces;
+9. stale-client and stale-owner-instance rejection;
+10. bounded ephemeral owner-side transport request dedupe with non-evictable
+    in-flight entries;
+11. owner-side human confirmation shared across clients;
+12. owner-side M6 reconciliation shared across clients;
+13. crash/restart/takeover preserving M5/M6 durable uncertainty;
+14. real sibling-process qualification, especially Windows Server 2025;
+15. explicit platform-local IPC permissions/remote rejection;
+16. one deterministic request canonicalization contract;
+17. explicit protocol + exact runtime-build compatibility gating;
+18. fail-stop owner-lock lifetime: no supported live-process ownership-loss
+    transition;
+19. an explicit local-artifact boundary so path-backed media input/output is
+    withheld until its owner-side referent semantics are qualified.
+
+### 4.2 Out of scope
+
+M7 does **not** provide:
+
+- multiple simultaneous production owners;
+- heartbeat/TTL automatic failover while an owner process is alive;
+- multi-machine coordination, leader election, quorum, or consensus;
+- distributed exactly-once execution;
+- arbitrary multi-writer EffectLedger/ReconciliationLedger semantics;
+- remote/network IPC exposure;
+- multi-user RBAC or hostile same-user process isolation;
+- Administrator/root protection from file/process/browser bypass;
+- network-filesystem lock/durability semantics;
+- durable human confirmation, ApprovalGrant, EffectPermit, browser lease, or
+  request-cache state;
+- replay-policy changes from M6;
+- reconciliation correction/supersession;
+- durable cross-restart token-bucket or semantic-dedupe state;
+- account-global uniqueness across intentionally different state roots;
+- compatibility safety against an older pre-M7 binary that ignores ownership;
+- cross-build/mixed-runtime interoperability until separately qualified;
+- lock primitives/filesystems that can revoke ownership from a still-live
+  mutation-capable owner independently of private-handle close/process death;
+- implicit translation of a client's CWD-relative/local filesystem path into an
+  owner-side media or output-file identity.
+
+---
+
+## 5. Constitutional distinctions
+
+M7 preserves:
+
+```text
+lock-file existence       != authority ownership
+PID                        != authority ownership
+heartbeat freshness        != authority ownership
+client connection          != execution authority
+authority instance id      != durable effect identity
+request id                 != effect id
+transport dedupe           != semantic/effect replay safety
+IPC response success       != external effect confirmation
+client disconnect          != mutation cancellation
+process death              != proof of NO_EFFECT
+owner takeover             != old-attempt continuation
+browser process existence  != WireAgent browser authority
+attach mode                != production ownership
+recovery clear             != permission to execute
+M7 owner lock              != M5/M6 policy approval
+relative state path        != account-global authority domain
+package runtime version    != exact qualified build identity
+protocol/build compatibility != effect authority
+lock-loss diagnostic       != safe takeover authority
+client filesystem path     != owner media artifact identity
+```
+
+Existing project laws remain unchanged:
+
+- **Cognition != authority.**
+- **Execution != external effect.**
+- **Evidence != claim.**
+- **UNKNOWN != NO_EFFECT.**
+- **Recovery clear != execution permission.**
+
+---
+
+## 6. Authority domain and owner lock
+
+One M7 authority domain is identified by the canonical configured `state_dir`.
+Production startup resolves it once to an absolute canonical local path before
+registry lookup and lock acquisition using the same case-normalization posture
+already required by the Windows safety-ledger work. The resolved path is surfaced
+in owner diagnostics and `AuthorityHello`. If configuration supplied a relative
+path, production startup emits a warning containing the absolute resolved domain.
+
+Conceptually:
+
+```text
+authority_domain = canonical_local_path(WebWireConfig.state_dir)
+authority_lock   = authority_domain / "authority.lock"
+```
+
+The lock file is a stable rendezvous object only. Its existence, content, PID,
+mtime, or age is never authority.
+
+### 6.1 `AuthorityOwnerLock`
+
+Required contract:
+
+- exclusive for one canonical authority domain;
+- supports non-blocking acquisition for deterministic `authority_busy`;
+- ownership is held continuously for the authority lifetime;
+- ownership is **not** time-expiring;
+- while the owner process remains alive and mutation-capable, the qualified OS
+  primitive cannot independently expire/revoke/drop ownership;
+- OS releases ownership on owner process death/termination;
+- controlled owner-handle close is permitted only after the owner authority root
+  has quiesced and the AuthoritySession is terminal;
+- dedicated owner handle is private and non-inheritable across qualified
+  spawn/exec paths;
+- POSIX fork semantics are separately qualified so a child cannot retain, extend,
+  release, or exercise production ownership after parent death;
+- unrelated descriptors cannot release ownership;
+- owner handle is private and not serialized/exposed;
+- one process-local normalized-domain registry also denies accidental sibling
+  authority roots in one interpreter;
+- acquisition/release errors fail closed;
+- rendezvous file is not deleted during normal transfer.
+
+The concrete Windows/POSIX primitive is an implementation choice that must be
+qualified against this contract and against the process-creation modes actually
+used by WireAgent/browser/test helpers. A primitive, filesystem, or child-process
+mode that cannot satisfy it is unsupported.
+
+### 6.2 No stale-lock-file cleanup
+
+After a crash, `authority.lock` may remain. A successor opens the same rendezvous
+and asks the qualified OS primitive whether exclusive ownership is available. It
+never deletes a supposedly stale lock file, trusts a PID, or compares mtime.
+
+### 6.3 `AuthoritySession`
+
+Successful acquisition creates:
+
+```text
+AuthoritySession
+  authority_domain
+  authority_instance_id   # random 256-bit runtime identity
+  acquired_at             # wall-clock provenance only
+  active                  # process-local terminal lifecycle
+  owner_handle            # private
+```
+
+`authority_instance_id` is runtime protocol identity/provenance. It is **not** an
+EffectLedger/ReconciliationLedger lineage field and is not persisted as execution
+authority.
+
+Explicit release marks the session terminal before closing the owner handle. A
+terminal session can never become active again. Reacquisition creates a new
+session and performs complete startup/hydration.
+
+### 6.4 No durable owner generation in M7
+
+M7 forbids live-owner stealing. A next owner acquires only after clean release or
+process death. Old M5/M6 ephemeral authority is never reconstructed across that
+boundary.
+
+A fresh random instance id is therefore sufficient for stale-client protocol
+rejection without introducing a third durable safety history and its own crash
+protocol. If a future design permits takeover while an old owner may remain live,
+it requires a mutation seam that can reject stale fencing generations; the
+current browser/X effect seam does not provide that property.
+
+---
+
+## 7. Authority service lifecycle
+
+Owner-service state is synchronized under one lifecycle fence:
+
+```text
+STARTING -> READY -> DRAINING -> TERMINAL
+```
+
+### 7.1 Request admission
+
+A request may reserve an active owner request slot only if, under one lifecycle
+critical section:
+
+```text
+session.active is true
+service state == READY
+authority_instance_id matches
+protocol_version is supported and matches
+runtime_build_id matches the owner exact qualified build
+request schema/version is valid
+resource/backpressure admission succeeds
+```
+
+The same critical section increments the active-request count before the request
+can run. The request slot is released after the owner-side operation reaches its
+safe local terminal boundary. In-flight request-table entries are pinned for the
+same interval and cannot be evicted to create capacity.
+
+### 7.2 Controlled drain
+
+`READY -> DRAINING` is synchronized with request admission. Once draining begins:
+
+- no new request slot can be admitted;
+- already-admitted work continues under the **still-held** AuthorityOwnerLock and
+  existing Dispatcher/M5/M6 authority;
+- shutdown waits for admitted work and the Dispatcher invocation domain to quiesce;
+- a hung admitted mutation does not cause lock release by timeout.
+
+If clean drain cannot complete, ownership remains held. Explicit process
+termination is the fail-stop takeover path. `DRAINING` is valid only while the
+owner still holds the qualified OS lock; it is never a recovery state after lock
+loss.
+
+---
+
+## 8. Startup and shutdown ordering
+
+### 8.1 Owner startup
+
+```text
+resolve/canonicalize/create local state directory
+-> warn if configured state_dir was relative; publish canonical authority domain
+-> establish exact runtime_build_id for the qualified WireAgent build
+-> reserve process-local authority-domain slot
+-> acquire OS AuthorityOwnerLock
+-> mint AuthoritySession + authority_instance_id
+-> create AuthorityServiceLifecycle(STARTING)
+-> construct canonical Dispatcher/M5/M6 authority root
+-> hydrate/validate composite RecoveryGuard from both safety ledgers
+-> if unavailable/corrupt: fail closed before browser startup
+-> start fresh owned browser/session
+-> install coherent M5/M6 live stack
+-> create local IPC endpoint with qualified same-user/local-machine restrictions
+-> transition STARTING -> READY
+-> begin accepting client work
+```
+
+If exact `runtime_build_id` cannot be established, production M7 IPC does not
+enter the qualified READY state. Human `runtime_version` remains diagnostic only.
+
+Ownership is acquired before authoritative recovery and before browser startup.
+A losing process therefore cannot construct a second supported production
+mutation path.
+
+If startup fails before readiness, cleanup may transition terminal and release
+ownership only after no mutation-capable runtime remains. A later owner still
+performs normal M5/M6 hydration; startup failure never implies clean external
+state.
+
+### 8.2 Controlled shutdown
+
+```text
+READY -> DRAINING under lifecycle fence
+-> stop new IPC admission
+-> wait for admitted owner work / Dispatcher invocation to quiesce
+-> advance/discard pending owner-side human confirmation authority for teardown
+-> close owner-side operator sessions
+-> retire/stop browser-capable live stack
+-> close local IPC endpoint
+-> AuthoritySession active -> terminal
+-> deliberately close private AuthorityOwnerLock handle LAST
+```
+
+If an in-flight operation cannot quiesce, clean shutdown does not release
+ownership merely to improve availability.
+
+The process may remain alive for diagnostics after controlled release, but the
+terminal session and retired browser-capable stack cannot authorize production
+work.
+
+---
+
+## 9. Takeover and hung-owner policy
+
+M7 deliberately chooses **fail-stop takeover**, not time-based failover.
+
+### 9.1 Clean takeover
+
+After controlled release, a successor acquires ownership, gets a new instance id,
+and rebuilds all ephemeral authority from scratch.
+
+### 9.2 Crash takeover
+
+After owner process death/forced termination, the qualified OS primitive releases
+ownership. A successor performs the complete startup ordering and rebuilds truth
+from durable M5/M6 histories.
+
+Old confirmation tokens, ApprovalGrants, EffectPermits, M5 claims, browser leases,
+request entries, and reconciliation authorities do not survive.
+
+### 9.3 Hung owner
+
+An alive but hung owner continues to hold ownership. Another process receives
+`authority_busy`; no TTL, heartbeat, PID age, or mtime permits stealing.
+
+Explicit operator recovery is:
+
+```text
+observe owner unhealthy
+-> create kill hot file if useful
+-> terminate hung owner if takeover is required
+-> wait for OS ownership release caused by owner process death
+-> start successor normally
+```
+
+This is intentionally less available than a lease. It prevents a paused owner
+from waking after timeout and crossing an unfenceable browser/X mutation seam.
+
+### 9.4 No supported live-process ownership-loss transition
+
+The qualified M7 state machine has only two ways to end OS ownership:
+
+```text
+controlled shutdown:
+  quiesce admitted mutation/browser authority
+  -> retire mutation-capable runtime
+  -> session terminal
+  -> deliberately close private owner handle
+
+fail-stop:
+  owner process dies/terminates
+  -> OS releases owner lock
+```
+
+There is no supported transition equivalent to:
+
+```text
+owner lock disappears while old process is alive
+-> old process drains/continues admitted mutation
+-> successor acquires concurrently
+```
+
+That sequence is precisely the unfenceable split-brain condition M7 exists to
+prevent. A platform/primitive/filesystem capable of spontaneous live-process lock
+loss is rejected during qualification. If a qualified implementation nevertheless
+detects an invalid/missing owner handle while the process is still alive, that is
+a fatal out-of-contract invariant breach. The process must cease/terminate rather
+than treating `DRAINING` as a safe recovery path, and M7 does **not** assert that a
+successor may safely overlap that impossible state. Production single-owner safety
+is claimed only for primitives where live-process ownership loss cannot occur
+outside deliberate post-quiescence close.
+
+---
+
+## 10. Local IPC boundary
+
+M7 adds a local client/server boundary so additional processes do not construct
+another Dispatcher/browser authority root.
+
+### 10.1 Transport constraints
+
+Production IPC is local-machine only:
+
+- Windows: a qualified named-pipe/equivalent primitive configured to reject
+  remote clients and protected by an explicit DACL for the intended local
+  user/service identity without permissive inherited access;
+- POSIX: a qualified Unix-domain/equivalent local primitive under an
+  owner-restricted directory/socket permission boundary, with peer-identity
+  checking where the platform reliably exposes it;
+- no production TCP listener;
+- endpoint permissions restricted to the current user where exposed;
+- no Python pickle or executable object deserialization;
+- bounded strict non-executable framing such as UTF-8 JSON with explicit schemas,
+  maximum frame/request sizes, and bounded queued/admitted work;
+- production qualification includes a negative remote-reachability test rather
+  than inferring locality from the transport name.
+
+Transport can differ by platform; authority semantics above it do not.
+
+### 10.2 Endpoint lifecycle
+
+Endpoint creation occurs only after owner lock acquisition. On POSIX, a successor
+that owns the authority lock may remove an unusable stale Unix-socket pathname
+before binding. Socket-path existence is never ownership. Controlled shutdown
+closes/unlinks the endpoint before releasing authority ownership.
+
+### 10.3 Handshake
+
+```text
+AuthorityHello
+  protocol_version
+  runtime_version          # diagnostic provenance only
+  runtime_build_id         # exact qualified artifact/source identity
+  authority_instance_id
+  authority_domain         # canonical absolute local path, diagnostic only
+  supported_ipc_operations
+  state: ready | draining | killed | recovery_unavailable
+```
+
+Initial production compatibility requires an exact supported `protocol_version`
+and exact matching `runtime_build_id`. `runtime_version` is diagnostic provenance
+and cannot substitute for build identity. A protocol/build mismatch fails before
+request admission. Later cross-build compatibility requires its own explicit
+qualification; it is not inferred from equal package versions or similar schemas.
+
+Handshake state, `runtime_version`, and `authority_domain` are diagnostic/protocol
+information, not execution authority.
+
+Layer-4 `supported_ipc_operations` is frozen to:
+
+```text
+health
+read
+read_profile
+read_thread
+read_search
+```
+
+`whoami` is withheld until Layer 5 because it establishes owner-side actor/session
+authority. `download_image` is withheld until the local-output contract in §18 is
+qualified. Path-backed media writes are also withheld until the media-ingress
+contract in §18 is qualified; Layer 5 may not advertise them by forwarding raw
+`image_path`/`image_paths` values.
+
+### 10.4 Request envelope
+
+```text
+AuthorityRequest
+  protocol_version
+  runtime_build_id
+  authority_instance_id
+  request_id
+  operation
+  payload
+```
+
+Rules:
+
+- protocol version and exact build identity must match the current supported owner
+  contract;
+- instance id must match the live owner;
+- request id is an opaque high-entropy client identifier;
+- unknown version/operation/schema fails before Dispatcher/recovery invocation;
+- stale instance fails `stale_authority_instance`;
+- file-backed media operations, when later exposed, use a qualified owner-side
+  media artifact/reference schema; raw client-relative filesystem paths are never
+  passed through as capability media identity;
+- client never receives raw SuperBrowser, CommitGateway, EffectLedger,
+  ReconciliationLedger, ConfirmationState, or ReconciliationAuthority objects.
+
+### 10.5 Canonical request identity and ephemeral owner request table
+
+Canonical request equality is computed **after strict schema validation** from a
+single deterministic owner-defined representation of:
+
+```text
+protocol_version
+operation
+schema-normalized payload
+```
+
+Dictionary/object keys are deterministically ordered, list order is preserved,
+non-finite numbers and unsupported values are rejected, and schema normalization
+decides scalar representation before canonical serialization/digesting.
+`authority_instance_id`, `runtime_build_id`, and `request_id` are validated
+routing/envelope identity and are not part of canonical payload equality.
+
+For a retained request entry:
+
+```text
+new id + canonical request          -> execute once
+same id + same in-flight request    -> join/await or request_in_progress
+same id + same completed request    -> return retained response
+same id + different request         -> protocol violation; no execution
+```
+
+In-flight entries are pinned and non-evictable. Admission holds a strong owner-side
+reference to the task/work until the request reaches its safe local terminal
+boundary. Resource pressure when all eligible capacity is occupied by live work
+causes backpressure/rejection of new admission rather than eviction of active
+entries.
+
+Completed entries are process-local and bounded by count/time/resource policy.
+Their retention window is a transport convenience, not a safety guarantee. After
+completed-entry eviction there is no transport-level exactly-once claim. M5/M6
+remains the external-effect authority.
+
+### 10.6 Connection loss and cancellation
+
+Once a **mutating or terminal-reconciliation** request is admitted, its owner-side
+operation is detached from the client connection lifetime. Client disconnect or
+RPC timeout means response uncertainty; it does not cancel the admitted mutation.
+The owner drives the operation to its normal safe M5/M6 terminal boundary.
+
+M7 defines no generic client cancel for an in-flight mutation. Any future
+cancellation protocol must prove a precommit boundary or use existing kill/effect
+semantics explicitly.
+
+Read-only requests may be cancelled according to bounded read semantics when
+that cannot interfere with an owned browser mutation/composer lease.
+
+---
+
+## 11. Browser ownership
+
+1. Only the active authority owner starts/owns the production browser session.
+2. All production browser reads **and** writes route through the owner.
+3. Client processes do not directly navigate the production browser.
+4. Existing Dispatcher serialization and M5 browser lease remain inner browser
+   coordination.
+5. Attach mode remains diagnostic, not production ownership/takeover authority.
+6. After owner crash, a successor does not silently attach to an orphaned browser.
+7. Successor launches/restores a fresh owned session and re-establishes live actor
+   identity using existing whoami authority rules.
+
+An orphan browser may still finish already-emitted network activity after owner
+death. Browser-process survival is never proof of effect or no-effect; durable
+M5/M6 evidence/recovery truth remains authoritative.
+
+---
+
+## 12. M5/M6 integration
+
+M7 adds one outer lifetime boundary:
+
+```text
+AuthorityOwnerLock                 # M7, whole owner lifetime
+  -> AuthorityServiceLifecycle
+     -> Dispatcher invocation domain
+        -> WriteKernel confirmation/policy shell
+        -> RecoveryGuard
+        -> M5 scoped authority
+        -> CommitGateway
+        -> EffectLedger
+        -> browser effect/evidence
+
+AuthorityOwnerLock                 # same owner
+  -> AuthorityServiceLifecycle
+     -> M6 ReconciliationCoordinator
+        -> ReconciliationPublicationFence
+        -> CommitGateway lifecycle fence
+        -> ConfirmationState epoch
+        -> ReconciliationLedger
+        -> RecoveryGuard publication
+```
+
+M7 does not create a CommitGateway, ConfirmationState, browser lease, or
+RecoveryGuard per client.
+
+### 12.1 Ledgers remain single-writer in the supported topology
+
+M7 does not redesign NDJSON ledgers as arbitrary multi-process writer formats.
+The supported law is:
+
+> A process without the active AuthoritySession cannot use a supported production
+> path that writes EffectLedger or ReconciliationLedger.
+
+Raw low-level class use by non-cooperating same-user code remains outside the
+M7 threat model.
+
+### 12.2 Existing durability semantics remain unchanged
+
+Owner death during M5/M6 persistence uses current laws:
+
+- torn/corrupt history fails closed;
+- raw `RESERVED` after restart projects to unresolved unknown;
+- `EFFECT_UNKNOWN` remains immutable historical truth;
+- ambiguous reconciliation is non-authoritative until exact re-durability;
+- old grant/permit/reconciliation authority is never reconstructed.
+
+---
+
+## 13. Human confirmation across clients
+
+The owner has exactly one canonical `ConfirmationState` for its authority
+instance. All clients share it indirectly:
+
+```text
+client A preview -> owner issues token T
+client B preview -> owner issues token U
+M6 reconciliation -> owner advances one confirmation epoch
+T and U -> stale under the same owner state
+```
+
+Rules:
+
+- clients hold opaque token strings/preview data only;
+- canonical token authority remains private owner state;
+- token authority is not bound to client process identity in the trusted same-
+  user model;
+- existing capability/intent/risk/single-use/monotonic-TTL rules remain
+  authoritative;
+- reconciliation advances the same epoch for every client;
+- owner restart destroys all pending token authority;
+- stale owner instance is rejected before an old token can reach current protocol
+  execution.
+
+Two concurrent requests carrying the same confirmation token are serialized by
+the owner; the existing single-use consume boundary permits at most one normal
+success path.
+
+No durable cross-restart confirmation epoch is introduced because restart retains
+no pending confirmation authority.
+
+---
+
+## 14. Reconciliation across processes
+
+M6 terminal reconciliation remains explicit local human/operator authority. M7
+changes only where that authority root lives.
+
+### 14.1 Production owner active
+
+Any external recovery/operator process routes through the owner IPC boundary or
+fails `authority_busy`. It does not construct an independent write-capable
+ReconciliationCoordinator for the same authority domain.
+
+Owner-side reconciliation retains the existing M6 publication, lifecycle,
+confirmation-epoch, durability, and RecoveryGuard ordering unchanged.
+
+### 14.2 Owner absent
+
+A standalone recovery program may acquire the same `AuthorityOwnerLock` and
+become a temporary authority owner:
+
+```text
+acquire ownership
+-> hydrate both safety ledgers
+-> construct canonical M6 authority root
+-> run explicit operator workflow
+-> start owned browser only if bounded inspection requires it
+-> drain/terminate owner lifecycle
+-> release ownership last
+```
+
+If another owner is active, it cannot write reconciliation directly.
+
+### 14.3 Operator sessions over IPC
+
+IPC operator sessions are owner-side, ephemeral, bound to the current instance,
+and closed by owner restart/drain. The M6 same-session explicit human
+confirmation requirement for terminal reconciliation remains authoritative.
+
+---
+
+## 15. Kill semantics
+
+The existing kill hot file remains the external same-state-directory emergency
+mechanism. Kill is not ownership transfer.
+
+- programmatic owner kill uses existing KillSwitch;
+- an external local process may create the hot file;
+- owner re-observes kill at existing M5 authority boundaries;
+- kill does not release `AuthorityOwnerLock`;
+- kill does not let a successor steal a live owner;
+- kill does not rewrite/clear M5/M6 history;
+- successor started while hot file remains begins mutation-blocked.
+
+A hot-file trip cannot instantaneously interrupt an arbitrary OS/browser call
+already in progress. If a hung owner must be replaced, the operator terminates
+the owner; M5/M6 then governs any uncertain effect.
+
+---
+
+## 16. Client retry and lost-response semantics
+
+Transport uncertainty must not become external-effect replay.
+
+### 16.1 Same owner instance remains alive
+
+While an in-flight entry exists, it is pinned and retrying the same request id and
+canonical request joins/observes that exact owner-side work. While a completed
+entry is retained, the same retry returns the retained outcome instead of starting
+a second copy.
+
+After a completed entry is evicted, transport dedupe makes no guarantee. Mutating
+operations remain protected by their deeper confirmation/M5/M6 semantics; eviction
+itself is never permission to issue fresh authority.
+
+### 16.2 Owner changes while a read-only request was in flight
+
+After a fresh compatible handshake, a client may retry a pure read operation
+according to its normal bounded read semantics.
+
+### 16.3 Owner changes while mutation/reconciliation outcome is unknown
+
+The client library **must not automatically resend** the old mutation against the
+new instance. It reports owner/transport outcome uncertainty. The successor then
+uses M5/M6 durable truth:
+
+```text
+old owner unavailable / response unknown
+-> fresh handshake with successor
+-> inspect effect/recovery state
+-> if durable uncertainty exists: remain blocked / reconcile
+-> otherwise any later mutation is a genuinely fresh human-approved invocation
+```
+
+A new instance id is a restart fence, not authorization to repeat old intent.
+
+`request_id` is never persisted into M5/M6 as a substitute for `effect_id`.
+
+---
+
+## 17. Crash and restart semantics
+
+### 17.1 Crash before M5 durable reservation
+
+No old ephemeral execution authority survives. Any later mutation requires fresh
+normal confirmation.
+
+### 17.2 Crash after durable `RESERVED`, before known terminal outcome
+
+Successor hydration projects unresolved unknown. Matching semantic replay remains
+blocked by RecoveryGuard.
+
+### 17.3 Crash after external mutation, before terminal evidence/outcome
+
+Same unresolved/reconciliation path. Process death is not `NO_EFFECT` evidence.
+
+### 17.4 Crash after durable terminal M5 outcome
+
+Successor reconstructs settled effect history. No old grant/permit is revived.
+
+### 17.5 Crash during reconciliation
+
+Existing M6 semantics apply: confirmation authority dies with the process;
+visible-but-ambiguous reconciliation cannot clear recovery; surviving durable
+reconciliation is re-durability-established before use.
+
+### 17.6 Crash with surviving browser child
+
+The child browser is not authority. Successor does not attach to it as production
+session. Any already-emitted remote effect is represented only through M5/M6
+history/evidence.
+
+### 17.7 Machine reboot
+
+OS ownership and all ephemeral authority disappear. New owner acquires normally
+and rebuilds from durable M5/M6 state.
+
+---
+
+## 18. Local file/artifact boundary
+
+M7 never assumes that a filesystem path string has the same referent in the IPC
+client and the authority owner. File-backed capability exposure therefore has a
+separate qualification boundary from ordinary JSON capability routing.
+
+### 18.1 Media ingress for path-backed writes
+
+The existing media writes are:
+
+```text
+post_photo
+post_multi_image
+reply_photo
+reply_multi_image
+quote_photo
+quote_multi_image
+```
+
+They are **not** advertised/exposed over M7 IPC until one owner-side media-ingress
+contract is implemented and qualified. Passing existing `image_path` /
+`image_paths` strings through the request envelope is not that contract.
+
+A qualified media-ingress contract must establish all of the following before
+preview/confirmation authority is issued:
+
+- no CWD-relative client path is interpreted in the owner process;
+- artifact identity is owner-side and unambiguous;
+- if canonical-path ingress is selected, the path is absolute, normalized, inside
+  configured owner-approved ingress roots, and revalidated by the owner;
+- if staging/transfer ingress is selected, the owner controls the staging root and
+  binds the staged artifact to the client-declared transfer identity;
+- owner recomputes/validates bytes, SHA-256, MIME/type, size/dimensions, EXIF/media
+  policy, and any existing upload-root restriction before capability compose;
+- the exact artifact/digest bound into preview/confirmation is the artifact later
+  supplied to the existing media compose path;
+- media references are scoped to the current `authority_instance_id`; restart
+  invalidates them and they are never durable M5/M6 execution authority;
+- staged/referenced artifacts needed by admitted mutations are pinned until the
+  existing M5/M6 safe terminal boundary, so client disconnect cannot delete or
+  substitute live media;
+- all items for a multi-image request are resolved/transferred and validated in
+  order before any composer/upload work starts; no valid prefix is uploaded after
+  a later item fails;
+- traversal, symlink/alias, digest mismatch, truncated transfer, unsupported media,
+  and over-limit input fail before preview/token/effect authority;
+- cleanup/retention cannot create replay authority and cannot race an admitted
+  mutation that still references the artifact.
+
+The concrete ingress mechanism is an implementation choice only after these laws
+are preserved and qualified. Until then, media writes are deliberately unsupported
+over M7 IPC; they are not silently reinterpreted against the owner's filesystem.
+
+### 18.2 Local-output capability boundary
+
+`download_image` is not an X mutation but has a local filesystem effect. M7 does
+not silently treat client paths as owner-local paths.
+
+Layer 4 IPC qualification initially includes only the pure operations frozen in
+§10.3 and excludes both authority-establishing `whoami` and local-output
+`download_image`. Before `download_image` is exposed over IPC, a separate bounded
+output contract must define:
+
+- owner-approved output root;
+- path normalization/traversal rules;
+- artifact identity/metadata returned to the client;
+- overwrite/collision semantics;
+- cleanup/retention behavior;
+- claim ceiling for local filesystem durability.
+
+That work need not alter remote M5 effect semantics but must be explicit.
+
+---
+
+## 19. Security and trust boundary
+
+M7 remains personal, local, single-user.
+
+Supported failure model:
+
+- multiple normal/cooperating M7-aware processes under the same local user;
+- accidental concurrent startup;
+- owner crash/forced termination;
+- hung owner requiring explicit termination;
+- stale client after owner restart;
+- IPC disconnect/duplicate delivery/lost response;
+- browser/runtime fault;
+- existing ledger crash/corruption ambiguity handled by M5/M6.
+
+Not protected against:
+
+- malicious same-user code importing raw safety classes or driving another
+  browser automation stack;
+- Administrator/root bypass of files, process handles, or IPC ACLs;
+- malicious safety-ledger editing;
+- hostile kernel/filesystem behavior;
+- remote multi-host races;
+- a platform/filesystem lock primitive that violates the qualified fail-stop
+  ownership-lifetime contract.
+
+IPC must not expand the boundary with a network listener or executable
+serialization.
+
+---
+
+## 20. Path, filesystem, and platform claim ceilings
+
+The M7 ownership claim applies only to one canonical **local** state directory on
+qualified platform/filesystem combinations.
+
+Initial claim ceiling excludes:
+
+- SMB/NFS/network/shared filesystem locking semantics;
+- container/VM shared-volume aliases not covered by qualification;
+- two intentionally distinct state dirs controlling the same remote actor;
+- pre-M7 binaries that ignore the owner protocol;
+- arbitrary path-alias attacks by hostile local code;
+- cross-build/mixed-runtime IPC until explicitly qualified;
+- any primitive/filesystem capable of releasing ownership while the owner process
+  remains alive and mutation-capable outside controlled post-quiescence close;
+- implicit client-path/owner-path equivalence for media ingress or local output.
+
+Known unsupported network/shared state should fail the production support gate
+where detection is reliable. Where platform APIs cannot conclusively classify the
+storage stack, runtime operation must not be documented as carrying the M7
+qualified cross-process claim. An explicit diagnostic/unsupported override, if
+one is added, must be visibly outside the production safety claim.
+
+Path normalization is ordinary alias defense, not cryptographic filesystem
+identity. Different canonical roots remain different authority domains even if
+they target the same remote actor; the production warning/diagnostics reduce
+accidental root divergence but do not claim account-global uniqueness.
+
+---
+
+## 21. Windows and multi-process qualification
+
+M7 cannot infer cross-process ownership from single-process tests. Qualification
+must run genuine sibling processes on actual Windows Server 2025 runners, using
+the same evidence discipline as M6 Layer 6.
+
+Qualification covers at least:
+
+```text
+two simultaneous owner acquisitions -> exactly one owner
+live owner blocks second process without timeout stealing
+normal release -> successor can acquire
+forced owner termination -> OS releases ownership
+qualified primitive cannot expire/revoke/drop lock while owner remains live/mutation-capable
+rendezvous file remains -> successor still acquires when OS lock is free
+same-process duplicate authority root -> denied
+case/path-normalized same domain -> one owner
+owner handle/process mode prevents child retention/release/extension
+spawn/exec child cannot inherit usable authority
+POSIX fork child cannot keep owner lock alive or exercise owner authority under the qualified adapter
+unrelated descriptor close does not release owner lock
+service drain races request admission -> one synchronized ordering
+owner crash before/after browser startup -> successor performs full hydration
+owner crash during EffectLedger/ReconciliationLedger I/O -> existing fail-closed semantics hold
+stale client instance after takeover -> rejected
+protocol/runtime-build mismatch -> rejected before admission
+mutating client is not automatically replayed across instance change
+admitted mutation survives client disconnect as owner-side work
+in-flight request entry remains pinned under cache/resource pressure
+stale POSIX socket path cleanup occurs only under authority ownership
+POSIX IPC permissions remain owner-restricted under the qualified platform
+Windows IPC DACL is restricted and remote client attempt is rejected
+production IPC is not remotely reachable
+no executable deserialization exists
+raw relative client media path is never resolved against owner CWD
+media-backed write is unsupported until qualified ingress exists
+when media ingress exists, owner revalidates exact bytes/digest/type before preview
+media reference/staging identity is owner-instance scoped and dies on restart
+admitted media artifacts remain pinned through the mutation terminal boundary
+multi-image ingress completes validation for every ordered item before composer work
+```
+
+POSIX sibling-process qualification is also required. No stronger lock/IPC/file-
+artifact portability statement is made than environments and primitives actually
+tested.
+
+---
+
+## 22. Frozen M7 invariants
+
+1. Exactly one M7-aware supported production authority owner exists per canonical
+   authority domain at a time.
+2. Authority domain is based on canonical local `state_dir` identity.
+3. Lock-file existence, PID, mtime, age, and heartbeat never grant/revoke
+   ownership.
+4. Production ownership uses a non-expiring qualified OS-held lock.
+5. An alive/hung owner is never automatically timed out and replaced.
+6. Takeover requires clean post-quiescence release or owner process
+   death/termination.
+7. Owner handle is dedicated and private; qualified spawn/exec/fork semantics
+   ensure no child can retain, extend, release, or exercise production ownership
+   after the parent owner dies.
+8. Owner lock is acquired before authoritative recovery and browser startup.
+9. Owner lock is released last after supported owner work/browser authority is
+   quiesced.
+10. Request admission and transition to `DRAINING` share one lifecycle fence.
+11. Clean shutdown never releases ownership while admitted mutating work remains.
+12. Same-process sibling authority roots for one domain are denied.
+13. Every acquisition creates a fresh random `authority_instance_id`.
+14. Instance id is not durable effect/reconciliation lineage.
+15. Released/terminal AuthoritySession can never authorize again.
+16. Successor never reconstructs old ConfirmationState, ApprovalGrant,
+    EffectPermit, M5 claim, browser lease, request cache, or reconciliation
+    authority.
+17. All production browser reads and writes execute in owner process.
+18. Attach mode remains diagnostic, not production takeover authority.
+19. Orphan browser after owner death is not reattached as production authority.
+20. One owner-side Dispatcher remains the supported capability authority root.
+21. One owner-side ConfirmationState serves all clients.
+22. M6 epoch advancement invalidates pending confirmations from all clients.
+23. Owner restart kills all pending confirmation authority naturally.
+24. One owner-side ReconciliationCoordinator serves the authority domain.
+25. Standalone recovery writes only after acquiring the same owner lock.
+26. Active-owner recovery routes through owner or fails busy.
+27. EffectLedger/ReconciliationLedger remain single-writer in supported topology.
+28. M5/M6 state machines and immutable-history semantics are unchanged.
+29. Process death is never proof of `NO_EFFECT`.
+30. Owner takeover never clears RecoveryGuard uncertainty.
+31. Request id is not effect id and carries no durable replay truth.
+32. Request dedupe is bounded/ephemeral and cannot authorize or clear recovery.
+33. In-flight request entries are non-evictable and strongly retained until their
+    safe local terminal boundary; capacity pressure backpressures new admission.
+34. Retained same request id with changed canonical request is rejected.
+35. Canonical request equality is one deterministic post-schema owner contract.
+36. Stale instance id is rejected before owner execution.
+37. Automatic mutating/reconciliation retry across owner-instance change is
+    forbidden.
+38. Read-only retry across owner-instance change may occur after fresh compatible
+    handshake.
+39. Client disconnect/timeout does not cancel an admitted mutation/reconciliation.
+40. IPC exposes bounded capabilities/operator workflow, not raw browser/ledger/
+    gateway/authority objects.
+41. IPC uses bounded non-executable serialization; pickle-equivalent executable
+    deserialization is forbidden.
+42. M7 opens no production TCP listener and the selected Windows/POSIX IPC adapter
+    must establish the same-machine/same-user claim directly.
+43. Endpoint-path existence is not authority; stale local endpoint cleanup occurs
+    only while owner lock is held.
+44. Kill does not transfer ownership or bypass M5/M6 recovery.
+45. External hot-file kill retains existing bounded semantics; no instantaneous
+    interruption claim is added.
+46. Under the qualified primitive, OS ownership cannot disappear while the owner
+    remains live and mutation-capable; live-process lock loss is not a supported
+    transition or safe drain/takeover condition.
+47. `download_image` is not exposed over IPC until local-output path semantics are
+    explicitly qualified.
+48. `whoami` is authority-establishing and is not part of the Layer-4 pure-read
+    IPC surface.
+49. Production startup exposes the resolved absolute authority domain and warns
+    when configuration supplied a relative state root.
+50. Protocol or exact runtime-build mismatch is rejected before request admission
+    under the initial M7 compatibility claim; human package version is not build
+    identity.
+51. M7 makes no cross-machine, distributed exactly-once, hostile-local-code, or
+    network-filesystem claim.
+52. Different state roots are distinct authority domains even if they target the
+    same remote actor.
+53. Pre-M7 processes that ignore ownership are outside the M7 coordination claim.
+54. Cross-build/mixed-runtime interoperability is unsupported until separately
+    qualified.
+55. M7 inherits the complete M5 and M6 acceptance **and mandatory regression**
+    contracts under one owner; range shorthand never narrows inherited safety.
+56. Path-backed media writes are not exposed over IPC until a qualified owner-side
+    media-ingress contract exists; raw client-relative filesystem paths never
+    become owner media identity.
+57. Media artifact/reference authority is process/owner-instance local and
+    non-durable; restart invalidates it, while admitted work pins required media
+    until the safe M5/M6 terminal boundary.
+58. Multi-image IPC ingress preserves the existing all-items-before-any-upload
+    preflight law and ordered digest binding.
+
+---
+
+## 23. Acceptance tests
+
+| # | Scenario | Required outcome |
+|---|---|---|
+| M7-T1 | First process starts on free domain | Acquires owner lock before recovery/browser |
+| M7-T2 | Two processes start concurrently | Exactly one owner; loser `authority_busy` before production browser/safety-write authority |
+| M7-T3 | Two authority roots in same interpreter/path | Second denied |
+| M7-T4 | `authority.lock` exists but OS lock free | New owner acquires; file existence irrelevant |
+| M7-T5 | PID/mtime appears stale while owner live | No takeover |
+| M7-T6 | Owner hung past arbitrary duration | No automatic takeover |
+| M7-T7 | Owner releases cleanly | Successor acquires new session/instance |
+| M7-T8 | Owner forcibly terminated | OS releases; successor may acquire after death |
+| M7-T9 | Terminal AuthoritySession used | Denied fail-closed |
+| M7-T10 | Child spawned while owner active | No inherited usable owner handle |
+| M7-T11 | Unrelated descriptor to rendezvous closes | Qualified owner lock remains held |
+| M7-T12 | Windows case/path alias | Same authority domain |
+| M7-T13 | Corrupt EffectLedger on startup | Fail closed before browser/IPC ready |
+| M7-T14 | Corrupt/ambiguous ReconciliationLedger | Same fail-closed behavior |
+| M7-T15 | Browser startup fails after ownership | Never READY; release only after no mutation-capable runtime remains |
+| M7-T16 | Admission races `READY -> DRAINING` | Request is either fully admitted before drain or rejected; no torn admission |
+| M7-T17 | Clean shutdown with active request | Ownership held until request leaves safe owner boundary |
+| M7-T18 | Active mutation hangs during shutdown | Clean release does not occur by timeout |
+| M7-T19 | Client handshake current owner | Returns current instance/version/build/domain/operations |
+| M7-T20 | Client stale instance id | Rejected before Dispatcher/recovery execution |
+| M7-T21 | Unknown protocol/schema/oversized frame | Rejected before execution |
+| M7-T22 | Same retained request id + same payload concurrent | One execution; duplicate joins/in-progress |
+| M7-T23 | Same retained completed id + same payload | Retained response; no new execution |
+| M7-T24 | Same retained id + different payload | Protocol violation; no execution |
+| M7-T25 | Completed request entry evicted | No transport exactly-once claim; eviction creates no mutation authority |
+| M7-T26 | Owner restarts | Old table gone; old instance rejected |
+| M7-T27 | Two clients obtain confirmation tokens | Both live in same owner ConfirmationState |
+| M7-T28 | Two clients race same confirmation token | Existing single-use authority allows at most one success path |
+| M7-T29 | M6 reconciliation advances epoch | Pending tokens from all clients stale |
+| M7-T30 | Owner restarts while client holds token | Old token not reconstructed; old instance stale |
+| M7-T31 | Client read/write contend | Both owner-routed through existing Dispatcher/browser coordination |
+| M7-T32 | Second process attempts supported production browser start | Denied by ownership before browser startup |
+| M7-T33 | Owner crash leaves browser child alive | Successor does not attach to orphan as production owner |
+| M7-T34 | Crash before durable RESERVED | No old execution authority; fresh confirmation required |
+| M7-T35 | Crash after RESERVED before terminal outcome | Successor RecoveryGuard blocks replay |
+| M7-T36 | Crash after external effect before evidence | Same unresolved/reconciliation path |
+| M7-T37 | Crash after durable terminal M5 outcome | Settled history recovers; no old grant/permit |
+| M7-T38 | Crash during ambiguous reconciliation append | Existing M6 ambiguity/re-durability semantics hold |
+| M7-T39 | Production owner active; external recovery starts | Cannot write independently; route through owner/fail busy |
+| M7-T40 | No owner; standalone recovery starts | Acquires same owner lock before M6 authority |
+| M7-T41 | Owner-side reconciliation completes | Existing M6 ordering unchanged; all clients share resulting owner state |
+| M7-T42 | Client disconnects after mutating request admission | Owner task continues independently to safe M5/M6 terminal boundary |
+| M7-T43 | Client retries same retained request after disconnect | Joins/returns same owner-side request |
+| M7-T44 | Client loses mutation response and owner crashes | Successor does not auto-replay; M5/M6 truth governs next action |
+| M7-T45 | Read response lost across owner restart | Fresh-compatible-handshake read retry allowed |
+| M7-T46 | Kill hot file trips while owner active | Existing authority boundaries block; ownership unchanged |
+| M7-T47 | Kill hot file trips while owner hung externally | No instantaneous-cancel/takeover claim |
+| M7-T48 | Operator terminates hung owner | Successor acquires only after OS release, then hydrates before browser |
+| M7-T49 | POSIX owner crashes leaving socket pathname | Successor removes/rebinds stale endpoint only after acquiring owner lock |
+| M7-T50 | IPC malformed/non-JSON/executable payload attempt | Rejected safely; no executable deserialization |
+| M7-T51 | IPC implementation inspection | No production TCP listener |
+| M7-T52 | `download_image` requested before output contract | Not exposed/unsupported over M7 IPC |
+| M7-T53 | Actual Windows Server 2025 sibling-process run | Ownership/crash-release/takeover matches bounded claim |
+| M7-T54 | POSIX sibling-process run | Same semantic contract under qualified primitive |
+| M7-T55 | Unsupported network/shared state | Production qualified claim refused/not asserted |
+| M7-T56 | Pre-M7 process ignores owner lock | Explicitly outside claim; docs/tests do not imply protection |
+| M7-T57 | Request table at capacity with admitted work still in flight | Live entries remain pinned; new admission backpressured/rejected; no duplicate owner work |
+| M7-T58 | Semantically identical validated request encoded with different JSON object key order | One canonical request identity; duplicate joins/returns retained outcome |
+| M7-T59 | Windows remote client attempts production IPC and ACL is inspected | Remote client rejected; endpoint DACL limited to intended local identity |
+| M7-T60 | POSIX local endpoint permissions/peer boundary inspected | Endpoint remains within qualified owner-restricted same-user boundary |
+| M7-T61 | Layer-4 client requests `whoami` | Not advertised/unsupported until Layer 5 authority-establishing read qualification |
+| M7-T62 | Production starts with relative `state_dir` | Canonical absolute domain is used/exposed and warning identifies resolved root |
+| M7-T63 | Qualified POSIX fork/spawn/exec child survives parent owner death | Child cannot retain/extend/release/use production ownership; successor acquisition follows chosen primitive contract |
+| M7-T64 | Client protocol or exact runtime build id differs from owner | Rejected before request admission under initial M7 compatibility claim |
+| M7-T65 | Qualified owner process remains alive/mutation-capable under supported platform faults without controlled release | OS ownership cannot disappear; any primitive that allows live-process lock loss fails qualification |
+| M7-T66 | Layer-5 client requests photo/multi-image write before media-ingress qualification | Operation not advertised/unsupported; no owner path resolution, preview, token, or effect authority |
+| M7-T67 | Media-enabled IPC receives a relative/raw client filesystem path | Rejected before capability compose; owner CWD is never used to reinterpret it |
+| M7-T68 | Qualified media ingress resolves/stages an artifact | Owner revalidates exact bytes/digest/type/policy before preview and the bound artifact is the one later uploaded |
+| M7-T69 | Media reference exists, then owner changes or client disconnects during admitted mutation | Restart makes old reference stale/no auto-replay; same-owner admitted work keeps required media pinned until safe terminal boundary |
+| M7-T70 | Multi-image ingress contains one invalid/failed item | Entire request fails before composer/upload; order/digests of valid prefix cannot authorize partial media effect |
+
+Mandatory regressions:
+
+- all M5 T1–T25 behavior and **all additional mandatory regressions** in
+  `docs/M5_DESIGN.md` §14 remain unchanged under one owner;
+- all M6 R1–R48 behavior and **all additional mandatory regressions** in
+  `docs/M6_DESIGN.md` §20 remain unchanged under one owner;
+- owner-lock acquisition failure issues no token, appends no safety fact, launches
+  no browser, and commits no reconciliation;
+- stale owner instance cannot mint/consume confirmation through IPC;
+- request-cache eviction cannot grant external replay authority;
+- request-table pressure cannot evict or orphan admitted in-flight owner work;
+- journal remains audit-only and cannot establish owner identity;
+- instance id may appear in diagnostics/audit but never changes M5/M6 lineage;
+- process restart does not turn token-bucket/dedupe reset into a durable claim;
+- offline reconciliation retains explicit M6 operator confirmation;
+- raw diagnostics outside owner never become mutation authority;
+- media ingress, if exposed, preserves existing immutable attachment digest/
+  manifest binding and all-before-any-upload preflight semantics;
+- qualification uses genuine sibling processes, not two objects in one interpreter.
+
+---
+
+## 24. Build order
+
+```text
+1. AuthorityOwnerLock + canonical domain + process-local owner registry
+2. AuthoritySession + AuthorityServiceLifecycle + Dispatcher/recovery ownership integration
+3. owner instance identity + startup/shutdown/crash-takeover qualification
+4. local IPC transport + handshake + bounded pure read/health path
+5. whoami authority-establishing read + non-file-backed write + confirmation + reconciliation routing + bounded request table
+6. local artifact boundary: media ingress before any path-backed media write exposure; download_image output contract only if exposed
+7. POSIX multi-process crash/fault/response-loss qualification
+8. Windows Server 2025 multi-process lock/IPC/takeover qualification
+```
+
+Each implementation layer uses the established project method:
+
+```text
+maintainer-first exhaustive review
+-> explicit findings register
+-> freeze exact candidate
+-> CI
+-> independent Codex/GitWire correctness review when actually available
+-> reconcile findings
+-> exact-head validation
+-> pinned merge
+```
+
+If an independent general correctness-review integration is unavailable, use a
+distinct recorded adversarial second pass. Never relabel the maintainer's own
+second reading as independent Codex verification.
+
+### 24.1 Layer boundaries
+
+**Layer 1** proves only ownership acquisition/release semantics. No browser/IPC.
+
+**Layer 2** makes ownership mandatory for supported Dispatcher and standalone
+recovery entrypoints and freezes request-admission/drain ordering.
+
+**Layer 3** qualifies lifecycle, stale-session denial, crash takeover, and no
+heartbeat stealing before adding a client protocol.
+
+**Layer 4** adds local IPC only for `health`, `read`, `read_profile`, `read_thread`,
+and `read_search`, so framing, canonical request identity, exact build/protocol
+compatibility, stale-instance, size/backpressure, disconnect, endpoint
+permissions/cleanup, and shutdown semantics are qualified without owner actor-state
+mutation or remote mutation risk. `whoami`, media-backed writes, and
+`download_image` remain withheld.
+
+**Layer 5** adds `whoami` as an authority-establishing read and routes
+non-file-backed write/confirmation/reconciliation through the existing owner
+authority root. Mutating tasks are decoupled from client connection lifetime and
+request-table entries remain pinned while work is active. The six media-backed
+write operations remain unsupported over IPC until Layer 6.
+
+**Layer 6** qualifies local artifact referents. A media-ingress contract is
+mandatory before any path-backed media write is exposed. `download_image` remains
+optional for milestone ordering only if it stays explicitly unsupported over IPC;
+if exposed, its owner-side output-path contract must also be qualified first.
+
+**Layers 7–8** are qualification layers. Production changes occur only when real
+multi-process/platform evidence falsifies a frozen assumption.
+
+---
+
+## 25. M7 completion criteria
+
+M7 is complete only when:
+
+```text
+✓ exactly one supported owner process exists per canonical qualified local state dir
+✓ production diagnostics expose the resolved absolute authority domain and warn on relative configuration
+✓ ownership is OS-held and non-expiring; no heartbeat/PID/mtime takeover exists
+✓ qualified owner lock cannot expire/revoke/drop while owner remains alive and mutation-capable
+✓ chosen lock primitive has dedicated-handle/process-death semantics and no unrelated-descriptor release
+✓ qualified child process modes cannot retain, extend, release, or use owner authority after parent death
+✓ losing processes fail before production browser or safety-write authority
+✓ request admission and owner drain have one synchronized ordering while ownership remains held
+✓ controlled release is last and never overtakes admitted mutation work
+✓ forced process death permits OS-level takeover without stale-lock-file deletion
+✓ successor never restores old ephemeral confirmation/grant/permit/reconciliation authority
+✓ every M7-exposed production browser read/write is owner-routed
+✓ active-owner recovery is owner-routed; offline recovery acquires same ownership boundary
+✓ stale-instance, incompatible-protocol, and different-build requests fail before execution
+✓ local transport uses bounded non-executable serialization and no production TCP listener
+✓ Windows IPC explicitly rejects remote clients and enforces the qualified local-identity ACL
+✓ POSIX IPC remains inside the qualified owner-restricted local-user boundary
+✓ stale local IPC rendezvous cleanup happens only under owner lock
+✓ canonical request identity is one deterministic post-schema owner contract
+✓ transport request dedupe is bounded/ephemeral/non-authoritative
+✓ admitted in-flight request entries are non-evictable and strongly retained
+✓ admitted mutation/reconciliation outlives client disconnect rather than being transport-cancelled
+✓ client does not automatically replay mutation/reconciliation across owner-instance change
+✓ lost-response and owner-crash cases fall back to M5/M6 durable truth
+✓ Layer-4 IPC surface remains pure read/health; whoami enters only with Layer-5 authority qualification
+✓ path-backed media writes stay off IPC until a qualified owner-side media-ingress contract exists
+✓ raw client-relative media paths are never resolved against owner CWD
+✓ any exposed media ingress revalidates/binds exact owner-side bytes and is owner-instance scoped/pinned while in use
+✓ `download_image` stays off IPC until its local-output contract is explicit
+✓ all M5 T1–T25 + all M5 mandatory regressions remain unchanged under one owner
+✓ all M6 R1–R48 + all M6 mandatory regressions remain unchanged under one owner
+✓ genuine sibling-process crash/takeover tests exist
+✓ actual Windows Server 2025 ownership/IPC behavior is qualified and claim-bounded
+✓ hostile-same-user, network-filesystem, cross-build/mixed-runtime, multi-state-root,
+  cross-machine, spontaneous-live-lock-loss, implicit-client-path-equivalence, and distributed-exactly-once exclusions remain explicit
+```
+
+The bounded M7 claim is:
+
+> On one qualified local machine/filesystem and one canonical WireAgent state
+> directory, cooperating M7-aware processes with the exact qualified protocol and
+> `runtime_build_id`, using an owner-lock primitive whose ownership cannot vanish
+> while the owner remains alive and mutation-capable, admit at most one supported
+> production authority owner at a time. Other processes interact through the
+> owner's local bounded capability/reconciliation boundary or fail busy. File-
+> backed capabilities are exposed only after their owner-side artifact referents
+> are explicitly qualified. After controlled post-quiescence release or owner
+> death, a successor rebuilds authority from durable M5/M6 truth and never resumes
+> old ephemeral execution or media-reference authority.
+
+That claim deliberately stops short of automatic hot failover, distributed
+exactly-once execution, hostile-local-process isolation, network-filesystem
+coordination, cross-build/mixed-runtime interoperability, spontaneous live-process
+lock-loss recovery, implicit client/owner filesystem-path equivalence, or global
+uniqueness across separate state roots.

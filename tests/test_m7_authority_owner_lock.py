@@ -80,12 +80,22 @@ def test_registry_uses_normcase_identity_before_os_lock(
     monkeypatch.setattr(os.path, "normcase", lambda value: value.casefold())
     first = AuthorityOwnerLock(tmp_path / "CaseDomain")
     second = AuthorityOwnerLock(tmp_path / "casedomain")
+    second_open_called = False
+
+    def fail_if_second_reaches_os_open() -> int:
+        nonlocal second_open_called
+        second_open_called = True
+        raise AssertionError("same-domain duplicate reached OS lock-file open")
+
+    monkeypatch.setattr(second, "_open_lock_file", fail_if_second_reaches_os_open)
 
     first.acquire()
     try:
         with pytest.raises(AuthorityBusyError, match="reserved by this process"):
             second.acquire()
-        assert not (tmp_path / "casedomain").exists()
+        # This is the actual invariant. Path.exists() cannot distinguish
+        # CaseDomain/casedomain on a real case-insensitive Windows filesystem.
+        assert second_open_called is False
     finally:
         first.release()
 

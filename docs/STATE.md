@@ -18,7 +18,9 @@
 ## Current version
 
 **v0.3 stabilized live path + M5 effect-transaction boundary complete + M6
-reconciliation/qualification Layers 1–7 implemented/qualified.**
+reconciliation/qualification Layers 1–7 implemented/qualified + M7 normative
+cross-process design frozen; M7 Layer 1 owner-lock mechanism implemented as a
+standalone candidate boundary.**
 
 Canonical M5 runtime baseline after the full M5 build order:
 
@@ -64,6 +66,27 @@ did **not** qualify a replay-policy promotion: like/unlike deliberately remain
 `ReplaySemantics.UNKNOWN` / `DurabilityPolicy.REQUIRED` because repository
 broker/DOM evidence cannot establish absence of residual public-engagement
 service effects.
+
+M7 centralizes cross-process production authority around the existing M5/M6
+root rather than turning every safety primitive into a distributed object:
+
+```text
+Design — Cross-Process Authority & Ownership Boundary       MERGED     PR #18  65e3961ed32d090b6a47983901d153838cf99267
+1. AuthorityOwnerLock + canonical domain + local registry   CANDIDATE  PR #19
+2. AuthoritySession + lifecycle + runtime integration       PENDING
+3. instance identity + crash/takeover qualification         PENDING
+4. local IPC + bounded pure read/health path                PENDING
+5. whoami + non-file writes/confirmation/reconciliation     PENDING
+6. local artifact/media ingress-output boundary             PENDING
+7. POSIX multi-process qualification                        PENDING
+8. Windows Server 2025 multi-process qualification          PENDING
+```
+
+Normative M7 contract: `docs/M7_DESIGN.md`. Layer 1 proves the ownership
+primitive only. **Mechanism existence is not runtime enforcement:** Dispatcher,
+recovery, and browser startup do not yet require `AuthorityOwnerLock`; that outer
+ordering becomes mandatory in Layer 2. No cross-process production-runtime claim
+is made from Layer 1 alone.
 
 ## Architecture invariants — do not violate
 
@@ -154,7 +177,7 @@ service effects.
     verdict is corruption, not latest-row-wins or silent supersession.
 29. **M6 authority and writer coordination remain process-local.** Same-path
     objects share canonical in-process fences/registries; concurrent independent
-    processes are outside the current claim.
+    processes are outside the M6 claim.
 30. **Qualification claims stay bounded.** Layer-6 evidence establishes the two
     safety-ledger protocol on the tested GitHub-hosted Windows Server 2025 /
     CPython 3.11/3.12 environment but not portable storage semantics or
@@ -163,6 +186,12 @@ service effects.
     tested DOM and browser-lease cases, but not absence of notifications,
     callbacks, analytics, counters, or other service-side residual effects and
     therefore not a `SAFE_STATE_SET` / `BEST_EFFORT` promotion.
+31. **M7 ownership has one non-expiring outer primitive, but Layer 1 is not yet
+    enforcement.** One canonical absolute `state_dir` maps to a process-local
+    normalized-domain reservation plus a dedicated OS-held `authority.lock`.
+    Lock-file existence/PID/mtime/age never creates authority; controlled release
+    is private-handle close. Until Layer 2 wraps Dispatcher/recovery/browser
+    startup with this boundary, independent runtime processes remain unsupported.
 
 ## M5 — completed transaction boundary
 
@@ -252,6 +281,37 @@ navigation. This qualifies the local broker/evidence mechanics only. The effect
 policy remains `UNKNOWN` / `REQUIRED` because external public-engagement residual
 side effects are not established absent.
 
+## M7 — cross-process authority boundary
+
+The frozen design adds one outer ownership law around the existing authority
+root rather than adding independent cross-process locks to each M5/M6 primitive:
+
+```text
+AuthorityOwnerLock                    # M7 outer lifetime boundary
+  -> later AuthoritySession/lifecycle
+     -> Dispatcher / Recovery / M5 / M6
+```
+
+Layer-1 candidate facts:
+
+- configured `state_dir` is frozen to an absolute `resolve(strict=False)` domain;
+- in-process identity uses the established `os.path.normcase` posture;
+- process-local reservation occurs before OS lock acquisition;
+- POSIX uses non-blocking `flock`; Windows uses non-blocking `msvcrt.locking`;
+- the dedicated descriptor is non-inheritable for spawn/exec paths;
+- a POSIX after-fork child hook closes only the child's inherited descriptor copy
+  and never explicitly unlocks the shared open-file description;
+- `authority.lock` is retained and carries no PID/mtime/heartbeat/TTL authority;
+- controlled release is deliberate private-handle close, with registry identity
+  validated before crossing that OS release boundary;
+- close/acquisition uncertainty fails closed rather than granting replacement;
+- fresh-process tests establish exclusion and clean-successor behavior for the
+  primitive itself.
+
+This does **not** yet mean Dispatcher or standalone recovery is cross-process
+protected. Layer 2 must acquire the outer ownership boundary before recovery or
+browser startup and make it mandatory for supported production entrypoints.
+
 ## Phase plan
 
 | Phase | Scope | Status |
@@ -274,6 +334,15 @@ side effects are not established absent.
 | M6 L5 | crash/fault/restart/corruption/concurrency qualification | MERGED — PR #15 |
 | M6 L6 | Windows durability qualification for both safety ledgers | MERGED — PR #16 |
 | M6 L7 | evidence-driven replay-safety qualification | QUALIFIED — PR #17 |
+| M7 design | cross-process authority/ownership normative contract | MERGED — PR #18 |
+| M7 L1 | AuthorityOwnerLock + canonical domain + process-local registry | CANDIDATE — PR #19 |
+| M7 L2 | AuthoritySession + lifecycle + runtime/recovery integration | PENDING |
+| M7 L3 | instance identity + startup/shutdown/crash-takeover qualification | PENDING |
+| M7 L4 | local IPC pure read/health path | PENDING |
+| M7 L5 | whoami + non-file-backed writes/confirmation/reconciliation | PENDING |
+| M7 L6 | local artifact/media ingress-output boundary | PENDING |
+| M7 L7 | POSIX multi-process qualification | PENDING |
+| M7 L8 | Windows Server 2025 multi-process lock/IPC qualification | PENDING |
 
 ## Capabilities
 
@@ -293,6 +362,7 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 | Surface | Role | Durability / authority |
 |---|---|---|
+| `.webwire/authority.lock` | M7 stable rendezvous for one canonical domain | file existence/content non-authoritative; OS-held owner lock is ephemeral; Layer-1 mechanism only until runtime integration |
 | `.webwire/effects.ndjson` | immutable M5 effect facts | fsync-backed; authoritative; fail-closed |
 | `.webwire/reconciliations.ndjson` | M6 terminal reconciliation facts | fsync-backed; append-only; exact-fact re-durability; fail-closed |
 | `RecoveryProjector` | validates/joins effect + reconciliation histories | derived authority projection; contradiction fails closed |
@@ -309,6 +379,7 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 | Surface | Purpose |
 |---|---|
+| `AuthorityOwnerLock` | M7 Layer-1 cross-process ownership primitive; not yet mandatory around runtime entrypoints |
 | `ReadOnlyBroker` / leased read broker | coordinated browser reads/evidence |
 | `DownloadBroker` | bounded local filesystem output |
 | scoped M5 authorities | approved semantic mutation ports |
@@ -323,6 +394,7 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 | File | Role |
 |---|---|
+| `authority.py` | M7 canonical domain + non-expiring OS owner-lock primitive and process-local owner registry |
 | `dispatcher.py` | invocation entry + M5 live routing + local M6 operator-session composition |
 | `journal.py` | best-effort audit-only NDJSON journal |
 | `m6_replay_qualified_write_broker.py` | Layer-7 qualified live like/unlike target-state and exact-click seam |
@@ -347,9 +419,14 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## Known gaps / open items
 
-- [ ] **Cross-process effect/reconciliation/browser coordination:** the current
-  safety contract is intentionally single-process. Concurrent independent
-  recovery/runtime processes are unsupported.
+- [ ] **M7 runtime ownership integration:** Layer 1 provides the canonical-domain
+  owner-lock mechanism, but Dispatcher/recovery/browser startup do not yet require
+  it. Cross-process production authority remains unsupported until Layer 2 wraps
+  the existing authority root and freezes lifecycle ordering.
+- [ ] **M7 full process/platform qualification:** forced-death takeover, child
+  process modes, POSIX fault/response-loss cases, network/shared-storage claim
+  gates, local IPC permissions, and Windows Server 2025 cross-process ownership/
+  IPC qualification remain Layers 3–8 as frozen in `docs/M7_DESIGN.md`.
 - [ ] **External like/unlike residual-effect proof:** M6 Layer 7 completed the
   broker/evidence qualification but intentionally retained `UNKNOWN`/`REQUIRED`.
   Promotion requires new evidence that repeated public engagement causes no
@@ -384,6 +461,33 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-09-28 — M7 Layer 1 owner-lock candidate (PR #19).** Started from the
+  exact M7-design merge `65e3961ed32d090b6a47983901d153838cf99267`.
+  Maintainer-first review froze the canonical-domain/process-registry/OS-lock
+  boundary before independent review. The implementation adds
+  `AuthorityOwnerLock`, absolute domain freezing, normalized same-process
+  exclusion, non-blocking POSIX/Windows lock adapters, non-inheritable private
+  descriptors, a POSIX after-fork child detach, stable non-authoritative
+  rendezvous-file behavior, and genuine fresh-process exclusion/successor tests.
+  The maintainer adversarial re-open found two lifecycle defects before Codex:
+  explicit unlock-before-close violated M7-RV17's owner-handle lifetime law, and
+  registry validation occurred too late after OS release. Both were corrected:
+  release is now close-only and registry authority is verified/pinned across the
+  close boundary. Initial Windows CI then caught a test-proof defect: a
+  `Path.exists()` case-alias assertion is meaningless on a real case-insensitive
+  filesystem. The test now proves the intended invariant directly by asserting
+  that duplicate normalized-domain admission is denied before the second OS
+  lock-file open. Layer 1 remains mechanism-only until Layer 2 runtime integration.
+- **2026-09-28 — M7 normative design merged (PR #18).** Reviewed candidate
+  `73993c54949990b81e598693f730bacf18665f89` and squash merge
+  `65e3961ed32d090b6a47983901d153838cf99267` share tree
+  `bdb4a866738735900c14969b56475cb0b905571d`. Maintainer-first review,
+  adversarial re-opens, and independent Codex reconciliation produced RV01–RV18
+  and a 70-case primary acceptance surface. The bounded topology is one
+  non-expiring qualified owner per canonical local state directory, local IPC
+  clients, no timed live-owner stealing, and no automatic mutation replay across
+  owner-instance replacement. Media-backed writes are withheld until owner-side
+  artifact ingress is qualified.
 - **2026-09-27 — M6 Layer 7 replay-safety qualification (PR #17).** Started from
   exact merged Layer-6 baseline `7b1bf7ee044ba653371e44d4abac7f7254b2c14d`.
   The frozen maintainer-first pass found the inherited target-state reader could

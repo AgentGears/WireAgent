@@ -143,12 +143,21 @@ class AuthorityOwnerLock:
         if os.name == "nt":
             import msvcrt
 
+            try:
+                locking = getattr(msvcrt, "locking")
+                lk_nblck = getattr(msvcrt, "LK_NBLCK")
+            except AttributeError as exc:
+                raise OSError(
+                    errno.ENOSYS,
+                    "Windows CRT does not expose non-blocking file-region locking",
+                ) from exc
+
             os.lseek(fd, 0, os.SEEK_SET)
             try:
                 # Locking may extend beyond EOF, so the rendezvous file does not
                 # need mutable sentinel content. LK_NBLCK is genuinely
                 # non-blocking; contention is reported as OSError.
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locking(fd, lk_nblck, 1)
             except OSError as exc:
                 if exc.errno in {
                     errno.EACCES,

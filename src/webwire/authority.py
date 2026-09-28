@@ -10,6 +10,7 @@ This module implements only the outer ownership mechanism frozen by
 - keep the dedicated owner descriptor private and non-inheritable across
   qualified spawn/exec paths;
 - leave the rendezvous file in place across release/crash;
+- end ownership by deliberate private-handle close, not a pre-close unlock;
 - fail closed on acquisition/release errors.
 
 It deliberately does **not** create AuthoritySession, service lifecycle, browser,
@@ -136,6 +137,8 @@ class AuthorityOwnerLock:
     def _open_lock_file(self) -> int:
         self._authority_domain.mkdir(parents=True, exist_ok=True)
         fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        # CPython opens descriptors non-inheritable by default, but repeat the
+        # requirement explicitly at the authority boundary.
         os.set_inheritable(fd, False)
         return fd
 
@@ -179,21 +182,10 @@ class AuthorityOwnerLock:
         raise OSError(errno.ENOSYS, f"unsupported owner-lock platform os.name={os.name!r}")
 
     @staticmethod
-    def _unlock_fd(fd: int) -> None:
-        if os.name == "nt":
-            import msvcrt
+    def _close_owner_fd(fd: int) -> None:
+        """Close the private owner descriptor; this is the release boundary."""
 
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            return
-
-        if os.name == "posix":
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return
-
-        raise OSError(errno.ENOSYS, f"unsupported owner-lock platform os.name={os.name!r}")
+        os.close(fd)
 
     @staticmethod
     def _close_noexcept(fd: int) -> None:
@@ -256,7 +248,7 @@ class AuthorityOwnerLock:
             return self
 
     def release(self) -> None:
-        """Release the OS owner lock without deleting the rendezvous file."""
+        """Close the private owner handle without deleting the rendezvous file."""
 
         with self._state_lock:
             if self._release_broken:
@@ -269,21 +261,18 @@ class AuthorityOwnerLock:
 
             fd = self._fd
             try:
-                self._unlock_fd(fd)
+                # Deliberately do not issue LOCK_UN/LK_UNLCK first. The frozen
+                # M7 contract makes private-handle close the ownership-release
+                # boundary, avoiding a live open owner handle after OS ownership
+                # has already been dropped.
+                self._close_owner_fd(fd)
             except OSError as exc:
-                raise AuthorityOwnerError(
-                    f"could not release authority owner lock {self._lock_path}: {exc!r}"
-                ) from exc
-
-            try:
-                os.close(fd)
-            except OSError as exc:
-                # The OS unlock already succeeded, so this object can no longer
-                # safely make a positive ownership claim. Keep the process-local
-                # reservation to fail closed and require process termination.
+                # close(2)/CloseHandle failure leaves descriptor/lock lifetime
+                # uncertain. Preserve the process-local reservation and require
+                # fail-stop process termination instead of guessing ownership.
                 self._release_broken = True
                 raise AuthorityOwnerError(
-                    f"owner-lock descriptor close failed after unlock: {exc!r}"
+                    f"could not close authority owner handle {self._lock_path}: {exc!r}"
                 ) from exc
 
             self._fd = None

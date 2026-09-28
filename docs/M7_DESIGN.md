@@ -390,7 +390,7 @@ forwarding their existing path payloads. `post_photo`, `post_multi_image`,
 withheld until a dedicated owner-side **media-ingress contract** is implemented and
 qualified. Raw relative client paths are forbidden. The contract must establish
 one unambiguous owner-side artifact identity before capability compose, using
- either (a) an owner-approved canonical absolute path within configured ingress
+either (a) an owner-approved canonical absolute path within configured ingress
 roots or (b) owner-managed artifact staging/transfer. In either case the owner
 revalidates the exact bytes, digest, MIME/type, size, and existing media policy
 before preview/confirmation; a client-supplied path string alone is never media

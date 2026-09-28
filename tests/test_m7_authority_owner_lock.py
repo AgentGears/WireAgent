@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import errno
+import gc
 import json
 import os
 import subprocess
 import sys
+import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -34,6 +37,17 @@ def _probe(state_dir: Path) -> tuple[subprocess.CompletedProcess[str], dict[str,
     payload = json.loads(stdout[-1])
     assert isinstance(payload, dict)
     return completed, payload
+
+
+def _wait_for_result(path: Path, *, timeout: float = 15.0) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for worker result {path}")
+        time.sleep(0.01)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    return payload
 
 
 def test_canonical_domain_freezes_absolute_path_at_construction(
@@ -100,6 +114,62 @@ def test_registry_uses_normcase_identity_before_os_lock(
         first.release()
 
 
+def test_two_fresh_processes_racing_same_domain_admit_exactly_one_owner(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    start_gate = tmp_path / "start"
+    release_gate = tmp_path / "release"
+    result_a = tmp_path / "result-a.json"
+    result_b = tmp_path / "result-b.json"
+
+    def launch(result_path: Path) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(_WORKER),
+                "race",
+                str(state_dir),
+                str(start_gate),
+                str(release_gate),
+                str(result_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    first = launch(result_a)
+    second = launch(result_b)
+    processes = (first, second)
+    try:
+        start_gate.touch()
+        payloads = (_wait_for_result(result_a), _wait_for_result(result_b))
+
+        acquired = [p for p in payloads if p.get("acquired") is True]
+        busy = [p for p in payloads if p.get("busy") is True]
+        assert len(acquired) == 1
+        assert len(busy) == 1
+
+        # The winner is still holding ownership here; only now allow it to
+        # close. This prevents scheduler timing from turning the test into two
+        # sequential successful acquisitions.
+        release_gate.touch()
+        outputs = [p.communicate(timeout=15) for p in processes]
+        assert sorted(p.returncode for p in processes) == [0, 23]
+        assert all(not stderr for _, stderr in outputs)
+    finally:
+        release_gate.touch(exist_ok=True)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
 def test_os_lock_excludes_fresh_process_then_allows_clean_successor(
     tmp_path: Path,
 ) -> None:
@@ -117,6 +187,25 @@ def test_os_lock_excludes_fresh_process_then_allows_clean_successor(
     assert successor.returncode == 0
     assert successor_payload["acquired"] is True
     assert successor_payload["busy"] is False
+
+
+def test_active_registry_strongly_retains_owner_after_caller_drops_reference(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir).acquire()
+    owner_ref = weakref.ref(owner)
+    del owner
+    gc.collect()
+
+    assert owner_ref() is not None
+    busy, payload = _probe(state_dir)
+    assert busy.returncode == 23
+    assert payload["busy"] is True
+
+    retained_owner = owner_ref()
+    assert retained_owner is not None
+    retained_owner.release()
 
 
 def test_rendezvous_file_existence_is_not_authority_and_file_is_retained(

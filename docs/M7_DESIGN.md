@@ -119,7 +119,9 @@ separately from the maintainer-first mechanism selection. Independent GitWire an
 Codex reviews were then run on exact candidate `3c4c68a90dbd7f1aa96542e0428fe98a02057201`.
 The findings below preserve that sequence: maintainer-first discovery remained
 primary, external review was used only after the candidate existed, and all
-accepted findings were reconciled before implementation.
+accepted findings were reconciled before implementation. The maintainer then
+re-opened the reconciled exact head and found two additional inherited-contract /
+compatibility gaps (RV15–RV16) before merge.
 
 ### M7-RV01 — instance-id checking alone leaves a shutdown admission race
 
@@ -210,9 +212,8 @@ or equivalent endpoint lifetime is qualified separately.
 
 ### M7-RV07 — local-output capabilities need separate IPC path semantics
 
-`download_image` is not a remote X mutation but writes to local storage. Routing
-it from a client process through an owner changes which process/CWD owns the
-output path.
+`download_image` is not an X mutation but writes to local storage. Routing it from
+a client process through an owner changes which process/CWD owns the output path.
 
 **Correction:** M7 Layer 4 initially qualifies pure read/health operations only.
 `download_image` is withheld from IPC until a bounded owner-side output contract
@@ -227,9 +228,9 @@ The initial M7 candidate required only M5 T1–T14 even though the normative
 Codex independently identified this omission on candidate `3c4c68a9`.
 
 **Correction:** M7 requires all M5 T1–T25 behavior **and** the additional mandatory
-M5 regression cases to remain unchanged under one owner, alongside all M6 R1–R48
-behavior. A future M7 implementation cannot claim completion by preserving only a
-subset of the inherited transaction-boundary contract.
+M5 regression cases to remain unchanged under one owner, alongside the complete
+M6 inherited contract. A future M7 implementation cannot claim completion by
+preserving only a subset of the inherited transaction-boundary contract.
 
 ### M7-RV09 — “local Windows named pipe” was not a sufficient local-only contract
 
@@ -306,14 +307,47 @@ policy.
 The initial handshake carried both `protocol_version` and `runtime_version` but did
 not freeze which field authorizes compatibility.
 
-**Correction:** the initial M7 production claim requires an exact supported
-`protocol_version` **and matching runtime version** between client and owner. A
-protocol mismatch or runtime mismatch is rejected before request admission. Later
-mixed-runtime compatibility may be qualified deliberately and then relaxed under a
-new protocol/compatibility contract; it is not inferred from equal-looking schemas.
+**Initial correction:** require an exact supported `protocol_version` and an exact
+runtime compatibility gate before request admission rather than inferring
+compatibility from similar schemas. The later exact-head re-open in RV16 tightens
+what qualifies as runtime identity; a human/package version string alone is not
+sufficient.
+
+### M7-RV15 — the inherited M6 mandatory regression surface was also incomplete
+
+The reconciled candidate required all M6 R1–R48 but did not explicitly inherit the
+**additional mandatory regressions** listed after the R1–R48 table in
+`docs/M6_DESIGN.md` §20. Those cases cover canonical evidence hashing, strict JSON
+identity, same-path writer serialization, publication non-regression, monotonic
+operator/confirmation clocks, clean-no-row restart behavior, journal
+non-authority, and preservation of M5 kill/epoch/policy/permit semantics.
+
+**Correction:** M7 requires **all M6 R1–R48 plus every additional mandatory M6
+regression in §20**, just as it requires all M5 T1–T25 plus M5's additional
+mandatory regressions. Inherited safety contracts are carried forward whole, not
+by table range alone.
+
+### M7-RV16 — package/runtime version is not exact build identity
+
+The exact-head re-open verified that WireAgent's package version remains `0.3.0`
+across many source commits. Therefore equality of `runtime_version` cannot prove
+that two M7 processes execute the same qualified runtime artifact. Two different
+commits could both truthfully advertise `0.3.0`.
+
+**Correction:** initial M7 production IPC carries a separate opaque
+`runtime_build_id` that identifies the exact qualified WireAgent runtime artifact
+or source build. The implementation may use an embedded exact source revision or
+a deterministic build/artifact digest, but **must not** derive this identity from
+the human package version alone. Owner and client must match both the supported
+`protocol_version` and exact `runtime_build_id` before request admission.
+`runtime_version` remains useful diagnostic provenance only. If a production build
+cannot establish a stable exact build identity, it does not carry the initial M7
+qualified IPC claim. A later compatibility design may deliberately permit
+different build ids under a new qualified compatibility contract; M7 does not
+infer that safety.
 
 No additional architectural contradiction remains after these corrections. The
-reviewed design still centralizes authority rather than distributing M5/M6 state.
+design still centralizes authority rather than distributing M5/M6 state.
 
 ---
 
@@ -398,7 +432,7 @@ M7 defines and qualifies:
 14. real sibling-process qualification, especially Windows Server 2025;
 15. explicit platform-local IPC permissions/remote rejection;
 16. one deterministic request canonicalization contract;
-17. explicit runtime/protocol compatibility gating.
+17. explicit protocol + exact runtime-build compatibility gating.
 
 ### 4.2 Out of scope
 
@@ -420,7 +454,7 @@ M7 does **not** provide:
 - durable cross-restart token-bucket or semantic-dedupe state;
 - account-global uniqueness across intentionally different state roots;
 - compatibility safety against an older pre-M7 binary that ignores ownership;
-- mixed-runtime-version interoperability until separately qualified.
+- cross-build/mixed-runtime interoperability until separately qualified.
 
 ---
 
@@ -445,7 +479,8 @@ attach mode                != production ownership
 recovery clear             != permission to execute
 M7 owner lock              != M5/M6 policy approval
 relative state path        != account-global authority domain
-protocol compatibility     != effect authority
+package runtime version    != exact qualified build identity
+protocol/build compatibility != effect authority
 ```
 
 Existing project laws remain unchanged:
@@ -560,7 +595,8 @@ critical section:
 session.active is true
 service state == READY
 authority_instance_id matches
-protocol/runtime compatibility matches
+protocol_version is supported and matches
+runtime_build_id matches the owner exact qualified build
 request schema/version is valid
 resource/backpressure admission succeeds
 ```
@@ -591,6 +627,7 @@ termination is the fail-stop takeover path.
 ```text
 resolve/canonicalize/create local state directory
 -> warn if configured state_dir was relative; publish canonical authority domain
+-> establish exact runtime_build_id for the qualified WireAgent build
 -> reserve process-local authority-domain slot
 -> acquire OS AuthorityOwnerLock
 -> mint AuthoritySession + authority_instance_id
@@ -604,6 +641,9 @@ resolve/canonicalize/create local state directory
 -> transition STARTING -> READY
 -> begin accepting client work
 ```
+
+If exact `runtime_build_id` cannot be established, production M7 IPC does not
+enter the qualified READY state. Human `runtime_version` remains diagnostic only.
 
 Ownership is acquired before authoritative recovery and before browser startup.
 A losing process therefore cannot construct a second supported production
@@ -723,20 +763,22 @@ closes/unlinks the endpoint before releasing authority ownership.
 ```text
 AuthorityHello
   protocol_version
-  runtime_version
+  runtime_version          # diagnostic provenance only
+  runtime_build_id         # exact qualified artifact/source identity
   authority_instance_id
-  authority_domain        # canonical absolute local path, diagnostic only
+  authority_domain         # canonical absolute local path, diagnostic only
   supported_ipc_operations
   state: ready | draining | killed | recovery_unavailable
 ```
 
 Initial production compatibility requires an exact supported `protocol_version`
-and matching `runtime_version`. Mismatch fails before request admission. Later
-mixed-runtime compatibility requires its own explicit qualification; it is not
-inferred from similar schemas.
+and exact matching `runtime_build_id`. `runtime_version` is diagnostic provenance
+and cannot substitute for build identity. A protocol/build mismatch fails before
+request admission. Later cross-build compatibility requires its own explicit
+qualification; it is not inferred from equal package versions or similar schemas.
 
-Handshake state and `authority_domain` are protocol/diagnostic information, not
-execution authority.
+Handshake state, `runtime_version`, and `authority_domain` are diagnostic/protocol
+information, not execution authority.
 
 Layer-4 `supported_ipc_operations` is frozen to:
 
@@ -757,7 +799,7 @@ qualified.
 ```text
 AuthorityRequest
   protocol_version
-  runtime_version
+  runtime_build_id
   authority_instance_id
   request_id
   operation
@@ -766,7 +808,8 @@ AuthorityRequest
 
 Rules:
 
-- protocol and runtime version must match the current supported owner contract;
+- protocol version and exact build identity must match the current supported owner
+  contract;
 - instance id must match the live owner;
 - request id is an opaque high-entropy client identifier;
 - unknown version/operation/schema fails before Dispatcher/recovery invocation;
@@ -788,8 +831,8 @@ schema-normalized payload
 Dictionary/object keys are deterministically ordered, list order is preserved,
 non-finite numbers and unsupported values are rejected, and schema normalization
 decides scalar representation before canonical serialization/digesting.
-`authority_instance_id` and `request_id` are routing/envelope identity and are not
-part of canonical payload equality.
+`authority_instance_id`, `runtime_build_id`, and `request_id` are validated
+routing/envelope identity and are not part of canonical payload equality.
 
 For a retained request entry:
 
@@ -1129,7 +1172,7 @@ Initial claim ceiling excludes:
 - two intentionally distinct state dirs controlling the same remote actor;
 - pre-M7 binaries that ignore the owner protocol;
 - arbitrary path-alias attacks by hostile local code;
-- mixed-runtime-version IPC until explicitly qualified.
+- cross-build/mixed-runtime IPC until explicitly qualified.
 
 Known unsupported network/shared state should fail the production support gate
 where detection is reliable. Where platform APIs cannot conclusively classify the
@@ -1168,7 +1211,7 @@ service drain races request admission -> one synchronized ordering
 owner crash before/after browser startup -> successor performs full hydration
 owner crash during EffectLedger/ReconciliationLedger I/O -> existing fail-closed semantics hold
 stale client instance after takeover -> rejected
-protocol/runtime mismatch -> rejected before admission
+protocol/runtime-build mismatch -> rejected before admission
 mutating client is not automatically replayed across instance change
 admitted mutation survives client disconnect as owner-side work
 in-flight request entry remains pinned under cache/resource pressure
@@ -1254,15 +1297,18 @@ portability statement is made than environments and primitives actually tested.
     IPC surface.
 49. Production startup exposes the resolved absolute authority domain and warns
     when configuration supplied a relative state root.
-50. Protocol/runtime mismatch is rejected before request admission under the
-    initial M7 compatibility claim.
+50. Protocol or exact runtime-build mismatch is rejected before request admission
+    under the initial M7 compatibility claim; human package version is not build
+    identity.
 51. M7 makes no cross-machine, distributed exactly-once, hostile-local-code, or
     network-filesystem claim.
 52. Different state roots are distinct authority domains even if they target the
     same remote actor.
 53. Pre-M7 processes that ignore ownership are outside the M7 coordination claim.
-54. Mixed-runtime-version interoperability is unsupported until separately
+54. Cross-build/mixed-runtime interoperability is unsupported until separately
     qualified.
+55. M7 inherits the complete M5 and M6 acceptance **and mandatory regression**
+    contracts under one owner; range shorthand never narrows inherited safety.
 
 ---
 
@@ -1288,7 +1334,7 @@ portability statement is made than environments and primitives actually tested.
 | M7-T16 | Admission races `READY -> DRAINING` | Request is either fully admitted before drain or rejected; no torn admission |
 | M7-T17 | Clean shutdown with active request | Ownership held until request leaves safe owner boundary |
 | M7-T18 | Active mutation hangs during shutdown | Clean release does not occur by timeout |
-| M7-T19 | Client handshake current owner | Returns current instance/version/domain/operations |
+| M7-T19 | Client handshake current owner | Returns current instance/version/build/domain/operations |
 | M7-T20 | Client stale instance id | Rejected before Dispatcher/recovery execution |
 | M7-T21 | Unknown protocol/schema/oversized frame | Rejected before execution |
 | M7-T22 | Same retained request id + same payload concurrent | One execution; duplicate joins/in-progress |
@@ -1333,13 +1379,14 @@ portability statement is made than environments and primitives actually tested.
 | M7-T61 | Layer-4 client requests `whoami` | Not advertised/unsupported until Layer 5 authority-establishing read qualification |
 | M7-T62 | Production starts with relative `state_dir` | Canonical absolute domain is used/exposed and warning identifies resolved root |
 | M7-T63 | Qualified POSIX fork/spawn/exec child survives parent owner death | Child cannot retain/extend/release/use production ownership; successor acquisition follows chosen primitive contract |
-| M7-T64 | Client runtime or protocol version differs from owner | Rejected before request admission under initial M7 compatibility claim |
+| M7-T64 | Client protocol or exact runtime build id differs from owner | Rejected before request admission under initial M7 compatibility claim |
 
 Mandatory regressions:
 
-- all M5 T1–T25 behavior and the additional mandatory regressions in
+- all M5 T1–T25 behavior and **all additional mandatory regressions** in
   `docs/M5_DESIGN.md` §14 remain unchanged under one owner;
-- all M6 R1–R48 behavior remains unchanged under one owner;
+- all M6 R1–R48 behavior and **all additional mandatory regressions** in
+  `docs/M6_DESIGN.md` §20 remain unchanged under one owner;
 - owner-lock acquisition failure issues no token, appends no safety fact, launches
   no browser, and commits no reconciliation;
 - stale owner instance cannot mint/consume confirmation through IPC;
@@ -1395,10 +1442,10 @@ recovery entrypoints and freezes request-admission/drain ordering.
 heartbeat stealing before adding a client protocol.
 
 **Layer 4** adds local IPC only for `health`, `read`, `read_profile`, `read_thread`,
-and `read_search`, so framing, canonical request identity, compatibility,
-stale-instance, size/backpressure, disconnect, endpoint permissions/cleanup, and
-shutdown semantics are qualified without owner actor-state mutation or remote
-mutation risk. `whoami` and `download_image` remain withheld.
+and `read_search`, so framing, canonical request identity, exact build/protocol
+compatibility, stale-instance, size/backpressure, disconnect, endpoint
+permissions/cleanup, and shutdown semantics are qualified without owner actor-state
+mutation or remote mutation risk. `whoami` and `download_image` remain withheld.
 
 **Layer 5** adds `whoami` as an authority-establishing read and routes
 write/confirmation/reconciliation through the existing owner authority root.
@@ -1431,7 +1478,7 @@ M7 is complete only when:
 ✓ successor never restores old ephemeral confirmation/grant/permit/reconciliation authority
 ✓ all production browser reads/writes are owner-routed
 ✓ active-owner recovery is owner-routed; offline recovery acquires same ownership boundary
-✓ stale-instance and incompatible-version requests fail before execution
+✓ stale-instance, incompatible-protocol, and different-build requests fail before execution
 ✓ local transport uses bounded non-executable serialization and no production TCP listener
 ✓ Windows IPC explicitly rejects remote clients and enforces the qualified local-identity ACL
 ✓ POSIX IPC remains inside the qualified owner-restricted local-user boundary
@@ -1444,23 +1491,25 @@ M7 is complete only when:
 ✓ lost-response and owner-crash cases fall back to M5/M6 durable truth
 ✓ Layer-4 IPC surface remains pure read/health; whoami enters only with Layer-5 authority qualification
 ✓ `download_image` stays off IPC until its local-output contract is explicit
-✓ all M5 T1–T25 + mandatory regressions and all M6 R1–R48 remain unchanged under one owner
+✓ all M5 T1–T25 + all M5 mandatory regressions remain unchanged under one owner
+✓ all M6 R1–R48 + all M6 mandatory regressions remain unchanged under one owner
 ✓ genuine sibling-process crash/takeover tests exist
 ✓ actual Windows Server 2025 ownership/IPC behavior is qualified and claim-bounded
-✓ hostile-same-user, network-filesystem, mixed-version, multi-state-root,
+✓ hostile-same-user, network-filesystem, cross-build/mixed-runtime, multi-state-root,
   cross-machine, and distributed-exactly-once exclusions remain explicit
 ```
 
 The bounded M7 claim is:
 
 > On one qualified local machine and one canonical WireAgent state directory,
-> cooperating M7-aware processes with the exact qualified protocol/runtime contract
-> admit at most one supported production authority owner at a time. Other processes
-> interact through the owner's local bounded capability/reconciliation boundary or
-> fail busy. After owner death, a successor rebuilds authority from durable M5/M6
-> truth and never resumes old ephemeral execution authority.
+> cooperating M7-aware processes with the exact qualified protocol and
+> `runtime_build_id` admit at most one supported production authority owner at a
+> time. Other processes interact through the owner's local bounded
+> capability/reconciliation boundary or fail busy. After owner death, a successor
+> rebuilds authority from durable M5/M6 truth and never resumes old ephemeral
+> execution authority.
 
 That claim deliberately stops short of automatic hot failover, distributed
 exactly-once execution, hostile-local-process isolation, network-filesystem
-coordination, mixed-runtime interoperability, or global uniqueness across
-separate state roots.
+coordination, cross-build/mixed-runtime interoperability, or global uniqueness
+across separate state roots.

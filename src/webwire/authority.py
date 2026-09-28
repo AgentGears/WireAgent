@@ -126,9 +126,16 @@ class AuthorityOwnerLock:
     def _open_lock_file(self) -> int:
         self._authority_domain.mkdir(parents=True, exist_ok=True)
         fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-        # CPython opens descriptors non-inheritable by default, but repeat the
-        # requirement explicitly at the authority boundary.
-        os.set_inheritable(fd, False)
+        try:
+            # CPython opens descriptors non-inheritable by default, but repeat
+            # the requirement explicitly at the authority boundary. If this
+            # hardening call itself fails, close the just-opened descriptor here:
+            # acquire() has not received/published it yet and therefore cannot
+            # clean it up on our behalf.
+            os.set_inheritable(fd, False)
+        except BaseException:
+            self._close_noexcept(fd)
+            raise
         return fd
 
     @staticmethod

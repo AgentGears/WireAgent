@@ -121,7 +121,9 @@ The findings below preserve that sequence: maintainer-first discovery remained
 primary, external review was used only after the candidate existed, and all
 accepted findings were reconciled before implementation. The maintainer then
 re-opened the reconciled exact head and found two additional inherited-contract /
-compatibility gaps (RV15–RV16) before merge.
+compatibility gaps (RV15–RV16) before merge. A fresh exact-head Codex review of
+`97e6cc69a375317f74af7fa56f0e8f5d4a1870e3` then found the live-process lock-loss
+gap in RV17; it is reconciled here before another merge gate.
 
 ### M7-RV01 — instance-id checking alone leaves a shutdown admission race
 
@@ -159,17 +161,21 @@ handshake because they do not cross the remote mutation seam.
 ### M7-RV03 — an OS lock primitive must have stronger semantics than “a file lock”
 
 Some lock APIs have surprising process/descriptor semantics. M7 cannot accept a
-primitive whose ownership can be lost when an unrelated descriptor closes or
-silently inherited into a child process.
+primitive whose ownership can be lost when an unrelated descriptor closes,
+silently inherited into a child process, or asynchronously revoked while the
+owner process remains alive and mutation-capable.
 
 **Correction:** the platform adapter must qualify a dedicated, private owner handle
 whose lock lifetime is tied to that handle/process and whose release behavior is
 not affected by unrelated descriptors. Exec/spawn inheritance is disabled, and
 POSIX fork semantics are qualified separately: no child may retain, extend,
-release, or exercise production ownership after the parent owner dies. The handle
-remains private to `AuthorityOwnerLock`. Explicit release marks the
-`AuthoritySession` terminal before closing the OS ownership handle. A primitive or
-process-creation mode that cannot establish these properties is unsupported.
+release, or exercise production ownership after the parent owner dies. Most
+importantly, within the supported local platform/filesystem contract **ownership
+may end only by the owner's deliberate private-handle close after the authority
+root is quiesced, or by OS cleanup after owner process death/termination**. There
+is no qualified lease expiry or spontaneous live-process lock-loss transition.
+The handle remains private to `AuthorityOwnerLock`. A primitive or process-creation
+mode that cannot establish all of these properties is unsupported.
 
 ### M7-RV04 — request-cache claims exceeded a bounded cache
 
@@ -346,6 +352,25 @@ qualified IPC claim. A later compatibility design may deliberately permit
 different build ids under a new qualified compatibility contract; M7 does not
 infer that safety.
 
+### M7-RV17 — live-process ownership loss cannot be recovered by draining
+
+Codex's fresh exact-head review of `97e6cc69a3` identified a real split-brain gap
+in the prior §9.4. If the OS lock were already gone while the old process remained
+alive, a successor could acquire and start while admitted old-process mutation
+work continued under `DRAINING`. Terminalizing the old session cannot revoke
+browser/effect authority that already crossed its final boundary.
+
+**Correction:** M7 removes live-process ownership loss as a supported lifecycle
+transition. Under a qualified `AuthorityOwnerLock`, ownership may cease only after
+controlled shutdown has quiesced all mutation-capable owner work and deliberately
+closes the private owner handle, or when the owner process dies/terminates and the
+OS releases it. An adapter/platform/filesystem whose lock can expire, be revoked,
+or otherwise disappear while the process remains alive and mutation-capable is
+**unsupported**. An impossible-handle-loss diagnostic in a qualified runtime is a
+fatal implementation/platform invariant breach, not a safe `DRAINING` recovery
+path and not authority for a successor. M7 makes no single-owner safety claim for
+that out-of-contract state.
+
 No additional architectural contradiction remains after these corrections. The
 design still centralizes authority rather than distributing M5/M6 state.
 
@@ -432,7 +457,9 @@ M7 defines and qualifies:
 14. real sibling-process qualification, especially Windows Server 2025;
 15. explicit platform-local IPC permissions/remote rejection;
 16. one deterministic request canonicalization contract;
-17. explicit protocol + exact runtime-build compatibility gating.
+17. explicit protocol + exact runtime-build compatibility gating;
+18. fail-stop owner-lock lifetime: no supported live-process ownership-loss
+    transition.
 
 ### 4.2 Out of scope
 
@@ -454,7 +481,9 @@ M7 does **not** provide:
 - durable cross-restart token-bucket or semantic-dedupe state;
 - account-global uniqueness across intentionally different state roots;
 - compatibility safety against an older pre-M7 binary that ignores ownership;
-- cross-build/mixed-runtime interoperability until separately qualified.
+- cross-build/mixed-runtime interoperability until separately qualified;
+- lock primitives/filesystems that can revoke ownership from a still-live
+  mutation-capable owner independently of private-handle close/process death.
 
 ---
 
@@ -481,6 +510,7 @@ M7 owner lock              != M5/M6 policy approval
 relative state path        != account-global authority domain
 package runtime version    != exact qualified build identity
 protocol/build compatibility != effect authority
+lock-loss diagnostic       != safe takeover authority
 ```
 
 Existing project laws remain unchanged:
@@ -519,8 +549,12 @@ Required contract:
 - exclusive for one canonical authority domain;
 - supports non-blocking acquisition for deterministic `authority_busy`;
 - ownership is held continuously for the authority lifetime;
-- OS releases ownership on owner process death/owner-handle close;
 - ownership is **not** time-expiring;
+- while the owner process remains alive and mutation-capable, the qualified OS
+  primitive cannot independently expire/revoke/drop ownership;
+- OS releases ownership on owner process death/termination;
+- controlled owner-handle close is permitted only after the owner authority root
+  has quiesced and the AuthoritySession is terminal;
 - dedicated owner handle is private and non-inheritable across qualified
   spawn/exec paths;
 - POSIX fork semantics are separately qualified so a child cannot retain, extend,
@@ -534,8 +568,8 @@ Required contract:
 
 The concrete Windows/POSIX primitive is an implementation choice that must be
 qualified against this contract and against the process-creation modes actually
-used by WireAgent/browser/test helpers. A primitive or child-process mode that
-cannot satisfy it is unsupported.
+used by WireAgent/browser/test helpers. A primitive, filesystem, or child-process
+mode that cannot satisfy it is unsupported.
 
 ### 6.2 No stale-lock-file cleanup
 
@@ -611,12 +645,15 @@ same interval and cannot be evicted to create capacity.
 `READY -> DRAINING` is synchronized with request admission. Once draining begins:
 
 - no new request slot can be admitted;
-- already-admitted work continues under the existing Dispatcher/M5/M6 authority;
+- already-admitted work continues under the **still-held** AuthorityOwnerLock and
+  existing Dispatcher/M5/M6 authority;
 - shutdown waits for admitted work and the Dispatcher invocation domain to quiesce;
 - a hung admitted mutation does not cause lock release by timeout.
 
 If clean drain cannot complete, ownership remains held. Explicit process
-termination is the fail-stop takeover path.
+termination is the fail-stop takeover path. `DRAINING` is valid only while the
+owner still holds the qualified OS lock; it is never a recovery state after lock
+loss.
 
 ---
 
@@ -665,14 +702,15 @@ READY -> DRAINING under lifecycle fence
 -> retire/stop browser-capable live stack
 -> close local IPC endpoint
 -> AuthoritySession active -> terminal
--> release AuthorityOwnerLock LAST
+-> deliberately close private AuthorityOwnerLock handle LAST
 ```
 
 If an in-flight operation cannot quiesce, clean shutdown does not release
 ownership merely to improve availability.
 
-The process may remain alive for diagnostics after release, but the terminal
-session cannot authorize production work.
+The process may remain alive for diagnostics after controlled release, but the
+terminal session and retired browser-capable stack cannot authorize production
+work.
 
 ---
 
@@ -705,24 +743,46 @@ Explicit operator recovery is:
 observe owner unhealthy
 -> create kill hot file if useful
 -> terminate hung owner if takeover is required
--> wait for OS ownership release
+-> wait for OS ownership release caused by owner process death
 -> start successor normally
 ```
 
 This is intentionally less available than a lease. It prevents a paused owner
 from waking after timeout and crossing an unfenceable browser/X mutation seam.
 
-### 9.4 Unexpected ownership-handle loss
+### 9.4 No supported live-process ownership-loss transition
 
-`AuthorityOwnerLock` owns the dedicated handle and never exposes it. Explicit
-release marks the local session terminal before closing it. If the platform
-adapter detects unexpected loss/invalidity, the session becomes terminal,
-service transitions to draining/terminal, new work fails closed, and the old
-session is never silently reacquired.
+The qualified M7 state machine has only two ways to end OS ownership:
 
-Qualification must establish that unrelated descriptor close and qualified child
-process creation cannot release, retain, or extend the chosen ownership primitive.
-If that cannot be established, the primitive/process mode is unsupported.
+```text
+controlled shutdown:
+  quiesce admitted mutation/browser authority
+  -> retire mutation-capable runtime
+  -> session terminal
+  -> deliberately close private owner handle
+
+fail-stop:
+  owner process dies/terminates
+  -> OS releases owner lock
+```
+
+There is no supported transition equivalent to:
+
+```text
+owner lock disappears while old process is alive
+-> old process drains/continues admitted mutation
+-> successor acquires concurrently
+```
+
+That sequence is precisely the unfenceable split-brain condition M7 exists to
+prevent. A platform/primitive/filesystem capable of spontaneous live-process lock
+loss is rejected during qualification. If a qualified implementation nevertheless
+detects an invalid/missing owner handle while the process is still alive, that is
+a fatal out-of-contract invariant breach. The process must cease/terminate rather
+than treating `DRAINING` as a safe recovery path, and M7 does **not** assert that a
+successor may safely overlap that impossible state. Production single-owner safety
+is claimed only for primitives where live-process ownership loss cannot occur
+outside deliberate post-quiescence close.
 
 ---
 
@@ -1153,7 +1213,9 @@ Not protected against:
 - Administrator/root bypass of files, process handles, or IPC ACLs;
 - malicious safety-ledger editing;
 - hostile kernel/filesystem behavior;
-- remote multi-host races.
+- remote multi-host races;
+- a platform/filesystem lock primitive that violates the qualified fail-stop
+  ownership-lifetime contract.
 
 IPC must not expand the boundary with a network listener or executable
 serialization.
@@ -1172,7 +1234,9 @@ Initial claim ceiling excludes:
 - two intentionally distinct state dirs controlling the same remote actor;
 - pre-M7 binaries that ignore the owner protocol;
 - arbitrary path-alias attacks by hostile local code;
-- cross-build/mixed-runtime IPC until explicitly qualified.
+- cross-build/mixed-runtime IPC until explicitly qualified;
+- any primitive/filesystem capable of releasing ownership while the owner process
+  remains alive and mutation-capable outside controlled post-quiescence close.
 
 Known unsupported network/shared state should fail the production support gate
 where detection is reliable. Where platform APIs cannot conclusively classify the
@@ -1200,6 +1264,7 @@ two simultaneous owner acquisitions -> exactly one owner
 live owner blocks second process without timeout stealing
 normal release -> successor can acquire
 forced owner termination -> OS releases ownership
+qualified primitive cannot expire/revoke/drop lock while owner remains live/mutation-capable
 rendezvous file remains -> successor still acquires when OS lock is free
 same-process duplicate authority root -> denied
 case/path-normalized same domain -> one owner
@@ -1236,7 +1301,8 @@ portability statement is made than environments and primitives actually tested.
    ownership.
 4. Production ownership uses a non-expiring qualified OS-held lock.
 5. An alive/hung owner is never automatically timed out and replaced.
-6. Takeover requires clean release or owner process death/termination.
+6. Takeover requires clean post-quiescence release or owner process
+   death/termination.
 7. Owner handle is dedicated and private; qualified spawn/exec/fork semantics
    ensure no child can retain, extend, release, or exercise production ownership
    after the parent owner dies.
@@ -1289,8 +1355,9 @@ portability statement is made than environments and primitives actually tested.
 44. Kill does not transfer ownership or bypass M5/M6 recovery.
 45. External hot-file kill retains existing bounded semantics; no instantaneous
     interruption claim is added.
-46. Unexpected detected owner-lock loss terminalizes local authority; old session
-    is never silently reacquired.
+46. Under the qualified primitive, OS ownership cannot disappear while the owner
+    remains live and mutation-capable; live-process lock loss is not a supported
+    transition or safe drain/takeover condition.
 47. `download_image` is not exposed over IPC until local-output path semantics are
     explicitly qualified.
 48. `whoami` is authority-establishing and is not part of the Layer-4 pure-read
@@ -1380,6 +1447,7 @@ portability statement is made than environments and primitives actually tested.
 | M7-T62 | Production starts with relative `state_dir` | Canonical absolute domain is used/exposed and warning identifies resolved root |
 | M7-T63 | Qualified POSIX fork/spawn/exec child survives parent owner death | Child cannot retain/extend/release/use production ownership; successor acquisition follows chosen primitive contract |
 | M7-T64 | Client protocol or exact runtime build id differs from owner | Rejected before request admission under initial M7 compatibility claim |
+| M7-T65 | Qualified owner process remains alive/mutation-capable under supported platform faults without controlled release | OS ownership cannot disappear; any primitive that allows live-process lock loss fails qualification |
 
 Mandatory regressions:
 
@@ -1469,10 +1537,11 @@ M7 is complete only when:
 ✓ exactly one supported owner process exists per canonical qualified local state dir
 ✓ production diagnostics expose the resolved absolute authority domain and warn on relative configuration
 ✓ ownership is OS-held and non-expiring; no heartbeat/PID/mtime takeover exists
+✓ qualified owner lock cannot expire/revoke/drop while owner remains alive and mutation-capable
 ✓ chosen lock primitive has dedicated-handle/process-death semantics and no unrelated-descriptor release
 ✓ qualified child process modes cannot retain, extend, release, or use owner authority after parent death
 ✓ losing processes fail before production browser or safety-write authority
-✓ request admission and owner drain have one synchronized ordering
+✓ request admission and owner drain have one synchronized ordering while ownership remains held
 ✓ controlled release is last and never overtakes admitted mutation work
 ✓ forced process death permits OS-level takeover without stale-lock-file deletion
 ✓ successor never restores old ephemeral confirmation/grant/permit/reconciliation authority
@@ -1496,20 +1565,21 @@ M7 is complete only when:
 ✓ genuine sibling-process crash/takeover tests exist
 ✓ actual Windows Server 2025 ownership/IPC behavior is qualified and claim-bounded
 ✓ hostile-same-user, network-filesystem, cross-build/mixed-runtime, multi-state-root,
-  cross-machine, and distributed-exactly-once exclusions remain explicit
+  cross-machine, spontaneous-live-lock-loss, and distributed-exactly-once exclusions remain explicit
 ```
 
 The bounded M7 claim is:
 
-> On one qualified local machine and one canonical WireAgent state directory,
-> cooperating M7-aware processes with the exact qualified protocol and
-> `runtime_build_id` admit at most one supported production authority owner at a
-> time. Other processes interact through the owner's local bounded
-> capability/reconciliation boundary or fail busy. After owner death, a successor
-> rebuilds authority from durable M5/M6 truth and never resumes old ephemeral
-> execution authority.
+> On one qualified local machine/filesystem and one canonical WireAgent state
+> directory, cooperating M7-aware processes with the exact qualified protocol and
+> `runtime_build_id`, using an owner-lock primitive whose ownership cannot vanish
+> while the owner remains alive and mutation-capable, admit at most one supported
+> production authority owner at a time. Other processes interact through the
+> owner's local bounded capability/reconciliation boundary or fail busy. After
+> controlled post-quiescence release or owner death, a successor rebuilds authority
+> from durable M5/M6 truth and never resumes old ephemeral execution authority.
 
 That claim deliberately stops short of automatic hot failover, distributed
 exactly-once execution, hostile-local-process isolation, network-filesystem
-coordination, cross-build/mixed-runtime interoperability, or global uniqueness
-across separate state roots.
+coordination, cross-build/mixed-runtime interoperability, spontaneous live-process
+lock-loss recovery, or global uniqueness across separate state roots.

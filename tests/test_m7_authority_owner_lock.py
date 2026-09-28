@@ -189,6 +189,29 @@ def test_non_contention_os_lock_error_rolls_back_registry(
     successor.release()
 
 
+def test_registry_invariant_is_checked_before_owner_handle_close(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir).acquire()
+
+    # Simulate an impossible in-process registry corruption. Release must notice
+    # it before closing the private owner descriptor, so the OS lock is still
+    # held and a fresh process remains excluded.
+    with AuthorityOwnerLock._registry_guard:
+        del AuthorityOwnerLock._registry[owner._identity]
+
+    try:
+        with pytest.raises(AuthorityOwnerError, match="lost the active domain"):
+            owner.release()
+
+        busy, payload = _probe(state_dir)
+        assert busy.returncode == 23
+        assert payload["busy"] is True
+    finally:
+        with AuthorityOwnerLock._registry_guard:
+            AuthorityOwnerLock._registry[owner._identity] = owner
+        owner.release()
+
+
 def test_close_failure_keeps_same_process_domain_reserved_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

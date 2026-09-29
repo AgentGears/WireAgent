@@ -63,3 +63,4 @@ jobs:
           tests/test_m6_layer6_windows_durability.py
           tests/test_m7_authority_owner_lock.py
           tests/test_m7_authority_owner_lock_setup_failures.py
+          tests/test_m7_authority_owner_lock_failstop_processes.py

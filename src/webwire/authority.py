@@ -147,13 +147,16 @@ class AuthorityOwnerLock:
             # is published as pending, a POSIX fork child can always discover and
             # close its inherited copy even if this hardening call is in flight.
             os.set_inheritable(fd, False)
+            # Keep the return itself inside the protected try. A caught async
+            # interruption between hardening and return must run the same cleanup
+            # instead of leaving a pending fd that the caller never received.
+            return fd
         except BaseException as exc:
             try:
                 self._close_and_unpublish_fd(fd, phase="pending owner handle")
             except AuthorityOwnerError as close_exc:
                 raise close_exc from exc
             raise
-        return fd
 
     @staticmethod
     def _lock_fd(fd: int) -> None:
@@ -256,9 +259,31 @@ class AuthorityOwnerLock:
             # A lower layer already encountered ambiguous close state. Preserve
             # every discoverable descriptor reference and the registry slot.
             return
-        if fd is not None:
-            self._close_and_unpublish_fd(fd, phase="pending authority owner handle")
-        self._fd = None
+
+        # An asynchronous exception may land after _open_lock_file publishes its
+        # pending descriptor but before the caller's STORE_FAST receives the
+        # return value. Derive cleanup authority from the object fields as well as
+        # the local variable so that bytecode seam cannot strand a descriptor.
+        cleanup_fd = fd
+        if cleanup_fd is None:
+            cleanup_fd = self._pending_fd
+        if cleanup_fd is None:
+            cleanup_fd = self._fd
+        if cleanup_fd is not None:
+            self._close_and_unpublish_fd(
+                cleanup_fd,
+                phase="pending authority owner handle",
+            )
+
+        if self._pending_fd is not None or self._fd is not None:
+            # Multiple/distinct owner descriptors are outside the invariant. Do
+            # not free the domain if cleanup could not establish an empty owner
+            # descriptor state.
+            self._release_broken = True
+            raise AuthorityOwnerError(
+                "authority owner acquisition cleanup left ambiguous descriptor state"
+            )
+
         self._owner_pid = None
         self._rollback_process_domain(self)
 

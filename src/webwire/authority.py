@@ -143,14 +143,18 @@ class AuthorityOwnerLock:
         if os.name == "nt":
             import msvcrt
 
-            try:
-                locking = getattr(msvcrt, "locking")
-                lk_nblck = getattr(msvcrt, "LK_NBLCK")
-            except AttributeError as exc:
+            # Linux typeshed intentionally omits the Windows-only locking API,
+            # while Ruff rejects constant getattr() calls. Resolve through the
+            # runtime module dictionary so static analysis remains portable and
+            # a Windows runtime missing the CRT members still fails closed.
+            crt = vars(msvcrt)
+            locking = crt.get("locking")
+            lk_nblck = crt.get("LK_NBLCK")
+            if not callable(locking) or not isinstance(lk_nblck, int):
                 raise OSError(
                     errno.ENOSYS,
                     "Windows CRT does not expose non-blocking file-region locking",
-                ) from exc
+                )
 
             os.lseek(fd, 0, os.SEEK_SET)
             try:

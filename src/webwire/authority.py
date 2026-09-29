@@ -88,6 +88,12 @@ class AuthorityOwnerLock:
     # must not continue with copied state or inspect stale descriptor integers.
     # The child exits fail-stop before any selective owner-fd cleanup.
     _BROKEN_FORK_EXIT_CODE: ClassVar[int] = 70
+    # A Python-level raising signal can theoretically arrive after the kernel
+    # returns a newly opened integer descriptor but before bytecode stores that
+    # integer anywhere Python cleanup can discover. There is no safe selective
+    # cleanup at that seam. The supported response is fail-stop process exit;
+    # process death closes the hidden descriptor before replacement is possible.
+    _HIDDEN_OPEN_EXIT_CODE: ClassVar[int] = 71
 
     def __init__(self, state_dir: Path) -> None:
         self._authority_domain = canonical_authority_domain(state_dir)
@@ -98,6 +104,7 @@ class AuthorityOwnerLock:
         self._fd: Optional[int] = None
         self._owner_pid: Optional[int] = None
         self._release_broken = False
+        self._opening_unpublished = False
 
     @property
     def authority_domain(self) -> Path:
@@ -142,8 +149,20 @@ class AuthorityOwnerLock:
         # child-detach hook. The at-fork prepare callback acquires _fork_guard,
         # so no supported os.fork() can cross this open/publication window.
         with self._fork_guard:
-            fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            # Mark the only interval in which the kernel may have created an fd
+            # whose integer has not yet reached a Python local/object field. A
+            # normal os.open OSError proves no descriptor was returned and clears
+            # the marker. Any other BaseException with no published fd forces the
+            # outer acquisition path to fail-stop the process rather than leak an
+            # unknowable descriptor.
+            self._opening_unpublished = True
+            try:
+                fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError:
+                self._opening_unpublished = False
+                raise
             self._pending_fd = fd
+            self._opening_unpublished = False
 
         try:
             # CPython opens descriptors non-inheritable by default, but repeat
@@ -251,6 +270,7 @@ class AuthorityOwnerLock:
                 if self._fd == fd:
                     self._fd = None
                     self._owner_pid = None
+                self._opening_unpublished = False
             except BaseException as exc:
                 # A signal/async exception can arrive after kernel close succeeds
                 # but before Python clears the published fd field. Treat that
@@ -294,6 +314,7 @@ class AuthorityOwnerLock:
                 "authority owner acquisition cleanup left ambiguous descriptor state"
             )
 
+        self._opening_unpublished = False
         self._owner_pid = None
         self._rollback_process_domain(self)
 
@@ -309,12 +330,20 @@ class AuthorityOwnerLock:
                     "owner lock entered an indeterminate release state; terminate "
                     "the process instead of reusing it"
                 )
-            if self._fd is not None or self._pending_fd is not None:
+            if (
+                self._fd is not None
+                or self._pending_fd is not None
+                or self._opening_unpublished
+            ):
                 raise AuthorityStateError("owner lock is already acquired or acquiring")
 
-            self._reserve_process_domain(self)
             fd: Optional[int] = None
             try:
+                # Reservation is part of the rollback-protected transaction. If
+                # an async exception lands immediately after insertion, the
+                # BaseException handler can remove this owner's strong registry
+                # entry instead of stranding a descriptor-free busy domain.
+                self._reserve_process_domain(self)
                 fd = self._open_lock_file()
                 self._lock_fd(fd)
                 # The OS lock is established. Publish the held descriptor before
@@ -345,6 +374,20 @@ class AuthorityOwnerLock:
                     f"could not acquire authority owner lock {self._lock_path}: {exc!r}"
                 ) from exc
             except BaseException as exc:
+                # If open entered the kernel/publication interval but no integer
+                # became discoverable in either the caller local or owner fields,
+                # Python cannot know whether a live descriptor escaped the frame.
+                # Fail-stop process death is the only sound cleanup: the OS closes
+                # every descriptor and releases any lock before replacement.
+                if (
+                    self._opening_unpublished
+                    and fd is None
+                    and self._pending_fd is None
+                    and self._fd is None
+                ):
+                    os._exit(self._HIDDEN_OPEN_EXIT_CODE)
+
+                # Otherwise the descriptor is known and can be closed normally.
                 # KeyboardInterrupt/SystemExit during low-level setup must not
                 # strand a clean descriptor/registry state. If cleanup itself is
                 # ambiguous, the close error supersedes the interruption and the
@@ -366,7 +409,7 @@ class AuthorityOwnerLock:
                     "owner lock release previously failed; terminate the process "
                     "instead of attempting ownership transfer"
                 )
-            if self._pending_fd is not None:
+            if self._pending_fd is not None or self._opening_unpublished:
                 raise AuthorityStateError("owner lock acquisition is still in progress")
             if self._fd is None or self._owner_pid != os.getpid():
                 raise AuthorityStateError("owner lock is not held by this process")
@@ -374,17 +417,26 @@ class AuthorityOwnerLock:
             fd = self._fd
             # Couple process-local reservation release to the private-handle
             # close. Verify registry authority before crossing the OS release
-            # boundary, keep the reservation on close failure, and remove it
-            # only after close succeeds. _close_and_unpublish_fd also pins the
-            # close -> field-clear transition against fork so the fd integer
-            # cannot be reused while still advertised to a child-detach hook.
+            # boundary. If interruption happens after close/unpublication but
+            # before registry deletion, the exception handler below completes the
+            # descriptor-free registry transition before propagating it.
             with self._registry_guard:
                 if self._registry.get(self._identity) is not self:
                     raise AuthorityOwnerError(
                         "authority owner registry lost the active domain reservation"
                     )
-                self._close_and_unpublish_fd(fd, phase="authority owner handle")
-                del self._registry[self._identity]
+                try:
+                    self._close_and_unpublish_fd(fd, phase="authority owner handle")
+                    del self._registry[self._identity]
+                except BaseException:
+                    if (
+                        not self._release_broken
+                        and self._fd is None
+                        and self._pending_fd is None
+                    ):
+                        if self._registry.get(self._identity) is self:
+                            del self._registry[self._identity]
+                    raise
 
     def __enter__(self) -> "AuthorityOwnerLock":
         return self.acquire()
@@ -394,9 +446,21 @@ class AuthorityOwnerLock:
 
     @classmethod
     def _before_fork(cls) -> None:
-        """Block fork across owner-descriptor publish/unpublish transitions."""
+        """Block fork across owner-descriptor publish/unpublish transitions.
 
-        cls._fork_guard.acquire()
+        CPython reports exceptions from registered at-fork callbacks as
+        unraisable and can continue the fork. Therefore a signal-interrupted
+        ``Lock.acquire`` cannot be allowed to escape: retry until the fork gate is
+        actually held. This may defer an interrupt, but it cannot unlock another
+        thread's critical transition or permit an unsafe fork snapshot.
+        """
+
+        while True:
+            try:
+                cls._fork_guard.acquire()
+            except BaseException:
+                continue
+            return
 
     @classmethod
     def _after_fork_parent(cls) -> None:
@@ -439,6 +503,7 @@ class AuthorityOwnerLock:
             owner._fd = None
             owner._owner_pid = None
             owner._release_broken = False
+            owner._opening_unpublished = False
             owner._state_lock = threading.RLock()
         cls._registry = {}
         cls._registry_guard = threading.Lock()

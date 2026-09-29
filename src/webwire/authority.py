@@ -84,6 +84,10 @@ class AuthorityOwnerLock:
     # gate therefore protects both publication after open and unpublication after
     # close. The at-fork prepare callback acquires it before every supported fork.
     _fork_guard: ClassVar[Any] = threading.Lock()
+    # If descriptor close/unpublication becomes ambiguous, a later fork child
+    # must not continue with copied state or inspect stale descriptor integers.
+    # The child exits fail-stop before any selective owner-fd cleanup.
+    _BROKEN_FORK_EXIT_CODE: ClassVar[int] = 70
 
     def __init__(self, state_dir: Path) -> None:
         self._authority_domain = canonical_authority_domain(state_dir)
@@ -232,25 +236,31 @@ class AuthorityOwnerLock:
         same gate used by the at-fork prepare callback across kernel close and
         owner-state unpublication.
 
-        A close error is deliberately ambiguous: do not clear either descriptor
-        field or the process-domain reservation. The caller must fail stop rather
+        Any exception across close *or* unpublication is ownership ambiguity.
+        Descriptor fields and the process-domain reservation remain fail-closed,
+        and any later POSIX fork child terminates before inspecting those possibly
+        stale integers. The caller must terminate the broken parent process rather
         than guess whether ownership survived.
         """
 
         with self._fork_guard:
             try:
                 self._close_owner_fd(fd)
-            except OSError as exc:
+                if self._pending_fd == fd:
+                    self._pending_fd = None
+                if self._fd == fd:
+                    self._fd = None
+                    self._owner_pid = None
+            except BaseException as exc:
+                # A signal/async exception can arrive after kernel close succeeds
+                # but before Python clears the published fd field. Treat that
+                # exactly like an OSError from close: the integer may already be
+                # reusable, so never let a fork child selectively close it.
                 self._release_broken = True
                 raise AuthorityOwnerError(
-                    f"could not close {phase} {self._lock_path}: {exc!r}"
+                    f"could not close {phase} {self._lock_path}: {exc!r}; "
+                    "owner descriptor state is ambiguous, terminate the process"
                 ) from exc
-
-            if self._pending_fd == fd:
-                self._pending_fd = None
-            if self._fd == fd:
-                self._fd = None
-                self._owner_pid = None
 
     def _rollback_failed_acquisition(self, fd: Optional[int]) -> None:
         """Undo a definitely-clean acquisition failure or stay reserved on ambiguity."""
@@ -405,11 +415,17 @@ class AuthorityOwnerLock:
         """
 
         inherited = list(cls._registry.values())
-        # Deduplicate globally, not just per owner: a close error in the parent is
-        # fail-stop/ambiguous and can leave stale descriptor integers published.
-        # The supported process must terminate rather than continue allocating,
-        # but a global set prevents a child hook from issuing duplicate closes if
-        # multiple copied owner fields happen to name the same integer.
+        if any(owner._release_broken for owner in inherited):
+            # A broken parent may advertise an fd integer whose close outcome is
+            # unknown; that integer may already belong to an unrelated resource.
+            # Selective child cleanup is therefore unsafe. Fail-stop the child:
+            # process exit closes every inherited descriptor copy without ever
+            # letting the child run with copied authority state or stale fd
+            # identity. The broken parent is already required to terminate.
+            os._exit(cls._BROKEN_FORK_EXIT_CODE)
+
+        # Deduplicate globally, not just per owner: pending/held fields may both
+        # name the same live descriptor during a clean promotion.
         inherited_fds = {
             fd
             for owner in inherited

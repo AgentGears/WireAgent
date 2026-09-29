@@ -1,4 +1,4 @@
-"""Regression for ambiguous owner close/unpublication followed by POSIX fork."""
+"""Regressions for ambiguous owner state followed by POSIX fork."""
 
 from __future__ import annotations
 
@@ -79,3 +79,26 @@ def test_interrupt_after_kernel_close_fail_stops_later_fork_child(
             os.close(fd)
         except OSError:
             pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork qualification only")
+def test_hidden_open_state_fail_stops_fork_child_before_user_code(tmp_path: Path) -> None:
+    """A child never continues while an inherited owner may hide an unpublished fd."""
+
+    owner = AuthorityOwnerLock(tmp_path / "state")
+    AuthorityOwnerLock._reserve_process_domain(owner)
+    owner._opening_unpublished = True
+
+    try:
+        child_pid = os.fork()
+        if child_pid == 0:  # pragma: no cover - after-fork callback must exit first
+            os._exit(99)
+
+        _, status = os.waitpid(child_pid, 0)
+        assert (
+            os.waitstatus_to_exitcode(status)
+            == AuthorityOwnerLock._BROKEN_FORK_EXIT_CODE
+        )
+    finally:
+        owner._opening_unpublished = False
+        AuthorityOwnerLock._rollback_process_domain(owner)

@@ -78,12 +78,18 @@ class AuthorityOwnerLock:
 
     _registry_guard: ClassVar[Any] = threading.Lock()
     _registry: ClassVar[dict[str, "AuthorityOwnerLock"]] = {}
+    # POSIX fork must not snapshot a just-opened descriptor before it is
+    # discoverable by the child-detach hook. The at-fork prepare callback uses
+    # this same gate, making os.open -> _pending_fd publication one atomic region
+    # with respect to supported os.fork() calls in sibling threads.
+    _fork_guard: ClassVar[Any] = threading.Lock()
 
     def __init__(self, state_dir: Path) -> None:
         self._authority_domain = canonical_authority_domain(state_dir)
         self._identity = os.path.normcase(str(self._authority_domain))
         self._lock_path = self._authority_domain / "authority.lock"
         self._state_lock: Any = threading.RLock()
+        self._pending_fd: Optional[int] = None
         self._fd: Optional[int] = None
         self._owner_pid: Optional[int] = None
         self._release_broken = False
@@ -125,16 +131,24 @@ class AuthorityOwnerLock:
 
     def _open_lock_file(self) -> int:
         self._authority_domain.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        # os.open() may release the GIL. A sibling thread could otherwise fork
+        # after the kernel installs the fd but before Python publishes it on this
+        # object, leaving an inherited open-file description invisible to the
+        # child-detach hook. The at-fork prepare callback acquires _fork_guard,
+        # so no supported os.fork() can cross this open/publication window.
+        with self._fork_guard:
+            fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            self._pending_fd = fd
+
         try:
             # CPython opens descriptors non-inheritable by default, but repeat
-            # the requirement explicitly at the authority boundary. If this
-            # hardening call itself fails, close the just-opened descriptor here:
-            # acquire() has not received/published it yet and therefore cannot
-            # clean it up on our behalf.
+            # the requirement explicitly at the authority boundary. Once the fd
+            # is published as pending, a POSIX fork child can always discover and
+            # close its inherited copy even if this hardening call is in flight.
             os.set_inheritable(fd, False)
         except BaseException:
             self._close_noexcept(fd)
+            self._pending_fd = None
             raise
         return fd
 
@@ -203,6 +217,11 @@ class AuthorityOwnerLock:
         except OSError:
             pass
 
+    def _discard_pending_fd(self, fd: int) -> None:
+        self._close_noexcept(fd)
+        if self._pending_fd == fd:
+            self._pending_fd = None
+
     def acquire(self) -> "AuthorityOwnerLock":
         """Acquire this authority domain immediately or fail ``authority_busy``.
 
@@ -215,29 +234,31 @@ class AuthorityOwnerLock:
                     "owner lock entered an indeterminate release state; terminate "
                     "the process instead of reusing it"
                 )
-            if self._fd is not None:
-                raise AuthorityStateError("owner lock is already acquired")
+            if self._fd is not None or self._pending_fd is not None:
+                raise AuthorityStateError("owner lock is already acquired or acquiring")
 
             self._reserve_process_domain(self)
             fd: Optional[int] = None
             try:
                 fd = self._open_lock_file()
-                # Publish the private descriptor before entering the OS call so a
-                # POSIX fork callback can detach it even if another thread forks
-                # while this thread is inside acquisition.
+                self._lock_fd(fd)
+                # The OS lock is established. Publish the held descriptor before
+                # clearing the pending marker so a fork child always sees at
+                # least one discoverable reference. The child hook deduplicates
+                # the two fields when a fork lands between these assignments.
                 self._fd = fd
                 self._owner_pid = os.getpid()
-                self._lock_fd(fd)
+                self._pending_fd = None
             except AuthorityBusyError:
                 if fd is not None:
-                    self._close_noexcept(fd)
+                    self._discard_pending_fd(fd)
                 self._fd = None
                 self._owner_pid = None
                 self._rollback_process_domain(self)
                 raise
             except (OSError, AuthorityOwnerError) as exc:
                 if fd is not None:
-                    self._close_noexcept(fd)
+                    self._discard_pending_fd(fd)
                 self._fd = None
                 self._owner_pid = None
                 self._rollback_process_domain(self)
@@ -251,7 +272,7 @@ class AuthorityOwnerLock:
                 # strand the canonical in-process domain reservation or a
                 # published descriptor if the caller catches the interruption.
                 if fd is not None:
-                    self._close_noexcept(fd)
+                    self._discard_pending_fd(fd)
                 self._fd = None
                 self._owner_pid = None
                 self._rollback_process_domain(self)
@@ -268,6 +289,8 @@ class AuthorityOwnerLock:
                     "owner lock release previously failed; terminate the process "
                     "instead of attempting ownership transfer"
                 )
+            if self._pending_fd is not None:
+                raise AuthorityStateError("owner lock acquisition is still in progress")
             if self._fd is None or self._owner_pid != os.getpid():
                 raise AuthorityStateError("owner lock is not held by this process")
 
@@ -309,28 +332,51 @@ class AuthorityOwnerLock:
         self.release()
 
     @classmethod
+    def _before_fork(cls) -> None:
+        """Block fork across the os.open -> pending-fd publication window."""
+
+        cls._fork_guard.acquire()
+
+    @classmethod
+    def _after_fork_parent(cls) -> None:
+        cls._fork_guard.release()
+
+    @classmethod
     def _after_fork_child(cls) -> None:
         """Detach inherited owner descriptors in a POSIX fork child.
 
         ``flock`` ownership may be associated with an inherited open-file
         description. Calling explicit unlock in the child could therefore drop
-        the parent's lock. The child closes only its inherited descriptor copy,
-        clears the copied process-local registry, and gets fresh thread locks.
-        Full fork semantics remain a later M7 platform-qualification claim.
+        the parent's lock. The child closes only inherited descriptor copies,
+        including a descriptor whose acquisition had not yet reached flock,
+        clears copied registry state, and gets fresh thread locks. Full fork
+        semantics remain a later M7 platform-qualification claim.
         """
 
         inherited = list(cls._registry.values())
         for owner in inherited:
-            fd = owner._fd
-            if fd is not None:
+            # A fork may land during promotion from pending -> held, so both
+            # fields can transiently name the same descriptor. Close each unique
+            # inherited descriptor at most once.
+            inherited_fds = {fd for fd in (owner._pending_fd, owner._fd) if fd is not None}
+            for fd in inherited_fds:
                 cls._close_noexcept(fd)
+            owner._pending_fd = None
             owner._fd = None
             owner._owner_pid = None
             owner._release_broken = False
             owner._state_lock = threading.RLock()
         cls._registry = {}
         cls._registry_guard = threading.Lock()
+        # The before-fork callback held the inherited copy at fork time. No other
+        # thread survives in the child, so replace it with a fresh unlocked gate
+        # rather than trying to recover the parent's lock state.
+        cls._fork_guard = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=AuthorityOwnerLock._after_fork_child)
+    os.register_at_fork(
+        before=AuthorityOwnerLock._before_fork,
+        after_in_parent=AuthorityOwnerLock._after_fork_parent,
+        after_in_child=AuthorityOwnerLock._after_fork_child,
+    )

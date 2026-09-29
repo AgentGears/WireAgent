@@ -49,21 +49,17 @@ arbitrary multi-threaded `fork()` is generally safe.
   state now fail-stops before user code instead of attempting selective fd
   cleanup. This closes the child side of the narrow hidden-descriptor window.
 
-## Exact-head evidence
+## Validation evidence
 
-Exact candidate: `a241d756ad22785cb076e3c6cc873a436e71664f`.
+The PR's final exact-head gate is recorded in the PR conversation/body rather
+than embedded as a self-referential commit SHA in this file. The required gate is:
 
-GitHub Actions CI #526 is green on that exact head:
-
-- Ubuntu CPython 3.11 and 3.12 full test/lint/type gates are green. The immediately
-  preceding code-identical gate reported 1012 passed and 6 Windows-only skipped;
-  Ruff was clean and mypy reported no issues across 87 source files.
-- Windows Server 2025 CPython 3.11 and 3.12 focused jobs are green, including the
-  fresh-process hidden-open fail-stop/successor probe. The immediately preceding
-  code-identical Windows jobs reported 169 passed and one POSIX-only fork skip.
-- CPython 3.12 warns that `fork()` in a multi-threaded process may deadlock; that
-  warning reinforces the explicit Layer-1 claim ceiling rather than establishing
-  general fork safety.
+- Ubuntu CPython 3.11 and 3.12: full pytest, Ruff, and mypy.
+- Windows Server 2025 CPython 3.11 and 3.12: focused safety-ledger plus Layer-1
+  owner-lock portability/exclusion suite, including the fresh-process hidden-open
+  fail-stop/successor probe.
+- CPython's warning that `fork()` in a multi-threaded process may deadlock is
+  treated as a claim-boundary constraint, not as evidence of general fork safety.
 
 No runtime integration, IPC authority, timed lease, stale-owner stealing, or
 automatic mutation replay policy is introduced by Layer 1.

@@ -57,35 +57,6 @@ class _InstrumentedForkGuard:
         self._lock.release()
 
 
-class _InterruptOnceForkGuard:
-    """At-fork test guard whose first explicit acquire is signal-interrupted."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.acquire_calls = 0
-
-    def acquire(self) -> bool:
-        self.acquire_calls += 1
-        if self.acquire_calls == 1:
-            raise KeyboardInterrupt
-        return self._lock.acquire()
-
-    def release(self) -> None:
-        self._lock.release()
-
-    def __enter__(self) -> "_InterruptOnceForkGuard":
-        self._lock.acquire()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
-    ) -> None:
-        self._lock.release()
-
-
 def _probe(state_dir: Path) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
     completed = subprocess.run(
         [sys.executable, str(_WORKER), "probe", str(state_dir)],
@@ -102,26 +73,27 @@ def _probe(state_dir: Path) -> tuple[subprocess.CompletedProcess[str], dict[str,
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork qualification only")
-def test_at_fork_prepare_retries_interrupted_guard_acquire(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A raising signal cannot make fork proceed without actually owning the gate."""
+def test_at_fork_prepare_interruption_fail_stops_before_fork(tmp_path: Path) -> None:
+    """Ambiguous before-fork guard ownership terminates rather than retrying/forking."""
 
-    guard = _InterruptOnceForkGuard()
-    monkeypatch.setattr(AuthorityOwnerLock, "_fork_guard", guard)
+    child_marker = tmp_path / "child-ran.txt"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(_WORKER),
+            "fork-prepare-interrupt",
+            str(child_marker),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
 
-    pid = os.fork()
-    if pid == 0:  # pragma: no cover - executed in fork child
-        os._exit(0)
-
-    _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
-    assert guard.acquire_calls == 2
-
-    # The registered parent callback must have released exactly the successful
-    # second acquisition, not a sibling's lock after the interrupted first call.
-    assert guard._lock.acquire(blocking=False) is True
-    guard._lock.release()
+    assert completed.returncode == AuthorityOwnerLock._BROKEN_FORK_EXIT_CODE
+    assert not child_marker.exists(), (
+        "registered before-fork failure returned to os.fork; child/parent code ran"
+    )
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork qualification only")

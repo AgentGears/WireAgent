@@ -16,6 +16,10 @@ from webwire.authority import AuthorityBusyError, AuthorityOwnerError, Authority
 _WORKER = Path(__file__).with_name("_m7_authority_worker.py")
 
 
+class _FailStop(BaseException):
+    """Test-only stand-in for the non-returning os._exit path."""
+
+
 def _assert_closed(fd: int) -> None:
     with pytest.raises(OSError) as excinfo:
         os.fstat(fd)
@@ -83,6 +87,92 @@ def test_interrupt_during_inheritance_setup_does_not_strand_fd_or_registry(
     _assert_closed(captured[0])
 
     monkeypatch.setattr(os, "set_inheritable", original)
+    successor = AuthorityOwnerLock(state_dir).acquire()
+    successor.release()
+
+
+def test_interrupt_after_registry_insert_rolls_back_descriptor_free_domain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The reservation itself is inside the acquisition rollback transaction."""
+
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir)
+    original_reserve = owner._reserve_process_domain
+
+    def reserve_then_interrupt(candidate: AuthorityOwnerLock) -> None:
+        original_reserve(candidate)
+        assert AuthorityOwnerLock._registry.get(owner._identity) is owner
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(owner, "_reserve_process_domain", reserve_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        owner.acquire()
+
+    assert AuthorityOwnerLock._registry.get(owner._identity) is None
+    assert owner._pending_fd is None
+    assert owner._fd is None
+
+    successor = AuthorityOwnerLock(state_dir).acquire()
+    successor.release()
+
+
+def test_hidden_open_interrupt_uses_fail_stop_instead_of_leaking_unknown_fd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No rollback guesses when os.open created an fd before Python could publish it."""
+
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir)
+    original_open = os.open
+    captured: list[int] = []
+    exits: list[int] = []
+
+    def open_then_interrupt(
+        path: os.PathLike[str] | str | bytes,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is None:
+            fd = original_open(path, flags, mode)
+        else:
+            fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if os.fspath(path) == os.fspath(owner.lock_path):
+            captured.append(fd)
+            # Simulate a raising signal after the kernel returned the integer but
+            # before the caller could STORE_FAST/publish it.
+            raise KeyboardInterrupt
+        return fd
+
+    def fail_stop(code: int) -> None:
+        exits.append(code)
+        raise _FailStop
+
+    monkeypatch.setattr(os, "open", open_then_interrupt)
+    monkeypatch.setattr(os, "_exit", fail_stop)
+
+    with pytest.raises(_FailStop):
+        owner.acquire()
+
+    assert exits == [AuthorityOwnerLock._HIDDEN_OPEN_EXIT_CODE]
+    assert len(captured) == 1
+    assert owner._opening_unpublished is True
+    assert owner._pending_fd is None
+    assert owner._fd is None
+    assert AuthorityOwnerLock._registry.get(owner._identity) is owner
+
+    # Test-only cleanup because the real production path terminates here and the
+    # OS closes the hidden descriptor. Restore normal os.open, close the captured
+    # descriptor explicitly, and clear the copied fail-stop state.
+    monkeypatch.setattr(os, "open", original_open)
+    os.close(captured[0])
+    owner._opening_unpublished = False
+    owner._rollback_process_domain(owner)
+
     successor = AuthorityOwnerLock(state_dir).acquire()
     successor.release()
 
@@ -173,3 +263,32 @@ def test_close_failure_after_os_lock_success_preserves_pending_fd_and_domain(
     assert successor.returncode == 0
     assert successor_payload["acquired"] is True
     assert successor_payload["busy"] is False
+
+
+def test_interrupt_after_close_unpublish_completes_registry_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A post-close async exception cannot strand a descriptor-free registry slot."""
+
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir).acquire()
+    original_finalize = owner._close_and_unpublish_fd
+
+    def finalize_then_interrupt(fd: int, *, phase: str) -> None:
+        original_finalize(fd, phase=phase)
+        assert owner._fd is None
+        assert owner._pending_fd is None
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(owner, "_close_and_unpublish_fd", finalize_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        owner.release()
+
+    assert owner._fd is None
+    assert owner._pending_fd is None
+    assert owner._release_broken is False
+    assert AuthorityOwnerLock._registry.get(owner._identity) is None
+
+    successor = AuthorityOwnerLock(state_dir).acquire()
+    successor.release()

@@ -1,4 +1,4 @@
-"""Regression for the M7 owner-lock fork pre-publication window."""
+"""Regressions for M7 owner-descriptor publication/unpublication vs POSIX fork."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ import os
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
+from types import TracebackType
+from typing import Optional, Type
 
 import pytest
 
@@ -17,26 +18,75 @@ from webwire.authority import AuthorityOwnerLock
 _WORKER = Path(__file__).with_name("_m7_authority_worker.py")
 
 
+class _InstrumentedForkGuard:
+    """Lock wrapper that distinguishes owner transitions from at-fork prepare.
+
+    Production owner code enters the guard through ``with``. The registered
+    at-fork prepare callback calls ``acquire()`` explicitly. That distinction
+    lets the tests handshake on the exact moment fork preparation has started
+    instead of relying on scheduler sleeps.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.transition_entered = threading.Event()
+        self.before_fork_started = threading.Event()
+        self.before_fork_acquired = threading.Event()
+
+    def acquire(self) -> bool:
+        self.before_fork_started.set()
+        acquired = self._lock.acquire()
+        if acquired:
+            self.before_fork_acquired.set()
+        return acquired
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> "_InstrumentedForkGuard":
+        self._lock.acquire()
+        self.transition_entered.set()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        self._lock.release()
+
+
+def _probe(state_dir: Path) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    completed = subprocess.run(
+        [sys.executable, str(_WORKER), "probe", str(state_dir)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    stdout = completed.stdout.strip().splitlines()
+    assert stdout, f"worker produced no JSON; stderr={completed.stderr!r}"
+    payload = json.loads(stdout[-1])
+    assert isinstance(payload, dict)
+    return completed, payload
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork qualification only")
 def test_fork_cannot_retain_descriptor_opened_before_python_publication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A sibling-thread fork cannot capture an owner fd hidden from at-fork cleanup.
-
-    The injected os.open wrapper pauses *after* the kernel has returned the new
-    descriptor but before AuthorityOwnerLock can publish it. M7's fork gate must
-    prevent the main thread from completing fork across that interval. The fork
-    child is deliberately kept alive after the parent releases ownership; a
-    fresh process must still acquire immediately, proving the child did not keep
-    the parent's flock/open-file-description alive.
-    """
+    """Fork prepare waits until a kernel-opened owner fd is child-discoverable."""
 
     state_dir = tmp_path / "state"
     owner = AuthorityOwnerLock(state_dir)
+    guard = _InstrumentedForkGuard()
+    monkeypatch.setattr(AuthorityOwnerLock, "_fork_guard", guard)
+
     original_open = os.open
-    open_returned = threading.Event()
-    allow_python_return = threading.Event()
+    kernel_open_returned = threading.Event()
+    allow_open_wrapper_return = threading.Event()
     acquire_done = threading.Event()
     acquire_errors: list[BaseException] = []
 
@@ -52,8 +102,8 @@ def test_fork_cannot_retain_descriptor_opened_before_python_publication(
         else:
             fd = original_open(path, flags, mode, dir_fd=dir_fd)
         if os.fspath(path) == os.fspath(owner.lock_path):
-            open_returned.set()
-            if not allow_python_return.wait(timeout=5):
+            kernel_open_returned.set()
+            if not allow_open_wrapper_return.wait(timeout=5):
                 os.close(fd)
                 raise RuntimeError("timed out holding pre-publication owner fd")
         return fd
@@ -70,19 +120,25 @@ def test_fork_cannot_retain_descriptor_opened_before_python_publication(
 
     acquire_thread = threading.Thread(target=acquire_owner, name="m7-owner-acquire")
     acquire_thread.start()
-    assert open_returned.wait(timeout=5)
+    assert kernel_open_returned.wait(timeout=5)
+    assert guard.transition_entered.is_set()
 
     hold_read, hold_write = os.pipe()
     child_pid: int | None = None
 
-    # Release the injected os.open pause only after fork has had enough time to
-    # enter its before-fork callback. With the required gate, fork cannot return
-    # before this event becomes set. Without the gate, it snapshots the hidden fd.
-    def release_open_window() -> None:
-        time.sleep(0.15)
-        allow_python_return.set()
+    # Do not use a timer. Wait until the actual registered at-fork prepare
+    # callback has attempted to acquire the guard and is therefore blocked behind
+    # the acquisition thread. Only then let the os.open wrapper return so the
+    # descriptor can be published as _pending_fd before fork proceeds.
+    def release_open_window_after_fork_prepare() -> None:
+        assert guard.before_fork_started.wait(timeout=5)
+        assert not guard.before_fork_acquired.is_set()
+        allow_open_wrapper_return.set()
 
-    releaser = threading.Thread(target=release_open_window, name="m7-open-release")
+    releaser = threading.Thread(
+        target=release_open_window_after_fork_prepare,
+        name="m7-open-release",
+    )
     releaser.start()
 
     try:
@@ -97,34 +153,26 @@ def test_fork_cannot_retain_descriptor_opened_before_python_publication(
 
         child_pid = pid
         os.close(hold_read)
-
-        # If fork returned while the os.open wrapper was still paused, the fd was
-        # inherited before AuthorityOwnerLock could publish it to the child hook.
-        assert allow_python_return.is_set()
+        assert guard.before_fork_acquired.is_set()
         assert acquire_done.wait(timeout=5)
         acquire_thread.join(timeout=5)
         releaser.join(timeout=5)
         assert not acquire_thread.is_alive()
+        assert not releaser.is_alive()
         assert not acquire_errors
         assert owner.held is True
 
         owner.release()
 
-        completed = subprocess.run(
-            [sys.executable, str(_WORKER), "probe", str(state_dir)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        stdout = completed.stdout.strip().splitlines()
-        assert stdout, f"worker produced no JSON; stderr={completed.stderr!r}"
-        payload = json.loads(stdout[-1])
+        # Keep the fork child alive while proving the parent's owner lock has
+        # truly ended. If that child retained the pre-publication open-file
+        # description, the fresh process would still report authority_busy.
+        completed, payload = _probe(state_dir)
         assert completed.returncode == 0
         assert payload["acquired"] is True
         assert payload["busy"] is False
     finally:
-        allow_python_return.set()
+        allow_open_wrapper_return.set()
         acquire_thread.join(timeout=5)
         releaser.join(timeout=5)
         if owner.held:
@@ -143,3 +191,130 @@ def test_fork_cannot_retain_descriptor_opened_before_python_publication(
         else:
             os.close(hold_read)
             os.close(hold_write)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork qualification only")
+def test_release_close_to_unpublish_is_atomic_against_fork_and_fd_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A fork child never closes an unrelated fd that reused a released owner number."""
+
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir).acquire()
+    assert owner._fd is not None
+    owner_fd = owner._fd
+
+    guard = _InstrumentedForkGuard()
+    monkeypatch.setattr(AuthorityOwnerLock, "_fork_guard", guard)
+
+    original_owner_close = owner._close_owner_fd
+    kernel_close_done = threading.Event()
+    allow_close_wrapper_return = threading.Event()
+    release_done = threading.Event()
+    release_errors: list[BaseException] = []
+
+    def close_then_pause(fd: int) -> None:
+        original_owner_close(fd)
+        kernel_close_done.set()
+        if not allow_close_wrapper_return.wait(timeout=5):
+            raise RuntimeError("timed out holding close-to-unpublish owner state")
+
+    monkeypatch.setattr(owner, "_close_owner_fd", close_then_pause)
+
+    def release_owner() -> None:
+        try:
+            owner.release()
+        except BaseException as exc:  # pragma: no cover - asserted in parent
+            release_errors.append(exc)
+        finally:
+            release_done.set()
+
+    # Allocate the child-report pipe before the owner descriptor is closed so it
+    # cannot consume the soon-to-be-reused owner fd number.
+    report_read, report_write = os.pipe()
+    release_thread = threading.Thread(target=release_owner, name="m7-owner-release")
+    release_thread.start()
+    assert kernel_close_done.wait(timeout=5)
+    assert guard.transition_entered.is_set()  # direct regression for Codex P1 follow-up
+
+    reused_fds: list[int] = []
+    reused_fd: int | None = None
+    for _ in range(64):
+        candidate = os.open(os.devnull, os.O_RDONLY)
+        reused_fds.append(candidate)
+        if candidate == owner_fd:
+            reused_fd = candidate
+            break
+    assert reused_fd == owner_fd, "test could not force reuse of the closed owner fd number"
+
+    child_pid: int | None = None
+
+    # As above, handshake on the real at-fork prepare callback. The release
+    # thread is paused after kernel close but still holds the production fork
+    # guard; fork must not snapshot the stale _fd integer. Let release finish
+    # only after before_fork is demonstrably waiting on that guard.
+    def finish_release_after_fork_prepare() -> None:
+        assert guard.before_fork_started.wait(timeout=5)
+        assert not guard.before_fork_acquired.is_set()
+        allow_close_wrapper_return.set()
+
+    finisher = threading.Thread(
+        target=finish_release_after_fork_prepare,
+        name="m7-close-release",
+    )
+    finisher.start()
+
+    try:
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - executed in fork child
+            os.close(report_read)
+            try:
+                os.fstat(reused_fd)
+            except OSError:
+                payload = b"closed"
+            else:
+                payload = b"open"
+            os.write(report_write, payload)
+            os.close(report_write)
+            os._exit(0)
+
+        child_pid = pid
+        os.close(report_write)
+        assert guard.before_fork_acquired.is_set()
+        assert release_done.wait(timeout=5)
+        release_thread.join(timeout=5)
+        finisher.join(timeout=5)
+        assert not release_thread.is_alive()
+        assert not finisher.is_alive()
+        assert not release_errors
+        assert owner._fd is None
+
+        child_payload = os.read(report_read, 32)
+        _, status = os.waitpid(child_pid, 0)
+        child_pid = None
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert child_payload == b"open"
+    finally:
+        allow_close_wrapper_return.set()
+        release_thread.join(timeout=5)
+        finisher.join(timeout=5)
+        if owner.held:
+            monkeypatch.setattr(owner, "_close_owner_fd", original_owner_close)
+            owner.release()
+        try:
+            os.close(report_read)
+        except OSError:
+            pass
+        try:
+            os.close(report_write)
+        except OSError:
+            pass
+        for fd in reused_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if child_pid is not None:
+            _, status = os.waitpid(child_pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0

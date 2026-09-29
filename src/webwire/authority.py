@@ -78,10 +78,11 @@ class AuthorityOwnerLock:
 
     _registry_guard: ClassVar[Any] = threading.Lock()
     _registry: ClassVar[dict[str, "AuthorityOwnerLock"]] = {}
-    # POSIX fork must not snapshot a just-opened descriptor before it is
-    # discoverable by the child-detach hook. The at-fork prepare callback uses
-    # this same gate, making os.open -> _pending_fd publication one atomic region
-    # with respect to supported os.fork() calls in sibling threads.
+    # POSIX fork must never snapshot a descriptor during an interval where its
+    # integer exists in the process descriptor table but the child-detach hook
+    # cannot identify whether that integer still belongs to this owner. The same
+    # gate therefore protects both publication after open and unpublication after
+    # close. The at-fork prepare callback acquires it before every supported fork.
     _fork_guard: ClassVar[Any] = threading.Lock()
 
     def __init__(self, state_dir: Path) -> None:
@@ -146,9 +147,11 @@ class AuthorityOwnerLock:
             # is published as pending, a POSIX fork child can always discover and
             # close its inherited copy even if this hardening call is in flight.
             os.set_inheritable(fd, False)
-        except BaseException:
-            self._close_noexcept(fd)
-            self._pending_fd = None
+        except BaseException as exc:
+            try:
+                self._close_and_unpublish_fd(fd, phase="pending owner handle")
+            except AuthorityOwnerError as close_exc:
+                raise close_exc from exc
             raise
         return fd
 
@@ -206,7 +209,7 @@ class AuthorityOwnerLock:
 
     @staticmethod
     def _close_owner_fd(fd: int) -> None:
-        """Close the private owner descriptor; this is the release boundary."""
+        """Close a private owner descriptor at an ownership-state boundary."""
 
         os.close(fd)
 
@@ -217,10 +220,47 @@ class AuthorityOwnerLock:
         except OSError:
             pass
 
-    def _discard_pending_fd(self, fd: int) -> None:
-        self._close_noexcept(fd)
-        if self._pending_fd == fd:
-            self._pending_fd = None
+    def _close_and_unpublish_fd(self, fd: int, *, phase: str) -> None:
+        """Close one owner fd and clear every published reference atomically vs fork.
+
+        A successful close can make ``fd`` immediately reusable by another
+        thread. Keeping a stale integer in ``_pending_fd``/``_fd`` across a fork
+        would make the child hook close an unrelated inherited resource. Hold the
+        same gate used by the at-fork prepare callback across kernel close and
+        owner-state unpublication.
+
+        A close error is deliberately ambiguous: do not clear either descriptor
+        field or the process-domain reservation. The caller must fail stop rather
+        than guess whether ownership survived.
+        """
+
+        with self._fork_guard:
+            try:
+                self._close_owner_fd(fd)
+            except OSError as exc:
+                self._release_broken = True
+                raise AuthorityOwnerError(
+                    f"could not close {phase} {self._lock_path}: {exc!r}"
+                ) from exc
+
+            if self._pending_fd == fd:
+                self._pending_fd = None
+            if self._fd == fd:
+                self._fd = None
+                self._owner_pid = None
+
+    def _rollback_failed_acquisition(self, fd: Optional[int]) -> None:
+        """Undo a definitely-clean acquisition failure or stay reserved on ambiguity."""
+
+        if self._release_broken:
+            # A lower layer already encountered ambiguous close state. Preserve
+            # every discoverable descriptor reference and the registry slot.
+            return
+        if fd is not None:
+            self._close_and_unpublish_fd(fd, phase="pending authority owner handle")
+        self._fd = None
+        self._owner_pid = None
+        self._rollback_process_domain(self)
 
     def acquire(self) -> "AuthorityOwnerLock":
         """Acquire this authority domain immediately or fail ``authority_busy``.
@@ -249,33 +289,35 @@ class AuthorityOwnerLock:
                 self._fd = fd
                 self._owner_pid = os.getpid()
                 self._pending_fd = None
-            except AuthorityBusyError:
-                if fd is not None:
-                    self._discard_pending_fd(fd)
-                self._fd = None
-                self._owner_pid = None
-                self._rollback_process_domain(self)
+            except AuthorityBusyError as exc:
+                try:
+                    self._rollback_failed_acquisition(fd)
+                except AuthorityOwnerError as close_exc:
+                    raise close_exc from exc
                 raise
             except (OSError, AuthorityOwnerError) as exc:
-                if fd is not None:
-                    self._discard_pending_fd(fd)
-                self._fd = None
-                self._owner_pid = None
-                self._rollback_process_domain(self)
+                # `_open_lock_file` can itself discover an ambiguous close while
+                # its local fd has not yet been returned to this frame. In that
+                # case keep the pending descriptor + registry reservation intact.
+                if not self._release_broken:
+                    try:
+                        self._rollback_failed_acquisition(fd)
+                    except AuthorityOwnerError as close_exc:
+                        raise close_exc from exc
                 if isinstance(exc, AuthorityOwnerError):
                     raise
                 raise AuthorityOwnerError(
                     f"could not acquire authority owner lock {self._lock_path}: {exc!r}"
                 ) from exc
-            except BaseException:
+            except BaseException as exc:
                 # KeyboardInterrupt/SystemExit during low-level setup must not
-                # strand the canonical in-process domain reservation or a
-                # published descriptor if the caller catches the interruption.
-                if fd is not None:
-                    self._discard_pending_fd(fd)
-                self._fd = None
-                self._owner_pid = None
-                self._rollback_process_domain(self)
+                # strand a clean descriptor/registry state. If cleanup itself is
+                # ambiguous, the close error supersedes the interruption and the
+                # domain remains reserved fail-closed.
+                try:
+                    self._rollback_failed_acquisition(fd)
+                except AuthorityOwnerError as close_exc:
+                    raise close_exc from exc
                 raise
 
             return self
@@ -298,31 +340,15 @@ class AuthorityOwnerLock:
             # Couple process-local reservation release to the private-handle
             # close. Verify registry authority before crossing the OS release
             # boundary, keep the reservation on close failure, and remove it
-            # only after close succeeds. This prevents a registry inconsistency
-            # from being discovered only after OS ownership is already gone.
+            # only after close succeeds. _close_and_unpublish_fd also pins the
+            # close -> field-clear transition against fork so the fd integer
+            # cannot be reused while still advertised to a child-detach hook.
             with self._registry_guard:
                 if self._registry.get(self._identity) is not self:
                     raise AuthorityOwnerError(
                         "authority owner registry lost the active domain reservation"
                     )
-                try:
-                    # Deliberately do not issue LOCK_UN/LK_UNLCK first. The
-                    # frozen M7 contract makes private-handle close the
-                    # ownership-release boundary, avoiding a live open owner
-                    # handle after OS ownership has already been dropped.
-                    self._close_owner_fd(fd)
-                except OSError as exc:
-                    # close(2)/CloseHandle failure leaves descriptor/lock
-                    # lifetime uncertain. Preserve the process-local reservation
-                    # and require fail-stop process termination instead of
-                    # guessing ownership.
-                    self._release_broken = True
-                    raise AuthorityOwnerError(
-                        f"could not close authority owner handle {self._lock_path}: {exc!r}"
-                    ) from exc
-
-                self._fd = None
-                self._owner_pid = None
+                self._close_and_unpublish_fd(fd, phase="authority owner handle")
                 del self._registry[self._identity]
 
     def __enter__(self) -> "AuthorityOwnerLock":
@@ -333,7 +359,7 @@ class AuthorityOwnerLock:
 
     @classmethod
     def _before_fork(cls) -> None:
-        """Block fork across the os.open -> pending-fd publication window."""
+        """Block fork across owner-descriptor publish/unpublish transitions."""
 
         cls._fork_guard.acquire()
 
@@ -354,13 +380,20 @@ class AuthorityOwnerLock:
         """
 
         inherited = list(cls._registry.values())
+        # Deduplicate globally, not just per owner: a close error in the parent is
+        # fail-stop/ambiguous and can leave stale descriptor integers published.
+        # The supported process must terminate rather than continue allocating,
+        # but a global set prevents a child hook from issuing duplicate closes if
+        # multiple copied owner fields happen to name the same integer.
+        inherited_fds = {
+            fd
+            for owner in inherited
+            for fd in (owner._pending_fd, owner._fd)
+            if fd is not None
+        }
+        for fd in inherited_fds:
+            cls._close_noexcept(fd)
         for owner in inherited:
-            # A fork may land during promotion from pending -> held, so both
-            # fields can transiently name the same descriptor. Close each unique
-            # inherited descriptor at most once.
-            inherited_fds = {fd for fd in (owner._pending_fd, owner._fd) if fd is not None}
-            for fd in inherited_fds:
-                cls._close_noexcept(fd)
             owner._pending_fd = None
             owner._fd = None
             owner._owner_pid = None

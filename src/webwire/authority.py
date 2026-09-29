@@ -449,18 +449,20 @@ class AuthorityOwnerLock:
         """Block fork across owner-descriptor publish/unpublish transitions.
 
         CPython reports exceptions from registered at-fork callbacks as
-        unraisable and can continue the fork. Therefore a signal-interrupted
-        ``Lock.acquire`` cannot be allowed to escape: retry until the fork gate is
-        actually held. This may defer an interrupt, but it cannot unlock another
-        thread's critical transition or permit an unsafe fork snapshot.
+        unraisable and can continue the fork. A raising interruption therefore
+        makes guard ownership ambiguous: it may have happened before acquisition
+        or immediately after the lock became held. Retrying can deadlock on a lock
+        this thread already acquired, while returning can allow an unsafe fork.
+        Fail-stop the process instead; process death closes every owner handle and
+        prevents the fork from observing an ambiguous transition.
         """
 
-        while True:
-            try:
-                cls._fork_guard.acquire()
-            except BaseException:
-                continue
-            return
+        try:
+            acquired = cls._fork_guard.acquire()
+        except BaseException:
+            os._exit(cls._BROKEN_FORK_EXIT_CODE)
+        if not acquired:
+            os._exit(cls._BROKEN_FORK_EXIT_CODE)
 
     @classmethod
     def _after_fork_parent(cls) -> None:

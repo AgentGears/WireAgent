@@ -196,14 +196,17 @@ automatic execution for fenced effects; M6 adds explicit evidence-bearing local
 reconciliation, not distributed exactly-once semantics. M7 now has a standalone
 Layer-1 owner-lock mechanism, but Dispatcher/recovery/browser entrypoints do not
 yet require it; therefore **runtime cross-process ownership is not claimed until
-Layer 2 integration**. Full POSIX process-creation/fault qualification and Windows
-Server 2025 cross-process ownership/IPC qualification remain M7 Layers 7–8.
-M6's Layer-6 Windows evidence remains limited to the tested GitHub-hosted Windows
-Server 2025 / CPython safety-ledger environment and does not establish portable
-directory-entry, hardware-cache, network-filesystem, or whole-browser-runtime
-durability. Layer-7 qualifies the tested local broker/evidence mechanics only; it
-does not establish platform-side replay safety for public engagement and therefore
-does not promote like/unlike from `UNKNOWN` / `REQUIRED`.
+Layer 2 integration**. Layer-1 includes targeted fork-transition regressions for
+specific descriptor publication/fail-stop seams, but this is **not** a claim that
+arbitrary multi-threaded `fork()` is generally safe; full POSIX process-creation/
+fault qualification and Windows Server 2025 cross-process ownership/IPC
+qualification remain M7 Layers 7–8. M6's Layer-6 Windows evidence remains limited
+to the tested GitHub-hosted Windows Server 2025 / CPython safety-ledger
+environment and does not establish portable directory-entry, hardware-cache,
+network-filesystem, or whole-browser-runtime durability. Layer-7 qualifies the
+tested local broker/evidence mechanics only; it does not establish platform-side
+replay safety for public engagement and therefore does not promote like/unlike
+from `UNKNOWN` / `REQUIRED`.
 
 See `docs/M5_DESIGN.md` for the frozen M5 transaction contract,
 `docs/M6_DESIGN.md` for the normative reconciliation/qualification contract,

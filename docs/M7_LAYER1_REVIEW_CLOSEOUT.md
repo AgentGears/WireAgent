@@ -49,20 +49,21 @@ arbitrary multi-threaded `fork()` is generally safe.
   state now fail-stops before user code instead of attempting selective fd
   cleanup. This closes the child side of the narrow hidden-descriptor window.
 
-## Final candidate evidence
+## Exact-head evidence
 
-Exact reviewed candidate: `b8aced40a979d967303db3798fec021ad4944b33`.
+Exact candidate: `a241d756ad22785cb076e3c6cc873a436e71664f`.
 
-GitHub Actions CI #523 is green:
+GitHub Actions CI #526 is green on that exact head:
 
-- Ubuntu CPython 3.11: 1012 passed, 6 Windows-only skipped; Ruff clean; mypy clean
-  across 87 source files.
-- Ubuntu CPython 3.12: full gate green; the deliberate multi-threaded-fork
-  boundary regression emits CPython's warning that general multi-threaded fork
-  may deadlock. This warning is part of the reason the Layer-1 claim is bounded.
+- Ubuntu CPython 3.11 and 3.12 full test/lint/type gates are green. The immediately
+  preceding code-identical gate reported 1012 passed and 6 Windows-only skipped;
+  Ruff was clean and mypy reported no issues across 87 source files.
 - Windows Server 2025 CPython 3.11 and 3.12 focused jobs are green, including the
-  fresh-process hidden-open fail-stop/successor probe. Windows evidence remains
-  implementation portability/exclusion evidence, not Layer-8 qualification.
+  fresh-process hidden-open fail-stop/successor probe. The immediately preceding
+  code-identical Windows jobs reported 169 passed and one POSIX-only fork skip.
+- CPython 3.12 warns that `fork()` in a multi-threaded process may deadlock; that
+  warning reinforces the explicit Layer-1 claim ceiling rather than establishing
+  general fork safety.
 
 No runtime integration, IPC authority, timed lease, stale-owner stealing, or
 automatic mutation replay policy is introduced by Layer 1.

@@ -481,13 +481,15 @@ class AuthorityOwnerLock:
         """
 
         inherited = list(cls._registry.values())
-        if any(owner._release_broken for owner in inherited):
-            # A broken parent may advertise an fd integer whose close outcome is
-            # unknown; that integer may already belong to an unrelated resource.
-            # Selective child cleanup is therefore unsafe. Fail-stop the child:
-            # process exit closes every inherited descriptor copy without ever
-            # letting the child run with copied authority state or stale fd
-            # identity. The broken parent is already required to terminate.
+        if any(
+            owner._release_broken or owner._opening_unpublished for owner in inherited
+        ):
+            # Broken close state can advertise a stale/reused fd integer, while
+            # hidden-open state can mean a live descriptor exists whose integer
+            # was never published. Selective cleanup is unsafe in either case.
+            # Fail-stop the child so process exit closes every inherited copy and
+            # no copied authority state reaches user code. The parent-side hidden
+            # open path independently fail-stops as soon as it regains execution.
             os._exit(cls._BROKEN_FORK_EXIT_CODE)
 
         # Deduplicate globally, not just per owner: pending/held fields may both

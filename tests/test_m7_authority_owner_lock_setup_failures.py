@@ -87,6 +87,38 @@ def test_interrupt_during_inheritance_setup_does_not_strand_fd_or_registry(
     successor.release()
 
 
+def test_interrupt_after_open_before_caller_assignment_closes_pending_fd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cleanup derives the fd from owner state if caller STORE_FAST never occurs."""
+
+    state_dir = tmp_path / "state"
+    owner = AuthorityOwnerLock(state_dir)
+    original_open = owner._open_lock_file
+    captured: list[int] = []
+
+    def open_then_interrupt() -> int:
+        fd = original_open()
+        captured.append(fd)
+        assert owner._pending_fd == fd
+        # Simulate an async exception after the callee has published/returned its
+        # logical result but before acquire() receives it in the local `fd` slot.
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(owner, "_open_lock_file", open_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        owner.acquire()
+
+    assert len(captured) == 1
+    _assert_closed(captured[0])
+    assert owner._pending_fd is None
+    assert owner._fd is None
+
+    successor = AuthorityOwnerLock(state_dir).acquire()
+    successor.release()
+
+
 def test_close_failure_after_os_lock_success_preserves_pending_fd_and_domain(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

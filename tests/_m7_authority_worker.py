@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -84,14 +86,85 @@ def race(
         lock.release()
 
 
+def fork_prepare_interrupt(child_marker: Path) -> int:
+    """Inject ambiguous guard acquisition inside the registered before-fork hook."""
+
+    if not hasattr(os, "fork"):
+        return 91
+
+    class _AcquireThenInterruptGuard:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def acquire(self) -> bool:
+            # Deliberately acquire first, then raise. Retrying a non-reentrant
+            # guard would deadlock; allowing the callback exception to escape can
+            # let CPython continue the fork. Production must fail-stop instead.
+            self._lock.acquire()
+            raise KeyboardInterrupt
+
+        def release(self) -> None:
+            self._lock.release()
+
+        def __enter__(self) -> "_AcquireThenInterruptGuard":
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self._lock.release()
+
+    AuthorityOwnerLock._fork_guard = _AcquireThenInterruptGuard()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - must be unreachable with the fixed hook
+        child_marker.write_text("child-ran", encoding="utf-8")
+        os._exit(99)
+
+    child_marker.write_text(f"parent-returned:{pid}", encoding="utf-8")
+    return 98
+
+
+def hidden_open_interrupt(state_dir: Path) -> int:
+    """Create a real fd, then raise before AuthorityOwnerLock can publish its integer."""
+
+    owner = AuthorityOwnerLock(state_dir)
+    original_open = os.open
+
+    def open_then_interrupt(
+        path: os.PathLike[str] | str | bytes,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is None:
+            fd = original_open(path, flags, mode)
+        else:
+            fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if os.fspath(path) == os.fspath(owner.lock_path):
+            # The raw integer is intentionally not returned to the caller. The
+            # production owner must terminate so process death closes this hidden
+            # descriptor; normal Python cleanup cannot name it safely.
+            raise KeyboardInterrupt
+        return fd
+
+    os.open = open_then_interrupt
+    owner.acquire()
+    return 97
+
+
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "probe":
         return probe(Path(argv[2]))
     if len(argv) == 6 and argv[1] == "race":
         return race(Path(argv[2]), Path(argv[3]), Path(argv[4]), Path(argv[5]))
+    if len(argv) == 3 and argv[1] == "fork-prepare-interrupt":
+        return fork_prepare_interrupt(Path(argv[2]))
+    if len(argv) == 3 and argv[1] == "hidden-open-interrupt":
+        return hidden_open_interrupt(Path(argv[2]))
     raise SystemExit(
         "usage: _m7_authority_worker.py probe STATE_DIR | "
-        "race STATE_DIR START_GATE RELEASE_GATE RESULT_PATH"
+        "race STATE_DIR START_GATE RELEASE_GATE RESULT_PATH | "
+        "fork-prepare-interrupt CHILD_MARKER | hidden-open-interrupt STATE_DIR"
     )
 
 

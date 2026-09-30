@@ -384,6 +384,44 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-01 — M8 layer 1 review fixes (PR #20, fallback pass).** The
+  external reviewer quota was unavailable, so the project's fallback rule
+  applied: a first-pass plus adversarial review, seven findings (F-01..F-07,
+  three blocking), every one verified against the code before fixing.
+  F-01 (blocker): invalid-entry skipping could WIDEN authority — a broken
+  NEVER left a valid ALLOW live; the old T7d tested only the safe direction.
+  Now any invalid entry voids the entire read to zero rules. F-02 (blocker):
+  enforcement caching could serve revoked authority; the cache is removed —
+  every match reads current persisted policy, making revocation freshness a
+  store invariant rather than integrator discipline. F-03 (blocker): NaN/±inf
+  timestamps (JSON accepts them as literals) made rules effectively
+  non-expiring; TTLs now finite and strictly forward, both at construction
+  and parse. F-04: save() raises RuleStoreError instead of swallowing write
+  failures. F-05: strict parse — provenance and source_text mandatory,
+  never manufactured. F-06: the frozen matcher signature (with target_type)
+  implemented and test-locked; target_types selector dimension added.
+  F-07: rule ids non-empty and unique; save() refuses duplicates. The
+  review-required test list is implemented in full, including the widening
+  case (malformed NEVER + valid ALLOW → no auto-approval) and both cache
+  revocation directions. Suite 1034 (count from the run).
+- **2026-10-01 — M8 design FROZEN + layer 1 (PR #20).** M8 adds the user
+  rule layer: standing decisions in the owner's own words, compiled once to
+  structured selectors, enforced deterministically at the approval gate.
+  docs/M8_DESIGN.md is normative and self-contained (four layers; negative
+  guarantees; M8-T1..T12 acceptance table). Two standing decisions recorded:
+  the compile-time model uses a plain API key (pluggable, optional —
+  hand-written rules need no model); no model ever runs in the enforcement
+  path. Layer 1 (this PR): RuleSelector (every specified dimension must
+  match; empty scope rejected at construction), UserRule with mandatory TTL
+  and provenance, deterministic matcher with never>ask>allow precedence,
+  the risk-tier ceiling enforced as a MATCH-TIME downgrade (an ALLOW match
+  above the ceiling yields ask — no store content can bypass it), and a
+  file-backed store with atomic writes and fail-open-equals-everything-asks
+  semantics (missing/corrupt/schema-mismatch → zero rules; one invalid entry
+  skipped without disabling the owner's bans). 18 tests (M8-T1..T9 covered).
+  Suite 1008 (count from the run). House rule adopted 2026-10-01: repository
+  content names no external products — reviews are "external review,"
+  patterns are described generically.
 - **2026-09-27 — M6 Layer 7 replay-safety qualification (PR #17).** Started from
   exact merged Layer-6 baseline `7b1bf7ee044ba653371e44d4abac7f7254b2c14d`.
   The frozen maintainer-first pass found the inherited target-state reader could

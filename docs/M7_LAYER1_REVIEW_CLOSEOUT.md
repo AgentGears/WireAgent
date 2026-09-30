@@ -75,18 +75,17 @@ child inherited-close failure, and child detach interruption, plus an exact
 acquisition-cleanup interruption test that proves same-process successor
 admission after clean descriptor teardown.
 
-## Exact-head validation evidence
+## Validation evidence
 
-Candidate `b93d6e449158a66eb9f06d1a0b49b6fff850ae5b` passed CI **#545**:
+The reviewed code state passed CI with the following exact evidence before this
+record-only close-out edit; the final PR head re-runs the same gate because the
+project requires exact-head validation:
 
-- Ubuntu CPython 3.11: **1016 passed, 6 skipped**; Ruff all checks passed; mypy
-  reported no issues in **87 source files**.
-- Ubuntu CPython 3.12: **1016 passed, 6 skipped**; Ruff all checks passed; mypy
-  reported no issues in **87 source files**.
+- Ubuntu CPython 3.11 and 3.12: **1016 passed, 6 skipped** on each interpreter;
+  Ruff all checks passed; mypy reported no issues in **87 source files**.
 - Windows Server 2025 CPython 3.11: **170 passed, 4 POSIX-only skips** in the
-  focused safety-ledger + Layer-1 owner-lock matrix.
-- Windows Server 2025 CPython 3.12: focused matrix completed successfully under
-  the same workflow definition.
+  focused safety-ledger + Layer-1 owner-lock matrix; the 3.12 focused job also
+  completed successfully under the same workflow definition.
 - CPython's warning that `fork()` in a multi-threaded process may deadlock is
   treated as a claim-boundary constraint, not as evidence of general fork safety.
 

@@ -82,6 +82,27 @@ UserRule
 └── source_text                     # the owner's words, kept for re-confirmation display
 ```
 
+### 4.1 Store contract (amended after the PR #20 fallback review, F-01..F-07)
+
+The external reviewer quota was unavailable; a first-pass plus adversarial
+fallback review found seven defects, three blocking. The amended contract:
+
+- **Whole-read invalidation.** Any invalid persisted entry — or duplicate
+  rule ids — voids the ENTIRE read to zero rules. A policy document
+  containing an invalid entry is never partially trusted: skipping one
+  entry could drop a restrictive NEVER while a permissive ALLOW stays live.
+- **Fresh read per match.** No enforcement caching. Revocation freshness is
+  a store invariant: a deleted ALLOW or a newly added NEVER must be
+  observed by the very next match in every process.
+- **Finite, forward TTLs.** NaN and ±inf (which JSON accepts as literals)
+  and expires_at <= created_at are rejected at construction and at parse.
+- **Persistence failures raise** (`RuleStoreError`), never log-and-continue.
+- **Strict parse.** Every mandatory field — including provenance and
+  source_text — must be present and well-typed. Provenance is never
+  manufactured during deserialization.
+- **Ids are non-empty strings, unique within a store.** save() refuses
+  duplicates at the write boundary.
+
 ## 5. Matching and precedence (deterministic)
 
 At the gate, the kernel holds the structured intent. Matching is dictionary

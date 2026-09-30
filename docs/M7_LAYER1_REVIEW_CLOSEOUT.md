@@ -49,6 +49,32 @@ arbitrary multi-threaded `fork()` is generally safe.
   state now fail-stops before user code instead of attempting selective fd
   cleanup. This closes the child side of the narrow hidden-descriptor window.
 
+## Final exact-head independent-review findings after e22ccb73
+
+- **F34 / Codex P1 — interrupted child-detach callback.** CPython may report a
+  raising exception from `after_in_child` as unraisable and continue into child
+  user code. The child callback now has an outer `BaseException` fail-stop barrier
+  so no partial inherited-owner cleanup can fall through into user code.
+- **F35 / Codex P2 — interrupted acquisition rollback after clean close.** The
+  acquisition cleanup path had the same descriptor-free registry-stranding seam
+  already repaired in normal release. Rollback now retries only idempotent
+  registry removal after descriptor state is proven clean; if that retry is also
+  interrupted, the process fail-stops rather than continuing with ambiguous
+  in-memory authority.
+- **F36 / Codex P1 — inherited owner-descriptor close failure was suppressed.** A
+  child-side `os.close()` failure can leave shared open-file-description lifetime
+  ambiguous. The child no longer suppresses inherited-owner close errors; any
+  close failure enters the callback fail-stop barrier before user code.
+- **F37 / Codex P2 — interrupted parent at-fork callback.** A raising interruption
+  during or immediately after the parent guard release could otherwise be
+  reported as unraisable and return to parent code with fork-gate state unknown.
+  Parent callback release is now fail-stop protected just like prepare.
+
+The F34–F37 regressions include genuine POSIX forks for parent-callback failure,
+child inherited-close failure, and child detach interruption, plus an exact
+acquisition-cleanup interruption test that proves same-process successor
+admission after clean descriptor teardown.
+
 ## Validation evidence
 
 The PR's final exact-head gate is recorded in the PR conversation/body rather

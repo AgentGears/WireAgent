@@ -75,15 +75,18 @@ child inherited-close failure, and child detach interruption, plus an exact
 acquisition-cleanup interruption test that proves same-process successor
 admission after clean descriptor teardown.
 
-## Validation evidence
+## Exact-head validation evidence
 
-The PR's final exact-head gate is recorded in the PR conversation/body rather
-than embedded as a self-referential commit SHA in this file. The required gate is:
+Candidate `b93d6e449158a66eb9f06d1a0b49b6fff850ae5b` passed CI **#545**:
 
-- Ubuntu CPython 3.11 and 3.12: full pytest, Ruff, and mypy.
-- Windows Server 2025 CPython 3.11 and 3.12: focused safety-ledger plus Layer-1
-  owner-lock portability/exclusion suite, including the fresh-process hidden-open
-  fail-stop/successor probe.
+- Ubuntu CPython 3.11: **1016 passed, 6 skipped**; Ruff all checks passed; mypy
+  reported no issues in **87 source files**.
+- Ubuntu CPython 3.12: **1016 passed, 6 skipped**; Ruff all checks passed; mypy
+  reported no issues in **87 source files**.
+- Windows Server 2025 CPython 3.11: **170 passed, 4 POSIX-only skips** in the
+  focused safety-ledger + Layer-1 owner-lock matrix.
+- Windows Server 2025 CPython 3.12: focused matrix completed successfully under
+  the same workflow definition.
 - CPython's warning that `fork()` in a multi-threaded process may deadlock is
   treated as a claim-boundary constraint, not as evidence of general fork safety.
 

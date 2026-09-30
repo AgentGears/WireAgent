@@ -123,6 +123,39 @@ def fork_prepare_interrupt(child_marker: Path) -> int:
     return 98
 
 
+def fork_parent_release_interrupt(parent_marker: Path) -> int:
+    """Inject an interruption after the parent at-fork guard release succeeds."""
+
+    if not hasattr(os, "fork"):
+        return 91
+
+    class _ReleaseThenInterruptGuard:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def acquire(self) -> bool:
+            return self._lock.acquire()
+
+        def release(self) -> None:
+            self._lock.release()
+            raise KeyboardInterrupt
+
+        def __enter__(self) -> "_ReleaseThenInterruptGuard":
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self._lock.release()
+
+    AuthorityOwnerLock._fork_guard = _ReleaseThenInterruptGuard()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child should exit normally and immediately
+        os._exit(0)
+
+    parent_marker.write_text(f"parent-returned:{pid}", encoding="utf-8")
+    return 98
+
+
 def hidden_open_interrupt(state_dir: Path) -> int:
     """Create a real fd, then raise before AuthorityOwnerLock can publish its integer."""
 
@@ -159,12 +192,16 @@ def main(argv: list[str]) -> int:
         return race(Path(argv[2]), Path(argv[3]), Path(argv[4]), Path(argv[5]))
     if len(argv) == 3 and argv[1] == "fork-prepare-interrupt":
         return fork_prepare_interrupt(Path(argv[2]))
+    if len(argv) == 3 and argv[1] == "fork-parent-release-interrupt":
+        return fork_parent_release_interrupt(Path(argv[2]))
     if len(argv) == 3 and argv[1] == "hidden-open-interrupt":
         return hidden_open_interrupt(Path(argv[2]))
     raise SystemExit(
         "usage: _m7_authority_worker.py probe STATE_DIR | "
         "race STATE_DIR START_GATE RELEASE_GATE RESULT_PATH | "
-        "fork-prepare-interrupt CHILD_MARKER | hidden-open-interrupt STATE_DIR"
+        "fork-prepare-interrupt CHILD_MARKER | "
+        "fork-parent-release-interrupt PARENT_MARKER | "
+        "hidden-open-interrupt STATE_DIR"
     )
 
 

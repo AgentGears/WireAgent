@@ -240,11 +240,10 @@ class AuthorityOwnerLock:
         os.close(fd)
 
     @staticmethod
-    def _close_noexcept(fd: int) -> None:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    def _close_inherited_fd(fd: int) -> None:
+        """Close one inherited owner descriptor in a fork child or raise."""
+
+        os.close(fd)
 
     def _close_and_unpublish_fd(self, fd: int, *, phase: str) -> None:
         """Close one owner fd and clear every published reference atomically vs fork.
@@ -299,24 +298,44 @@ class AuthorityOwnerLock:
             cleanup_fd = self._pending_fd
         if cleanup_fd is None:
             cleanup_fd = self._fd
-        if cleanup_fd is not None:
-            self._close_and_unpublish_fd(
-                cleanup_fd,
-                phase="pending authority owner handle",
-            )
 
-        if self._pending_fd is not None or self._fd is not None:
-            # Multiple/distinct owner descriptors are outside the invariant. Do
-            # not free the domain if cleanup could not establish an empty owner
-            # descriptor state.
-            self._release_broken = True
-            raise AuthorityOwnerError(
-                "authority owner acquisition cleanup left ambiguous descriptor state"
-            )
+        try:
+            if cleanup_fd is not None:
+                self._close_and_unpublish_fd(
+                    cleanup_fd,
+                    phase="pending authority owner handle",
+                )
 
-        self._opening_unpublished = False
-        self._owner_pid = None
-        self._rollback_process_domain(self)
+            if self._pending_fd is not None or self._fd is not None:
+                # Multiple/distinct owner descriptors are outside the invariant.
+                # Do not free the domain if cleanup could not establish an empty
+                # owner descriptor state.
+                self._release_broken = True
+                raise AuthorityOwnerError(
+                    "authority owner acquisition cleanup left ambiguous descriptor state"
+                )
+
+            self._opening_unpublished = False
+            self._owner_pid = None
+            self._rollback_process_domain(self)
+        except BaseException:
+            if (
+                not self._release_broken
+                and self._pending_fd is None
+                and self._fd is None
+                and not self._opening_unpublished
+            ):
+                # The descriptor is proven gone. A raising interruption after
+                # close/unpublication must not strand the strong process-domain
+                # reservation. Retry only the idempotent registry removal. If
+                # even that cleanup is interrupted, fail-stop the process so
+                # replacement cannot inherit ambiguous in-memory authority.
+                self._owner_pid = None
+                try:
+                    self._rollback_process_domain(self)
+                except BaseException:
+                    os._exit(self._BROKEN_FORK_EXIT_CODE)
+            raise
 
     def acquire(self) -> "AuthorityOwnerLock":
         """Acquire this authority domain immediately or fail ``authority_busy``.
@@ -466,7 +485,15 @@ class AuthorityOwnerLock:
 
     @classmethod
     def _after_fork_parent(cls) -> None:
-        cls._fork_guard.release()
+        """Release fork preparation in the parent or fail-stop on ambiguity."""
+
+        try:
+            cls._fork_guard.release()
+        except BaseException:
+            # CPython may otherwise report callback exceptions as unraisable and
+            # return to parent user code with the gate still held or ownership of
+            # it unknown. Process death is the only safe recovery boundary.
+            os._exit(cls._BROKEN_FORK_EXIT_CODE)
 
     @classmethod
     def _after_fork_child(cls) -> None:
@@ -476,45 +503,53 @@ class AuthorityOwnerLock:
         description. Calling explicit unlock in the child could therefore drop
         the parent's lock. The child closes only inherited descriptor copies,
         including a descriptor whose acquisition had not yet reached flock,
-        clears copied registry state, and gets fresh thread locks. Full fork
-        semantics remain a later M7 platform-qualification claim.
+        clears copied registry state, and gets fresh thread locks. Any exception
+        in this registered callback fail-stops the child because CPython may
+        otherwise report it as unraisable and continue into user code with copied
+        owner state. Full fork semantics remain a later M7 qualification claim.
         """
 
-        inherited = list(cls._registry.values())
-        if any(
-            owner._release_broken or owner._opening_unpublished for owner in inherited
-        ):
-            # Broken close state can advertise a stale/reused fd integer, while
-            # hidden-open state can mean a live descriptor exists whose integer
-            # was never published. Selective cleanup is unsafe in either case.
-            # Fail-stop the child so process exit closes every inherited copy and
-            # no copied authority state reaches user code. The parent-side hidden
-            # open path independently fail-stops as soon as it regains execution.
-            os._exit(cls._BROKEN_FORK_EXIT_CODE)
+        try:
+            inherited = list(cls._registry.values())
+            if any(
+                owner._release_broken or owner._opening_unpublished
+                for owner in inherited
+            ):
+                # Broken close state can advertise a stale/reused fd integer,
+                # while hidden-open state can mean a live descriptor exists whose
+                # integer was never published. Selective cleanup is unsafe in
+                # either case. Fail-stop the child so process exit closes every
+                # inherited copy and no copied authority state reaches user code.
+                os._exit(cls._BROKEN_FORK_EXIT_CODE)
 
-        # Deduplicate globally, not just per owner: pending/held fields may both
-        # name the same live descriptor during a clean promotion.
-        inherited_fds = {
-            fd
-            for owner in inherited
-            for fd in (owner._pending_fd, owner._fd)
-            if fd is not None
-        }
-        for fd in inherited_fds:
-            cls._close_noexcept(fd)
-        for owner in inherited:
-            owner._pending_fd = None
-            owner._fd = None
-            owner._owner_pid = None
-            owner._release_broken = False
-            owner._opening_unpublished = False
-            owner._state_lock = threading.RLock()
-        cls._registry = {}
-        cls._registry_guard = threading.Lock()
-        # The before-fork callback held the inherited copy at fork time. No other
-        # thread survives in the child, so replace it with a fresh unlocked gate
-        # rather than trying to recover the parent's lock state.
-        cls._fork_guard = threading.Lock()
+            # Deduplicate globally, not just per owner: pending/held fields may
+            # both name the same live descriptor during a clean promotion.
+            inherited_fds = {
+                fd
+                for owner in inherited
+                for fd in (owner._pending_fd, owner._fd)
+                if fd is not None
+            }
+            for fd in inherited_fds:
+                # Never suppress child-side close failures. A failed/interrupted
+                # close leaves shared open-file-description lifetime ambiguous;
+                # the outer callback barrier fail-stops before user code.
+                cls._close_inherited_fd(fd)
+            for owner in inherited:
+                owner._pending_fd = None
+                owner._fd = None
+                owner._owner_pid = None
+                owner._release_broken = False
+                owner._opening_unpublished = False
+                owner._state_lock = threading.RLock()
+            cls._registry = {}
+            cls._registry_guard = threading.Lock()
+            # The before-fork callback held the inherited copy at fork time. No
+            # other thread survives in the child, so replace it with a fresh
+            # unlocked gate rather than recovering the parent's lock state.
+            cls._fork_guard = threading.Lock()
+        except BaseException:
+            os._exit(cls._BROKEN_FORK_EXIT_CODE)
 
 
 if hasattr(os, "register_at_fork"):

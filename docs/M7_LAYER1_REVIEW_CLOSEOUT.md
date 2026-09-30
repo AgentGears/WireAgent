@@ -77,8 +77,7 @@ admission after clean descriptor teardown.
 
 ## Validation evidence
 
-The final implementation is gated in the PR conversation and CI rather than by a
-self-referential SHA embedded here. The required exact-head evidence is:
+Exact-head CI evidence is recorded in PR #19. The required gate is:
 
 - Ubuntu CPython 3.11 and 3.12: **1016 passed, 6 skipped** on each interpreter;
   Ruff all checks passed; mypy reported no issues in **87 source files**.

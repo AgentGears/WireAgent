@@ -9,6 +9,7 @@ failures, strict parsing, id uniqueness, and the frozen matcher signature.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -416,3 +417,106 @@ def test_save_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
     assert (tmp_path / "rules.json").exists()
     assert not list(tmp_path.glob("*.tmp"))
     json.loads((tmp_path / "rules.json").read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# F-08: concurrent saves own unique staging files
+# ---------------------------------------------------------------------------
+
+def test_F08_concurrent_saves_no_cross_contamination(tmp_path: Path,
+                                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic barrier interleave: both writers stage BEFORE either
+    replaces. Every successful os.replace must install that CALLER's payload
+    — with a shared staging file, writer A's replace installs writer B's
+    bytes while A reports success (and B's replace fails on the vanished
+    tmp). Unique staging gives last-writer-wins linearization instead."""
+    import threading
+
+    import webwire.safety.user_rules as ur_mod
+
+    p = tmp_path / "rules.json"
+    marker = threading.local()
+    real_replace = os.replace
+    barrier = threading.Barrier(2, timeout=10)
+    captured: list[tuple[str, bytes]] = []
+    lock = threading.Lock()
+
+    def slow_replace(src, dst):
+        with open(src, "rb") as f:
+            data = f.read()
+        # Gate only the FIRST attempt per thread — the Windows retry helper
+        # re-enters os.replace on transient sharing violations, and those
+        # retries must pass straight through.
+        if not getattr(marker, "entered", False):
+            marker.entered = True
+            barrier.wait()  # both payloads staged before either installs
+            with lock:
+                captured.append((marker.owner, data))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(ur_mod.os, "replace", slow_replace)
+
+    never = _rule(RuleDecision.NEVER, action_types=frozenset({"delete_post"}), rule_id="never-x")
+    allow = _rule(RuleDecision.ALLOW, action_types=frozenset({"bookmark"}), rule_id="allow-x")
+    errors: list[Exception] = []
+
+    def worker(owner: str, rule: UserRule) -> None:
+        marker.owner = owner
+        try:
+            RuleStore(p).save([rule])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=worker, args=("never-writer", never))
+    t2 = threading.Thread(target=worker, args=("allow-writer", allow))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors, f"both saves must succeed; got {errors!r}"
+    assert len(captured) == 2
+    for owner, data in captured:
+        rule_id = json.loads(data.decode("utf-8"))["rules"][0]["rule_id"]
+        expected = "never-x" if owner == "never-writer" else "allow-x"
+        assert rule_id == expected, (
+            f"{owner} installed {rule_id!r} — cross-contaminated staging"
+        )
+    # Final file holds exactly one writer's complete payload; no litter.
+    final = json.loads(p.read_text(encoding="utf-8"))
+    assert len(final["rules"]) == 1
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# Hardening: selector runtime contracts + bool parity
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    "bookmark",                    # plain string
+    {"bookmark"},                  # mutable set
+    frozenset(),                   # empty: a dimension that matches nothing
+    frozenset({"bookmark", ""}),   # empty-string element
+    frozenset([7]),
+])
+def test_selector_dimensions_must_be_exact_frozensets(bad) -> None:
+    with pytest.raises(ValueError):
+        RuleSelector(action_types=bad)
+
+
+def test_selector_risk_tiers_strict_type() -> None:
+    with pytest.raises(ValueError):
+        RuleSelector(risk_tiers=frozenset({"private_reversible"}))  # str, not enum
+    with pytest.raises(ValueError):
+        RuleSelector(risk_tiers={"private_reversible"})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad_created,bad_expires", [(True, 2.0), (1.0, True), (True, True)])
+def test_bool_timestamps_rejected_at_construction(bad_created: float, bad_expires: float) -> None:
+    """Parity with the persisted parser: bool is numeric in Python, so
+    isfinite(True) passes — construction must reject what parsing rejects."""
+    with pytest.raises(ValueError, match="must be a number"):
+        UserRule(rule_id="b", decision=RuleDecision.ALLOW,
+                 created_at=bad_created, expires_at=bad_expires,
+                 selector=RuleSelector(action_types=frozenset({"x"})))
+

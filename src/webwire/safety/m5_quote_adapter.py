@@ -51,9 +51,20 @@ class M5QuoteCapabilityAdapter:
         return await self._capability.preview(intent, broker)
 
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
-        """Execute through M5; the legacy kernel broker is intentionally ignored."""
+        """Execute through M5 with human attribution (the pre-M8 call shape)."""
+        return await self.execute_with_approver(intent, broker, approver="human")
+
+    async def execute_with_approver(
+        self, intent: WriteIntent, broker: Any, approver: str
+    ) -> ActionResult:
+        """M8 attribution seam: the kernel's trusted approver value
+        reaches the single grant mint through this explicit parameter
+        (spec 6; supplied identically by every migrated adapter).
+
+        The legacy kernel broker is intentionally ignored.
+        """
         del broker
-        execution = await self._executor.execute(intent)
+        execution = await self._executor.execute(intent, approver=approver)
         if not execution.result.ok:
             self._execution.set(None)
             return execution.result

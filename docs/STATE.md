@@ -384,6 +384,79 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-01 — M8 layer 2 review fixes (PR #22): F-09..F-15 resolved.**
+  The maintainer-first pass at exact head 81ced8c found three blockers, two
+  contract gaps, and an evidence gap; every finding verified against the code
+  before fixing. F-09 (blocker): the live Dispatcher never installed a
+  RuleStore — the M8 gate was unreachable from ordinary construction. Fixed:
+  WebWireConfig.rules_path() added; the Dispatcher constructs ONE RuleStore at
+  the authority root and passes it to WriteKernel (long-lived instance safe —
+  Layer 1 reloads on every match); dispatcher-level regression proves a
+  persisted NEVER denies through normal construction. F-10 (blocker): approver
+  was mutable after mint (not in _GRANT_PUBLIC_FIELDS) — sealed; reassignment
+  raises GrantStateError (regression-locked). F-11 (blocker): approver was in
+  the ledger but NOT in _LINEAGE_FIELDS — reserved/terminal records could
+  disagree on provenance without contradiction, and a changed-approver retry
+  counted as the same fact. approver added to canonical lineage + exact-fact
+  identity; None remains its own legacy lineage (never upgraded to "human");
+  both regressions locked. F-12: canonical validate_approver (human |
+  rule:<id>, None only for pre-M8 reads) wired at the validator, grant-store
+  mint, runtime.issue, ledger validate, and ledger parse. F-13: rule_gate
+  metadata now emitted ONLY when a rule matched — no-match responses are
+  byte-for-byte pre-M8. F-14: the four weak tests replaced with real
+  lifecycle qualification through a real runtime + gateway + file-backed
+  ledger (T20 real policy drift, T21 real epoch advancement, T22
+  durable-record approver identity, T24 human end-to-end); no
+  inspect.getsource remains. F-15: the execute_with_approver seam exposed on
+  ALL six migrated adapters (post-text, reply, quote, media, delete adapters
+  now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #22 second review pass: F-16/F-17/F-18.** F-16 (blocker):
+  layer 2 had re-imposed a stricter id contract than the frozen layer-1
+  UserRule contract (any non-empty string), so a legal rule id with internal
+  whitespace became an invalid approver at the mint boundary. Fixed with ONE
+  invariant: user_rules.validate_rule_id is now the single rule-id authority
+  (UserRule construction and validate_approver both call it); spaced ids such
+  as "rule:allow likes" are legal attribution, cross-layer regression locks
+  the full lineage (store round-trip → kernel attribution → mint → durable
+  ledger). F-17: the acceptance tests rewritten to the scenarios the frozen
+  matrix names — T20/T21 now mutate the LIVE shared registry / the gateway
+  epoch after mint and deny on the actual commit path (scope_effect) with
+  policy_mismatch / epoch_mismatch, and the epoch denial is terminal (the
+  grant is REVOKED; every later attempt denies grant_not_active); T22
+  requires BOTH the durable RESERVED reservation and the terminal
+  confirmation (the like policy is fenced — ReplaySemantics.UNKNOWN); T24
+  crosses actual kernel human confirmation (token issued and consumed) →
+  adapter → runtime → permit → ledger; T16 compares the full response
+  byte-for-byte (only the volatile token mint fields normalized); the
+  invalid-approver ledger parse regression uses a canonical UPPERCASE state
+  so the approver vocabulary is provably the rejection. F-18: the five
+  non-engagement adapters no longer park the approver in mutable instance
+  state (_m8_approver removed) — execute() delegates to
+  execute_with_approver(approver="human") exactly like the engagement
+  adapter; approval provenance is per-call throughout.
+- **2026-10-01 — M8 LAYER 2 (PR #22): the kernel rule gate + approver
+  lineage.** Implemented per the corrected section 6 topology: the gate sits
+  after preview and before the confirmation section, so it is re-evaluated
+  on EVERY invocation including the token-bearing one (T14: a NEVER
+  installed after token issuance still denies — the gate dominates tokens).
+  NEVER denies with blocked_by=user_rule and the rule cited; ASK/no-match
+  uses the existing human confirmation path with the matched rule cited in
+  the card payload; below-ceiling ALLOW establishes approver="rule:<id>"
+  with NO confirmation carrier and flows to execution in ONE invocation.
+  The critical rule honored: approval source is an explicit trusted value —
+  the kernel passes approver through a new execute_with_approver adapter
+  seam, the six M5 executors thread it to M5ExecutionRuntime.issue, and the
+  runtime stamps it on the grant at the SINGLE mint seam. Capabilities
+  without the seam are denied standing approval
+  (approver_unsupported_adapter). Attribution descends monotonically:
+  ApprovalGrant.approver -> EffectPermit.approver -> EffectLedgerRecord
+  .approver (top-level lineage field; optional on read for pre-M8 rows —
+  T23 locks old rows parse with None). Human default "human" keeps every
+  pre-M8 caller correct (T24). Also landed: the reviewer's two cleanups
+  (section 6.1 typo; the Windows retry now inspects winerror 5/32, retrying
+  only the transient sharing violation per the stated contract). T13-T24
+  all covered (tests/test_m8_rule_gate.py, 13 tests). Suite 1057 (count
+  from the run). Kernel with rule_store=None is byte-for-byte pre-M8 (T16).
 - **2026-10-01 — M8 layer 1 hardening + section 6 amendment (PR #21).** The
   post-merge fallback pass found one new blocker and one falsified design
   assumption. F-08 (blocker): concurrent saves shared one staging file —

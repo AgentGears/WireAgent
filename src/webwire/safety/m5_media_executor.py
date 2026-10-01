@@ -106,9 +106,11 @@ class M5MediaExecutor:
         self._content_evidence = content_evidence
         self._media_evidence = media_evidence
 
-    async def execute(self, intent: WriteIntent) -> M5MediaExecution:
+    async def execute(
+        self, intent: WriteIntent, *, approver: str = "human"
+    ) -> M5MediaExecution:
         frozen = deepcopy(intent)
-        session = self._runtime.issue(frozen)
+        session = self._runtime.issue(frozen, approver=approver)
         action_type = session.action_type
         if action_type not in {"post", "reply", "quote"}:
             session.resolve_no_external_effect(reason="media_executor_wrong_action")

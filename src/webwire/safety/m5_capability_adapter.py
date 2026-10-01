@@ -58,7 +58,17 @@ class M5EngagementCapabilityAdapter:
         return await self._capability.preview(intent, broker)
 
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
+        """Execute through M5 (human attribution — the pre-M8 call shape)."""
+        return await self.execute_with_approver(intent, broker, approver="human")
+
+    async def execute_with_approver(
+        self, intent: WriteIntent, broker: Any, approver: str
+    ) -> ActionResult:
         """Execute through M5; ``broker`` is intentionally ignored.
+
+        ``approver`` is the M8 trusted attribution value from the kernel's
+        rule gate or human confirmation path — the explicit parameter the
+        spec requires (never "skip token validation" as the encoding).
 
         The legacy kernel decides its final policy verdict from ``execute_ok``.
         Therefore an M5 ``EFFECT_UNKNOWN`` must be translated to an explicit
@@ -71,7 +81,7 @@ class M5EngagementCapabilityAdapter:
         # entering the executor so an exception can never expose a receipt from
         # an earlier invocation to a later verification path.
         self._execution.set(None)
-        execution = await self._executor.execute(intent)
+        execution = await self._executor.execute(intent, approver=approver)
         result = execution.result
 
         if execution.attempt_state is AttemptState.EFFECT_UNKNOWN:

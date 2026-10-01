@@ -110,6 +110,7 @@ class Dispatcher:
         )
         from webwire.safety.commit_gateway import CommitGateway
         from webwire.safety.execution_models import AuthorizationEpoch
+        from webwire.safety.user_rules import RuleStore
 
         # These two controls are process-local defense in depth. Layer 7 no
         # longer rebuilds either one from the best-effort invocation journal.
@@ -150,6 +151,7 @@ class Dispatcher:
             journal=self._journal,
             write_broker_factory=_make_write_broker,
             recovery_guard=self._m5_recovery,
+            rule_store=RuleStore(self._config.rules_path()),
         )
 
         # M6 reconciliation is local bookkeeping authority, not a Dispatcher

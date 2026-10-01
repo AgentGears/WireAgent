@@ -433,7 +433,7 @@ a genuine non-empty string carrier — anything else returns the sanitized
 result with no card, flowing to the CLI's confirmation-required protocol
 error (exit 1). SUPERSEDES the F-48..F-53 entry's 'closed by F-49' claim:
 F-49 closed the structural gap only; the semantic composition is closed
-here. Suite count from the run (below).
+here. Suite 1142 (count from the run).
 - **2026-10-01 — PR #24 third review pass: F-48..F-53 (the card entry
   point and the audit boundary).** F-48 (blocker): CardFlow.begin()
   forwarded the caller's payload unchanged, so a caller holding a valid

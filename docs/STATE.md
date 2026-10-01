@@ -406,7 +406,7 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   NEVER defeats an old human token); attribution descends
   grant→permit→ledger with approver as a top-level ledger lineage field
   (optional on read for pre-M8 rows). Acceptance matrix extended
-  M8-T13..T24. Suite 1044 passed in 107.85s (0:01:47) (count from the run).
+  M8-T13..T24. Suite 1044 (count from the run).
 - **2026-10-01 — M8 layer 1 review fixes (PR #20, fallback pass).** The
   external reviewer quota was unavailable, so the project's fallback rule
   applied: a first-pass plus adversarial review, seven findings (F-01..F-07,

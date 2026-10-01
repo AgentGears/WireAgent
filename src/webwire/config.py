@@ -75,6 +75,14 @@ class WebWireConfig:
     # verified whoami. Treated as a secret: gitignored, restrictive perms.
     session_file: str = "session.json"
 
+    # -- M8 rule compiler (layer 3; frozen spec 7) ----------------------------
+    # Optional by design: with no API key / endpoint configured, the compiler
+    # is simply unavailable and hand-written rules work unchanged. The model
+    # runs at compile time only — never during matching, gating, or approval.
+    compiler_api_key: Optional[str] = None
+    compiler_endpoint: Optional[str] = None
+    compiler_model_name: str = "default"
+
     def kill_path(self) -> Path:
         """Absolute path to the kill hot file."""
         return self.state_dir / self.kill_file

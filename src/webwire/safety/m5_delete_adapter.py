@@ -44,19 +44,21 @@ class M5DeleteCapabilityAdapter:
     async def preview(self, intent: WriteIntent, broker: Any) -> Any:
         return await self._capability.preview(intent, broker)
 
+    async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
+        """Execute through M5 with human attribution (the pre-M8 call shape)."""
+        return await self.execute_with_approver(intent, broker, approver="human")
+
     async def execute_with_approver(
         self, intent: WriteIntent, broker: Any, approver: str
     ) -> ActionResult:
         """M8 attribution seam: the kernel's trusted approver value
         reaches the single grant mint through this explicit parameter
-        (spec 6; supplied identically by every migrated adapter)."""
-        return await self._execute_with_approver(intent, broker, approver)
+        (spec 6; supplied identically by every migrated adapter).
 
-    async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
+        The legacy kernel broker is intentionally ignored.
+        """
         del broker
-        execution = await self._executor.execute(
-            intent, approver=getattr(self, "_m8_approver", "human")
-        )
+        execution = await self._executor.execute(intent, approver=approver)
         if execution.attempt_state is AttemptState.EFFECT_UNKNOWN and execution.result.ok:
             # Defensive boundary: the current delete executor already returns a
             # hard UNKNOWN failure, but the transitional WriteKernel decides its
@@ -115,12 +117,3 @@ class M5DeleteCapabilityAdapter:
             "M5 delete execution did not reach EFFECT_CONFIRMED",
             failure_category=FailureCategory.UNKNOWN,
         )
-
-    async def _execute_with_approver(
-        self, intent: WriteIntent, broker: Any, approver: str
-    ) -> ActionResult:
-        self._m8_approver = approver
-        try:
-            return await self.execute(intent, broker)
-        finally:
-            self._m8_approver = "human"

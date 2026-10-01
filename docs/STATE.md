@@ -400,17 +400,40 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   counted as the same fact. approver added to canonical lineage + exact-fact
   identity; None remains its own legacy lineage (never upgraded to "human");
   both regressions locked. F-12: canonical validate_approver (human |
-  rule:<non-empty whitespace-free id>, None only for pre-M8 reads) wired at
-  the validator, grant-store mint, runtime.issue, ledger validate, and ledger
-  parse; whitespace rule ids rejected. F-13: rule_gate metadata now emitted
-  ONLY when a rule matched — no-match responses are byte-for-byte pre-M8.
-  F-14: the four weak tests replaced with real lifecycle qualification
-  through a real runtime + gateway + file-backed ledger (T20 real policy
-  drift, T21 real epoch advancement, T22 durable-record approver identity,
-  T24 human end-to-end); no inspect.getsource remains. F-15: the
-  execute_with_approver seam exposed on ALL six migrated adapters (post-text,
-  reply, quote, media, delete adapters now delegate with a per-call approver).
-  Suite 1062 (count from the run).
+  rule:<id>, None only for pre-M8 reads) wired at the validator, grant-store
+  mint, runtime.issue, ledger validate, and ledger parse. F-13: rule_gate
+  metadata now emitted ONLY when a rule matched — no-match responses are
+  byte-for-byte pre-M8. F-14: the four weak tests replaced with real
+  lifecycle qualification through a real runtime + gateway + file-backed
+  ledger (T20 real policy drift, T21 real epoch advancement, T22
+  durable-record approver identity, T24 human end-to-end); no
+  inspect.getsource remains. F-15: the execute_with_approver seam exposed on
+  ALL six migrated adapters (post-text, reply, quote, media, delete adapters
+  now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #22 second review pass: F-16/F-17/F-18.** F-16 (blocker):
+  layer 2 had re-imposed a stricter id contract than the frozen layer-1
+  UserRule contract (any non-empty string), so a legal rule id with internal
+  whitespace became an invalid approver at the mint boundary. Fixed with ONE
+  invariant: user_rules.validate_rule_id is now the single rule-id authority
+  (UserRule construction and validate_approver both call it); spaced ids such
+  as "rule:allow likes" are legal attribution, cross-layer regression locks
+  the full lineage (store round-trip → kernel attribution → mint → durable
+  ledger). F-17: the acceptance tests rewritten to the scenarios the frozen
+  matrix names — T20/T21 now mutate the LIVE shared registry / the gateway
+  epoch after mint and deny on the actual commit path (scope_effect) with
+  policy_mismatch / epoch_mismatch, and the epoch denial is terminal (the
+  grant is REVOKED; every later attempt denies grant_not_active); T22
+  requires BOTH the durable RESERVED reservation and the terminal
+  confirmation (the like policy is fenced — ReplaySemantics.UNKNOWN); T24
+  crosses actual kernel human confirmation (token issued and consumed) →
+  adapter → runtime → permit → ledger; T16 compares the full response
+  byte-for-byte (only the volatile token mint fields normalized); the
+  invalid-approver ledger parse regression uses a canonical UPPERCASE state
+  so the approver vocabulary is provably the rejection. F-18: the five
+  non-engagement adapters no longer park the approver in mutable instance
+  state (_m8_approver removed) — execute() delegates to
+  execute_with_approver(approver="human") exactly like the engagement
+  adapter; approval provenance is per-call throughout.
 - **2026-10-01 — M8 LAYER 2 (PR #22): the kernel rule gate + approver
   lineage.** Implemented per the corrected section 6 topology: the gate sits
   after preview and before the confirmation section, so it is re-evaluated

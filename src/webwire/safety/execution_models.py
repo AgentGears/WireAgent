@@ -81,9 +81,15 @@ DEFAULT_GRANT_TTL_S = 300.0
 DEFAULT_MAX_PRECOMMIT_ATTEMPTS = 3
 
 def validate_approver(value: Any, *, allow_none: bool = False) -> None:
-    """The canonical M8 attribution vocabulary (spec 6.1 / F-12):
+    """The canonical M8 attribution vocabulary (spec 6.1 / F-12, F-16):
 
-    "human" | "rule:<non-empty-rule-id>"
+    "human" | "rule:<rule-id>"
+
+    where ``<rule-id>`` satisfies the ONE shared rule-id invariant
+    (``user_rules.validate_rule_id`` — the frozen layer-1 ``UserRule``
+    contract: any non-empty string). The rule layer and this authority layer
+    cannot disagree about what a valid rule identity is, because they call
+    the same validator.
 
     Ledger deserialization additionally permits None for pre-M8 history.
     One validator for the entire lineage: mint seam, grant construction,
@@ -97,10 +103,16 @@ def validate_approver(value: Any, *, allow_none: bool = False) -> None:
         raise ValueError(f"approver must be a string, got {type(value).__name__}")
     if value == "human":
         return
-    rule_id = value[len("rule:"):] if value.startswith("rule:") else ""
-    # Rule ids are opaque store identifiers: non-empty and free of whitespace
-    # (a space inside would let arbitrary prose ride the provenance field).
-    if rule_id and not any(ch.isspace() for ch in rule_id):
+    if value.startswith("rule:"):
+        from webwire.safety.user_rules import validate_rule_id
+
+        try:
+            validate_rule_id(value[len("rule:"):])
+        except ValueError:
+            raise ValueError(
+                f"approver {value!r} is outside the attribution vocabulary "
+                "(expected 'human' or 'rule:<non-empty-rule-id>')"
+            ) from None
         return
     raise ValueError(
         f"approver {value!r} is outside the attribution vocabulary "

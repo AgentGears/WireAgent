@@ -201,6 +201,12 @@ async def test_T18_above_ceiling_allow_downgrades_to_ask(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 async def test_T16_no_match_identical_to_pre_m8(tmp_path: Path) -> None:
+    """T16's written contract: byte-for-byte identity. A no-match store must
+    not alter the response beyond the three volatile fields every token mint
+    carries (the random confirmation_token, its wall-clock created_at and
+    expires_at) — those are normalized in BOTH envelopes, then the entire
+    response is serialized and compared. Any other drift, including an
+    unauthorized rule_gate key anywhere, fails the comparison."""
     rules = _store(tmp_path, [
         _rule(RuleDecision.ALLOW, action_types=frozenset({"bookmark"})),
     ])
@@ -208,10 +214,27 @@ async def test_T16_no_match_identical_to_pre_m8(tmp_path: Path) -> None:
     post, cap_post = _kernel(tmp_path, rules)
     r_a = await _p1(pre, cap_pre)
     r_b = await _p1(post, cap_post)
-    assert r_a.data["policy"]["verdict"] == r_b.data["policy"]["verdict"]
-    assert (r_a.data["policy"]["blocked_by"] is None) == (r_b.data["policy"]["blocked_by"] is None)
-    assert "confirmation_token" in r_a.data["data"]
-    assert "confirmation_token" in r_b.data["data"]
+    assert r_a.data["policy"]["verdict"] == PolicyVerdict.CONFIRMATION_REQUIRED.value
+    assert r_b.data["policy"]["verdict"] == PolicyVerdict.CONFIRMATION_REQUIRED.value
+
+    def scrub(node: Any) -> Any:
+        if isinstance(node, dict):
+            out: dict[str, Any] = {}
+            for k, v in node.items():
+                if k in ("confirmation_token", "expires_at", "created_at"):
+                    out[k] = f"<{k}>"
+                else:
+                    out[k] = scrub(v)
+            return out
+        if isinstance(node, list):
+            return [scrub(v) for v in node]
+        return node
+
+    a = json.dumps(scrub(r_a.data), sort_keys=True)
+    b = json.dumps(scrub(r_b.data), sort_keys=True)
+    assert a == b, "no-match must leave the response byte-for-byte pre-M8"
+    assert "rule_gate" not in r_b.data["trace"]
+    assert "rule_gate" not in r_b.data["data"]
 
 
 async def test_T19_corrupt_store_falls_back_to_human_confirmation(tmp_path: Path) -> None:
@@ -304,6 +327,19 @@ class _FakeLikeWriteBroker:
         return ok_result(data={"liked": post_url})
 
 
+class _FakeEvidenceReader:
+    """Answers the executor's post-mutation state read with the exact state
+    its verification expects, so record_confirmed() terminalizes."""
+
+    async def read_bookmark_state(self, post_url: str):  # type: ignore[no-untyped-def]
+        from webwire.envelope import ok_result
+        return ok_result(data={"bookmark_state": "bookmarked"})
+
+    async def read_like_state(self, post_url: str):  # type: ignore[no-untyped-def]
+        from webwire.envelope import ok_result
+        return ok_result(data={"like_state": "liked"})
+
+
 def _live_runtime_and_ledger(tmp_path: Path):
     """A real M5 runtime + gateway + file-backed effect ledger, so lifecycle
     tests inspect actual durable records rather than source text. The scoped
@@ -347,69 +383,84 @@ def _engagement_intent(action: str = "like", target: str = "42") -> WriteIntent:
     )
 
 
-def test_T20_real_policy_drift_denies_rule_grant(tmp_path: Path) -> None:
-    """Rule-ALLOW grant minted under policy P; the registry drifts before
-    commit; the existing binding validation denies the claim."""
-    from webwire.safety.effect_policy import EffectPolicyRegistry, EffectVerb, ReplaySemantics
-    from webwire.safety.execution_models import EffectAttempt, GrantClaimDenied
+def test_T20_real_policy_drift_denies_rule_grant_at_commit(tmp_path: Path) -> None:
+    """Frozen T20 scenario, via the ACTUAL commit path: the rule-ALLOW grant
+    is minted under policy P; the LIVE registry shared by the runtime, the
+    scoped authority, and the CommitGateway drifts BEFORE commit;
+    session.scope_effect() re-freezes the binding against that live registry
+    and the grant's minted binding no longer matches — denied with
+    policy_mismatch. No durable fact is written."""
+    from webwire.safety.effect_policy import (
+        DEFAULT_EFFECT_POLICIES,
+        EffectPolicy,
+        EffectVerb,
+        ReplaySemantics,
+    )
+    from webwire.safety.scoped_authority import ScopedAuthorityDenied
 
-    runtime, _gw, _ledger, _epoch = _live_runtime_and_ledger(tmp_path)
+    runtime, _gateway, ledger, _epoch = _live_runtime_and_ledger(tmp_path)
     session = runtime.issue(_engagement_intent(), approver="rule:allow-like")
-    grant = session.grant
-    assert grant.approver == "rule:allow-like"
+    assert session.grant.approver == "rule:allow-like"
 
-    drifted = EffectPolicyRegistry()
-    drifted.register(__import__(
-        "webwire.safety.effect_policy", fromlist=["EffectPolicy"]
-    ).EffectPolicy(
+    # The registry instance the runtime, scoped broker, and gateway all hold.
+    # Drift 'like' by changing its replay semantics — the binding hash
+    # changes while allowed_effects stays exactly {SET_LIKE}, so the denial
+    # is the binding mismatch, not effect_scope_not_exact. Restore in
+    # finally so the shared singleton is left untouched.
+    original = DEFAULT_EFFECT_POLICIES.require("like")
+    drifted = EffectPolicy.derive(
         action_type="like",
         risk_tier=DEFAULT_REGISTRY.require("like")[0].derive_tier(),
-        allowed_effects=frozenset({EffectVerb.SET_LIKE, EffectVerb.CLEAR_LIKE, EffectVerb.REPOST}),
+        allowed_effects=frozenset({EffectVerb.SET_LIKE}),
         replay_semantics=ReplaySemantics.SAFE_STATE_SET,
-        durability=__import__(
-            'webwire.safety.effect_policy', fromlist=['DurabilityPolicy']
-        ).DurabilityPolicy.BEST_EFFORT,
-    ))
-    new_binding = drifted.require("like").binding_hash()
-    assert new_binding != grant.policy_binding, "drift must change the binding"
-    attempt = EffectAttempt(grant_id=grant.grant_id)
-    with pytest.raises(GrantClaimDenied):
-        grant.claim(
-            attempt.attempt_id,
-            intent_hash=grant.intent_hash, actor_id=grant.actor_id,
-            policy_binding=new_binding,  # the drifted policy
-            authorization_epoch=grant.authorization_epoch,
-        )
+    )
+    assert drifted.binding_hash() != original.binding_hash(), "drift must change the binding"
+
+    try:
+        DEFAULT_EFFECT_POLICIES.register(drifted)
+        with pytest.raises(ScopedAuthorityDenied) as exc:
+            session.scope_effect()  # the actual commit path begins here
+        assert exc.value.reason == "policy_mismatch", exc.value.reason
+        assert ledger.read_records() == [], "denial must precede any durable fact"
+    finally:
+        DEFAULT_EFFECT_POLICIES.register(original)
 
 
-def test_T21_rule_grant_dies_on_epoch_advancement(tmp_path: Path) -> None:
-    """A rule-derived approval minted through the real runtime and claimed by
-    attempt 1; the epoch advances; no re-validation can succeed."""
-    from webwire.safety.execution_models import EffectAttempt, GrantClaimDenied
+def test_T21_rule_grant_dies_on_epoch_advancement_at_commit(tmp_path: Path) -> None:
+    """Frozen T21 scenario, via the ACTUAL commit path: the rule-derived
+    approval is minted through the real runtime; the gateway's
+    AuthorizationEpoch advances; the commit attempt then denies with
+    epoch_mismatch — and no re-validation can succeed, so a second commit
+    attempt denies identically. No durable fact is written."""
+    from webwire.safety.scoped_authority import ScopedAuthorityDenied
 
-    runtime, gateway, _ledger, epoch = _live_runtime_and_ledger(tmp_path)
+    runtime, _gateway, ledger, epoch = _live_runtime_and_ledger(tmp_path)
     session = runtime.issue(_engagement_intent(), approver="rule:allow-like")
-    grant, attempt = session.grant, session.attempt
-    assert grant.approver == "rule:allow-like"
-    assert grant.claimed_by == attempt.attempt_id  # claimed at mint
+    minted_epoch = session.grant.authorization_epoch
+    assert session.grant.claimed_by == session.attempt.attempt_id  # claimed at mint
 
-    epoch.bump()  # the gateway's AuthorizationEpoch object
+    epoch.bump()  # the gateway's AuthorizationEpoch — after mint, before commit
+    assert epoch.current != minted_epoch
 
-    fresh = EffectAttempt(grant_id=grant.grant_id)
-    with pytest.raises(GrantClaimDenied) as exc:
-        grant.claim(
-            fresh.attempt_id,
-            intent_hash=grant.intent_hash, actor_id=grant.actor_id,
-            policy_binding=grant.policy_binding,
-            authorization_epoch=epoch.current,
-        )
-    assert exc.value.reason == "epoch_mismatch"
+    with pytest.raises(ScopedAuthorityDenied) as first:
+        session.scope_effect()  # the actual commit path begins here
+    assert first.value.reason == "epoch_mismatch", first.value.reason
+    # validate_live terminally REVOKES an epoch-invalidated grant: the
+    # approval itself is dead, so no re-validation can ever succeed —
+    # every later attempt denies at the ACTIVE-state check instead.
+    assert session.grant.state.value == "revoked", session.grant.state.value
+    with pytest.raises(ScopedAuthorityDenied) as second:
+        session.scope_effect()  # no re-validation can succeed
+    assert second.value.reason == "grant_not_active", second.value.reason
+    assert ledger.read_records() == [], "denial must precede any durable fact"
 
 
 def test_T22_reservation_and_terminal_share_approver_in_durable_ledger(tmp_path: Path) -> None:
     """Full lifecycle: a rule-granted session scopes an effect through the
-    REAL gateway; every durable record (RESERVED + terminal) in the file
-    ledger carries the identical approver. No inspect.getsource."""
+    REAL gateway; every durable record in the file ledger carries the
+    identical approver, and the fenced like policy (ReplaySemantics.UNKNOWN)
+    must durably record BOTH the reservation and the terminal confirmation.
+    No inspect.getsource."""
     import asyncio
 
     runtime, gateway, ledger, epoch = _live_runtime_and_ledger(tmp_path)
@@ -423,32 +474,46 @@ def test_T22_reservation_and_terminal_share_approver_in_durable_ledger(tmp_path:
     asyncio.run(main())
 
     rows = ledger.read_records()
+    assert rows, "the lifecycle must durably record the effect"
     approvers = {r.approver for r in rows}
     assert approvers == {"rule:allow-like"}, (
         f"one effect lifecycle, one approver; saw {approvers} across {len(rows)} records"
     )
-    assert rows, "the lifecycle must durably record the effect"
     states = {r.state.value for r in rows}
+    assert "RESERVED" in states, f"fenced policy must durably reserve: {states}"
     assert "EFFECT_CONFIRMED" in states, states
 
 
-def test_T24_human_execution_attributed_human_through_real_gateway(tmp_path: Path) -> None:
-    """Human path end-to-end: default approver through the real runtime and
-    gateway; durable records say 'human', never rule-derived."""
-    import asyncio
+async def test_T24_human_execution_attributed_human_through_real_gateway(tmp_path: Path) -> None:
+    """Frozen T24 scenario: a HUMAN-CONFIRMED execution. The kernel issues a
+    confirmation token (phase 1), the second invocation consumes it (phase
+    2), and execution then crosses the real adapter → runtime → gateway
+    permit → file ledger. Every durable record says 'human', never
+    rule-derived; the fenced reservation and terminal confirmation are both
+    present."""
+    from webwire.safety.m5_capability_adapter import M5EngagementCapabilityAdapter
+    from webwire.safety.m5_effect_executor import M5EffectExecutor
 
     runtime, _gateway, ledger, _epoch = _live_runtime_and_ledger(tmp_path)
+    executor = M5EffectExecutor(runtime=runtime, evidence_reader=_FakeEvidenceReader())
+    adapter = M5EngagementCapabilityAdapter(_RecordingCap(), executor)
+    kernel, _ = _kernel(tmp_path, None)  # no rules — the human path
 
-    async def main():
-        session = runtime.issue(_engagement_intent())  # human default
-        receipt = session.scope_effect()
-        await receipt.authority.apply()
-        session.record_confirmed(evidence={"verified": True})
+    r1 = await kernel.execute(adapter, object(), {"post_id": "1"})
+    assert r1.data["policy"]["verdict"] == PolicyVerdict.CONFIRMATION_REQUIRED.value
+    token = r1.data["data"]["confirmation_token"]
 
-    asyncio.run(main())
+    r2 = await kernel.execute(
+        adapter, object(), {"post_id": "1", "confirmation_token": token}
+    )
+    assert r2.data["policy"]["verdict"] == PolicyVerdict.ALLOW.value
+    assert r2.data["trace"]["approver"] == "human"
+
     rows = ledger.read_records()
-    assert rows, "lifecycle must produce durable records"
+    assert rows, "human-confirmed execution must reach the durable ledger"
     assert all(r.approver == "human" for r in rows), [r.approver for r in rows]
+    states = {r.state.value for r in rows}
+    assert "RESERVED" in states and "EFFECT_CONFIRMED" in states, states
 
 
 def test_ledger_rejects_approver_lineage_mismatch(tmp_path: Path) -> None:
@@ -503,16 +568,20 @@ def test_grant_approver_reassignment_rejected(tmp_path: Path) -> None:
 
 
 def test_invalid_approver_vocabulary_rejected_everywhere(tmp_path: Path) -> None:
-    """F-12 regression: the canonical validator rejects bad values at the
-    validator, the mint seam, and the ledger parse."""
+    """F-12/F-16 regression: the canonical validator rejects bad values at
+    the validator, the mint seam, and the ledger parse. The rule-id suffix
+    obeys the ONE shared layer-1 invariant (any non-empty string), so a
+    spaced id such as 'rule:allow likes' is VALID attribution; blank
+    suffixes and foreign prefixes are not."""
     from webwire.safety.effect_ledger import EffectLedgerCorruptError, EffectLedgerRecord
     from webwire.safety.execution_models import ApprovalGrantStore, validate_approver
 
-    for bad in ("", "rule:", "rule:   ", "machine", "Human", "rule:a b"):
+    for bad in ("", "rule:", "rule:   ", "machine", "Human"):
         with pytest.raises(ValueError):
             validate_approver(bad)
     validate_approver("human")
     validate_approver("rule:x")
+    validate_approver("rule:allow likes")  # F-16: legal layer-1 rule id
     validate_approver(None, allow_none=True)
 
     store = ApprovalGrantStore(clock=lambda: NOW)
@@ -523,13 +592,48 @@ def test_invalid_approver_vocabulary_rejected_everywhere(tmp_path: Path) -> None
             authorization_epoch=0, approver="",
         )
 
+    # Canonical UPPERCASE state: the state parses cleanly, so the APPROVER
+    # vocabulary is provably what rejected the row. (A lowercase state would
+    # fail at EffectState() first and prove nothing about the approver.)
     payload = {
-        "effect_id": "e3", "semantic_key": "k3", "state": "reserved",
+        "effect_id": "e3", "semantic_key": "k3", "state": "RESERVED",
         "action_type": "like", "intent_hash": "h" * 32, "policy_binding": "p" * 32,
         "approver": "machine",
     }
-    with pytest.raises(EffectLedgerCorruptError):
+    with pytest.raises(EffectLedgerCorruptError, match="attribution vocabulary"):
         EffectLedgerRecord.from_dict(payload)
+
+
+async def test_F16_legal_spaced_rule_id_flows_to_durable_approver(tmp_path: Path) -> None:
+    """F-16 regression: 'allow likes' is a LEGAL layer-1 rule id (the frozen
+    UserRule contract accepts any non-empty string). With one shared
+    invariant it now rides the entire lineage — store round-trip, kernel
+    rule-ALLOW attribution, runtime mint, durable ledger — with no layer
+    re-imposing a stricter id contract mid-stream and failing the mint."""
+    from webwire.safety.m5_capability_adapter import M5EngagementCapabilityAdapter
+    from webwire.safety.m5_effect_executor import M5EffectExecutor
+
+    spaced = UserRule.create(
+        selector=RuleSelector(action_types=frozenset({"like"})),
+        decision=RuleDecision.ALLOW, rule_id="allow likes",
+    )
+    store = _store(tmp_path, [spaced])
+    assert [r.rule_id for r in store.load()] == ["allow likes"]
+
+    runtime, _gateway, ledger, _epoch = _live_runtime_and_ledger(tmp_path)
+    executor = M5EffectExecutor(runtime=runtime, evidence_reader=_FakeEvidenceReader())
+    adapter = M5EngagementCapabilityAdapter(_RecordingCap(), executor)
+    kernel, _ = _kernel(tmp_path, store)
+
+    r = await kernel.execute(adapter, object(), {"post_id": "9"})
+    assert r.data["policy"]["verdict"] == PolicyVerdict.ALLOW.value
+    assert r.data["trace"]["approver"] == "rule:allow likes"
+
+    rows = ledger.read_records()
+    assert rows
+    assert all(rec.approver == "rule:allow likes" for rec in rows), [
+        rec.approver for rec in rows
+    ]
 
 
 async def test_F09_live_dispatcher_installs_rule_store_and_ban_reaches_kernel(

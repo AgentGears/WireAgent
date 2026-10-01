@@ -60,10 +60,25 @@ __all__ = [
     "ALLOW_CEILING_TIERS",
     "DEFAULT_RULE_TTL_S",
     "RuleStore",
+    "validate_rule_id",
 ]
 
 DEFAULT_RULE_TTL_S = 7 * 24 * 3600.0
 _SCHEMA_VERSION = 1
+
+
+def validate_rule_id(value: Any) -> None:
+    """The ONE rule-id invariant, shared with the M8 approver vocabulary.
+
+    A rule id is any non-empty string: ``value.strip()`` must be non-blank.
+    This is the frozen layer-1 ``UserRule`` contract (ids are opaque store
+    identifiers — internal whitespace such as ``"allow likes"`` is legal).
+    Layer 2's approver attribution (``"rule:<id>"``) validates ids through
+    this same function, so the rule layer and the authority layer can never
+    disagree about what a valid rule identity is (F-16).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("rule_id must be a non-empty string")
 
 
 class RuleDecision(StrEnum):
@@ -175,8 +190,7 @@ class UserRule:
 
     def __post_init__(self) -> None:
         self.selector.validate()
-        if not isinstance(self.rule_id, str) or not self.rule_id.strip():
-            raise ValueError("rule_id must be a non-empty string")
+        validate_rule_id(self.rule_id)
         if not isinstance(self.decision, RuleDecision):
             raise ValueError(f"decision must be RuleDecision, got {self.decision!r}")
         if self.provenance not in ("hand_written", "compiled"):

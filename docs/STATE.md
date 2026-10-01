@@ -410,6 +410,24 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 fifth review pass: F-57 (derived-tier composition).
+  The one remaining renderer edge.** With unknown actions present and NO
+  explicit risk_tiers, the unknown-action branch returned before deriving
+  the KNOWN actions' registry tiers — so a persisted rule like
+  {post, future_action} reported only the unknown action's latent behavior
+  and never told the owner that post (above the standing ceiling) will
+  still ASK. The renderer now partitions the vocabulary on that path:
+  known actions' tiers are derived from the registry, any above-ceiling
+  known tier adds 'the known above-ceiling actions in this rule will still
+  ASK', and the unknown-action latent warning stands beside it — composed,
+  neither masking the other. Unknown-only selectors keep the pure latent
+  warning. Three regressions: {post, future_action} (ASK + latent),
+  {like, post, future_action} (three-way: like unaccused, post ASK,
+  future latent, no blanket tier claim), and unknown-only (latent, no ASK
+  claim). SUPERSEDES the F-54..F-56 entry's implication that 'no explicit
+  tiers → latent-authority wording' is universally sufficient: it is
+  sufficient only when no KNOWN actions are present. Suite 1145 (count
+  from the run).
 - **2026-10-01 — PR #24 fourth review pass: F-54..F-56 (final semantic/
 edge hardening).** F-55 (high): the F-49 unknown-action branch MASKED the
 deterministic tier-ceiling math for mixed selectors — with explicit tiers

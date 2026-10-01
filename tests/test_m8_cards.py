@@ -1103,3 +1103,49 @@ async def test_F56_malformed_token_carrier_never_becomes_a_card(
     assert code == 1
     assert runtime.calls == ["invoke:like_post"]
     assert runtime.stopped
+
+
+def _rule_with_actions(*actions: str) -> UserRule:
+    return UserRule(
+        rule_id="mixed-vocab",
+        decision=RuleDecision.ALLOW,
+        created_at=NOW,
+        expires_at=NOW + 3600.0,
+        selector=RuleSelector(action_types=frozenset(actions)),
+        source_text="",
+    )
+
+
+def test_F57_known_action_ceiling_not_masked_by_unknown_actions() -> None:
+    """F-57: with NO explicit tiers, the KNOWN actions' derived tiers must
+    compose with the unknown-action warning. {post, future_action}: post is
+    above the standing ceiling — the owner must be told it will still ASK,
+    alongside the unknown action's latent behavior."""
+    desc = describe_rule(_rule_with_actions("post", "future_action"))
+    assert "outside the active registry" in desc
+    assert "currently non-executable" in desc
+    assert "may auto-approve only if" in desc
+    assert "will still ASK" in desc, "post's above-ceiling ASK must appear"
+    assert "known above-ceiling actions" in desc
+
+
+def test_F57_three_way_composition_keeps_each_fact_separate() -> None:
+    """{like, post, future_action}: like is below the ceiling (no adverse
+    claim), post still ASKs, the unknown action is stated separately —
+    three behaviors, one honest note, none masking another."""
+    desc = describe_rule(_rule_with_actions("like", "post", "future_action"))
+    assert "will still ASK" in desc, "post's above-ceiling ASK must appear"
+    assert "outside the active registry" in desc
+    assert "currently non-executable" in desc
+    # The known below-ceiling action (like) is not accused of asking...
+    assert "every named" not in desc, "no blanket tier claim over all actions"
+
+
+def test_F57_unknown_only_still_gets_the_pure_latent_warning() -> None:
+    """An unknown-only selector with no explicit tiers keeps the plain
+    latent warning — no known actions exist to compose."""
+    desc = describe_rule(_rule_with_actions("future_action"))
+    assert "outside the active registry" in desc
+    assert "currently non-executable" in desc
+    assert "may auto-approve only if" in desc
+    assert "still ASK" not in desc, "no known actions — no ASK claim"

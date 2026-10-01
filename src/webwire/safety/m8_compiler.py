@@ -302,10 +302,26 @@ def _ceiling_note(
             "non-executable"
         )
         if selector.risk_tiers is None:
-            return (
-                f"{prefix}; if one is later registered below the "
-                "standing-rule ceiling, this ALLOW may auto-approve"
+            # F-57: no explicit tiers — derive the KNOWN actions' registry
+            # tiers and compose them with the unknown-action warning. A
+            # rule like {post, future_action} must say BOTH: the unknown
+            # action's latent behavior AND that post (above ceiling) will
+            # still ASK — the unknown must not mask known behavior.
+            latent = (
+                f"{prefix}; such actions may auto-approve only if later "
+                "registered below the standing-rule ceiling"
             )
+            known_tiers = {
+                registry.require(a)[0].derive_tier()
+                for a in (selector.action_types or frozenset())
+                if registry.get(a) is not None
+            }
+            if known_tiers - ALLOW_CEILING_TIERS:
+                return (
+                    f"{latent}; the known above-ceiling actions in this "
+                    "rule will still ASK"
+                )
+            return latent
         below = selector.risk_tiers & ALLOW_CEILING_TIERS
         above = selector.risk_tiers - ALLOW_CEILING_TIERS
         if not below:

@@ -487,6 +487,23 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #19 MERGED (edba2af): M7 LAYER 1 on main — the
+  authority-owner lock is real.** Cleared through three fresh-review rounds
+  after M8 completed (F-38 Windows-mypy portability via runtime module
+  resolution on both lock branches; F-39 merge with M8-complete main
+  keeping both CI additions; F-40/F-41/F-42 documentation provenance and
+  evidence currency). Layer 1 delivers canonical authority-domain
+  identity, process-local owner reservation, the non-expiring OS-held
+  owner lock on authority.lock, fork-gated descriptor lifecycle with
+  child detach, and fail-stop at every ambiguous seam — standalone, stdlib
+  only, nothing yet wired to the Dispatcher. Merged-tree qualification:
+  Linux 3.11 1171 passed + 6 platform-skipped = 1177; Ruff clean; mypy
+  clean across 92 files on BOTH platform resolutions; Windows focused
+  matrix 170 passed + 4 skipped plus rule-store 57; maintainer's local
+  Windows gate 1168 + 9. NEXT BUILD (M7 Layer 2): make AuthorityOwnerLock
+  mandatory around the supported runtime authority root — Dispatcher
+  startup/drain ordering, and a controlled authority_busy path for
+  transient entrypoints such as `m8 card`.
 - **2026-10-01 — M8 LAYER 4 LIVE-SESSION QUALIFICATION (record only; no
   architectural changes).** Qualification executed against a real logged-in
   X session per the directed sequence. Environment: Windows 11 (10.0.26200),

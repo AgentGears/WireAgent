@@ -517,8 +517,8 @@ def test_F49_mixed_action_tier_selector_gets_the_latent_warning() -> None:
     desc = describe_rule(mixed)
     assert "outside the active registry" in desc
     assert "currently non-executable" in desc
-    assert "at a tier matching this selector" in desc
-    assert "may auto-approve" in desc
+    assert "may auto-approve only if" in desc
+    assert "below-ceiling tiers matching this selector" in desc
     assert "ASK" not in desc.split("—")[0], "no unconditional ASK promise"
 
 
@@ -983,3 +983,123 @@ def test_F44_rules_cli_imports_without_the_browser_dependency(tmp_path: Path) ->
     )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout  # rules output may precede the marker
+
+
+# ---------------------------------------------------------------------------
+# F-55 / F-54 / F-56 (final round): composed ceiling semantics, CLI-early
+# reserved-field rejection, genuine-string carrier requirement
+# ---------------------------------------------------------------------------
+
+
+def _unknown_action_rule(tiers: frozenset | None) -> UserRule:
+
+    return UserRule(
+        rule_id="latent",
+        decision=RuleDecision.ALLOW,
+        created_at=NOW,
+        expires_at=NOW + 3600.0,
+        selector=RuleSelector(
+            action_types=frozenset({"future_action"}),
+            risk_tiers=frozenset(tiers) if tiers is not None else None,
+        ),
+        source_text="",
+    )
+
+
+def test_F55_unknown_action_composes_with_explicit_tier_ceiling() -> None:
+    """With explicit tiers, whether auto-approval is even POSSIBLE is
+    determined by those tiers — the unknown-action warning must compose
+    with the ceiling math, not mask it (frozen §5: above-ceiling ALLOW is
+    honestly ASK)."""
+    from webwire.safety.models import RiskTier
+
+    # All named tiers above the ceiling: any future matching registration
+    # still ASKs — auto-approval is impossible, and the text says so.
+    all_above = describe_rule(_unknown_action_rule(frozenset({RiskTier.PUBLIC_CONTENT_IRREVERSIBLE})))
+    assert "currently non-executable" in all_above
+    assert "will still ASK" in all_above
+    assert "every named tier is above the allow ceiling" in all_above
+    assert "may auto-approve" not in all_above
+
+    # Mixed tiers: auto-approval possible ONLY at the below-ceiling tier;
+    # the above-ceiling tier still ASKs.
+    mixed = describe_rule(
+        _unknown_action_rule(frozenset({RiskTier.PRIVATE_REVERSIBLE, RiskTier.PUBLIC_CONTENT_IRREVERSIBLE}))
+    )
+    assert "may auto-approve only if" in mixed
+    assert "below-ceiling tiers matching this selector" in mixed
+    assert "above-ceiling tiers still ASK" in mixed
+
+    # All below the ceiling: the only auto-approval route; no ASK claim.
+    all_below = describe_rule(_unknown_action_rule(frozenset({RiskTier.PRIVATE_REVERSIBLE})))
+    assert "may auto-approve only if" in all_below
+    assert "still ASK" not in all_below
+
+    # No explicit tiers: the F-49 latent-authority wording stands.
+    no_tiers = describe_rule(_unknown_action_rule(None))
+    assert "may auto-approve" in no_tiers
+    assert "currently non-executable" in no_tiers
+
+
+async def test_F54_cli_rejects_reserved_token_before_building_runtime(tmp_path, capsys) -> None:
+    """The forbidden field is a USAGE error before ANY live-session work:
+    the runtime factory must never be invoked."""
+
+    def _forbidden_factory():
+        raise AssertionError("runtime must not be built for forbidden input")
+
+    cli = CardCli(
+        store=_store(tmp_path),
+        runtime_factory=_forbidden_factory,
+        decision_reader=lambda p: "y",
+        clock=lambda: NOW,
+    )
+    code = await cli.run(["card", "like_post", '{"post_id": "1", "confirmation_token": "T"}'])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "reserved confirmation_token" in err
+
+
+async def test_F56_malformed_token_carrier_never_becomes_a_card(
+    tmp_path: Path,
+) -> None:
+    """A non-string confirmation carrier (dict, number) is not usable
+    authority: no card is constructed, the sanitized result is returned,
+    and the CLI reports the confirmation-required protocol error."""
+    for bad_carrier in ({"token": "abc"}, 123, ""):
+        payload = {
+            "preview": "Will like 1",
+            "confirmation_token": bad_carrier,
+            "expires_at": NOW + 300.0,
+        }
+        drifted = ok_result(
+            data={
+                "policy": {
+                    "verdict": "confirmation_required",
+                    "confirmation_token": bad_carrier,
+                },
+                "data": payload,
+                "trace": {},
+            }
+        )
+        result, card = await CardFlow(_FakeInvoke([drifted])).begin("like_post", {"post_id": "1"})
+        assert card is None, f"a {type(bad_carrier).__name__} carrier is not a card"
+        assert "confirmation_token" not in result.data["data"]
+        assert "confirmation_token" not in result.data["policy"]
+
+    # The CLI turns the same shape into the controlled protocol error.
+    drifted_cli = ok_result(
+        data={
+            "policy": {
+                "verdict": "confirmation_required",
+                "confirmation_token": {"token": "abc"},
+            },
+            "data": {"preview": "Will like 1", "confirmation_token": {"token": "abc"}},
+            "trace": {},
+        }
+    )
+    runtime = _FakeRuntime([drifted_cli])
+    code = await _cli(tmp_path, runtime_factory=_ready(runtime)).run(["card", "like_post", '{"post_id": "1"}'])
+    assert code == 1
+    assert runtime.calls == ["invoke:like_post"]
+    assert runtime.stopped

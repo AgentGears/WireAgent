@@ -152,6 +152,18 @@ class CardCli:
         if not isinstance(payload, dict):
             print("card: payload must be a JSON object", file=sys.stderr)
             return _EXIT_USAGE
+        if "confirmation_token" in payload:
+            # F-54: reserved confirmation authority is rejected BEFORE any
+            # live-session work — no runtime is built, no browser starts,
+            # no whoami runs. CardFlow enforces the same rule at its own
+            # boundary (F-48); this is the CLI's controlled usage error.
+            print(
+                "card: payload carries a reserved confirmation_token — "
+                "confirmation authority may only be minted by phase 1 and "
+                "held inside the card",
+                file=sys.stderr,
+            )
+            return _EXIT_USAGE
 
         # Imported lazily: the card surface needs the browser result types,
         # and rules-only invocations of this CLI must not (F-44).

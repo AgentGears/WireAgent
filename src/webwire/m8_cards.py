@@ -237,14 +237,21 @@ class CardFlow:
         data = sanitized.data if isinstance(sanitized.data, dict) else {}
         policy = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
         phase1 = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
-        if policy.get("verdict") != "confirmation_required" or not token:
+        # F-56: the confirmation subsystem's carrier is a non-empty string.
+        # Anything else (a dict, a number) is not usable authority — a card
+        # built on a coerced string could never be consumed by phase 2.
+        # Fail closed: no card, sanitized result, and the CLI's F-52
+        # protocol-error path reports it.
+        if policy.get("verdict") != "confirmation_required":
+            return sanitized, None
+        if not isinstance(token, str) or not token:
             return sanitized, None
         card = ApprovalCard(
             invoke=self._invoke,
             capability_name=capability_name,
             payload=request,
             summary=str(phase1.get("preview", "")),
-            token=str(token),
+            token=token,
             target_url=str(phase1.get("target_url", "") or ""),
             current_state=str(phase1.get("current_state", "") or ""),
             warnings=tuple(str(w) for w in phase1.get("warnings", []) or []),

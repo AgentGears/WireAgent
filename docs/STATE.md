@@ -410,6 +410,30 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 fourth review pass: F-54..F-56 (final semantic/
+edge hardening).** F-55 (high): the F-49 unknown-action branch MASKED the
+deterministic tier-ceiling math for mixed selectors — with explicit tiers
+all above the ceiling, the old text promised conditional auto-approval
+even though every matching registration would still ASK (impossible
+condition; frozen §5 requires above-ceiling ALLOW to be honestly ASK).
+The renderer now COMPOSES the two facts: unknown action + explicit tiers
+all above → 'will still ASK (every named tier is above the allow
+ceiling)'; tiers containing below-ceiling → 'may auto-approve only if
+later registered at one of the below-ceiling tiers matching this
+selector', plus 'matching above-ceiling tiers still ASK' when mixed; no
+explicit tiers → the F-49 latent wording stands. Regression locks all
+four compositions. F-54: the CLI rejected a caller-supplied
+confirmation_token only at CardFlow's boundary — AFTER building the live
+runtime (browser start, whoami) and via an uncontrolled traceback. The
+reserved-field check now runs immediately after JSON validation: exit 2,
+stderr message, and the regression proves runtime_factory was NEVER
+called. F-56: a non-string confirmation carrier (dict, number, empty
+string) was coerced into an unusable ApprovalCard; the card now requires
+a genuine non-empty string carrier — anything else returns the sanitized
+result with no card, flowing to the CLI's confirmation-required protocol
+error (exit 1). SUPERSEDES the F-48..F-53 entry's 'closed by F-49' claim:
+F-49 closed the structural gap only; the semantic composition is closed
+here. Suite count from the run (below).
 - **2026-10-01 — PR #24 third review pass: F-48..F-53 (the card entry
   point and the audit boundary).** F-48 (blocker): CardFlow.begin()
   forwarded the caller's payload unchanged, so a caller holding a valid

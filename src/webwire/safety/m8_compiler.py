@@ -291,20 +291,36 @@ def _ceiling_note(
         else []
     )
     if unknown_actions:
-        if selector.risk_tiers is not None:
-            return (
-                "ceiling not verifiable: some named actions are outside "
-                "the active registry — such actions are currently "
-                "non-executable; if one is later registered at a tier "
-                "matching this selector and below the standing-rule "
-                "ceiling, this ALLOW may auto-approve"
-            )
-        return (
+        # F-55: compose the two facts — unknown action AND effective tier
+        # ceiling — rather than choosing one. With explicit tiers, whether
+        # auto-approval is even possible is DETERMINED by those tiers: all
+        # above the ceiling means any future matching registration still
+        # ASKs; below-ceiling tiers are the only auto-approval route.
+        prefix = (
             "ceiling not verifiable: some named actions are outside "
             "the active registry — such actions are currently "
-            "non-executable; if one is later registered below the "
-            "standing-rule ceiling, this ALLOW may auto-approve"
+            "non-executable"
         )
+        if selector.risk_tiers is None:
+            return (
+                f"{prefix}; if one is later registered below the "
+                "standing-rule ceiling, this ALLOW may auto-approve"
+            )
+        below = selector.risk_tiers & ALLOW_CEILING_TIERS
+        above = selector.risk_tiers - ALLOW_CEILING_TIERS
+        if not below:
+            return (
+                f"{prefix}; if one is later registered at a tier matching "
+                "this selector, it will still ASK (every named tier is "
+                "above the allow ceiling)"
+            )
+        note = (
+            f"{prefix}; it may auto-approve only if later registered at "
+            "one of the below-ceiling tiers matching this selector"
+        )
+        if above:
+            note += "; matching above-ceiling tiers still ASK"
+        return note
     if selector.risk_tiers is not None:
         tiers = set(selector.risk_tiers)
     elif selector.action_types is not None:

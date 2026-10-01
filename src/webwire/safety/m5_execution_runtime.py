@@ -94,6 +94,7 @@ class _PruningApprovalGrantStore(ApprovalGrantStore):
     def mint(
         self,
         *,
+        approver: str = "human",
         intent_hash: str,
         actor_id: str,
         action_type: str,
@@ -104,6 +105,7 @@ class _PruningApprovalGrantStore(ApprovalGrantStore):
     ) -> ApprovalGrant:
         self._prune_terminal()
         return super().mint(
+            approver=approver,
             intent_hash=intent_hash,
             actor_id=actor_id,
             action_type=action_type,
@@ -333,8 +335,13 @@ class M5ExecutionRuntime:
         self._grants = grants if grants is not None else _PruningApprovalGrantStore()
         self._policies = policies
 
-    def issue(self, intent: WriteIntent) -> M5ExecutionSession:
-        """Mint one approval grant after human confirmation and claim attempt 1."""
+    def issue(self, intent: WriteIntent, *, approver: str = "human") -> M5ExecutionSession:
+        """Mint one approval grant and claim attempt 1.
+
+        ``approver`` is the M8 trusted attribution value supplied by the
+        kernel's rule gate or the human confirmation path — the ONLY seam
+        that may set it ("human" | "rule:<rule_id>").
+        """
         frozen = deepcopy(intent)
         actor_id = frozen.actor_identity or ""
         if not actor_id:
@@ -349,6 +356,7 @@ class M5ExecutionRuntime:
         binding = policy.binding_hash()
         epoch = self._gateway.authorization_epoch
         grant = self._grants.mint(
+            approver=approver,
             intent_hash=frozen.intent_hash(),
             actor_id=actor_id,
             action_type=frozen.action_type,

@@ -33,6 +33,8 @@ from webwire.safety.models import (
 from webwire.safety.recovery_guard import RecoveryGuardUnavailable
 from webwire.safety.risk_registry import RiskRegistry
 from webwire.safety.token_bucket import TokenBucket
+from webwire.safety.user_rules import RuleDecision as _M8RuleDecision
+from webwire.safety.user_rules import RuleStore
 
 if TYPE_CHECKING:
     from webwire.broker import ReadOnlyBroker
@@ -111,6 +113,7 @@ class WriteKernel:
         auto_approve_private: bool = False,
         recovery_guard: Optional["RecoveryGuard"] = None,
         confirmation_state: Optional[ConfirmationState] = None,
+        rule_store: Optional["RuleStore"] = None,
     ) -> None:
         self._kill = kill_switch
         self._risk = risk_registry
@@ -123,6 +126,9 @@ class WriteKernel:
         self._confirmation_state = confirmation_state or ConfirmationState(
             ttl_seconds=_CONFIRM_TTL_S
         )
+        # M8 rule gate (spec 6, corrected topology). None = pre-M8 behavior
+        # byte-for-byte: no rule gate, every write asks (T16).
+        self._rule_store = rule_store
 
     @property
     def confirmation_state(self) -> ConfirmationState:
@@ -300,55 +306,126 @@ class WriteKernel:
         preview = await write_cap.preview(intent, broker)
         trace["preview"] = preview.summary
 
+        # 4b. M8 RULE GATE (spec 6, corrected topology). Runs AFTER preview
+        # and BEFORE the confirmation section, so it is re-evaluated on EVERY
+        # invocation — including the confirmation-token invocation. A newly
+        # installed NEVER therefore defeats a previously issued human token
+        # (T14): the gate dominates tokens because it precedes token
+        # validation. None store = pre-M8 behavior, gate skipped (T16).
+        rule_match = None
+        if self._rule_store is not None:
+            rule_match = self._rule_store.match(
+                action_type=intent.action_type,
+                risk_tier=risk_tier,
+                target_type=intent.target_type,
+                target_id=intent.target_id,
+                actor=actor_identity or "",
+            )
+        if rule_match is not None and rule_match.decision is _M8RuleDecision.NEVER:
+            trace["stages"].append("denied:user_rule")
+            trace["rule_gate"] = {"rule_id": rule_match.rule_id, "decision": "never"}
+            return self._finish(PolicyDecision(
+                verdict=PolicyVerdict.DENY,
+                reason=f"blocked by user rule {rule_match.rule_id!r}",
+                risk_tier=risk_tier, intent_hash=intent.intent_hash(),
+                blocked_by="user_rule",
+            ), trace, {"rule_id": rule_match.rule_id, "decision": "never"})
+
         # 5. Confirmation gate.
         provided_token = input.get("confirmation_token")
-        if provided_token is None:
-            try:
-                token = self._issue_token(intent, write_cap.name)
-            except ConfirmationStateError as exc:
-                logger.error("confirmation authority unavailable during issue: %r", exc)
-                trace["stages"].append("denied:confirmation_state_unavailable")
+
+        # Rule-ALLOW (spec 6): standing approval — no human confirmation
+        # carrier is minted; the approver value is established HERE and
+        # passed explicitly to the execution adapter (the critical Layer-2
+        # rule: never encode rule approval as "skip token validation").
+        approver = "human"
+        if (
+            self._rule_store is not None
+            and rule_match is not None
+            and rule_match.decision is _M8RuleDecision.ALLOW
+        ):
+            approver = "rule:" + rule_match.rule_id
+            trace["rule_gate"] = {"rule_id": rule_match.rule_id, "decision": "allow"}
+            trace["stages"].append("rule_approved")
+        else:
+            # Human path: ASK, no-match, or an above-ceiling downgraded ALLOW.
+            if rule_match is not None:
+                trace["rule_gate"] = {
+                    "rule_id": rule_match.rule_id,
+                    "decision": rule_match.decision.value,
+                    "ceiling_downgraded": rule_match.ceiling_downgraded,
+                }
+            if provided_token is None:
+                try:
+                    token = self._issue_token(intent, write_cap.name)
+                except ConfirmationStateError as exc:
+                    logger.error("confirmation authority unavailable during issue: %r", exc)
+                    trace["stages"].append("denied:confirmation_state_unavailable")
+                    return self._finish(PolicyDecision(
+                        verdict=PolicyVerdict.DENY,
+                        reason="confirmation authority state is unavailable",
+                        risk_tier=risk_tier,
+                        intent_hash=intent.intent_hash(),
+                        blocked_by="confirmation_state_unavailable",
+                    ), trace, None)
+                trace["stages"].append("confirmation_required")
+                rule_info = {
+                    "matched_rule_id": rule_match.rule_id if rule_match else None,
+                    "ceiling_downgraded": rule_match.ceiling_downgraded if rule_match else False,
+                }
                 return self._finish(PolicyDecision(
-                    verdict=PolicyVerdict.DENY,
-                    reason="confirmation authority state is unavailable",
+                    verdict=PolicyVerdict.CONFIRMATION_REQUIRED,
+                    reason="human approval required",
                     risk_tier=risk_tier,
                     intent_hash=intent.intent_hash(),
-                    blocked_by="confirmation_state_unavailable",
-                ), trace, None)
-            trace["stages"].append("confirmation_required")
-            return self._finish(PolicyDecision(
-                verdict=PolicyVerdict.CONFIRMATION_REQUIRED,
-                reason="human approval required",
-                risk_tier=risk_tier,
-                intent_hash=intent.intent_hash(),
-                confirmation_token=token,
-            ), trace, {
-                "preview": preview.summary,
-                "target_url": preview.target_url,
-                "current_state": preview.current_state,
-                "warnings": preview.warnings,
-                "confirmation_token": token.token,
-                "intent_hash": token.intent_hash,
-                "capability_name": token.capability_name,
-                "confirmation_epoch": token.confirmation_epoch,
-                "expires_at": token.expires_at,
-            })
+                    confirmation_token=token,
+                ), trace, {
+                    "preview": preview.summary,
+                    "target_url": preview.target_url,
+                    "current_state": preview.current_state,
+                    "warnings": preview.warnings,
+                    "confirmation_token": token.token,
+                    "intent_hash": token.intent_hash,
+                    "capability_name": token.capability_name,
+                    "confirmation_epoch": token.confirmation_epoch,
+                    "expires_at": token.expires_at,
+                    "rule_gate": rule_info,
+                })
 
-        # Final validation + consumption are one synchronized authority operation.
-        decision = self._validate_token(
-            provided_token,
-            intent,
-            capability_name=write_cap.name,
-        )
-        if decision is not None:
-            trace["stages"].append(f"denied:{decision.blocked_by}")
-            return self._finish(decision, trace, None)
-        trace["stages"].append("confirmed")
+            # Final validation + consumption: one synchronized authority op.
+            decision = self._validate_token(
+                provided_token,
+                intent,
+                capability_name=write_cap.name,
+            )
+            if decision is not None:
+                trace["stages"].append(f"denied:{decision.blocked_by}")
+                return self._finish(decision, trace, None)
+            trace["stages"].append("confirmed")
 
-        # 6. Execute after confirmation consumption.
+        # 6. Execute with explicit approver attribution (the Layer-2 critical
+        # rule): adapters that accept the trusted approver value receive it;
+        # rule-ALLOW REQUIRES such an adapter — a capability that cannot
+        # carry attribution must not execute on standing approval.
         write_broker = self._write_broker_factory() if self._write_broker_factory else broker
         trace["stages"].append("execute_attempted")
-        exec_result = await write_cap.execute(intent, write_broker)
+        exec_with_approver = getattr(write_cap, "execute_with_approver", None)
+        if exec_with_approver is not None:
+            exec_result = await exec_with_approver(intent, write_broker, approver)
+        elif approver != "human":
+            trace["stages"].append("denied:approver_unsupported_adapter")
+            return self._finish(PolicyDecision(
+                verdict=PolicyVerdict.DENY,
+                reason=(
+                    "rule approval requires an execution adapter that carries "
+                    "approver attribution (execute_with_approver)"
+                ),
+                risk_tier=risk_tier, intent_hash=intent.intent_hash(),
+                blocked_by="approver_unsupported_adapter",
+            ), trace, None)
+        else:
+            exec_result = await write_cap.execute(intent, write_broker)
+        trace["approver"] = approver
         trace["execute_ok"] = exec_result.ok
 
         exec_data = exec_result.data if isinstance(exec_result.data, dict) else {}

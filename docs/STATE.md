@@ -384,6 +384,29 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-01 — M8 LAYER 2 (PR #22): the kernel rule gate + approver
+  lineage.** Implemented per the corrected section 6 topology: the gate sits
+  after preview and before the confirmation section, so it is re-evaluated
+  on EVERY invocation including the token-bearing one (T14: a NEVER
+  installed after token issuance still denies — the gate dominates tokens).
+  NEVER denies with blocked_by=user_rule and the rule cited; ASK/no-match
+  uses the existing human confirmation path with the matched rule cited in
+  the card payload; below-ceiling ALLOW establishes approver="rule:<id>"
+  with NO confirmation carrier and flows to execution in ONE invocation.
+  The critical rule honored: approval source is an explicit trusted value —
+  the kernel passes approver through a new execute_with_approver adapter
+  seam, the six M5 executors thread it to M5ExecutionRuntime.issue, and the
+  runtime stamps it on the grant at the SINGLE mint seam. Capabilities
+  without the seam are denied standing approval
+  (approver_unsupported_adapter). Attribution descends monotonically:
+  ApprovalGrant.approver -> EffectPermit.approver -> EffectLedgerRecord
+  .approver (top-level lineage field; optional on read for pre-M8 rows —
+  T23 locks old rows parse with None). Human default "human" keeps every
+  pre-M8 caller correct (T24). Also landed: the reviewer's two cleanups
+  (section 6.1 typo; the Windows retry now inspects winerror 5/32, retrying
+  only the transient sharing violation per the stated contract). T13-T24
+  all covered (tests/test_m8_rule_gate.py, 13 tests). Suite 1057 (count
+  from the run). Kernel with rule_store=None is byte-for-byte pre-M8 (T16).
 - **2026-10-01 — M8 layer 1 hardening + section 6 amendment (PR #21).** The
   post-merge fallback pass found one new blocker and one falsified design
   assumption. F-08 (blocker): concurrent saves shared one staging file —

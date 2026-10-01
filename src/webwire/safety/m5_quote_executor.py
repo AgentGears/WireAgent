@@ -74,9 +74,11 @@ class M5QuoteExecutor:
         self._runtime = runtime
         self._evidence = evidence_reader
 
-    async def execute(self, intent: WriteIntent) -> M5QuoteExecution:
+    async def execute(
+        self, intent: WriteIntent, *, approver: str = "human"
+    ) -> M5QuoteExecution:
         frozen = deepcopy(intent)
-        session = self._runtime.issue(frozen)
+        session = self._runtime.issue(frozen, approver=approver)
         if session.action_type != "quote":
             session.resolve_no_external_effect(reason="quote_executor_wrong_action")
             return self._clean_failure(

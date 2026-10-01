@@ -182,7 +182,7 @@ EffectPermit.approver
 EffectLedgerRecord.approver
 ```
 
-- `ApprovalGain.approver` — the grant reuses the existing M5 lifecycle and
+- `ApprovalGrant.approver` — the grant reuses the existing M5 lifecycle and
   bindings (intent, actor, action, target, policy binding, epoch); T10/T11
   reuse the existing policy-mismatch and epoch denials rather than new ones.
 - `EffectPermit.approver` — the permit is the immutable carrier across the

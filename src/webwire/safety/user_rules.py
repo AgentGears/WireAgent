@@ -472,7 +472,11 @@ def _replace_with_windows_retry(src: Path, dst: Path, attempts: int = 8) -> None
         try:
             os.replace(src, dst)
             return
-        except PermissionError:
-            if attempt == attempts - 1:
+        except PermissionError as exc:
+            # Contract says the TRANSIENT SHARING VIOLATION specifically
+            # (winerror 5/32); persistent permission failures are not
+            # transient and raise immediately.
+            transient = getattr(exc, "winerror", None) in (5, 32)
+            if not transient or attempt == attempts - 1:
                 raise
             time.sleep(0.01 * (attempt + 1))

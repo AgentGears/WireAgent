@@ -12,7 +12,7 @@ class _Capability:
 
 
 class _RaisingExecutor:
-    async def execute(self, intent: Any):  # type: ignore[no-untyped-def]
+    async def execute(self, intent: Any, *, approver: str = "human") -> Any:
         del intent
         raise RuntimeError("executor exploded")
 

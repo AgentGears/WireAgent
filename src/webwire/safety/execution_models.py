@@ -190,6 +190,11 @@ class ApprovalGrant:
     state: GrantState = GrantState.ACTIVE
     claimed_by: Optional[str] = None
     precommit_attempts: int = 0
+    # M8 attribution (spec 6.1): who supplied the approval — "human" or
+    # "rule:<rule_id>". Set once at the single mint seam; descends
+    # grant -> permit -> ledger. "human" default keeps every pre-M8
+    # caller correct.
+    approver: str = "human"
     clock: Callable[[], float] = field(
         default_factory=lambda: time.monotonic,
         repr=False,
@@ -479,6 +484,7 @@ class ApprovalGrantStore:
     def mint(
         self,
         *,
+        approver: str = "human",
         intent_hash: str,
         actor_id: str,
         action_type: str,
@@ -488,6 +494,7 @@ class ApprovalGrantStore:
         authorization_epoch: int,
     ) -> ApprovalGrant:
         grant = ApprovalGrant(
+            approver=approver,
             intent_hash=intent_hash,
             actor_id=actor_id,
             action_type=action_type,

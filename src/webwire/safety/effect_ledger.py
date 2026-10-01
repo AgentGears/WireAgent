@@ -125,6 +125,10 @@ class EffectLedgerRecord:
     actor_id: Optional[str] = None
     target_type: Optional[str] = None
     target_id: Optional[str] = None
+    # M8 attribution lineage (spec 6.1): top-level, immutable across
+    # reservation and terminal records. None only on pre-M8 rows read from
+    # disk; every M8-created record supplies "human" or "rule:<rule_id>".
+    approver: Optional[str] = None
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -191,6 +195,9 @@ class EffectLedgerRecord:
             details_raw = raw.get("details", {})
             if not isinstance(details_raw, dict):
                 raise ValueError("details must be an object when present")
+            approver_raw = raw.get("approver")
+            if approver_raw is not None and not isinstance(approver_raw, str):
+                raise ValueError("approver must be a string when present")
             record = cls(
                 effect_id=raw["effect_id"],
                 semantic_key=raw["semantic_key"],
@@ -198,6 +205,7 @@ class EffectLedgerRecord:
                 action_type=raw["action_type"],
                 intent_hash=raw["intent_hash"],
                 policy_binding=raw["policy_binding"],
+                approver=approver_raw,
                 actor_id=raw.get("actor_id"),
                 target_type=raw.get("target_type"),
                 target_id=raw.get("target_id"),

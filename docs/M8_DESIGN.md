@@ -64,6 +64,7 @@ with its output confirmed by the human before anything is stored.
 RuleSelector
 ├── action_types: frozenset[str] | None     # base action types, e.g. {"bookmark"}
 ├── risk_tiers:   frozenset[RiskTier] | None
+├── target_types: frozenset[str] | None     # e.g. {"post"}, {"user"}
 ├── target_ids:   frozenset[str] | None     # post ids / handles
 └── actors:       frozenset[str] | None     # resolved handles
 
@@ -102,6 +103,17 @@ fallback review found seven defects, three blocking. The amended contract:
   manufactured during deserialization.
 - **Ids are non-empty strings, unique within a store.** save() refuses
   duplicates at the write boundary.
+- **Each save stages through a unique per-writer temporary file** (F-08,
+  post-merge review). A shared staging file let one writer's replace install
+  another writer's bytes while the first reported success. Unique staging
+  gives concurrent whole-store saves last-writer-wins linearization; a
+  bounded retry absorbs the Windows transient sharing violation on the
+  destination.
+- **Selector annotations are runtime contracts.** Every specified dimension
+  must be a non-empty frozenset of the exact element type (strings;
+  RiskTier enums for risk_tiers); empty dimensions are rejected.
+- **Timestamp parity.** Construction and parsing reject the same values:
+  bools (numeric in Python), NaN, ±inf, and expires_at <= created_at.
 
 ## 5. Matching and precedence (deterministic)
 
@@ -120,22 +132,66 @@ impossible to bypass by any store content.
 
 ## 6. The three-way gate (layer 2)
 
-Slotted between preview and token issuance in the kernel pipeline:
+> **Amended after the PR #20 post-merge review.** The original wording had
+> the rule gate "mint ApprovalGrant with approver=rule:<id>" — creating a
+> second grant-mint seam inside WriteKernel. The kernel does not own grant
+> creation: it owns the human confirmation carrier, validates and consumes
+> it, and invokes the execution runtime, which is the SINGLE existing
+> ApprovalGrant mint authority. The implementation topology falsified the
+> original assumption; M8's change rule applies.
+
+The corrected contract — **one execution-authority mint seam, not two**:
 
 ```text
-compose → registry gate → budget → dedupe → preview
-       → RULE GATE:
-            never  → DENY  (blocked_by=user_rule, rule_id cited) — no token minted
-            allow  → mint ApprovalGrant with approver="rule:<id>"
-                     (tier ceiling already downgraded any above-ceiling match to ask)
-            ask    → confirmation_required (today's behavior), card cites the rule
-            no match → confirmation_required (today's default)
-       → gateway → ledger → fencing → spend → recovery     [ALL UNCHANGED]
+preview
+  ↓
+rule gate (in WriteKernel, before the confirmation gate)
+  ├─ NEVER → DENY; blocked_by=user_rule; rule cited; no confirmation authority
+  │
+  ├─ ASK / no match
+  │     → existing human-confirmation flow (unchanged)
+  │     → successful confirmation establishes approver="human"
+  │
+  └─ ALLOW
+        → no human confirmation carrier minted
+        → establishes approver="rule:<id>"
+        ↓
+existing execution path (unchanged)
+        ↓
+single existing ApprovalGrant mint seam (the execution runtime)
+        ↓
+grant carries immutable approver attribution
 ```
 
-Layer 2 touches three things: the gate itself, an `approver` field on
-`ApprovalGrant`, and an `approver` citation on ledger records. Nothing else
-below the surface changes.
+**The rule gate is re-evaluated on EVERY invocation, including the
+confirmation-token invocation.** The kernel already recomposes and previews
+on the second invocation before validating the token, so a newly installed
+NEVER defeats a previously issued human token — the rule gate dominates
+tokens, matching the frozen precedence that standing policy outranks stale
+authority.
+
+### 6.1 Attribution descends monotonically through the authority lineage
+
+```text
+Rule/Human decision
+    ↓
+ApprovalGrant.approver
+    ↓
+EffectPermit.approver
+    ↓
+EffectLedgerRecord.approver
+```
+
+- `ApprovalGain.approver` — the grant reuses the existing M5 lifecycle and
+  bindings (intent, actor, action, target, policy binding, epoch); T10/T11
+  reuse the existing policy-mismatch and epoch denials rather than new ones.
+- `EffectPermit.approver` — the permit is the immutable carrier across the
+  boundary where grants may be pruned while terminal evidence is written
+  later.
+- `EffectLedgerRecord.approver` — a TOP-LEVEL lineage field (beside
+  semantic key, action, intent, policy, actor, target), immutable across
+  reservation and terminal records. Optional on deserialization for pre-M8
+  rows; every M8-created record supplies it.
 
 ## 7. The compiler (layer 3)
 
@@ -185,3 +241,15 @@ Qualification follows each layer in the established fault-injection style.
 | M8-T10 | Rule-granted approval under policy drift | grant denied (existing binding validation) |
 | M8-T11 | Rule-granted approval after epoch bump | grant dead (existing epoch rule) |
 | M8-T12 | Compiler rejects inexpressible clause | stored nothing; explanation surfaced |
+| M8-T13 | Matching NEVER, no token supplied | deny, rule cited, no token minted |
+| M8-T14 | Matching NEVER, valid old human token supplied | still deny — rule gate dominates tokens |
+| M8-T15 | Matching ASK | ordinary confirmation path; matched rule cited |
+| M8-T16 | No rule matches | authorization behavior byte-for-byte identical to pre-M8 |
+| M8-T17 | Below-ceiling ALLOW | no human token; execution grant carries approver=rule:id |
+| M8-T18 | Above-ceiling ALLOW | ASK with ceiling_downgraded, rule cited |
+| M8-T19 | Corrupt/missing store at gate time | human confirmation; never auto-allow |
+| M8-T20 | Rule ALLOW, policy changes before commit | existing policy_mismatch denial |
+| M8-T21 | Rule ALLOW, epoch advances before commit | existing epoch denial |
+| M8-T22 | Rule-granted reservation + terminal record | identical approver on both durable records |
+| M8-T23 | Pre-M8 ledger history | still parses and recovers (approver optional on read) |
+| M8-T24 | Human-confirmed execution | grant/permit/ledger attribution says human, never rule-derived |

@@ -384,6 +384,29 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-01 — M8 layer 1 hardening + section 6 amendment (PR #21).** The
+  post-merge fallback pass found one new blocker and one falsified design
+  assumption. F-08 (blocker): concurrent saves shared one staging file —
+  writer A's os.replace could install writer B's bytes while A reported
+  success (believing a restrictive policy installed while a permissive one
+  persisted). Each save now stages through a unique per-writer temp file;
+  a bounded retry absorbs the Windows transient sharing violation on the
+  destination; a deterministic barrier-based concurrency test proves every
+  successful replace installs that caller's payload (run 5x for flake).
+  Hardening: selector annotations became runtime contracts (exact non-empty
+  frozensets of the exact element type — strings/RiskTier enums; plain
+  strings, mutable sets, empty dimensions, empty-string elements all
+  rejected); bool timestamps rejected at construction (parity with the
+  parser — bool is numeric in Python). Doc repair: target_types added to
+  the frozen selector diagram. SECTION 6 REWRITTEN per the corrected
+  authority topology: the kernel does NOT mint ApprovalGrants — the
+  execution runtime is the single mint seam; rule-ALLOW establishes
+  approver attribution with no human carrier; the rule gate is
+  re-evaluated on every invocation including the token invocation (a new
+  NEVER defeats an old human token); attribution descends
+  grant→permit→ledger with approver as a top-level ledger lineage field
+  (optional on read for pre-M8 rows). Acceptance matrix extended
+  M8-T13..T24. Suite 1044 passed in 107.85s (0:01:47) (count from the run).
 - **2026-10-01 — M8 layer 1 review fixes (PR #20, fallback pass).** The
   external reviewer quota was unavailable, so the project's fallback rule
   applied: a first-pass plus adversarial review, seven findings (F-01..F-07,

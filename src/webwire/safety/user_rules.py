@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 from webwire.safety.models import RiskTier
 
@@ -111,9 +112,31 @@ class RuleSelector:
                 "rule selector must name its scope: at least one of "
                 "action_types/risk_tiers/target_types/target_ids/actors must be set"
             )
-        for tier in self.risk_tiers or ():
-            if not isinstance(tier, RiskTier):
-                raise ValueError(f"risk_tiers entries must be RiskTier, got {tier!r}")
+        # Annotations are not runtime contracts (PR #20 hardening): a plain
+        # string or mutable set would make matching rely on Python membership
+        # semantics instead of guaranteed set semantics. Every specified
+        # dimension must be a non-empty frozenset of the exact element type.
+        for name in ("action_types", "target_types", "target_ids", "actors"):
+            values = getattr(self, name)
+            if values is None:
+                continue
+            if type(values) is not frozenset:
+                raise ValueError(f"{name} must be a frozenset, got {type(values).__name__}")
+            if not values:
+                raise ValueError(f"{name} must not be empty — use None for unspecified")
+            for v in values:
+                if not isinstance(v, str) or not v:
+                    raise ValueError(f"{name} entries must be non-empty strings, got {v!r}")
+        if self.risk_tiers is not None:
+            if type(self.risk_tiers) is not frozenset:
+                raise ValueError(
+                    f"risk_tiers must be a frozenset, got {type(self.risk_tiers).__name__}"
+                )
+            if not self.risk_tiers:
+                raise ValueError("risk_tiers must not be empty — use None for unspecified")
+            for tier in self.risk_tiers:
+                if not isinstance(tier, RiskTier):
+                    raise ValueError(f"risk_tiers entries must be RiskTier, got {tier!r}")
 
     def matches(
         self,
@@ -160,11 +183,15 @@ class UserRule:
             raise ValueError(f"provenance must be hand_written|compiled, got {self.provenance!r}")
         if not isinstance(self.source_text, str):
             raise ValueError("source_text must be a string")
-        # F-03: NaN/±inf parse cleanly from JSON and never satisfy >=, which
-        # would make a rule effectively non-expiring. TTLs are finite and
-        # strictly forward.
-        if not (math.isfinite(self.created_at) and math.isfinite(self.expires_at)):
-            raise ValueError("created_at/expires_at must be finite timestamps")
+        # F-03 + hardening parity: NaN/±inf parse cleanly from JSON and never
+        # satisfy >=; bools are ints in Python so isfinite(True) passes while
+        # the persisted parser rejects them. Construction and parsing enforce
+        # the same contract: real, finite numbers only.
+        for _name, _v in (("created_at", self.created_at), ("expires_at", self.expires_at)):
+            if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                raise ValueError(f"{_name} must be a number, got {type(_v).__name__}")
+            if not math.isfinite(_v):
+                raise ValueError("created_at/expires_at must be finite timestamps")
         if self.expires_at <= self.created_at:
             raise ValueError("expires_at must be strictly greater than created_at")
 
@@ -240,10 +267,17 @@ class RuleStore:
             self._path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise RuleStoreError(f"could not create rule store directory: {exc!r}") from exc
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        # F-08: each save stages through a UNIQUE per-writer temporary file.
+        # A shared "<store>.tmp" let two concurrent savers cross-contaminate:
+        # writer A's os.replace could install writer B's bytes while A reports
+        # success — believing a restrictive policy was installed while a
+        # permissive one persists. Unique staging gives concurrent whole-store
+        # saves normal last-writer-wins linearization: every successful
+        # replace installs exactly that caller's payload.
+        tmp = self._path.with_name(f"{self._path.name}.{uuid4().hex}.tmp")
         try:
             tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-            os.replace(tmp, self._path)
+            _replace_with_windows_retry(tmp, self._path)
         except OSError as exc:
             try:
                 tmp.unlink(missing_ok=True)
@@ -422,3 +456,23 @@ def _selector_to_dict(sel: RuleSelector) -> dict[str, Any]:
         "target_ids": _opt_sorted(sel.target_ids),
         "actors": _opt_sorted(sel.actors),
     }
+
+
+def _replace_with_windows_retry(src: Path, dst: Path, attempts: int = 8) -> None:
+    """os.replace with a bounded retry for the Windows sharing violation.
+
+    Two concurrent atomic replaces of the same destination are safe (each
+    installs its own staged bytes or raises), but on Windows the loser can
+    transiently get PermissionError (winerror 5/32) while the winner holds
+    the target. A short bounded retry restores last-writer-wins
+    linearization so concurrent savers both succeed. Any persistent error
+    raises to the caller as usual.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.01 * (attempt + 1))

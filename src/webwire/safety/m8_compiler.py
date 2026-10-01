@@ -270,13 +270,28 @@ def _ceiling_note(
 ) -> str:
     """The honest effective-policy line (frozen spec: an above-ceiling ALLOW
     is reported as 'that will still ask'), derived from the same tier
-    vocabulary the layer-2 gate enforces at match time."""
+    vocabulary the layer-2 gate enforces at match time.
+
+    TOTAL over stored rules (F-35): an action outside the supplied registry
+    (a custom, stale, or removed capability) renders an explicit
+    unverifiable-ceiling note — a tier is never INFERRED for an unknown
+    action, and management display never raises on legal rules. The
+    compiler itself rejects unknown actions before rendering, so this path
+    exists for lifecycle rendering of already-stored rules."""
     if decision is not RuleDecision.ALLOW:
         return ""
     if selector.risk_tiers is not None:
-        tiers = set(selector.risk_tiers)
+        tiers: set[RiskTier] = set(selector.risk_tiers)
     elif selector.action_types is not None:
-        tiers = {registry.require(a)[0].derive_tier() for a in selector.action_types}
+        tiers = set()
+        for action in selector.action_types:
+            entry = registry.get(action)
+            if entry is None:
+                return (
+                    "will still ASK: ceiling not verifiable — some named "
+                    "actions are outside the active registry"
+                )
+            tiers.add(entry[0].derive_tier())
     else:
         return "actions above the allow ceiling will still ASK"
     if not tiers & ALLOW_CEILING_TIERS:

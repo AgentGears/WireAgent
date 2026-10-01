@@ -470,6 +470,41 @@ class RuleStore:
                 [rule if r.rule_id == rule.rule_id else r for r in existing]
             )
 
+    def replace_if_current(self, expected: UserRule, replacement: UserRule) -> UserRule:
+        """Compare-and-swap replacement under the mutation fence (F-34).
+
+        The owner re-confirms what they REVIEWED: the stored rule under
+        ``expected.rule_id`` must equal ``expected`` on every field —
+        decision, selector, provenance, source text, and both timestamps.
+        Any intervening change (a same-ID ALLOW→NEVER edit, a TTL tweak, a
+        deletion, corruption) raises with ZERO mutation, forcing the owner
+        to list and review the new rule again. The replacement's rule_id
+        must equal the expected one — identity is never rewritten here."""
+        if replacement.rule_id != expected.rule_id:
+            raise RuleStoreError(
+                f"replace_if_current cannot rewrite identity: expected "
+                f"{expected.rule_id!r}, replacement {replacement.rule_id!r}"
+            )
+        with self._mutation_fence():
+            existing = self._load_strict()
+            current = next(
+                (r for r in existing if r.rule_id == expected.rule_id), None
+            )
+            if current is None:
+                raise RuleStoreError(
+                    f"rule_id {expected.rule_id!r} is no longer present — "
+                    "re-confirm from a fresh listing"
+                )
+            if current != expected:
+                raise RuleStoreError(
+                    f"rule_id {expected.rule_id!r} changed since review — "
+                    "refusing to re-confirm stale authority; list the rule again"
+                )
+            self._write_replaced(
+                [replacement if r.rule_id == expected.rule_id else r for r in existing]
+            )
+        return replacement
+
     def load(self) -> list[UserRule]:
         """All stored rules — or ZERO on any invalid content (see class doc).
         Every call reads current persisted policy (F-02). Invalid bytes are

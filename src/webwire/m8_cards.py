@@ -6,22 +6,36 @@ renders the preview as a card (summary, warnings, matched rule), takes
 approve/deny, and holds the confirmation token internally. Plus the rule
 lifecycle surface the build order names: list, TTL re-confirm.
 
+The one principle carried over from Layer 3 (F-34..F-40): human-visible
+state, confirmation authority, and the mutation performed afterward are all
+bound to one immutable snapshot.
+
+- **Token custody is an API property, not a rendering property.** The
+  phase-1 result returned to the caller has the confirmation token removed
+  (from both the payload and the policy echo); the token exists only inside
+  the card, which is bound to the invoke callable that created it —
+  ``approve()`` takes no arguments and replays phase 2 through that exact
+  route. ``deny()`` invokes nothing; the kernel token simply expires
+  unconsumed (the confirmation subsystem exposes no per-token cancellation,
+  and its bounded TTL bounds the denial).
+- **The replayed payload is the phase-1 payload.** The request is
+  deep-copied at begin and deep-copied again at replay, so later mutation
+  of the caller's nested structures cannot change what is confirmed.
+- **Re-confirmation is compare-and-swap.** Listing hands back the exact
+  immutable ``UserRule`` snapshot (with the owner's original words); TTL
+  re-confirm replaces that snapshot — and ONLY that snapshot — under the
+  store's mutation fence. A same-ID edit between display and confirmation
+  conflicts with zero mutation, forcing a fresh review.
+
 Scope discipline (frozen spec): the CLI scope is exactly what cards need —
-this is not a workflow framework. Two deliberate non-features:
-
-- **No new authority.** Every decision still comes from the WriteKernel
-  through the caller's invoke callable (normally the Dispatcher); the card
-  only renders, remembers the token, and replays phase 2 on approval.
-- **No rule removal.** The build order names exactly two lifecycle
-  operations — list and TTL re-confirm. Revocation stays what it is today:
-  editing the store (or deleting it), observed by the very next match.
-
-The confirmation token is treated as the authority it is: the card holds it
-internally, never renders it, and never appears in ``repr``.
+this is not a workflow framework. Rule removal is deliberately absent: the
+build order names exactly list and TTL re-confirm; revocation remains
+editing the store, observed by the very next match.
 """
 
 from __future__ import annotations
 
+import copy
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -30,10 +44,10 @@ from super_browser.results.types import FailureCategory
 
 from webwire.envelope import ActionResult
 from webwire.safety.m8_compiler import describe_compiled_rule
+from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
 from webwire.safety.user_rules import (
     DEFAULT_RULE_TTL_S,
     RuleStore,
-    RuleStoreError,
     UserRule,
 )
 
@@ -49,16 +63,38 @@ __all__ = [
 _Invoke = Callable[[str, dict[str, Any]], Awaitable[ActionResult]]
 
 
+def _scrub_token(result: ActionResult) -> ActionResult:
+    """Return a copy of the phase-1 result with the confirmation token
+    removed from every location the kernel puts it: the payload
+    (data.data.confirmation_token) and the policy echo
+    (data.policy.confirmation_token). The raw token never leaves the card
+    surface."""
+    sanitized = copy.copy(result)
+    if not isinstance(result.data, dict):
+        return sanitized
+    data = copy.deepcopy(result.data)
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        payload.pop("confirmation_token", None)
+    policy = data.get("policy")
+    if isinstance(policy, dict) and isinstance(policy.get("confirmation_token"), dict):
+        policy["confirmation_token"] = None
+    sanitized.data = data
+    return sanitized
+
+
 class ApprovalCard:
     """One pending human decision, rendered from a phase-1 response.
 
-    The confirmation token lives inside the card and never leaves it except
-    as the phase-2 replay the owner approved. A card is single-use: approve
-    or deny consumes it, and a second decision raises."""
+    Bound to the invoke callable and the exact payload that produced phase
+    1. The confirmation token lives inside the card and never leaves it
+    except as the phase-2 replay the owner approved. A card is single-use:
+    approve or deny consumes it, and a second decision raises."""
 
     def __init__(
         self,
         *,
+        invoke: _Invoke,
         capability_name: str,
         payload: dict[str, Any],
         summary: str,
@@ -78,7 +114,8 @@ class ApprovalCard:
         self.matched_rule = matched_rule
         self.intent_hash = intent_hash
         self.expires_at = expires_at
-        self._payload = dict(payload)
+        self._invoke = invoke
+        self._payload = copy.deepcopy(payload)  # F-39: the snapshot, frozen
         self._token = token
         self._spent: Optional[str] = None
 
@@ -87,7 +124,7 @@ class ApprovalCard:
         return (
             f"ApprovalCard(capability_name={self.capability_name!r}, "
             f"summary={self.summary!r}, matched_rule={self.matched_rule!r}, "
-            f"spent={self._spent})"
+            f"spent={self._spent!r})"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,9 +147,7 @@ class ApprovalCard:
             note = ""
             if self.matched_rule.get("ceiling_downgraded"):
                 note = " (above the allow ceiling — still asks)"
-            lines.append(
-                f"matched rule: {self.matched_rule.get('matched_rule_id')}{note}"
-            )
+            lines.append(f"matched rule: {self.matched_rule.get('matched_rule_id')}{note}")
         for warning in self.warnings:
             lines.append(f"warning: {warning}")
         lines.append(f"expires at {self.expires_at:.0f}")
@@ -126,17 +161,20 @@ class ApprovalCard:
             )
         self._spent = action
 
-    async def approve(self, invoke: _Invoke) -> ActionResult:
-        """The owner approved: replay the exact original payload with the
-        held token as phase 2."""
+    async def approve(self) -> ActionResult:
+        """The owner approved: replay the exact phase-1 payload with the
+        held token, through the SAME invoke route that produced it (F-38:
+        the card is bound at begin; there is no caller-selected transport)."""
         self._consume("approved")
-        payload = dict(self._payload)
+        payload = copy.deepcopy(self._payload)
         payload["confirmation_token"] = self._token
-        return await invoke(self.capability_name, payload)
+        return await self._invoke(self.capability_name, payload)
 
     def deny(self) -> ActionResult:
-        """The owner declined: no invocation is made, the token simply
-        expires unconsumed, and the card is spent."""
+        """The owner declined: no invocation is made, the kernel token
+        expires unconsumed (the confirmation subsystem exposes no per-token
+        cancellation; its bounded TTL is the denial's bound), and the card
+        is spent."""
         self._consume("denied")
         result = action_result(
             ok=False,
@@ -153,8 +191,9 @@ class ApprovalCard:
 class CardFlow:
     """Begin a card-mediated write through any invoke callable.
 
-    ``begin`` returns the phase-1 result plus a card when human confirmation
-    is pending; a rule-ALLOW (no confirmation carrier) or a NEVER denial
+    ``begin`` returns a SANITIZED phase-1 result (token removed — F-40)
+    plus a card bound to this flow's invoke when human confirmation is
+    pending; a rule-ALLOW (no confirmation carrier) or a NEVER denial
     returns the outcome with NO card — there is nothing for an owner to
     approve."""
 
@@ -166,7 +205,7 @@ class CardFlow:
         capability_name: str,
         payload: dict[str, Any],
     ) -> tuple[ActionResult, Optional[ApprovalCard]]:
-        result = await self._invoke(capability_name, dict(payload))
+        result = await self._invoke(capability_name, copy.deepcopy(payload))
         data = result.data if isinstance(result.data, dict) else {}
         policy = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
         phase1 = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
@@ -174,6 +213,7 @@ class CardFlow:
         if policy.get("verdict") != "confirmation_required" or not token:
             return result, None
         card = ApprovalCard(
+            invoke=self._invoke,
             capability_name=capability_name,
             payload=payload,
             summary=str(phase1.get("preview", "")),
@@ -181,74 +221,93 @@ class CardFlow:
             target_url=str(phase1.get("target_url", "") or ""),
             current_state=str(phase1.get("current_state", "") or ""),
             warnings=tuple(str(w) for w in phase1.get("warnings", []) or []),
-            matched_rule=(
-                dict(phase1["rule_gate"])
-                if isinstance(phase1.get("rule_gate"), dict)
-                else None
-            ),
+            matched_rule=(dict(phase1["rule_gate"]) if isinstance(phase1.get("rule_gate"), dict) else None),
             intent_hash=str(phase1.get("intent_hash", "") or ""),
             expires_at=float(phase1.get("expires_at", 0.0) or 0.0),
         )
-        return result, card
+        return _scrub_token(result), card
 
 
 # -- rule lifecycle (frozen build order: list, TTL re-confirm) ---------------
 
 
-def describe_rule(rule: UserRule) -> str:
+def describe_rule(rule: UserRule, *, registry: RiskRegistry = DEFAULT_REGISTRY) -> str:
     """The canonical structural description of ANY stored rule — the same
     renderer the compiler's owner-confirmation uses, applied to the rule's
-    full original TTL window."""
+    full original TTL window. Total over legal rules (F-35): unknown or
+    stale action names render an explicit unverifiable-ceiling note instead
+    of raising."""
     return describe_compiled_rule(
-        rule.decision, rule.selector, rule.expires_at - rule.created_at
+        rule.decision,
+        rule.selector,
+        rule.expires_at - rule.created_at,
+        registry=registry,
     )
 
 
 class RuleCard:
-    """One listed rule with its live TTL state."""
+    """One listed rule: the display fields AND the exact immutable snapshot
+    (``rule``) that a later re-confirmation is bound to (F-34/F-36)."""
 
     def __init__(
         self,
         *,
-        rule_id: str,
-        decision: str,
-        provenance: str,
-        description: str,
+        rule: UserRule,
         remaining_seconds: float,
-        expired: bool,
+        registry: RiskRegistry = DEFAULT_REGISTRY,
     ) -> None:
-        self.rule_id = rule_id
-        self.decision = decision
-        self.provenance = provenance
-        self.description = description
+        self.rule = rule
+        self.rule_id = rule.rule_id
+        self.decision = rule.decision.value
+        self.provenance = rule.provenance
+        self.source_text = rule.source_text  # the owner's words (F-36)
         self.remaining_seconds = remaining_seconds
-        self.expired = expired
+        self.expired = remaining_seconds <= 0
+        self._registry = registry
+
+    @property
+    def description(self) -> str:
+        return describe_rule(self.rule, registry=self._registry)
+
+    def render_text(self) -> str:
+        base = f"{self.rule_id}: {self.description}"
+        if self.source_text:
+            base += f'\n  owner\'s words: "{self.source_text}"'
+        if self.expired:
+            base += "\n  EXPIRED"
+        else:
+            base += f"\n  {self.remaining_seconds:.0f}s remaining"
+        return base
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "rule_id": self.rule_id,
             "decision": self.decision,
             "provenance": self.provenance,
+            "source_text": self.source_text,
             "description": self.description,
             "remaining_seconds": self.remaining_seconds,
             "expired": self.expired,
         }
 
 
-def list_rules(store: RuleStore, *, now: Optional[float] = None) -> list[RuleCard]:
+def list_rules(
+    store: RuleStore,
+    *,
+    now: Optional[float] = None,
+    registry: RiskRegistry = DEFAULT_REGISTRY,
+) -> list[RuleCard]:
     """Every stored rule with its remaining lifetime, in store order.
 
     Reading uses the enforcement reader: a corrupt store lists as zero
-    rules (the same fail-safe every match sees), never raises."""
+    rules (the same fail-safe every match sees), never raises. Each card
+    carries the immutable rule snapshot the owner is reviewing."""
     t = now if now is not None else time.time()
     return [
         RuleCard(
-            rule_id=r.rule_id,
-            decision=r.decision.value,
-            provenance=r.provenance,
-            description=describe_rule(r),
+            rule=r,
             remaining_seconds=max(0.0, r.expires_at - t),
-            expired=r.is_expired(t),
+            registry=registry,
         )
         for r in store.load()
     ]
@@ -256,46 +315,36 @@ def list_rules(store: RuleStore, *, now: Optional[float] = None) -> list[RuleCar
 
 def reconfirm_rule(
     store: RuleStore,
-    rule_id: str,
+    expected: UserRule,
     *,
     ttl_seconds: float = DEFAULT_RULE_TTL_S,
     now: Optional[float] = None,
 ) -> UserRule:
-    """Re-confirm one rule: same rule_id, same selector and decision, a
-    fresh TTL window starting now.
+    """Re-confirm the EXACT rule the owner reviewed (F-34): compare-and-swap
+    under the store's mutation fence.
 
-    The owner's explicit call IS the confirmation. Identity (rule_id) is
-    preserved so existing approver attribution stays meaningful. The
-    replacement goes through the store's fenced update_strict: a corrupt
-    store refuses with bytes unchanged, and every OTHER rule survives in
-    place. Re-confirming an expired rule re-establishes it — that is what
-    re-confirmation means; the rule was inert, the owner chose to revive it."""
+    ``expected`` is the immutable snapshot handed out by listing (or read
+    fresh by the CLI in the same breath it displays it). The replacement
+    keeps the same rule_id — attribution identity — the same selector,
+    decision, provenance, and the owner's original words, with a fresh TTL
+    window starting now. If ANYTHING about the stored rule changed since
+    that snapshot (decision, scope, timestamps, deletion, corruption), the
+    store raises with zero mutation and the owner must list again."""
     if (
         isinstance(ttl_seconds, bool)
         or not isinstance(ttl_seconds, (int, float))
         or ttl_seconds <= 0
         or ttl_seconds > DEFAULT_RULE_TTL_S
     ):
-        raise ValueError(
-            f"ttl_seconds must be a positive number no greater than "
-            f"{DEFAULT_RULE_TTL_S:.0f}"
-        )
+        raise ValueError(f"ttl_seconds must be a positive number no greater than {DEFAULT_RULE_TTL_S:.0f}")
     t = now if now is not None else time.time()
-    # Source read through the enforcement reader: a corrupt store fails
-    # closed here as "unknown rule" (no widening path reaches the update).
-    source = next((r for r in store.load() if r.rule_id == rule_id), None)
-    if source is None:
-        raise RuleStoreError(
-            f"rule_id {rule_id!r} not found — nothing to re-confirm"
-        )
-    reconfirmed = UserRule(
-        rule_id=source.rule_id,
-        decision=source.decision,
+    replacement = UserRule(
+        rule_id=expected.rule_id,
+        decision=expected.decision,
         created_at=t,
         expires_at=t + float(ttl_seconds),
-        provenance=source.provenance,
-        source_text=source.source_text,
-        selector=source.selector,
+        provenance=expected.provenance,
+        source_text=expected.source_text,
+        selector=expected.selector,
     )
-    store.update_strict(reconfirmed)
-    return reconfirmed
+    return store.replace_if_current(expected, replacement)

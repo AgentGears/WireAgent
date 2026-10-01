@@ -410,6 +410,50 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 review pass: F-34..F-40 (snapshot binding, token
+  custody, the frozen CLI).** The review's principle, accepted: human-visible
+  state, confirmation authority, and the mutation performed afterward must
+  all bind to ONE immutable snapshot. F-34 (blocker): TTL re-confirm was
+  id-keyed only — a same-id ALLOW→NEVER edit between the owner's read and
+  the fenced write would be silently overwritten by the stale re-confirm
+  (the fence serialized the write but not the read→confirm→write
+  transaction). Fixed with compare-and-swap: RuleStore.replace_if_current
+  (expected, replacement) under the existing mutation fence — the stored
+  rule must EQUAL the reviewed snapshot on every field (decision, selector,
+  provenance, source text, timestamps); any change, deletion, or corruption
+  conflicts with zero mutation; identity can never be rewritten.
+  reconfirm_rule now takes the reviewed UserRule itself, and listing hands
+  out the exact immutable snapshot (RuleCard.rule). Regressions lock the
+  review's exact race (stale ALLOW re-confirm can never overwrite a newer
+  NEVER) and the deleted-rule conflict. F-40 (blocker): begin() returned
+  the RAW kernel phase-1 result beside the card — token custody was a
+  rendering property, not an API property. The returned result is now
+  SANITIZED (deep-copied, token removed from BOTH the payload and the
+  policy echo); the token exists only inside the card. deny() still invokes
+  nothing; the confirmation subsystem exposes no per-token cancellation, so
+  the denial's bound is the token's existing TTL — stated, not implied.
+  F-38: the card is bound to the invoke route that created it;
+  approve() is parameterless (no caller-selected phase-2 transport). F-39:
+  the payload is deep-copied at begin and again at replay — nested caller
+  mutation after phase 1 cannot change what is confirmed (regression
+  locked). F-35: lifecycle rendering is TOTAL over legal rules — an ALLOW
+  naming an action outside the active registry renders 'ceiling not
+  verifiable … outside the active registry' instead of raising (a tier is
+  never inferred for an unknown action; management display is more total
+  than enforcement configuration). F-36: RuleCard carries source_text (the
+  owner's original words) and renders them beside the canonical
+  description; re-confirm displays words + structure + new TTL. F-37
+  (blocker/spec): the frozen Card CLI is now IMPLEMENTED (m8_card_cli.py;
+  console entry `m8`): `m8 card CAPABILITY PAYLOAD [--yes|--deny]` (render,
+  and decide in-run; without a flag the card is shown and the token dies
+  with the process), `m8 rules list`, and `m8 rules reconfirm RULE_ID
+  --ttl S [--yes]` (display then CAS-replace; dry-run without --yes).
+  Dependencies are injectable — the CLI is fully tested without a live
+  session. This SUPERSEDES the previous entry's 'library-only' scope claim,
+  which silently redefined layer 4: that was wrong, the frozen build order
+  names a CLI and now has one. Rule removal remains deliberately absent
+  (the build order names exactly list + TTL re-confirm). 12 net-new tests;
+  suite 1128 (count from the run).
 - **2026-10-01 — PR #23 MERGED (04176da) + M8 LAYER 4: the card surface +
   rule lifecycle (PR pending).** Layer 3 cleared the maintainer pass at
   6fc5467 (no new blockers; the reviewer's own log check confirmed the

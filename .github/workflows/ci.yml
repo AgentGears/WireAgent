@@ -61,6 +61,10 @@ jobs:
           tests/test_m6_recovery_projector.py
           tests/test_m6_layer5_restart.py
           tests/test_m6_layer6_windows_durability.py
+          tests/test_m7_authority_owner_lock.py
+          tests/test_m7_authority_owner_lock_setup_failures.py
+          tests/test_m7_authority_owner_lock_callback_failures.py
+          tests/test_m7_authority_owner_lock_failstop_processes.py
       - name: Windows rule-store qualification (F-32)
         # The rule store's interprocess fence has a platform-specific lock
         # branch (msvcrt.locking here, flock on Linux); the full suite only

@@ -3,7 +3,7 @@
 Browser-native X/Twitter capability layer for AI agents — built on the user's
 own [Super-Browser](https://github.com/Octo-Lex/Super-Browser) SDK.
 
-**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation and qualification Layers 1–7 implemented/qualified.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, both safety-ledger durability paths qualified on actual GitHub-hosted Windows Server 2025 runners for CPython 3.11/3.12, and Layer-7 like/unlike broker/evidence mechanics qualified without making an unsupported replay-policy promotion. Like/unlike deliberately remain `ReplaySemantics.UNKNOWN` / `DurabilityPolicy.REQUIRED` because absence of residual public-engagement side effects has not been established.
+**Status: v0.3 — M5 effect-transaction boundary complete; M6 evidence-bearing reconciliation and qualification Layers 1–7 implemented/qualified; M7 cross-process authority design frozen with Layer 1 owner-lock mechanism implemented as a standalone boundary.** 20 capabilities — 7 read, 13 write — with supported remote mutations routed through scoped M5 authority and the CommitGateway, durable uncertainty governed by the EffectLedger + ReconciliationLedger composite recovery model, both safety-ledger durability paths qualified on actual GitHub-hosted Windows Server 2025 runners for CPython 3.11/3.12, and Layer-7 like/unlike broker/evidence mechanics qualified without making an unsupported replay-policy promotion. M7 Layer 1 adds canonical authority-domain identity plus a non-expiring cross-process `AuthorityOwnerLock`; it is **not yet wired into Dispatcher/recovery/browser startup**, so runtime cross-process ownership enforcement begins only with M7 Layer 2. Like/unlike deliberately remain `ReplaySemantics.UNKNOWN` / `DurabilityPolicy.REQUIRED` because absence of residual public-engagement side effects has not been established.
 
 ## Framing
 
@@ -41,8 +41,10 @@ bash scripts/check.sh           # the gate: pytest + ruff + mypy
 ```
 
 CI runs the full pytest + Ruff + mypy gate on Ubuntu with Python 3.11/3.12 and a
-separate Windows Python 3.11/3.12 durability qualification matrix for the two
-safety ledgers and their restart/re-durability boundary.
+separate Windows Python 3.11/3.12 matrix for the two M6 safety ledgers plus basic
+M7 Layer-1 owner-lock portability/exclusion coverage. The M7 tests in this matrix
+are implementation compatibility evidence only; the stronger Windows Server 2025
+cross-process ownership/IPC qualification remains M7 Layer 8.
 
 ## Install (editable, local)
 
@@ -140,6 +142,14 @@ commit-authority boundaries; leaves the browser intact. External trip: create
   a separate fsync-backed append-only safety ledger. `RecoveryProjector` joins
   the two histories, validates exact lineage/evidence, and `RecoveryGuard`
   publishes the composite result under the process-local publication fence.
+- **M7 Layer-1 owner lock is mechanism, not yet runtime enforcement.** One
+  canonical absolute state directory maps to a stable `authority.lock` rendezvous
+  and a non-expiring OS owner lock with same-process normalized-domain exclusion.
+  Lock-file existence/PID/mtime/age never grant authority, controlled release is
+  private-handle close, and acquisition has genuine fresh-process tests. Until
+  M7 Layer 2 makes this boundary mandatory around Dispatcher/recovery/browser
+  startup, the existing runtime remains governed by the documented M5/M6
+  single-process topology.
 - **Unknown outcomes are never blindly retried.** Raw `RESERVED` after restart
   and `EFFECT_UNKNOWN` block matching semantic replay until an independently
   authorized terminal reconciliation becomes known durable and published.
@@ -183,22 +193,25 @@ Pre-alpha software driving X's real DOM: selectors can churn; verification is
 bounded by what the DOM exposes. Sessions are cookie-persistence only and
 `whoami` remains the live actor-identity authority. M5 targets at-most-once
 automatic execution for fenced effects; M6 adds explicit evidence-bearing local
-reconciliation, not distributed exactly-once semantics. Effect/reconciliation
-writer coordination, browser ownership, publication fencing, and confirmation
-authority remain supported as **single-process** contracts. M6 does not provide
-a remote reconciliation service, automatic model-authorized terminal verdicts,
-terminal-verdict correction/supersession, or cryptographic protection against a
-hostile local filesystem user. Layer-6 Windows evidence is limited to the tested
-GitHub-hosted Windows Server 2025 / CPython safety-ledger environment and does not
-establish portable directory-entry, hardware-cache, network-filesystem, or whole
-browser-runtime durability. Layer-7 qualifies the tested local broker/evidence
-mechanics only; it does not establish platform-side replay safety for public
-engagement and therefore does not promote like/unlike from `UNKNOWN` /
-`REQUIRED`.
+reconciliation, not distributed exactly-once semantics. M7 now has a standalone
+Layer-1 owner-lock mechanism, but Dispatcher/recovery/browser entrypoints do not
+yet require it; therefore **runtime cross-process ownership is not claimed until
+Layer 2 integration**. Layer-1 includes targeted fork-transition regressions for
+specific descriptor publication/fail-stop seams, but this is **not** a claim that
+arbitrary multi-threaded `fork()` is generally safe; full POSIX process-creation/
+fault qualification and Windows Server 2025 cross-process ownership/IPC
+qualification remain M7 Layers 7–8. M6's Layer-6 Windows evidence remains limited
+to the tested GitHub-hosted Windows Server 2025 / CPython safety-ledger
+environment and does not establish portable directory-entry, hardware-cache,
+network-filesystem, or whole-browser-runtime durability. Layer-7 qualifies the
+tested local broker/evidence mechanics only; it does not establish platform-side
+replay safety for public engagement and therefore does not promote like/unlike
+from `UNKNOWN` / `REQUIRED`.
 
 See `docs/M5_DESIGN.md` for the frozen M5 transaction contract,
 `docs/M6_DESIGN.md` for the normative reconciliation/qualification contract,
 `docs/M6_LAYER6_WINDOWS_QUALIFICATION.md` for the bounded Windows evidence,
 `docs/M6_LAYER7_REPLAY_SAFETY_QUALIFICATION.md` for the replay-safety
-qualification result and claim ceiling, and `docs/STATE.md` for the living
-project record.
+qualification result and claim ceiling, `docs/M7_DESIGN.md` for the frozen
+cross-process ownership/IPC contract, and `docs/STATE.md` for the living project
+record.

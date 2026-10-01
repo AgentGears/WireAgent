@@ -608,15 +608,29 @@ from webwire.safety.user_rules import (
 )
 
 path, rule_id, mode = sys.argv[1], sys.argv[2], sys.argv[3]
-if mode == "slow":
+
+if mode == "hold":
+    # Patched strict load: by the time this runs, the append already holds
+    # BOTH fences and has loaded the old document. Signal READY (the stale-
+    # read window is NOW open), then hold it until the parent says release.
+    ready, release = Path(sys.argv[4]), Path(sys.argv[5])
     original = RuleStore._load_strict
 
-    def slowed(self):
+    def held(self):
         result = original(self)
-        time.sleep(1.5)  # hold this append's read-modify-write window open
+        ready.write_text("ready", encoding="utf-8")
+        deadline = time.monotonic() + 30.0
+        while not release.exists():
+            if time.monotonic() > deadline:
+                raise SystemExit("release sentinel never appeared")
+            time.sleep(0.05)
         return result
 
-    RuleStore._load_strict = slowed
+    RuleStore._load_strict = held
+else:
+    # Fast writer: announce that the append call is being made NOW, so the
+    # parent can prove it blocks (rather than not having started yet).
+    Path(sys.argv[4]).write_text("started", encoding="utf-8")
 
 RuleStore(Path(path)).append_strict(
     UserRule(
@@ -633,15 +647,24 @@ print("OK", rule_id)
 
 
 def test_F25_two_processes_never_lose_an_append(tmp_path: Path) -> None:
-    """The lost-update window across PROCESS boundaries: process A holds its
-    append window open (slow strict load); process B appends inside that
-    window. Without the interprocess fence, B's NEVER/ALLOW lands and A's
-    stale replace silently drops it; with it, B blocks until A completes.
-    Both rules must survive — two REAL processes, not threads."""
+    """A deterministic lost-update FALSIFICATION across real processes.
+
+    1. A acquires the fence, strict-loads the old document, signals READY —
+       its stale-read window is provably open.
+    2. B starts an append and signals STARTED — provably at the mutation.
+    3. B must still be alive: it blocks on the OS-level lock A holds. (With
+       no interprocess fence, B's append completes in milliseconds and this
+       assertion FAILS.)
+    4. The parent releases A; B re-loads A's result and appends.
+    5. Both rules survive. Two REAL processes, not threads."""
     import subprocess
     import sys
+    import time as _time
 
     p = tmp_path / "rules.json"
+    ready = tmp_path / "a-ready"
+    release = tmp_path / "a-release"
+    started = tmp_path / "b-started"
 
     # The child inherits the parent's exact sys.path: importing webwire.safety
     # pulls the package __init__ → dispatcher → the browser dependency, which
@@ -655,13 +678,34 @@ def test_F25_two_processes_never_lose_an_append(tmp_path: Path) -> None:
     )
 
     a = subprocess.Popen(
-        [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-a", "slow"],
+        [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-a", "hold",
+         str(ready), str(release)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
     )
-    b = subprocess.Popen(  # launched inside A's 1.5s window
-        [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-b", "fast"],
+    deadline = _time.monotonic() + 30.0
+    while not ready.exists() and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert ready.exists(), "process A never opened its stale-read window"
+
+    b = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-b", "fast",
+         str(started)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
     )
+    deadline = _time.monotonic() + 30.0
+    while not started.exists() and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert started.exists(), "process B never reached its append call"
+
+    # B is provably AT the mutation while A provably holds the fence: the
+    # interprocess lock must keep B alive-but-blocked here.
+    _time.sleep(1.0)
+    assert b.poll() is None, (
+        "B completed its append while A held the fence — the interprocess "
+        "lock is not excluding across processes"
+    )
+
+    release.write_text("go", encoding="utf-8")
     out_a, err_a = a.communicate(timeout=60)
     out_b, err_b = b.communicate(timeout=60)
     assert a.returncode == 0, err_a

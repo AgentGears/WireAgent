@@ -410,6 +410,35 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #23 third review pass: F-30..F-33 (present-null
+  widening, deterministic fence falsification, Windows lock qualification,
+  closed fences).** F-30 (blocker): the rule-field reducers used
+  payload.get() — an explicit JSON null was indistinguishable from an
+  omitted field, so {"actors": null} widened an ALLOW to every actor and
+  {"ttl_seconds": null} silently took the default lifetime. All rule fields
+  now use presence checks: omitted = unspecified; present = must satisfy
+  the declared type (null is not a list, not a tier list, not a number).
+  Regression matrix covers null for all six fields with the store proven
+  empty. F-31: the F-25 two-process test was probabilistic (a scheduler
+  could run B to completion before A entered its window, passing
+  vacuously). Rewritten as a deterministic lost-update FALSIFICATION: A
+  signals READY from inside its held fence after the strict load; B signals
+  STARTED at its append call; the parent then asserts B is still alive —
+  blocked on the OS lock (without the fence, B completes in milliseconds
+  and the assertion fails) — releases A, and both rules survive. F-32: the
+  Windows CI jobs ran only the effect/recovery durability files — the
+  msvcrt.locking branch of the interprocess fence was never qualified by
+  CI. The windows job now also runs tests/test_user_rules.py (the full
+  suite covers flock on Linux; the store suite covers msvcrt here; offline
+  imports resolve through the conftest super_browser stub). F-33: the code-
+  fence tolerance now accepts bare JSON or one COMPLETELY surrounding
+  fence; a half-open fence (opening line, no closing marker) or a bare
+  "```" rejects as unparseable_response. Evidence corrections to the
+  entries below: F-25's original qualification text overstated the
+  interleaving (now deterministic per F-31); F-27's "every mixed shape
+  rejects" claim was true of refusal/rule tagging but not of explicit null
+  in rule fields (closed by F-30). 2 new regressions; suite 1102 (count
+  from the run).
 - **2026-10-01 — PR #23 second review pass: F-25..F-29 (the process
   boundary, the byte boundary, and two strictness completions).** F-25
   (blocker): the F-19 mutation lock was process-local — two PROCESSES could

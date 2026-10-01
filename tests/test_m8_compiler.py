@@ -845,3 +845,68 @@ async def test_F28_unknown_target_vocabulary_never_proves_satisfiability(
     )
     draft = await plain.compile("ask before custom things")
     assert draft.selector.action_types == frozenset({"custom"})
+
+
+# ---------------------------------------------------------------------------
+# F-30: omitted means unspecified; PRESENT means it must satisfy the type —
+# an explicit JSON null never widens a rule
+# ---------------------------------------------------------------------------
+
+
+async def test_F30_explicit_null_never_broadens_a_rule(tmp_path: Path) -> None:
+    """Every rule field carried as explicit null must reject: null actors
+    must not become 'any actor', null target ids must not become 'every
+    target', null TTL must not silently acquire the default lifetime."""
+    for field in (
+        "action_types",
+        "risk_tiers",
+        "target_types",
+        "target_ids",
+        "actors",
+        "ttl_seconds",
+    ):
+        payload = {"decision": "allow", "action_types": ["like"], field: None}
+        with pytest.raises(RuleCompileRejected) as exc:
+            await _compiler(_FakeModel(json.dumps(payload))).compile("allow likes")
+        assert exc.value.reason == "invalid_shape", (field, exc.value.reason)
+        assert "nothing was stored" in exc.value.explanation
+    # No draft was produced for any of them: the store stays empty.
+    assert _store(tmp_path).load() == []
+
+    # Omission still means unspecified — the same fields simply absent of
+    # the null compile fine.
+    draft = await _compiler(_FakeModel(json.dumps(
+        {"decision": "allow", "action_types": ["like"]}
+    ))).compile("allow likes")
+    assert draft.selector.actors is None
+    assert draft.ttl_seconds == 604800.0
+
+
+# ---------------------------------------------------------------------------
+# F-33: the optional code fence must be COMPLETELY surrounding — bare JSON
+# or a properly closed fence; never a half-open wrapper
+# ---------------------------------------------------------------------------
+
+
+async def test_F33_half_open_code_fence_rejected(tmp_path: Path) -> None:
+    body = json.dumps({"decision": "never", "action_types": ["like"]})
+    half_open = _FakeModel(f"```json\n{body}")
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(half_open).compile("never likes")
+    assert exc.value.reason == "unparseable_response"
+    assert "unterminated code fence" in exc.value.explanation
+
+    fence_only = _FakeModel("```")
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(fence_only).compile("never likes")
+    assert exc.value.reason == "unparseable_response"
+
+    # The two accepted forms: bare JSON, and a properly CLOSED fence.
+    bare = await _compiler(_FakeModel(body)).compile("never likes")
+    fenced = await _compiler(_FakeModel(f"```json\n{body}\n```")).compile(
+        "never likes again"
+    )
+    assert bare.decision.value == "never"
+    assert fenced.decision.value == "never"
+    assert bare.selector == fenced.selector
+    assert _store(tmp_path).load() == []  # drafting still stores nothing

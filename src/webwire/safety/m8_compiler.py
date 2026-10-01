@@ -430,7 +430,12 @@ class RuleCompiler:
         self._reduce_refusal(payload)
         decision = self._reduce_decision(payload)
         selector = self._reduce_selector(payload)
-        ttl = self._reduce_ttl(payload.get("ttl_seconds"))
+        # F-30 presence semantics: omitted TTL takes the default; an explicit
+        # null is not a number and rejects downstream.
+        if "ttl_seconds" in payload:
+            ttl = self._reduce_ttl(payload["ttl_seconds"])
+        else:
+            ttl = min(DEFAULT_RULE_TTL_S, self._max_ttl)
 
         rule_id = f"compiled-{uuid.uuid4().hex[:12]}"
         validate_rule_id(rule_id)
@@ -447,16 +452,27 @@ class RuleCompiler:
         )
 
     def _parse_json(self, raw: str) -> dict[str, Any]:
-        # One deterministic mechanical tolerance: strip a surrounding code
-        # fence if present, then require strict JSON. Anything else the model
-        # emitted is unparseable, not fuzzed into shape.
+        # One deterministic mechanical tolerance (F-33): a COMPLETELY
+        # surrounding code fence — opening line AND closing marker — is
+        # stripped before strict JSON. Bare JSON is accepted; a half-open
+        # fence or any other wrapper is unparseable, not fuzzed into shape.
         text = raw.strip()
         if text.startswith("```"):
+            if not text.endswith("```"):
+                raise RuleCompileRejected(
+                    "unparseable_response",
+                    "unterminated code fence in the model output; "
+                    "nothing was stored",
+                )
             first_newline = text.find("\n")
-            if first_newline != -1:
-                text = text[first_newline + 1 :]
-            if text.rstrip().endswith("```"):
-                text = text.rstrip()[:-3]
+            if first_newline == -1:
+                raise RuleCompileRejected(
+                    "unparseable_response",
+                    "empty code fence in the model output; nothing was stored",
+                )
+            text = text[first_newline + 1 :].rstrip()
+            if text.endswith("```"):
+                text = text[:-3].rstrip()
         try:
             payload = _loads_strict(text)
         except (_StrictJsonError, json.JSONDecodeError) as exc:
@@ -548,9 +564,12 @@ class RuleCompiler:
     def _string_dim(
         self, payload: dict[str, Any], name: str
     ) -> Optional[frozenset[str]]:
-        value = payload.get(name)
-        if value is None:
+        # F-30: OMITTED means unspecified; PRESENT means it must satisfy the
+        # declared type. JSON null is not a list — an explicit null must
+        # reject, never widen the dimension to "anything".
+        if name not in payload:
             return None
+        value = payload[name]
         if not isinstance(value, list) or not value:
             raise RuleCompileRejected(
                 "invalid_shape",
@@ -576,9 +595,11 @@ class RuleCompiler:
         return frozenset(entries)
 
     def _tier_dim(self, payload: dict[str, Any]) -> Optional[frozenset[RiskTier]]:
-        value = payload.get("risk_tiers")
-        if value is None:
+        # F-30: presence semantics — explicit null rejects, only omission
+        # leaves the dimension unspecified.
+        if "risk_tiers" not in payload:
             return None
+        value = payload["risk_tiers"]
         if not isinstance(value, list) or not value:
             raise RuleCompileRejected(
                 "invalid_shape",
@@ -635,13 +656,9 @@ class RuleCompiler:
         )
 
     def _reduce_ttl(self, value: Any) -> float:
-        if value is None:
-            # Omitted TTL takes the standard default, clamped to this
-            # compiler's configured maximum (F-21: an omitted field must
-            # not bypass a tighter cap).
-            return min(DEFAULT_RULE_TTL_S, self._max_ttl)
         # bools are ints in Python (the layer-1 parse lesson): reject them
-        # rather than letting True parse as 1 second.
+        # rather than letting True parse as 1 second. An explicit JSON null
+        # is not a number either — only omission takes the default (F-30).
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise RuleCompileRejected(
                 "invalid_shape",

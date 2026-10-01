@@ -410,6 +410,38 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #23 second review pass: F-25..F-29 (the process
+  boundary, the byte boundary, and two strictness completions).** F-25
+  (blocker): the F-19 mutation lock was process-local — two PROCESSES could
+  still interleave read-modify-write windows and silently drop a NEVER
+  (atomic os.replace serializes each install, not the read-write around
+  it). Fixed: every rule-store mutation now takes a two-level fence in one
+  order — the in-process per-path RLock, then an OS-RELEASED interprocess
+  lock file (<store>.lock via flock/msvcrt.locking; the lock dies with the
+  process, so a crashed writer cannot leave a stale lock). save() and
+  append_strict() share the fence (save factored to _write_replaced);
+  enforcement reads stay lock-free. Qualified with two REAL processes:
+  process A holds its append window open (slow strict load), process B
+  appends inside it, both rules survive. F-26 (blocker): read_text's
+  UnicodeDecodeError escaped both readers' except tuples — invalid UTF-8
+  bytes raised out of the enforcement path instead of voiding to zero
+  rules. Both paths now treat undecodable bytes as corrupt content:
+  load() → zero rules (no raise); _load_strict() → RuleStoreError, bytes
+  untouched. Regression writes real invalid bytes (b"\\xff\\xfe...").
+  F-27: the model output is now TAGGED, not merged — refusal = expressible
+  false + non-empty string explanation + NO rule fields; rule = no
+  refusal fields at all. Every mixed shape (explanation floating through
+  rule fields, expressible beside a decision, refusal without its
+  explanation) rejects as invalid_shape; only the two pure shapes
+  interpret. F-28: empty RiskMeta.target_types is UNKNOWN vocabulary and
+  can never ESTABLISH satisfiability — a selector naming a custom action
+  (pre-Layer-3 constructor shape) plus any target type now rejects; naming
+  the action without a target claim remains expressible. F-29: the F-08
+  serialization rewrite kept, plus a NEW direct regression locking the
+  unique-staging invariant itself — two saves' os.replace source paths are
+  recorded and must be two distinct rules.json.<32-hex>.tmp files (never a
+  shared rules.json.tmp), a check the serialized concurrency test can no
+  longer provide. 5 new regressions; suite 1100.
 - **2026-10-01 — PR #23 review fixes: F-19..F-24 (persistence boundary,
   strict model output, exact confirmation).** F-19 (blocker): confirm()'s
   load-then-save made enforcement's fail-closed load() ([] on corrupt

@@ -748,3 +748,100 @@ def test_F24_api_key_absent_from_config_repr() -> None:
     )
     assert "hunter2-secret" not in repr(cfg)
     assert cfg.compiler_api_key == "hunter2-secret"  # still readable by the owner
+
+
+# ---------------------------------------------------------------------------
+# F-27: the model output is TAGGED — refusal or rule, never both, never mixed
+# ---------------------------------------------------------------------------
+
+
+async def test_F27_tagged_schema_rejects_mixed_shapes(tmp_path: Path) -> None:
+    """An explanation floating through rule fields, an expressible flag
+    beside a decision, a refusal without its explanation — every mixed shape
+    rejects as invalid_shape; only the two pure shapes interpret."""
+    for raw in (
+        # explanation floating through a rule (even null)
+        '{"decision": "allow", "action_types": ["like"], "explanation": null}',
+        '{"decision": "allow", "action_types": ["like"], "explanation": "why"}',
+        # expressible flag beside rule fields
+        '{"expressible": true, "decision": "allow", "action_types": ["like"], "explanation": 42}',
+        '{"expressible": false, "decision": "never", "action_types": ["like"]}',
+        # refusal without its explanation
+        '{"expressible": false}',
+        '{"expressible": false, "explanation": null}',
+        '{"expressible": false, "explanation": ""}',
+        # explanation with no refusal at all
+        '{"explanation": "floating"}',
+    ):
+        with pytest.raises(RuleCompileRejected) as exc:
+            await _compiler(_FakeModel(raw)).compile("some clause")
+        assert exc.value.reason == "invalid_shape", raw
+    assert _store(tmp_path).load() == []
+
+    # The two PURE shapes still interpret exactly.
+    refusal = _FakeModel(
+        '{"expressible": false, "explanation": "cannot name an exact action"}'
+    )
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(refusal).compile("vibe check my posts")
+    assert exc.value.reason == "inexpressible"
+    assert exc.value.explanation == "cannot name an exact action"
+    draft = await _compiler(_FakeModel(
+        json.dumps({"decision": "never", "action_types": ["like"]})
+    )).compile("never likes")
+    assert draft.decision.value == "never"
+
+
+# ---------------------------------------------------------------------------
+# F-28: unknown target vocabulary never establishes satisfiability
+# ---------------------------------------------------------------------------
+
+
+async def test_F28_unknown_target_vocabulary_never_proves_satisfiability(
+    tmp_path: Path,
+) -> None:
+    """A custom action registered with the pre-Layer-3 constructor shape has
+    target_types == () — UNKNOWN vocabulary. For a compiler whose rule is
+    'express exactly or reject', unknown cannot establish satisfiability:
+    naming that action plus any target type rejects."""
+    from webwire.safety.models import (
+        Amplification,
+        CompensationMeta,
+        Reversibility,
+        RiskMeta,
+        Visibility,
+    )
+    from webwire.safety.risk_registry import RiskRegistry
+
+    custom = RiskRegistry()
+    custom.register(
+        "custom",
+        RiskMeta(  # no target_types — the default () means unknown
+            visibility=Visibility.PRIVATE,
+            reversibility=Reversibility.REVERSIBLE,
+            amplification=Amplification.NONE,
+        ),
+        CompensationMeta(supports_compensation=False),
+    )
+    compiler = RuleCompiler(
+        _FakeModel(json.dumps(
+            {"decision": "never", "action_types": ["custom"],
+             "target_types": ["spaceship"]}
+        )),
+        registry=custom,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(RuleCompileRejected) as exc:
+        await compiler.compile("never custom the spaceship")
+    assert exc.value.reason == "inexpressible"
+    assert _store(tmp_path).load() == []
+
+    # Naming the action WITHOUT a target constraint is still expressible —
+    # the tier derives and no target claim is made.
+    plain = RuleCompiler(
+        _FakeModel(json.dumps({"decision": "ask", "action_types": ["custom"]})),
+        registry=custom,
+        clock=lambda: NOW,
+    )
+    draft = await plain.compile("ask before custom things")
+    assert draft.selector.action_types == frozenset({"custom"})

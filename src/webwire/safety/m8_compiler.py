@@ -347,6 +347,17 @@ _ALLOWED_KEYS = frozenset(
     }
 )
 
+_REFUSAL_FIELD_KEYS = ("expressible", "explanation")
+_RULE_FIELD_KEYS = (
+    "decision",
+    "action_types",
+    "risk_tiers",
+    "target_types",
+    "target_ids",
+    "actors",
+    "ttl_seconds",
+)
+
 
 class RuleCompiler:
     """Compile-time bridge from natural language to the frozen rule store."""
@@ -467,28 +478,39 @@ class RuleCompiler:
         return payload
 
     def _reduce_refusal(self, payload: dict[str, Any]) -> None:
-        """The refusal shape is strict (F-21): expressible, when present,
-        must be a real JSON boolean — "false"/0/null are malformed, not
-        refusals, and must never fall through into a rule."""
-        if "expressible" not in payload:
-            return
-        expressible = payload["expressible"]
-        if not isinstance(expressible, bool):
+        """The model output is TAGGED, not merged (F-27): exactly one of
+
+          refusal — expressible=false, explanation=<non-empty string>,
+                    and NO rule fields
+          rule    — expressible/explanation ABSENT, decision + selector
+                    fields present
+
+        Any mixed shape (an explanation floating through rule fields, an
+        expressible flag beside a decision, a refusal without its
+        explanation) rejects as invalid_shape — never interpreted."""
+        tagged_refusal = any(k in payload for k in _REFUSAL_FIELD_KEYS)
+        tagged_rule = any(k in payload for k in _RULE_FIELD_KEYS)
+        if not tagged_refusal:
+            return  # rule shape; decision is enforced downstream
+        if tagged_rule:
             raise RuleCompileRejected(
                 "invalid_shape",
-                "expressible must be a boolean; nothing was stored",
+                "mixed refusal/rule shape: refusal fields and rule fields in "
+                "one object; nothing was stored",
             )
-        if expressible is not False:
-            return
-        if "explanation" in payload:
-            explanation = payload["explanation"]
-            if not isinstance(explanation, str) or not explanation.strip():
-                raise RuleCompileRejected(
-                    "invalid_shape",
-                    "explanation must be a non-empty string; nothing was stored",
-                )
-        else:
-            explanation = "the model judged the clause inexpressible"
+        expressible = payload.get("expressible")
+        if not isinstance(expressible, bool) or expressible is not False:
+            raise RuleCompileRejected(
+                "invalid_shape",
+                "a refusal must carry expressible=false; nothing was stored",
+            )
+        explanation = payload.get("explanation")
+        if not isinstance(explanation, str) or not explanation.strip():
+            raise RuleCompileRejected(
+                "invalid_shape",
+                "a refusal must carry a non-empty explanation string; "
+                "nothing was stored",
+            )
         raise RuleCompileRejected("inexpressible", explanation)
 
     def _reduce_decision(self, payload: dict[str, Any]) -> RuleDecision:
@@ -574,17 +596,19 @@ class RuleCompiler:
         return frozenset(tiers)
 
     def _check_satisfiable(self, selector: RuleSelector) -> None:
-        """F-22: a selector provably unable to match any registered action
-        would be a silent no-op rule — reject it as inexpressible.
+        """F-22/F-28: a selector provably unable to match any registered
+        action would be a silent no-op rule — reject it as inexpressible.
 
         Provable means: across the named actions (or every registered action
         when none is named), no candidate satisfies the tier and target
         constraints together — e.g. like with target 'tweet' (like targets
         posts), or like with tier private_reversible (like deterministically
-        derives public_reversible_engagement). An action with no recorded
-        target_types imposes no provable target constraint: absence of
-        recorded truth is not permission, and unsatisfiability is only
-        asserted when the vocabulary proves it."""
+        derives public_reversible_engagement). An action with EMPTY
+        target_types has UNKNOWN target vocabulary: for a compiler whose
+        rule is 'express exactly or reject', unknown can never ESTABLISH
+        satisfiability — such a candidate proves nothing and the search
+        continues; if no candidate with known, intersecting vocabulary
+        remains, the selector rejects."""
         candidates = (
             sorted(selector.action_types)
             if selector.action_types is not None
@@ -597,12 +621,11 @@ class RuleCompiler:
                 and meta.derive_tier() not in selector.risk_tiers
             ):
                 continue
-            if (
-                selector.target_types is not None
-                and meta.target_types
-                and not (set(meta.target_types) & set(selector.target_types))
-            ):
-                continue
+            if selector.target_types is not None:
+                if not meta.target_types:
+                    continue  # unknown vocabulary cannot prove satisfiability
+                if not (set(meta.target_types) & set(selector.target_types)):
+                    continue
             return  # one satisfiable candidate is enough
         raise RuleCompileRejected(
             "inexpressible",

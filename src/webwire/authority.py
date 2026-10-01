@@ -217,10 +217,29 @@ class AuthorityOwnerLock:
             return
 
         if os.name == "posix":
+            # Symmetric with the msvcrt branch above: resolve through the
+            # runtime module dictionary so static analysis stays portable on
+            # BOTH platforms (mypy running on Windows typechecks this POSIX
+            # branch too -- os.name conditionals are not resolved per
+            # platform -- and plain fcntl attribute access fails there).
             import fcntl
 
+            posix = vars(fcntl)
+            flock = posix.get("flock")
+            lock_ex = posix.get("LOCK_EX")
+            lock_nb = posix.get("LOCK_NB")
+            if (
+                not callable(flock)
+                or not isinstance(lock_ex, int)
+                or not isinstance(lock_nb, int)
+            ):
+                raise OSError(
+                    errno.ENOSYS,
+                    "POSIX fcntl does not expose non-blocking file locking",
+                )
+
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                flock(fd, lock_ex | lock_nb)
             except OSError as exc:
                 if isinstance(exc, BlockingIOError) or exc.errno in {
                     errno.EACCES,

@@ -410,6 +410,51 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — M8 LAYER 4 LIVE-SESSION QUALIFICATION (record only; no
+  architectural changes).** Qualification executed against a real logged-in
+  X session per the directed sequence. Environment: Windows 11 (10.0.26200),
+  Python 3.12.1, live Super-Browser SDK (C:/Next-Era/Super-Browser,
+  LAUNCH mode), account **infaag**, isolated state dir with a copy of the
+  persisted session; harnesses: scripts/qualify_m8_layer4_live.py (full)
+  and scripts/qualify_m8_sc67_live.py (focused 6/7b re-verification).
+  Action types: like (executed), post_text (card-only, denied — nothing
+  published), bookmark (not executed). Real effects, disclosed: FOUR
+  public likes on ordinary home-timeline posts (one human-approved via
+  card; one standing-ALLOW auto-executed; two raw-route token-pair first
+  uses). Likes are not reversible through the current capability surface.
+  Scenarios, all PASS across the two runs: (0) whoami resolved
+  handle=infaag with resolved_handle set; (1) ASK → card rendered
+  ('Will like post …', token scrubbed from the returned result) →
+  operator approve → verdict allow, execute_ok, ledger
+  RESERVED+EFFECT_CONFIRMED approver=human; (2) ASK → deny → zero ledger
+  change, phase 2 never invoked; (3) standing ALLOW (like) → NO card,
+  one invocation, trace approver=rule:qual-allow-like, ledger pair
+  approver=rule:qual-allow-like; (4) NEVER → blocked_by=user_rule BEFORE
+  any confirmation carrier, no card, ledger unchanged; (5) above-ceiling
+  ALLOW (post) → confirmation_required with ceiling_downgraded=True and
+  the honest still-asks card note → denied, nothing posted; (6) rule
+  changed between phase 1 and phase 2 → the token-bearing replay was
+  denied by the re-evaluated NEVER (blocked_by=user_rule), zero like
+  lifecycles in the ledger; (7) malformed token denied (consumed_token),
+  reused token denied fail-closed (run A: token_bucket — the rate gate
+  precedes token validation; run B: dedupe), caller-supplied token at
+  the card boundary raised ValueError; (8) journal carries
+  '"confirmation_token":"<redacted>"' with ZERO raw token bytes, and
+  every ledger row's approver is exactly human or rule:qual-allow-like.
+  Browser-specific findings recorded: (a) whoami identity resolution is
+  INTERMITTENT across loads (~1 in 3 observed failures; hydration race —
+  markers AppTabBar_Profile_Link/SideNav_AccountSwitcher_Button present
+  when resolved; bounded retry in the harness) — a pre-existing known
+  fragility, not an M8 defect; (b) timeline permalink availability
+  varies per load (3-6 on first viewport; scroll-harvest required);
+  (c) the dedupe gate fires BEFORE preview and the rule gate on
+  same-target repeats within TTL — each phase-1+ scenario therefore
+  needed a distinct real post; (d) BEST_EFFORT actions (bookmark) write
+  no ledger rows by design, so ledger attribution evidence requires a
+  fenced action (like). The first full run recorded FAILs on scenarios
+  6/7b from harness assertion bugs (ledger rows counted instead of
+  lifecycles; an over-specified denial reason) — the product outcomes
+  were correct in that run and the focused rerun passed both cleanly.
 - **2026-10-01 — PR #24 MERGED (8d89827): M8 COMPLETE — all four layers
   of the frozen build order are on main.** The final pass found no new
   findings across the whole interaction surface (token custody,

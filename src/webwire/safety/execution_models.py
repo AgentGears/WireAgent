@@ -80,6 +80,34 @@ __all__ = [
 DEFAULT_GRANT_TTL_S = 300.0
 DEFAULT_MAX_PRECOMMIT_ATTEMPTS = 3
 
+def validate_approver(value: Any, *, allow_none: bool = False) -> None:
+    """The canonical M8 attribution vocabulary (spec 6.1 / F-12):
+
+    "human" | "rule:<non-empty-rule-id>"
+
+    Ledger deserialization additionally permits None for pre-M8 history.
+    One validator for the entire lineage: mint seam, grant construction,
+    ledger validate, and ledger parse all enforce the same domain.
+    """
+    if value is None:
+        if allow_none:
+            return
+        raise ValueError("approver must not be None")
+    if not isinstance(value, str):
+        raise ValueError(f"approver must be a string, got {type(value).__name__}")
+    if value == "human":
+        return
+    rule_id = value[len("rule:"):] if value.startswith("rule:") else ""
+    # Rule ids are opaque store identifiers: non-empty and free of whitespace
+    # (a space inside would let arbitrary prose ride the provenance field).
+    if rule_id and not any(ch.isspace() for ch in rule_id):
+        return
+    raise ValueError(
+        f"approver {value!r} is outside the attribution vocabulary "
+        "(expected 'human' or 'rule:<non-empty-rule-id>')"
+    )
+
+
 _GRANT_PUBLIC_FIELDS = frozenset(
     {
         "intent_hash",
@@ -89,6 +117,7 @@ _GRANT_PUBLIC_FIELDS = frozenset(
         "target_id",
         "policy_binding",
         "authorization_epoch",
+        "approver",
         "grant_id",
         "issued_at",
         "expires_at",
@@ -493,6 +522,7 @@ class ApprovalGrantStore:
         policy_binding: str,
         authorization_epoch: int,
     ) -> ApprovalGrant:
+        validate_approver(approver)
         grant = ApprovalGrant(
             approver=approver,
             intent_hash=intent_hash,

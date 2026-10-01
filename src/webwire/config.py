@@ -102,3 +102,7 @@ class WebWireConfig:
     def session_path(self) -> Path:
         """Absolute path to the session-persistence file (cookie jar)."""
         return self.state_dir / self.session_file
+
+    def rules_path(self) -> Path:
+        """Canonical M8 user-rule store path under the state directory."""
+        return self.state_dir / "rules.json"

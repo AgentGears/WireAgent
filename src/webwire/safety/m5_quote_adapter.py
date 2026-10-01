@@ -50,10 +50,20 @@ class M5QuoteCapabilityAdapter:
     async def preview(self, intent: WriteIntent, broker: Any) -> Any:
         return await self._capability.preview(intent, broker)
 
+    async def execute_with_approver(
+        self, intent: WriteIntent, broker: Any, approver: str
+    ) -> ActionResult:
+        """M8 attribution seam: the kernel's trusted approver value
+        reaches the single grant mint through this explicit parameter
+        (spec 6; supplied identically by every migrated adapter)."""
+        return await self._execute_with_approver(intent, broker, approver)
+
     async def execute(self, intent: WriteIntent, broker: Any) -> ActionResult:
         """Execute through M5; the legacy kernel broker is intentionally ignored."""
         del broker
-        execution = await self._executor.execute(intent)
+        execution = await self._executor.execute(
+            intent, approver=getattr(self, "_m8_approver", "human")
+        )
         if not execution.result.ok:
             self._execution.set(None)
             return execution.result
@@ -80,3 +90,12 @@ class M5QuoteCapabilityAdapter:
             "M5 quote execution did not reach EFFECT_CONFIRMED",
             failure_category=FailureCategory.UNKNOWN,
         )
+
+    async def _execute_with_approver(
+        self, intent: WriteIntent, broker: Any, approver: str
+    ) -> ActionResult:
+        self._m8_approver = approver
+        try:
+            return await self.execute(intent, broker)
+        finally:
+            self._m8_approver = "human"

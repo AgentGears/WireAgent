@@ -40,7 +40,7 @@ class _FakeQuoteExecutor:
         self.unknown = unknown
         self.calls = 0
 
-    async def execute(self, intent) -> M5QuoteExecution:  # type: ignore[no-untyped-def]
+    async def execute(self, intent, *, approver: str = "human") -> M5QuoteExecution:  # type: ignore[no-untyped-def]
         self.calls += 1
         if self.unknown:
             result = hard_failure(

@@ -369,17 +369,7 @@ class WriteKernel:
                         blocked_by="confirmation_state_unavailable",
                     ), trace, None)
                 trace["stages"].append("confirmation_required")
-                rule_info = {
-                    "matched_rule_id": rule_match.rule_id if rule_match else None,
-                    "ceiling_downgraded": rule_match.ceiling_downgraded if rule_match else False,
-                }
-                return self._finish(PolicyDecision(
-                    verdict=PolicyVerdict.CONFIRMATION_REQUIRED,
-                    reason="human approval required",
-                    risk_tier=risk_tier,
-                    intent_hash=intent.intent_hash(),
-                    confirmation_token=token,
-                ), trace, {
+                phase1_payload: dict[str, Any] = {
                     "preview": preview.summary,
                     "target_url": preview.target_url,
                     "current_state": preview.current_state,
@@ -389,8 +379,22 @@ class WriteKernel:
                     "capability_name": token.capability_name,
                     "confirmation_epoch": token.confirmation_epoch,
                     "expires_at": token.expires_at,
-                    "rule_gate": rule_info,
-                })
+                }
+                # F-13: rule_gate metadata appears ONLY when a rule matched.
+                # No match — with or without a store — is byte-for-byte the
+                # pre-M8 response (T16's written contract).
+                if rule_match is not None:
+                    phase1_payload["rule_gate"] = {
+                        "matched_rule_id": rule_match.rule_id,
+                        "ceiling_downgraded": rule_match.ceiling_downgraded,
+                    }
+                return self._finish(PolicyDecision(
+                    verdict=PolicyVerdict.CONFIRMATION_REQUIRED,
+                    reason="human approval required",
+                    risk_tier=risk_tier,
+                    intent_hash=intent.intent_hash(),
+                    confirmation_token=token,
+                ), trace, phase1_payload)
 
             # Final validation + consumption: one synchronized authority op.
             decision = self._validate_token(

@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import pytest
 
+from webwire.config import WebWireConfig
 from webwire.journal import Journal
 from webwire.safety import (
     DEFAULT_REGISTRY,
@@ -258,80 +259,7 @@ async def test_allow_requires_approver_capable_adapter(tmp_path: Path) -> None:
 # T20/T21: rule approval under policy drift / epoch bump (existing denials)
 # ---------------------------------------------------------------------------
 
-async def test_T20_allow_intent_change_invalidates(tmp_path: Path) -> None:
-    """The intent hash is bound into the confirmation/dedupe path — a
-    materially different intent between phase 1 and phase 2 denies via the
-    existing machinery (the rule-ALLOW path re-composes each invocation, and
-    a changed intent produces a different rule match or registry binding)."""
-    kernel, cap = _kernel(tmp_path, _store(tmp_path, [
-        _rule(RuleDecision.ALLOW, action_types=frozenset({"like"}), rule_id="only-like"),
-    ]))
-    r_like = await kernel.execute(cap, object(), {"post_id": "1"})
-    assert r_like.data["policy"]["verdict"] == PolicyVerdict.ALLOW.value
 
-    # Same rule store, but an action the rule does NOT cover executes as
-    # nothing-changed only through the human path (no standing approval).
-    class _PostCap(_RecordingCap):
-        name = "post_text"
-
-        def compose(self, input, actor_identity):  # type: ignore[no-untyped-def]
-            meta, comp = DEFAULT_REGISTRY.require("post")
-            return WriteIntent(
-                action_type="post", target_type="none", target_id="none",
-                risk_meta=meta, compensation=comp,
-                actor_identity=actor_identity or "infaag",
-            )
-
-    r_post = await kernel.execute(_PostCap(), object(), {"text": "hi"})
-    assert r_post.data["policy"]["verdict"] == PolicyVerdict.CONFIRMATION_REQUIRED.value
-
-
-def test_T21_epoch_advancement_kills_grants() -> None:
-    """Covered at the model level already (layer-2 tests); the kernel path
-    relies on the same grant-epoch validation. Lock the model behavior."""
-    from webwire.safety.execution_models import (
-        ApprovalGrantStore,
-        AuthorizationEpoch,
-        EffectAttempt,
-        GrantClaimDenied,
-    )
-
-    store = ApprovalGrantStore(clock=lambda: NOW)
-    epoch = AuthorizationEpoch(0)
-    grant = store.mint(
-        intent_hash="a" * 32, actor_id="u", action_type="like",
-        target_type="post", target_id="1", policy_binding="b" * 64,
-        authorization_epoch=epoch.current, approver="rule:only-like",
-    )
-    assert grant.approver == "rule:only-like"
-    epoch.bump()
-    a = EffectAttempt(grant_id=grant.grant_id)
-    with pytest.raises(GrantClaimDenied) as exc:
-        grant.claim(a.attempt_id, intent_hash="a" * 32, actor_id="u",
-                    policy_binding="b" * 64, authorization_epoch=epoch.current)
-    assert exc.value.reason == "epoch_mismatch"
-
-
-# ---------------------------------------------------------------------------
-# T22/T23/T24: durable attribution + pre-M8 compatibility + human path
-# ---------------------------------------------------------------------------
-
-def test_T22_reservation_and_terminal_share_approver(tmp_path: Path) -> None:
-    """At the ledger-record level: the reservation writer and the terminal
-    writer both stamp approver from the same grant, so a rule-granted
-    effect's two durable records agree (verifying the seam values)."""
-
-    # We verify the stamping functions directly (integration covered by the
-    # gateway suite; here we lock the lineage contract on both writers).
-    import inspect
-
-    from webwire.safety import commit_gateway as gw_mod
-    src = inspect.getsource(gw_mod)
-    assert src.count("approver=grant.approver") >= 1, "reservation writer stamps grant approver"
-    assert src.count("approver=permit.approver") >= 1, "terminal writer stamps permit approver"
-    assert src.count("approver=grant.approver") + src.count(
-        "approver=permit.approver"
-    ) >= 3, "NO_EFFECT writer also stamps"
 
 
 def test_T23_pre_m8_ledger_rows_still_parse(tmp_path: Path) -> None:
@@ -354,15 +282,277 @@ def test_T23_pre_m8_ledger_rows_still_parse(tmp_path: Path) -> None:
     assert m8.approver == "rule:allow-post"
 
 
-def test_T24_human_execution_attributes_human(tmp_path: Path) -> None:
-    """Human-confirmed executions carry approver=human end to end (never an
-    accidental rule derivation)."""
-    from webwire.safety.execution_models import ApprovalGrantStore
+# ---------------------------------------------------------------------------
+# F-14 replacements: REAL lifecycle qualification (PR #22 review)
+# ---------------------------------------------------------------------------
+
+class _FakeLikeWriteBroker:
+    """Minimal write broker matching the commit-gate protocol the scoped
+    authority expects (keyword _commit_gate, same shape as the executor
+    test fakes)."""
+
+    async def click_like(
+        self,
+        post_url: str,
+        *,
+        _commit_gate,  # type: ignore[no-untyped-def]
+    ):
+        from webwire.envelope import ok_result
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
+        return ok_result(data={"liked": post_url})
+
+
+def _live_runtime_and_ledger(tmp_path: Path):
+    """A real M5 runtime + gateway + file-backed effect ledger, so lifecycle
+    tests inspect actual durable records rather than source text. The scoped
+    authority broker needs a write broker; the tests never invoke the
+    browser through it (apply() is faked at the receipt level where needed),
+    so a None write broker satisfies construction."""
+    from webwire.safety.commit_gateway import CommitGateway
+    from webwire.safety.effect_ledger import EffectLedger
+    from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+    from webwire.safety.execution_models import AuthorizationEpoch
+    from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+    from webwire.safety.scoped_authority import ScopedAuthorityBroker
+
+    ledger = EffectLedger(path=tmp_path / "effects.ndjson")
+    kill = KillSwitch(WebWireConfig(state_dir=tmp_path, kill_env_var=None))
+    epoch = AuthorizationEpoch()
+    gateway = CommitGateway(
+        ledger=ledger,
+        kill_switch=kill,
+        authorization_epoch=epoch,
+        policies=DEFAULT_EFFECT_POLICIES,
+    )
+    scoped = ScopedAuthorityBroker(
+        write_broker=_FakeLikeWriteBroker(), commit_gateway=gateway,
+        policies=DEFAULT_EFFECT_POLICIES,
+    )
+    runtime = M5ExecutionRuntime(
+        scoped_authority=scoped,
+        commit_gateway=gateway,
+        grants=None,  # default pruning store
+        policies=DEFAULT_EFFECT_POLICIES,
+    )
+    return runtime, gateway, ledger, epoch
+
+
+def _engagement_intent(action: str = "like", target: str = "42") -> WriteIntent:
+    meta, comp = DEFAULT_REGISTRY.require(action)
+    return WriteIntent(
+        action_type=action, target_type="post", target_id=target,
+        risk_meta=meta, compensation=comp, actor_identity="infaag",
+    )
+
+
+def test_T20_real_policy_drift_denies_rule_grant(tmp_path: Path) -> None:
+    """Rule-ALLOW grant minted under policy P; the registry drifts before
+    commit; the existing binding validation denies the claim."""
+    from webwire.safety.effect_policy import EffectPolicyRegistry, EffectVerb, ReplaySemantics
+    from webwire.safety.execution_models import EffectAttempt, GrantClaimDenied
+
+    runtime, _gw, _ledger, _epoch = _live_runtime_and_ledger(tmp_path)
+    session = runtime.issue(_engagement_intent(), approver="rule:allow-like")
+    grant = session.grant
+    assert grant.approver == "rule:allow-like"
+
+    drifted = EffectPolicyRegistry()
+    drifted.register(__import__(
+        "webwire.safety.effect_policy", fromlist=["EffectPolicy"]
+    ).EffectPolicy(
+        action_type="like",
+        risk_tier=DEFAULT_REGISTRY.require("like")[0].derive_tier(),
+        allowed_effects=frozenset({EffectVerb.SET_LIKE, EffectVerb.CLEAR_LIKE, EffectVerb.REPOST}),
+        replay_semantics=ReplaySemantics.SAFE_STATE_SET,
+        durability=__import__(
+            'webwire.safety.effect_policy', fromlist=['DurabilityPolicy']
+        ).DurabilityPolicy.BEST_EFFORT,
+    ))
+    new_binding = drifted.require("like").binding_hash()
+    assert new_binding != grant.policy_binding, "drift must change the binding"
+    attempt = EffectAttempt(grant_id=grant.grant_id)
+    with pytest.raises(GrantClaimDenied):
+        grant.claim(
+            attempt.attempt_id,
+            intent_hash=grant.intent_hash, actor_id=grant.actor_id,
+            policy_binding=new_binding,  # the drifted policy
+            authorization_epoch=grant.authorization_epoch,
+        )
+
+
+def test_T21_rule_grant_dies_on_epoch_advancement(tmp_path: Path) -> None:
+    """A rule-derived approval minted through the real runtime and claimed by
+    attempt 1; the epoch advances; no re-validation can succeed."""
+    from webwire.safety.execution_models import EffectAttempt, GrantClaimDenied
+
+    runtime, gateway, _ledger, epoch = _live_runtime_and_ledger(tmp_path)
+    session = runtime.issue(_engagement_intent(), approver="rule:allow-like")
+    grant, attempt = session.grant, session.attempt
+    assert grant.approver == "rule:allow-like"
+    assert grant.claimed_by == attempt.attempt_id  # claimed at mint
+
+    epoch.bump()  # the gateway's AuthorizationEpoch object
+
+    fresh = EffectAttempt(grant_id=grant.grant_id)
+    with pytest.raises(GrantClaimDenied) as exc:
+        grant.claim(
+            fresh.attempt_id,
+            intent_hash=grant.intent_hash, actor_id=grant.actor_id,
+            policy_binding=grant.policy_binding,
+            authorization_epoch=epoch.current,
+        )
+    assert exc.value.reason == "epoch_mismatch"
+
+
+def test_T22_reservation_and_terminal_share_approver_in_durable_ledger(tmp_path: Path) -> None:
+    """Full lifecycle: a rule-granted session scopes an effect through the
+    REAL gateway; every durable record (RESERVED + terminal) in the file
+    ledger carries the identical approver. No inspect.getsource."""
+    import asyncio
+
+    runtime, gateway, ledger, epoch = _live_runtime_and_ledger(tmp_path)
+
+    async def main():
+        session = runtime.issue(_engagement_intent(), approver="rule:allow-like")
+        receipt = session.scope_effect()
+        await receipt.authority.apply()
+        session.record_confirmed(evidence={"verified": True})
+
+    asyncio.run(main())
+
+    rows = ledger.read_records()
+    approvers = {r.approver for r in rows}
+    assert approvers == {"rule:allow-like"}, (
+        f"one effect lifecycle, one approver; saw {approvers} across {len(rows)} records"
+    )
+    assert rows, "the lifecycle must durably record the effect"
+    states = {r.state.value for r in rows}
+    assert "EFFECT_CONFIRMED" in states, states
+
+
+def test_T24_human_execution_attributed_human_through_real_gateway(tmp_path: Path) -> None:
+    """Human path end-to-end: default approver through the real runtime and
+    gateway; durable records say 'human', never rule-derived."""
+    import asyncio
+
+    runtime, _gateway, ledger, _epoch = _live_runtime_and_ledger(tmp_path)
+
+    async def main():
+        session = runtime.issue(_engagement_intent())  # human default
+        receipt = session.scope_effect()
+        await receipt.authority.apply()
+        session.record_confirmed(evidence={"verified": True})
+
+    asyncio.run(main())
+    rows = ledger.read_records()
+    assert rows, "lifecycle must produce durable records"
+    assert all(r.approver == "human" for r in rows), [r.approver for r in rows]
+
+
+def test_ledger_rejects_approver_lineage_mismatch(tmp_path: Path) -> None:
+    """F-11 regression: RESERVED approver=rule:a then EFFECT_CONFIRMED
+    approver=rule:b for the same effect is a lineage contradiction."""
+    from webwire.safety.effect_ledger import EffectLedger, EffectLedgerRecord, EffectState
+
+    ledger = EffectLedger(path=tmp_path / "effects.ndjson")
+    base = dict(
+        effect_id="e1", semantic_key="k1", action_type="like",
+        intent_hash="h" * 32, policy_binding="p" * 32,
+        actor_id="u", target_type="post", target_id="1",
+    )
+    ledger.append_durable(EffectLedgerRecord(
+        state=EffectState.RESERVED, approver="rule:a", **base))
+    with pytest.raises(Exception, match="(?i)lineage|approver|contradict"):
+        ledger.append_durable(EffectLedgerRecord(
+            state=EffectState.EFFECT_CONFIRMED, approver="rule:b", **base))
+
+
+def test_ledger_changed_approver_retry_is_a_different_fact(tmp_path: Path) -> None:
+    """F-11 second consequence: an ambiguous append retried with a DIFFERENT
+    approver is a different fact, not 'the same fact'."""
+    from webwire.safety.effect_ledger import EffectLedger, EffectLedgerRecord, EffectState
+
+    ledger = EffectLedger(path=tmp_path / "effects.ndjson")
+    base = dict(
+        effect_id="e2", semantic_key="k2", action_type="like",
+        intent_hash="h" * 32, policy_binding="p" * 32,
+        actor_id="u", target_type="post", target_id="2",
+    )
+    r1 = EffectLedgerRecord(state=EffectState.RESERVED, approver="rule:a", **base)
+    r2 = EffectLedgerRecord(state=EffectState.RESERVED, approver="rule:b", **base)
+    ledger.append_durable(r1)
+    assert not ledger._same_fact(r1, r2), (
+        "a changed-approver retry must not be treated as the same fact"
+    )
+
+
+def test_grant_approver_reassignment_rejected(tmp_path: Path) -> None:
+    """F-10 regression: approver is sealed after mint."""
+    from webwire.safety.execution_models import ApprovalGrantStore, GrantStateError
 
     store = ApprovalGrantStore(clock=lambda: NOW)
-    grant = store.mint(  # the runtime's human-path default
+    grant = store.mint(
         intent_hash="a" * 32, actor_id="u", action_type="like",
         target_type="post", target_id="1", policy_binding="b" * 64,
-        authorization_epoch=0,
+        authorization_epoch=0, approver="rule:allow-like",
     )
-    assert grant.approver == "human"
+    with pytest.raises(GrantStateError):
+        grant.approver = "rule:different-rule"
+
+
+def test_invalid_approver_vocabulary_rejected_everywhere(tmp_path: Path) -> None:
+    """F-12 regression: the canonical validator rejects bad values at the
+    validator, the mint seam, and the ledger parse."""
+    from webwire.safety.effect_ledger import EffectLedgerCorruptError, EffectLedgerRecord
+    from webwire.safety.execution_models import ApprovalGrantStore, validate_approver
+
+    for bad in ("", "rule:", "rule:   ", "machine", "Human", "rule:a b"):
+        with pytest.raises(ValueError):
+            validate_approver(bad)
+    validate_approver("human")
+    validate_approver("rule:x")
+    validate_approver(None, allow_none=True)
+
+    store = ApprovalGrantStore(clock=lambda: NOW)
+    with pytest.raises(ValueError):
+        store.mint(
+            intent_hash="a" * 32, actor_id="u", action_type="like",
+            target_type="post", target_id="1", policy_binding="b" * 64,
+            authorization_epoch=0, approver="",
+        )
+
+    payload = {
+        "effect_id": "e3", "semantic_key": "k3", "state": "reserved",
+        "action_type": "like", "intent_hash": "h" * 32, "policy_binding": "p" * 32,
+        "approver": "machine",
+    }
+    with pytest.raises(EffectLedgerCorruptError):
+        EffectLedgerRecord.from_dict(payload)
+
+
+async def test_F09_live_dispatcher_installs_rule_store_and_ban_reaches_kernel(
+    tmp_path: Path,
+) -> None:
+    """F-09 regression: normal Dispatcher construction wires the RuleStore —
+    a persisted NEVER denies through the ordinary authority path."""
+    import webwire.dispatcher as disp_mod
+    from webwire.config import WebWireConfig
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    # The Dispatcher's store reads the REAL clock, so the rule must use the
+    # real-time default TTL (a NOW-anchored fixture rule would arrive expired).
+    RuleStore(cfg.rules_path()).save([
+        UserRule.create(
+            selector=RuleSelector(action_types=frozenset({"like"})),
+            decision=RuleDecision.NEVER, rule_id="live-ban",
+        ),
+    ])
+    d = disp_mod.Dispatcher(cfg)
+    assert d._write_kernel._rule_store is not None, "Dispatcher must install the store"
+    cap = _RecordingCap()
+    r = await d._write_kernel.execute(cap, object(), {"post_id": "1"})
+    assert r.data["policy"]["blocked_by"] == "user_rule"
+    assert r.data["data"]["rule_id"] == "live-ban"
+    assert not hasattr(cap, "approver_seen")

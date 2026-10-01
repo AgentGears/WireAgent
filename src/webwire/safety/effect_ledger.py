@@ -84,6 +84,12 @@ _LINEAGE_FIELDS = (
     "actor_id",
     "target_type",
     "target_id",
+    # M8 attribution is lineage (spec 6.1): a reservation and its terminal
+    # records MUST agree on who approved; a changed approver between them is
+    # a lineage contradiction, and an exact-fact retry with a different
+    # approver is a different fact. None (pre-M8 rows) is its own legacy
+    # lineage value — never silently upgraded to "human".
+    "approver",
 )
 
 
@@ -177,6 +183,13 @@ class EffectLedgerRecord:
             )
         _validate_json_value(self.details, "details")
 
+        # F-12: approver vocabulary is lineage, checked like other lineage.
+        # None is legal ONLY as the pre-M8 legacy value on read/persisted
+        # rows; records created by M8 code carry the validated vocabulary.
+        if self.approver is not None:
+            from webwire.safety.execution_models import validate_approver
+            validate_approver(self.approver)
+
     def to_jsonl(self) -> str:
         self.validate()
         payload = asdict(self)
@@ -196,8 +209,9 @@ class EffectLedgerRecord:
             if not isinstance(details_raw, dict):
                 raise ValueError("details must be an object when present")
             approver_raw = raw.get("approver")
-            if approver_raw is not None and not isinstance(approver_raw, str):
-                raise ValueError("approver must be a string when present")
+            if approver_raw is not None:
+                from webwire.safety.execution_models import validate_approver
+                validate_approver(approver_raw)
             record = cls(
                 effect_id=raw["effect_id"],
                 semantic_key=raw["semantic_key"],

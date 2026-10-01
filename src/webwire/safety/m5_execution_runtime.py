@@ -342,6 +342,8 @@ class M5ExecutionRuntime:
         kernel's rule gate or the human confirmation path — the ONLY seam
         that may set it ("human" | "rule:<rule_id>").
         """
+        from webwire.safety.execution_models import validate_approver
+        validate_approver(approver)
         frozen = deepcopy(intent)
         actor_id = frozen.actor_identity or ""
         if not actor_id:

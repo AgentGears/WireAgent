@@ -104,7 +104,7 @@ class _FakeMediaExecutor:
         self.unknown = unknown
         self.calls: list[WriteIntent] = []
 
-    async def execute(self, intent: WriteIntent) -> M5MediaExecution:
+    async def execute(self, intent: WriteIntent, *, approver: str = "human") -> M5MediaExecution:
         self.calls.append(intent)
         if self.unknown:
             result = hard_failure(

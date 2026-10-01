@@ -384,6 +384,33 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-01 — M8 layer 2 review fixes (PR #22): F-09..F-15 resolved.**
+  The maintainer-first pass at exact head 81ced8c found three blockers, two
+  contract gaps, and an evidence gap; every finding verified against the code
+  before fixing. F-09 (blocker): the live Dispatcher never installed a
+  RuleStore — the M8 gate was unreachable from ordinary construction. Fixed:
+  WebWireConfig.rules_path() added; the Dispatcher constructs ONE RuleStore at
+  the authority root and passes it to WriteKernel (long-lived instance safe —
+  Layer 1 reloads on every match); dispatcher-level regression proves a
+  persisted NEVER denies through normal construction. F-10 (blocker): approver
+  was mutable after mint (not in _GRANT_PUBLIC_FIELDS) — sealed; reassignment
+  raises GrantStateError (regression-locked). F-11 (blocker): approver was in
+  the ledger but NOT in _LINEAGE_FIELDS — reserved/terminal records could
+  disagree on provenance without contradiction, and a changed-approver retry
+  counted as the same fact. approver added to canonical lineage + exact-fact
+  identity; None remains its own legacy lineage (never upgraded to "human");
+  both regressions locked. F-12: canonical validate_approver (human |
+  rule:<non-empty whitespace-free id>, None only for pre-M8 reads) wired at
+  the validator, grant-store mint, runtime.issue, ledger validate, and ledger
+  parse; whitespace rule ids rejected. F-13: rule_gate metadata now emitted
+  ONLY when a rule matched — no-match responses are byte-for-byte pre-M8.
+  F-14: the four weak tests replaced with real lifecycle qualification
+  through a real runtime + gateway + file-backed ledger (T20 real policy
+  drift, T21 real epoch advancement, T22 durable-record approver identity,
+  T24 human end-to-end); no inspect.getsource remains. F-15: the
+  execute_with_approver seam exposed on ALL six migrated adapters (post-text,
+  reply, quote, media, delete adapters now delegate with a per-call approver).
+  Suite 1062 (count from the run).
 - **2026-10-01 — M8 LAYER 2 (PR #22): the kernel rule gate + approver
   lineage.** Implemented per the corrected section 6 topology: the gate sits
   after preview and before the confirmation section, so it is re-evaluated

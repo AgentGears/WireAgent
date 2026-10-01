@@ -451,6 +451,25 @@ class RuleStore:
                 )
             self._write_replaced(existing + [rule])
 
+    def update_strict(self, rule: UserRule) -> None:
+        """Serialized, fail-closed IN-PLACE replacement by rule_id (M8
+        layer 4's TTL re-confirm).
+
+        The fence discipline is append_strict's: strict read under both
+        fences, the rule_id must ALREADY exist (updating nothing into
+        existence), every other rule survives byte-identical in its
+        position, then one atomic replace. Corrupt/unreadable content
+        refuses with bytes unchanged."""
+        with self._mutation_fence():
+            existing = self._load_strict()
+            if not any(r.rule_id == rule.rule_id for r in existing):
+                raise RuleStoreError(
+                    f"rule_id {rule.rule_id!r} not present — nothing to update"
+                )
+            self._write_replaced(
+                [rule if r.rule_id == rule.rule_id else r for r in existing]
+            )
+
     def load(self) -> list[UserRule]:
         """All stored rules — or ZERO on any invalid content (see class doc).
         Every call reads current persisted policy (F-02). Invalid bytes are

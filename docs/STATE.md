@@ -410,6 +410,39 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #23 MERGED (04176da) + M8 LAYER 4: the card surface +
+  rule lifecycle (PR pending).** Layer 3 cleared the maintainer pass at
+  6fc5467 (no new blockers; the reviewer's own log check confirmed the
+  Windows rule-store step: 147 durability + 57 rule-store tests) and
+  squash-merged. Layer 4 implemented per frozen section 8 (m8_cards.py,
+  top-level — presentation, not enforcement): CardFlow.begin() wraps any
+  invoke callable (the Dispatcher in production) and returns a phase-1
+  result plus an ApprovalCard when human confirmation is pending; rule-ALLOW
+  and NEVER outcomes return with NO card (nothing to approve). The card
+  renders summary/target/current-state/warnings/matched-rule (+ ceiling
+  note) via to_dict()/render_text(); the confirmation token is held
+  INTERNALLY — never in to_dict, render_text, or repr. approve() replays the
+  exact original payload with the held token (phase 2); deny() invokes
+  nothing and returns a defined declined outcome; a card is single-use (the
+  spent message names which decision consumed it). No new authority: every
+  verdict still comes from the kernel through the invoke callable. Rule
+  lifecycle per the build order's named two operations: list_rules()
+  (enforcement-reader fail-safe — corrupt store lists as empty; canonical
+  descriptions via the SAME renderer the compiler's owner-confirmation
+  uses; live remaining-TTL/expired state) and reconfirm_rule() (same
+  rule_id — attribution identity preserved; same selector/decision/
+  provenance; fresh TTL starting at the re-confirm call; TTL bounded by
+  the 7-day contract; unknown id fails closed; the write goes through a NEW
+  store primitive update_strict — fenced in-place replacement, corrupt
+  store refuses with bytes unchanged, every other rule keeps its position;
+  re-confirming an expired rule re-establishes it by owner choice).
+  Integration test drives the REAL dispatcher phase-1 → card → phase-2
+  through the M5 executor + gateway (fake bookmark broker) to a executed
+  bookmark. Deliberate scope limits, stated: no rule removal (the build
+  order names exactly list + TTL re-confirm; revocation remains editing the
+  store, observed by the next match); the surface is a library (a CLI
+  program wrapping it against a live session is out of CI-qualifiable
+  scope here). 14 new tests; suite 1116.
 - **2026-10-01 — PR #23 third review pass: F-30..F-33 (present-null
   widening, deterministic fence falsification, Windows lock qualification,
   closed fences).** F-30 (blocker): the rule-field reducers used

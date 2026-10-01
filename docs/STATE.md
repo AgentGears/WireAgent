@@ -1077,8 +1077,9 @@ here. Suite 1142 (count from the run).
   qualification, integrated R39 publication races, direct R25/R44 acceptance
   evidence, a real pre-crash pending-token proof, and same-path sibling
   coordinator serialization/confirmation-domain qualification. No independent
-  the external-review automation quota was exhausted, so the frozen-design fallback was a distinct
-  recorded adversarial second pass with zero additional production findings.
+  external-review action was available because the automation quota was
+  exhausted, so the frozen-design fallback was a distinct recorded
+  adversarial second pass with zero additional production findings.
   Squash merge: `e1e3eeb679cf54b5707c88b0e82e3db4a04d9319`.
 - **2026-09-27 — M6 Layer 4 merged (PR #14).** Squash merge
   `0f40959ea74fe8f8ddeb77c5474512c5bccb9c18`. Added explicit local operator
@@ -1099,7 +1100,7 @@ here. Suite 1142 (count from the run).
 - **2026-09-25 — M5 complete; L7 merged (PR #8).** Final Layer-7 candidate
   `390967d96f87cdb483334bd8a2120629312df3f4`; CI #366 green on Python
   3.11/3.12 with **765 tests** on Python 3.11, Ruff clean, and mypy clean across
-  78 source files. an external exact-head review was unavailable because the repository
+  78 source files. An external exact-head review was unavailable because the repository
   code-review usage limit was exhausted; no external review appeared. Per the
   standing review rule, a distinct maintainer adversarial second pass substituted
   for the unavailable external reviewer and found one additional coverage defect:

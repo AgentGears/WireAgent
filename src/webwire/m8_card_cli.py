@@ -103,8 +103,7 @@ async def build_production_runtime(
         actor = getattr(session, "resolved_handle", None)
         if not actor:
             raise RuntimeError(
-                "whoami did not establish a resolved actor identity — "
-                "card writes would be refused"
+                "whoami did not establish a resolved actor identity — card writes would be refused"
             )
     except BaseException:
         try:
@@ -169,7 +168,14 @@ class CardCli:
         # and rules-only invocations of this CLI must not (F-44).
         from webwire.m8_cards import CardFlow
 
-        dispatcher = await self._runtime_factory()
+        try:
+            dispatcher = await self._runtime_factory()
+        except RuntimeError as exc:
+            # M7 Layer 2: a transient authority process (this CLI) loses the
+            # ownership race against a live runtime — surface the controlled
+            # authority_busy/start failure instead of a traceback.
+            print(f"card: {exc}", file=sys.stderr)
+            return _EXIT_ERROR
         try:
             flow = CardFlow(dispatcher.invoke)
             result, card = await flow.begin(capability, payload)

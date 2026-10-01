@@ -62,12 +62,16 @@ _M5_MEDIA_CAPABILITIES = frozenset(
         "quote_multi_image",
     }
 )
-_M5_MIGRATED_CAPABILITIES = _M5_ENGAGEMENT_CAPABILITIES | _M5_MEDIA_CAPABILITIES | {
-    _M5_POST_TEXT_CAPABILITY,
-    _M5_REPLY_CAPABILITY,
-    _M5_QUOTE_CAPABILITY,
-    _M5_DELETE_CAPABILITY,
-}
+_M5_MIGRATED_CAPABILITIES = (
+    _M5_ENGAGEMENT_CAPABILITIES
+    | _M5_MEDIA_CAPABILITIES
+    | {
+        _M5_POST_TEXT_CAPABILITY,
+        _M5_REPLY_CAPABILITY,
+        _M5_QUOTE_CAPABILITY,
+        _M5_DELETE_CAPABILITY,
+    }
+)
 
 
 class _NoMutationBroker:
@@ -96,6 +100,10 @@ class Dispatcher:
         # Dispatcher invocations so no sibling task can navigate over an owned
         # M5 composer. Same-task re-entry is allowed for trusted orchestration.
         self._invoke_lock = asyncio.Lock()
+        # M7 Layer 2: authority ownership for this state directory. Acquired
+        # first in start(), released last in stop() after admitted invocation
+        # work has drained. None while this Dispatcher holds no authority.
+        self._owner_lock: Optional[Any] = None
         self._invoke_lock_owner: Optional[asyncio.Task[Any]] = None
 
         from webwire.safety import (
@@ -169,7 +177,64 @@ class Dispatcher:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> ActionResult:
-        """Hydrate recovery authority, then install the coherent live M5 stack."""
+        """Take authority ownership, hydrate recovery, install the live stack.
+
+        M7 Layer 2: the AuthorityOwnerLock is acquired FIRST — before recovery
+        hydration and before any browser/session activity — so a losing
+        process fails before production browser or safety-write authority
+        exists. Ownership is held until the end of stop(); controlled release
+        is last and never overtakes admitted mutation work (stop() drains the
+        invocation lock before releasing)."""
+        from super_browser.results.types import FailureCategory
+
+        from webwire.authority import (
+            AuthorityBusyError,
+            AuthorityOwnerError,
+            AuthorityOwnerLock,
+        )
+        from webwire.envelope import hard_failure
+
+        if self._owner_lock is not None:
+            return hard_failure(
+                "Dispatcher.start() called while already started",
+                failure_category=FailureCategory.SECURITY,
+            )
+        try:
+            self._owner_lock = AuthorityOwnerLock(self._config.state_dir).acquire()
+        except AuthorityBusyError:
+            self._owner_lock = None
+            return hard_failure(
+                "authority_busy: another WireAgent runtime owns this state "
+                f"directory ({self._config.state_dir.resolve(strict=False)}); "
+                "stop the other runtime before starting a second one",
+                failure_category=FailureCategory.SECURITY,
+            )
+        except AuthorityOwnerError as exc:
+            self._owner_lock = None
+            return hard_failure(
+                f"could not establish authority ownership for this state directory: {exc}",
+                failure_category=FailureCategory.SECURITY,
+            )
+        try:
+            result = await self._start_locked()
+        except BaseException:
+            # A failed start must not strand the authority domain: release
+            # ownership so a retry or a successor can proceed cleanly.
+            self._release_authority()
+            raise
+        if not result.ok:
+            self._release_authority()
+        return result
+
+    def _release_authority(self) -> None:
+        """Release authority ownership (idempotent; M7 Layer 2)."""
+        lock = self._owner_lock
+        self._owner_lock = None
+        if lock is not None:
+            lock.release()
+
+    async def _start_locked(self) -> ActionResult:
+        """Start under held authority ownership (caller releases on failure)."""
         # Recovery truth is M5 authority, not diagnostics. Establish it before
         # launching/restoring a browser so corrupt or unreadable effects history
         # cannot accidentally become an empty replay-denial set.
@@ -262,6 +327,9 @@ class Dispatcher:
                 failure_category=FailureCategory.SECURITY,
             )
         async with self._invoke_lock:
+            # Drain first: acquiring the invocation lock waits for any
+            # admitted invocation to complete, and blocks new ones — no
+            # mutation work can be overtaken by shutdown (M7 Layer 2).
             self._m5_stack = None
             self._m5_canary_adapters.clear()
             self._m5_post_text_adapter = None
@@ -270,7 +338,12 @@ class Dispatcher:
             self._m5_delete_adapter = None
             self._m5_media_adapters.clear()
             self._broker = None
-            return await self._session.stop()
+            result = await self._session.stop()
+            # Controlled release is LAST: ownership outlives the browser and
+            # every drained mutation so a successor can never start while
+            # admitted work might still be in flight.
+            self._release_authority()
+            return result
 
     # -- invocation ----------------------------------------------------------
 
@@ -492,11 +565,7 @@ class Dispatcher:
             policy_decision=policy_decision,
             actions=[],
             started_monotonic=started_monotonic,
-            capability_tier=(
-                capability.tier.value
-                if capability.tier == CapabilityTier.WRITE
-                else None
-            ),
+            capability_tier=(capability.tier.value if capability.tier == CapabilityTier.WRITE else None),
             **write_facts,
         )
         return result
@@ -694,13 +763,9 @@ class Dispatcher:
             policy_info = data.get("policy") or {}
             facts = {
                 "action_type": intent_info.get("action_type"),
-                "risk_tier": (
-                    intent_info.get("risk_tier") or policy_info.get("risk_tier")
-                ),
+                "risk_tier": (intent_info.get("risk_tier") or policy_info.get("risk_tier")),
                 "dedupe_key": (
-                    intent_info.get("dedupe_key")
-                    if trace_info.get("dedupe_recorded") is True
-                    else None
+                    intent_info.get("dedupe_key") if trace_info.get("dedupe_recorded") is True else None
                 ),
             }
         return facts
@@ -709,9 +774,7 @@ class Dispatcher:
         if self._registered_default:
             return
         self._registry.register(WhoamiCapability())
-        self._registry.register(
-            HealthCapability(self._kill, self._session, self._config)
-        )
+        self._registry.register(HealthCapability(self._kill, self._session, self._config))
         self._registry.register(ReadCapability())
         self._registry.register(ReadProfileCapability())
 
@@ -791,12 +854,8 @@ class Dispatcher:
             kill_switch_tripped=self._kill.tripped(),
             policy_decision=policy_decision,
             result_ok=bool(result.ok),
-            success_category=(
-                result.success_category.value if result.success_category else None
-            ),
-            failure_category=(
-                result.failure_category.value if result.failure_category else None
-            ),
+            success_category=(result.success_category.value if result.success_category else None),
+            failure_category=(result.failure_category.value if result.failure_category else None),
             error_message=(err.message if err else None),
             browser_actions=[a.__dict__ for a in actions] if actions else [],
             duration_ms=duration_ms,

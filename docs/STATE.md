@@ -487,6 +487,32 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — M7 LAYER 2 BUILT (PR pending): ownership is mandatory
+  around the runtime authority root.** Dispatcher.start() now acquires the
+  AuthorityOwnerLock FIRST — before recovery hydration and before any
+  browser/session activity — so a losing process fails with a controlled
+  authority_busy error BEFORE production browser or safety-write authority
+  exists. A start that fails after acquisition (session refused, stack
+  failure, exception) releases ownership instead of stranding the domain;
+  double-start is refused without releasing. stop() drains the invocation
+  lock first (admitted mutation work completes; nothing is overtaken) and
+  releases ownership LAST — a successor can never start while admitted
+  work might be in flight. The m8 card CLI (a transient authority
+  process) surfaces the busy failure as a controlled one-line stderr
+  message with exit 1, no traceback. Scope boundaries stated: this wires
+  the supported Dispatcher authority root and the CLI busy path;
+  standalone recovery entrypoints, lifecycle/stale-session/crash-takeover
+  QUALIFICATION beyond the OS-release semantics proven here, and the IPC
+  topology are Layers 3+. In-process topology note: the pre-existing
+  ReconciliationCoordinator same-path registry already refuses two
+  Dispatchers on one state dir inside one process at construction —
+  Layer 2's tests therefore model the rival owner with a raw lock (the
+  real cross-process shape) and at most one Dispatcher per path per
+  process; the cross-process test uses two real subprocesses. 6 new
+  tests: loser-fails-before-browser + retry-after-release,
+  failed-start-releases, double-start-refused, drain-before-release,
+  cross-process refusal + OS-level takeover after kill, CLI busy path
+  through the real production factory. Suite 1174 (count from the run).
 - **2026-10-01 — PR #19 MERGED (edba2af): M7 LAYER 1 on main — the
   authority-owner lock is real.** Cleared through three fresh-review rounds
   after M8 completed (F-38 Windows-mypy portability via runtime module

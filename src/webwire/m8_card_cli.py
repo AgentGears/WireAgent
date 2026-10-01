@@ -96,9 +96,16 @@ async def build_production_runtime(
                 "whoami failed — no verified actor identity for card writes: "
                 f"{getattr(whoami.error, 'message', 'unknown error')}"
             )
-        handle = whoami.data.get("handle") if isinstance(whoami.data, dict) else None
-        if not handle:
-            raise RuntimeError("whoami returned no handle — no verified actor identity")
+        # F-51: verify the state the write path actually trusts, not merely
+        # response data. set_resolved_handle() strips and refuses blank
+        # values, so a whitespace-only response handle leaves resolved_handle
+        # unset — and migrated writes refuse without it.
+        actor = getattr(session, "resolved_handle", None)
+        if not actor:
+            raise RuntimeError(
+                "whoami did not establish a resolved actor identity — "
+                "card writes would be refused"
+            )
     except BaseException:
         try:
             await dispatcher.stop()
@@ -155,11 +162,23 @@ class CardCli:
             flow = CardFlow(dispatcher.invoke)
             result, card = await flow.begin(capability, payload)
             if card is None:
-                # The kernel decided without a human (rule-ALLOW, NEVER, or
-                # a drifted confirmation envelope): report, nothing to ask.
                 policy: dict[str, Any] = {}
                 if isinstance(result.data, dict) and isinstance(result.data.get("policy"), dict):
                     policy = result.data["policy"]
+                if policy.get("verdict") == "confirmation_required":
+                    # F-52: a confirmation-required response with no usable
+                    # card is a PROTOCOL failure — neither execution nor
+                    # usable approval authority exists. Fail closed with a
+                    # non-zero exit, never a success.
+                    print(
+                        "card error: the kernel asked for confirmation but "
+                        "the response carried no usable approval carrier — "
+                        "nothing was executed and nothing can be approved",
+                        file=sys.stderr,
+                    )
+                    return _EXIT_ERROR
+                # The kernel decided without a human (rule-ALLOW or NEVER):
+                # report the outcome, there is nothing to ask.
                 print(f"no card: verdict={policy.get('verdict')!r} blocked_by={policy.get('blocked_by')!r}")
                 return _EXIT_OK if result.ok else _EXIT_ERROR
 

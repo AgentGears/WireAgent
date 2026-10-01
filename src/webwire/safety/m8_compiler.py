@@ -280,20 +280,37 @@ def _ceiling_note(
     exists for lifecycle rendering of already-stored rules."""
     if decision is not RuleDecision.ALLOW:
         return ""
+    # F-49: the action vocabulary is checked WHENEVER action_types is
+    # present — independently of whether risk_tiers is also specified. A
+    # mixed action+tier selector with an unknown action is exactly as
+    # latent (currently non-executable, possibly live authority after a
+    # future registration) as an action-only selector.
+    unknown_actions = (
+        [a for a in selector.action_types if registry.get(a) is None]
+        if selector.action_types is not None
+        else []
+    )
+    if unknown_actions:
+        if selector.risk_tiers is not None:
+            return (
+                "ceiling not verifiable: some named actions are outside "
+                "the active registry — such actions are currently "
+                "non-executable; if one is later registered at a tier "
+                "matching this selector and below the standing-rule "
+                "ceiling, this ALLOW may auto-approve"
+            )
+        return (
+            "ceiling not verifiable: some named actions are outside "
+            "the active registry — such actions are currently "
+            "non-executable; if one is later registered below the "
+            "standing-rule ceiling, this ALLOW may auto-approve"
+        )
     if selector.risk_tiers is not None:
-        tiers: set[RiskTier] = set(selector.risk_tiers)
+        tiers = set(selector.risk_tiers)
     elif selector.action_types is not None:
-        tiers = set()
-        for action in selector.action_types:
-            entry = registry.get(action)
-            if entry is None:
-                return (
-                    "ceiling not verifiable: some named actions are outside "
-                    "the active registry — such actions are currently "
-                    "non-executable; if one is later registered below the "
-                    "standing-rule ceiling, this ALLOW may auto-approve"
-                )
-            tiers.add(entry[0].derive_tier())
+        tiers = {
+            registry.require(a)[0].derive_tier() for a in selector.action_types
+        }
     else:
         return "actions above the allow ceiling will still ASK"
     if not tiers & ALLOW_CEILING_TIERS:

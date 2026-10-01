@@ -28,6 +28,7 @@ from webwire.m8_card_cli import CardCli
 from webwire.m8_cards import (
     CardFlow,
     RuleCard,
+    describe_rule,
     list_rules,
     reconfirm_rule,
 )
@@ -274,10 +275,10 @@ async def test_ask_card_surfaces_matched_rule_and_warnings() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_card_drives_real_dispatcher_phase1_phase2(tmp_path: Path) -> None:
-    """End to end through the ordinary authority path: a stubbed session and
-    a fake M5 bookmark broker; the card's approve() consumes a REAL kernel
-    token through the bound route and the bookmark executes."""
+async def _live_bookmark_dispatcher(tmp_path: Path):
+    """A real Dispatcher over a stubbed session with the M5 bookmark stack
+    installed (the test_bookmark_dispatch._install_fake_m5 pattern). Returns
+    (dispatcher, fake_broker, config)."""
     from types import SimpleNamespace
 
     from webwire.config import WebWireConfig
@@ -346,6 +347,14 @@ async def test_card_drives_real_dispatcher_phase1_phase2(tmp_path: Path) -> None
     d._m5_stack = SimpleNamespace(effect_executor=executor)  # type: ignore[assignment]
     d._m5_canary_adapters.clear()
     d._write_kernel._write_broker_factory = lambda: object()  # type: ignore[attr-defined]
+    return d, fake, cfg
+
+
+async def test_card_drives_real_dispatcher_phase1_phase2(tmp_path: Path) -> None:
+    """End to end through the ordinary authority path: the card's approve()
+    consumes a REAL kernel token through the bound route and the bookmark
+    executes."""
+    d, fake, _cfg = await _live_bookmark_dispatcher(tmp_path)
 
     flow = CardFlow(d.invoke)
     r1, card = await flow.begin("bookmark_post", {"post_url": "https://x.com/jack/status/20"})
@@ -358,6 +367,64 @@ async def test_card_drives_real_dispatcher_phase1_phase2(tmp_path: Path) -> None
     assert r2.data["policy"]["verdict"] == "allow"
     assert r2.data["trace"]["execute_ok"] is True
     assert fake.bookmark_clicks == ["https://x.com/jack/status/20"]
+
+
+async def test_F48_caller_supplied_token_rejected_before_anything_runs() -> None:
+    """The card entry point never accepts pre-existing confirmation
+    authority: a payload carrying confirmation_token would make the kernel
+    treat begin() as PHASE 2 and execute before any card or decision.
+    Rejected — not stripped — with ZERO invocations."""
+    invoke = _FakeInvoke([])
+    with pytest.raises(ValueError, match="caller-supplied"):
+        await CardFlow(invoke).begin("like_post", {"post_id": "1", "confirmation_token": "T"})
+    assert invoke.calls == []
+
+
+async def test_F50_live_token_never_reaches_the_journal(tmp_path: Path) -> None:
+    """The stronger F-50 regression: a REAL kernel token, a NEVER installed
+    after phase 1 denies BEFORE the confirmation gate consumes it, and the
+    exact token bytes never appear in the audit journal — the record is
+    redacted by key."""
+    from webwire.safety.user_rules import RuleSelector, UserRule
+
+    d, _fake, cfg = await _live_bookmark_dispatcher(tmp_path)
+    payload = {"post_url": "https://x.com/jack/status/20"}
+
+    # Phase 1 through the raw dispatcher (the caller's own authority here):
+    # a REAL confirmation token is minted.
+    r1 = await d.invoke("bookmark_post", dict(payload))
+    assert r1.data["policy"]["verdict"] == "confirmation_required"
+    token = r1.data["data"]["confirmation_token"]
+
+    # A NEVER arrives after phase 1 — the rule gate runs BEFORE token
+    # validation and consumption (T14 ordering).
+    from webwire.safety.user_rules import RuleDecision, RuleStore
+
+    RuleStore(cfg.rules_path()).save(
+        [
+            UserRule.create(
+                selector=RuleSelector(action_types=frozenset({"bookmark"})),
+                decision=RuleDecision.NEVER,
+                rule_id="late-ban",
+            ),
+        ]
+    )
+    r2 = await d.invoke("bookmark_post", {**payload, "confirmation_token": token})
+    assert r2.data["policy"]["blocked_by"] == "user_rule"
+
+    # The denial happened BEFORE consumption: remove the ban and the SAME
+    # token still carries phase 2 to execution.
+    cfg.rules_path().unlink()
+    r3 = await d.invoke("bookmark_post", {**payload, "confirmation_token": token})
+    assert r3.data["policy"]["verdict"] == "allow"
+    assert r3.data["trace"]["execute_ok"] is True
+
+    # The journal is audit data, never an authority carrier: the exact
+    # token bytes are absent, and the denial record redacts by key (the
+    # journal serializes compact — no space after the colon).
+    journal = cfg.journal_path().read_text(encoding="utf-8")
+    assert token not in journal, "a live token must never be journaled verbatim"
+    assert '"confirmation_token":"<redacted>"' in journal
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +495,33 @@ def test_F35_listing_is_total_over_unknown_actions(tmp_path: Path) -> None:
     assert "ASK" not in cards[1].description
 
 
+def test_F49_mixed_action_tier_selector_gets_the_latent_warning() -> None:
+    """F-49: the action vocabulary is checked even when risk_tiers is also
+    specified. A stored ALLOW naming an unknown action WITH an explicit tier
+    is just as latent — currently non-executable, possibly live authority
+    after a future registration — and the note says the tier must MATCH the
+    selector too."""
+    from webwire.safety.models import RiskTier
+
+    mixed = UserRule(
+        rule_id="mixed",
+        decision=RuleDecision.ALLOW,
+        created_at=NOW,
+        expires_at=NOW + 3600.0,
+        selector=RuleSelector(
+            action_types=frozenset({"future_action"}),
+            risk_tiers=frozenset({RiskTier.PRIVATE_REVERSIBLE}),
+        ),
+        source_text="",
+    )
+    desc = describe_rule(mixed)
+    assert "outside the active registry" in desc
+    assert "currently non-executable" in desc
+    assert "at a tier matching this selector" in desc
+    assert "may auto-approve" in desc
+    assert "ASK" not in desc.split("—")[0], "no unconditional ASK promise"
+
+
 def test_list_rules_on_corrupt_store_fails_safe_to_empty(tmp_path: Path) -> None:
     p = tmp_path / "rules.json"
     p.write_bytes(b"\xff\xfe broken")
@@ -464,8 +558,9 @@ def test_F34_stale_reconfirm_cannot_overwrite_a_newer_never(tmp_path: Path) -> N
     store.save([_stored_rule("r1", RuleDecision.ALLOW)])
     reviewed = store.load()[0]  # the owner saw ALLOW
 
-    # Another writer flips the same id to NEVER (fenced update).
-    store.update_strict(_stored_rule("r1", RuleDecision.NEVER))
+    # Another writer flips the same id to NEVER (deliberate whole-document
+    # replacement — the only sanctioned unconditional write).
+    store.save([_stored_rule("r1", RuleDecision.NEVER)])
 
     with pytest.raises(RuleStoreError, match="changed since review"):
         reconfirm_rule(store, reviewed, ttl_seconds=3600.0, now=NOW)
@@ -715,6 +810,29 @@ async def test_cli_card_without_runtime_errors(tmp_path: Path, capsys) -> None:
     assert "no live runtime" in capsys.readouterr().err
 
 
+async def test_F52_malformed_confirmation_required_is_an_error(tmp_path, capsys) -> None:
+    """F-52: a confirmation-required response with no usable card is a
+    PROTOCOL failure — neither execution nor approval authority exists, so
+    the CLI must exit non-zero, never success."""
+    drifted = ok_result(
+        data={
+            "policy": {
+                "verdict": "confirmation_required",
+                "confirmation_token": {"token": "tok-x"},
+            },
+            "data": {"preview": "Will like 1"},
+            "trace": {},
+        }
+    )
+    runtime = _FakeRuntime([drifted])
+    code = await _cli(tmp_path, runtime_factory=_ready(runtime)).run(["card", "like_post", '{"post_id": "1"}'])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "no usable approval carrier" in err
+    assert runtime.calls == ["invoke:like_post"]  # phase 2 never ran
+    assert runtime.stopped
+
+
 # ---------------------------------------------------------------------------
 # F-41: the PRODUCTION runtime factory wiring
 # ---------------------------------------------------------------------------
@@ -723,11 +841,12 @@ async def test_cli_card_without_runtime_errors(tmp_path: Path, capsys) -> None:
 class _RecordingDispatcher:
     """Injectable dispatcher double: records lifecycle order, can fail."""
 
-    def __init__(self, *, whoami_ok=True, whoami_handle="@owner", start_ok=True) -> None:
+    def __init__(self, *, whoami_ok=True, whoami_handle="@owner", start_ok=True, session=None) -> None:
         self.order: list[str] = []
         self._whoami_ok = whoami_ok
         self._whoami_handle = whoami_handle
         self._start_ok = start_ok
+        self.session = session
         self.stopped = False
 
     async def start(self):
@@ -751,6 +870,11 @@ class _RecordingDispatcher:
                 r.ok = False
                 r.error = type("E", (), {"message": "not logged in"})()
                 return r
+            # Mirror the real post-whoami hook: set_resolved_handle strips
+            # and refuses blank values, so a whitespace handle leaves the
+            # session's actor state unset (F-51).
+            if self._whoami_handle.strip():
+                self.session.resolved_handle = self._whoami_handle.strip()
             return ok_result(data={"handle": self._whoami_handle})
         raise AssertionError(f"unexpected invoke {capability}")
 
@@ -761,7 +885,7 @@ class _RecordingDispatcher:
 
 class _FakeSession:
     def __init__(self, config) -> None:
-        pass
+        self.resolved_handle = None
 
 
 async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
@@ -772,28 +896,38 @@ async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
     made: list = []
 
     def dispatcher_factory(config, *, session_manager):
-        d = _RecordingDispatcher()
+        d = _RecordingDispatcher(session=session_manager)
         made.append(d)
         return d
 
-    # Success: start → whoami → verified handle; NOT stopped by the factory.
-    await build_production_runtime(
-        cfg, dispatcher_factory=dispatcher_factory, session_factory=_FakeSession
-    )
+    # Success: start → whoami → resolved actor; NOT stopped by the factory.
+    await build_production_runtime(cfg, dispatcher_factory=dispatcher_factory, session_factory=_FakeSession)
     assert made[0].order == ["start", "invoke:whoami"]
+    assert made[0].session.resolved_handle == "@owner"
     assert made[0].stopped is False, "the caller owns stop()"
 
     def bad_factory(config, *, session_manager):
-        return _RecordingDispatcher(whoami_ok=False)
+        return _RecordingDispatcher(whoami_ok=False, session=session_manager)
 
     with pytest.raises(RuntimeError, match="no verified actor"):
         await build_production_runtime(cfg, dispatcher_factory=bad_factory, session_factory=_FakeSession)
 
     def handleless_factory(config, *, session_manager):
-        return _RecordingDispatcher(whoami_handle="")
+        return _RecordingDispatcher(whoami_handle="", session=session_manager)
 
-    with pytest.raises(RuntimeError, match="no handle"):
+    with pytest.raises(RuntimeError, match="resolved actor"):
         await build_production_runtime(cfg, dispatcher_factory=handleless_factory, session_factory=_FakeSession)
+
+    # F-51: a whitespace-only response handle is TRUTHY response data but
+    # set_resolved_handle refuses it — the factory must verify the actor
+    # state the write path trusts, and that state is unset here.
+    def blank_handle_factory(config, *, session_manager):
+        return _RecordingDispatcher(whoami_handle="   ", session=session_manager)
+
+    with pytest.raises(RuntimeError, match="resolved actor"):
+        await build_production_runtime(
+            cfg, dispatcher_factory=blank_handle_factory, session_factory=_FakeSession
+        )
 
     start_failed = _RecordingDispatcher(start_ok=False)
 

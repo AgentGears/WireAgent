@@ -410,6 +410,42 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 third review pass: F-48..F-53 (the card entry
+  point and the audit boundary).** F-48 (blocker): CardFlow.begin()
+  forwarded the caller's payload unchanged, so a caller holding a valid
+  token could pass it INSIDE begin() — the kernel interprets that as phase
+  2 and the mutation executes before any card is rendered or any decision
+  asked. The card entry point now REJECTS a caller-supplied
+  confirmation_token before invoking anything (reject, not strip — silent
+  stripping changes caller intent); regression proves ZERO invocations.
+  F-50: policy gates run BEFORE token consumption, so a NEVER installed
+  after phase 1 denies while the token is still LIVE — and the Dispatcher
+  journaled the token verbatim (the journal is audit data, not an authority
+  carrier). _redact_input now redacts confirmation_token BY KEY
+  irrespective of value; the regression uses a REAL kernel token, denies
+  phase 2 pre-consumption via a late NEVER, proves the SAME token still
+  executes after the ban is removed (pre-consumption denial), and asserts
+  the exact token bytes never appear in the journal while the redacted
+  marker does. F-49: the unknown-action vocabulary check is now
+  ORTHOGONAL to risk_tiers — a mixed action+tier selector naming an
+  unknown action gets the latent warning too, with the precise conditional
+  ("if later registered at a tier matching this selector and below the
+  standing-rule ceiling, this ALLOW may auto-approve"). F-51: the
+  production runtime now verifies session.resolved_handle after whoami —
+  the state the write path actually trusts — not merely the response data
+  (a whitespace-only response handle is truthy data but set_resolved_handle
+  refuses it; regression covers the blank case). F-52: a
+  confirmation-required response with no usable card is now an explicit
+  protocol error in the CLI (non-zero exit, stderr message); it previously
+  exited 0 via the generic no-card path. F-53: update_strict() REMOVED —
+  an unconditional same-ID replace is exactly the stale-write shape F-34
+  invalidated, left behind as an attractive footgun; replace_if_current is
+  the only lifecycle mutation. Evidence corrections to the entries below:
+  the F-41..F-47 entry's claim that "the token exists only inside the
+  card" overstated custody (F-48: callers could previously SUPPLY their
+  own; F-50: live tokens could reach the journal — both now closed), and
+  "F-45 closed" was premature for mixed selectors (closed by F-49).
+  Suite 1139 (count from the run).
 - **2026-10-01 — PR #24 second review pass: F-41..F-47 (the human/CLI
   boundary).** The review's framing, accepted: the store CAS was the
   strongest part; the remaining blockers were concentrated exactly where

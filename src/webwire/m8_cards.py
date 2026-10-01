@@ -210,6 +210,19 @@ class CardFlow:
         capability_name: str,
         payload: dict[str, Any],
     ) -> tuple[ActionResult, Optional[ApprovalCard]]:
+        # F-48: the card entry point never accepts pre-existing human
+        # confirmation authority. A caller-supplied confirmation_token makes
+        # the kernel treat this as PHASE 2 — the mutation would execute
+        # before a card is ever rendered or a decision asked. Reject before
+        # invoking anything (reject, not strip: silently stripping would
+        # change caller intent).
+        if "confirmation_token" in payload:
+            raise ValueError(
+                "CardFlow.begin() received a caller-supplied "
+                "confirmation_token: confirmation authority may only be "
+                "minted by phase 1 and held inside the card — remove the "
+                "field and let the card mediate phase 2"
+            )
         # F-43: freeze the request BEFORE the first await. Phase 1 and the
         # token describe this snapshot; the card replays this snapshot.
         request = copy.deepcopy(payload)

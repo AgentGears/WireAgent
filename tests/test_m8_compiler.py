@@ -353,8 +353,11 @@ def test_model_from_config_requires_explicit_opt_in() -> None:
 def test_enforcement_path_never_imports_the_compiler() -> None:
     """Frozen spec: no model executes during matching, gating, or approval.
     Runtime import-graph evidence from a clean interpreter: importing the
-    store, the kernel, and the dispatcher must never pull this module in."""
-    repo_root = Path(__file__).resolve().parents[1]
+    store, the kernel, and the dispatcher must never pull this module in.
+
+    The child inherits the parent's exact sys.path (webwire AND its browser
+    dependency resolve wherever the test process found them — a bare
+    PYTHONPATH=src misses conftest/dependency paths and fails on CI)."""
     code = (
         "import sys\n"
         "import webwire.safety.user_rules\n"
@@ -364,8 +367,12 @@ def test_enforcement_path_never_imports_the_compiler() -> None:
         "'compiler leaked into the enforcement path'\n"
         "print('OK')\n"
     )
+    parent_path = [os.path.abspath(p) for p in sys.path if p]
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    inherited = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        parent_path + ([inherited] if inherited else [])
+    )
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,

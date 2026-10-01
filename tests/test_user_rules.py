@@ -425,11 +425,16 @@ def test_save_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
 
 def test_F08_concurrent_saves_no_cross_contamination(tmp_path: Path,
                                                       monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deterministic barrier interleave: both writers stage BEFORE either
-    replaces. Every successful os.replace must install that CALLER's payload
-    — with a shared staging file, writer A's replace installs writer B's
-    bytes while A reports success (and B's replace fails on the vanished
-    tmp). Unique staging gives last-writer-wins linearization instead."""
+    """F-08's locked property under the F-19 serialization: every successful
+    os.replace installs exactly that CALLER'S payload — with a shared staging
+    file, writer A's replace installs writer B's bytes while A reports
+    success. The original forced-simultaneity barrier (both writers stage
+    before either replaces) is no longer reachable through save(): F-19 gave
+    same-path mutations a process-wide lock, so concurrent saves serialize —
+    a strictly stronger guarantee. Unique staging remains load-bearing (and
+    is still asserted): each install carries its own writer's bytes, both
+    saves succeed, the final file holds exactly one complete payload, and no
+    staging litter remains."""
     import threading
 
     import webwire.safety.user_rules as ur_mod
@@ -437,19 +442,17 @@ def test_F08_concurrent_saves_no_cross_contamination(tmp_path: Path,
     p = tmp_path / "rules.json"
     marker = threading.local()
     real_replace = os.replace
-    barrier = threading.Barrier(2, timeout=10)
     captured: list[tuple[str, bytes]] = []
     lock = threading.Lock()
 
     def slow_replace(src, dst):
         with open(src, "rb") as f:
             data = f.read()
-        # Gate only the FIRST attempt per thread — the Windows retry helper
-        # re-enters os.replace on transient sharing violations, and those
-        # retries must pass straight through.
+        # Capture only the FIRST attempt per thread — the Windows retry
+        # helper re-enters os.replace on transient sharing violations, and
+        # those retries must pass straight through.
         if not getattr(marker, "entered", False):
             marker.entered = True
-            barrier.wait()  # both payloads staged before either installs
             with lock:
                 captured.append((marker.owner, data))
         return real_replace(src, dst)
@@ -520,3 +523,196 @@ def test_bool_timestamps_rejected_at_construction(bad_created: float, bad_expire
                  created_at=bad_created, expires_at=bad_expires,
                  selector=RuleSelector(action_types=frozenset({"x"})))
 
+
+
+# ---------------------------------------------------------------------------
+# F-25/F-26/F-29 (PR #23 second-pass review): the filesystem policy authority
+# is shared across processes — and its fail-safe must survive invalid bytes.
+# ---------------------------------------------------------------------------
+
+
+class _assert_no_raise:
+    """Context manager that fails the test if ANY exception escapes."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        assert exc_type is None, f"load() leaked {exc_type.__name__}: {exc}"
+        return True
+
+
+def test_F26_invalid_utf8_is_fail_safe_everywhere(tmp_path: Path) -> None:
+    """Actual invalid BYTES (not malformed-but-valid JSON): the enforcement
+    reader voids to zero rules without raising; the strict mutation reader
+    refuses with bytes unchanged."""
+    p = tmp_path / "rules.json"
+    raw = b'\xff\xfe{"rules": []}'  # BOM-ish garbage — not decodable UTF-8
+    p.write_bytes(raw)
+    store = RuleStore(p)
+
+    with _assert_no_raise():
+        assert store.load() == [], "invalid bytes must mean zero rules, no raise"
+
+    with pytest.raises(RuleStoreError, match="refusing mutation"):
+        store.append_strict(
+            _rule(RuleDecision.ALLOW, action_types=frozenset({"like"}), rule_id="a1")
+        )
+    assert p.read_bytes() == raw, "a refused mutation must not touch a byte"
+
+
+def test_F29_unique_per_save_staging_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F-08's actual invariant, locked directly: every save stages through
+    its OWN unique file. The serialized-save concurrency test can no longer
+    catch a regression back to a shared 'rules.json.tmp' (the mutation fence
+    serializes same-path writers), so the staging path shape is asserted
+    here instead."""
+    import webwire.safety.user_rules as ur_mod
+
+    p = tmp_path / "rules.json"
+    real_replace = os.replace
+    staged: list[str] = []
+
+    def capture_replace(src, dst):
+        staged.append(os.path.basename(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(ur_mod.os, "replace", capture_replace)
+    store = RuleStore(p)
+    store.save([_rule(RuleDecision.NEVER, action_types=frozenset({"like"}), rule_id="n1")])
+    store.save([_rule(RuleDecision.ALLOW, action_types=frozenset({"like"}), rule_id="a1")])
+
+    unique = list(dict.fromkeys(staged))  # the Windows retry helper may re-enter
+    assert len(unique) == 2, staged
+    for name in unique:
+        assert name != "rules.json.tmp", "regressed to a shared staging file"
+        assert name.startswith("rules.json.") and name.endswith(".tmp")
+        uuid_part = name[len("rules.json.") : -len(".tmp")]
+        assert len(uuid_part) == 32 and all(c in "0123456789abcdef" for c in uuid_part)
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+_CHILD_APPEND = """
+import sys
+import time
+from pathlib import Path
+
+import webwire.safety.user_rules as ur
+from webwire.safety.user_rules import (
+    RuleDecision,
+    RuleSelector,
+    RuleStore,
+    UserRule,
+)
+
+path, rule_id, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+
+if mode == "hold":
+    # Patched strict load: by the time this runs, the append already holds
+    # BOTH fences and has loaded the old document. Signal READY (the stale-
+    # read window is NOW open), then hold it until the parent says release.
+    ready, release = Path(sys.argv[4]), Path(sys.argv[5])
+    original = RuleStore._load_strict
+
+    def held(self):
+        result = original(self)
+        ready.write_text("ready", encoding="utf-8")
+        deadline = time.monotonic() + 30.0
+        while not release.exists():
+            if time.monotonic() > deadline:
+                raise SystemExit("release sentinel never appeared")
+            time.sleep(0.05)
+        return result
+
+    RuleStore._load_strict = held
+else:
+    # Fast writer: announce that the append call is being made NOW, so the
+    # parent can prove it blocks (rather than not having started yet).
+    Path(sys.argv[4]).write_text("started", encoding="utf-8")
+
+RuleStore(Path(path)).append_strict(
+    UserRule(
+        rule_id=rule_id,
+        decision=RuleDecision.ALLOW,
+        created_at=1.0,
+        expires_at=9999999999.0,
+        selector=RuleSelector(action_types=frozenset({"like"})),
+        source_text="child process",
+    )
+)
+print("OK", rule_id)
+"""
+
+
+def test_F25_two_processes_never_lose_an_append(tmp_path: Path) -> None:
+    """A deterministic lost-update FALSIFICATION across real processes.
+
+    1. A acquires the fence, strict-loads the old document, signals READY —
+       its stale-read window is provably open.
+    2. B starts an append and signals STARTED — provably at the mutation.
+    3. B must still be alive: it blocks on the OS-level lock A holds. (With
+       no interprocess fence, B's append completes in milliseconds and this
+       assertion FAILS.)
+    4. The parent releases A; B re-loads A's result and appends.
+    5. Both rules survive. Two REAL processes, not threads."""
+    import subprocess
+    import sys
+    import time as _time
+
+    p = tmp_path / "rules.json"
+    ready = tmp_path / "a-ready"
+    release = tmp_path / "a-release"
+    started = tmp_path / "b-started"
+
+    # The child inherits the parent's exact sys.path: importing webwire.safety
+    # pulls the package __init__ → dispatcher → the browser dependency, which
+    # resolves wherever the TEST process found it (bare PYTHONPATH=src misses
+    # it and fails on CI).
+    parent_path = [os.path.abspath(entry) for entry in sys.path if entry]
+    env = dict(os.environ)
+    inherited = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        parent_path + ([inherited] if inherited else [])
+    )
+
+    a = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-a", "hold",
+         str(ready), str(release)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    deadline = _time.monotonic() + 30.0
+    while not ready.exists() and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert ready.exists(), "process A never opened its stale-read window"
+
+    b = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-b", "fast",
+         str(started)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    deadline = _time.monotonic() + 30.0
+    while not started.exists() and _time.monotonic() < deadline:
+        _time.sleep(0.05)
+    assert started.exists(), "process B never reached its append call"
+
+    # B is provably AT the mutation while A provably holds the fence: the
+    # interprocess lock must keep B alive-but-blocked here.
+    _time.sleep(1.0)
+    assert b.poll() is None, (
+        "B completed its append while A held the fence — the interprocess "
+        "lock is not excluding across processes"
+    )
+
+    release.write_text("go", encoding="utf-8")
+    out_a, err_a = a.communicate(timeout=60)
+    out_b, err_b = b.communicate(timeout=60)
+    assert a.returncode == 0, err_a
+    assert b.returncode == 0, err_b
+    assert "OK" in out_a and "OK" in out_b
+
+    ids = {r.rule_id for r in RuleStore(p).load()}
+    assert ids == {"rule-a", "rule-b"}, (
+        f"both concurrent cross-process appends must survive; saw {ids}"
+    )

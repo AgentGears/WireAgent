@@ -410,6 +410,131 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #23 third review pass: F-30..F-33 (present-null
+  widening, deterministic fence falsification, Windows lock qualification,
+  closed fences).** F-30 (blocker): the rule-field reducers used
+  payload.get() — an explicit JSON null was indistinguishable from an
+  omitted field, so {"actors": null} widened an ALLOW to every actor and
+  {"ttl_seconds": null} silently took the default lifetime. All rule fields
+  now use presence checks: omitted = unspecified; present = must satisfy
+  the declared type (null is not a list, not a tier list, not a number).
+  Regression matrix covers null for all six fields with the store proven
+  empty. F-31: the F-25 two-process test was probabilistic (a scheduler
+  could run B to completion before A entered its window, passing
+  vacuously). Rewritten as a deterministic lost-update FALSIFICATION: A
+  signals READY from inside its held fence after the strict load; B signals
+  STARTED at its append call; the parent then asserts B is still alive —
+  blocked on the OS lock (without the fence, B completes in milliseconds
+  and the assertion fails) — releases A, and both rules survive. F-32: the
+  Windows CI jobs ran only the effect/recovery durability files — the
+  msvcrt.locking branch of the interprocess fence was never qualified by
+  CI. The windows job now also runs tests/test_user_rules.py (the full
+  suite covers flock on Linux; the store suite covers msvcrt here; offline
+  imports resolve through the conftest super_browser stub). F-33: the code-
+  fence tolerance now accepts bare JSON or one COMPLETELY surrounding
+  fence; a half-open fence (opening line, no closing marker) or a bare
+  "```" rejects as unparseable_response. Evidence corrections to the
+  entries below: F-25's original qualification text overstated the
+  interleaving (now deterministic per F-31); F-27's "every mixed shape
+  rejects" claim was true of refusal/rule tagging but not of explicit null
+  in rule fields (closed by F-30). 2 new regressions; suite 1102 (count
+  from the run).
+- **2026-10-01 — PR #23 second review pass: F-25..F-29 (the process
+  boundary, the byte boundary, and two strictness completions).** F-25
+  (blocker): the F-19 mutation lock was process-local — two PROCESSES could
+  still interleave read-modify-write windows and silently drop a NEVER
+  (atomic os.replace serializes each install, not the read-write around
+  it). Fixed: every rule-store mutation now takes a two-level fence in one
+  order — the in-process per-path RLock, then an OS-RELEASED interprocess
+  lock file (<store>.lock via flock/msvcrt.locking; the lock dies with the
+  process, so a crashed writer cannot leave a stale lock). save() and
+  append_strict() share the fence (save factored to _write_replaced);
+  enforcement reads stay lock-free. Qualified with two REAL processes:
+  process A holds its append window open (slow strict load), process B
+  appends inside it, both rules survive. F-26 (blocker): read_text's
+  UnicodeDecodeError escaped both readers' except tuples — invalid UTF-8
+  bytes raised out of the enforcement path instead of voiding to zero
+  rules. Both paths now treat undecodable bytes as corrupt content:
+  load() → zero rules (no raise); _load_strict() → RuleStoreError, bytes
+  untouched. Regression writes real invalid bytes (b"\\xff\\xfe...").
+  F-27: the model output is now TAGGED, not merged — refusal = expressible
+  false + non-empty string explanation + NO rule fields; rule = no
+  refusal fields at all. Every mixed shape (explanation floating through
+  rule fields, expressible beside a decision, refusal without its
+  explanation) rejects as invalid_shape; only the two pure shapes
+  interpret. F-28: empty RiskMeta.target_types is UNKNOWN vocabulary and
+  can never ESTABLISH satisfiability — a selector naming a custom action
+  (pre-Layer-3 constructor shape) plus any target type now rejects; naming
+  the action without a target claim remains expressible. F-29: the F-08
+  serialization rewrite kept, plus a NEW direct regression locking the
+  unique-staging invariant itself — two saves' os.replace source paths are
+  recorded and must be two distinct rules.json.<32-hex>.tmp files (never a
+  shared rules.json.tmp), a check the serialized concurrency test can no
+  longer provide. 5 new regressions; suite 1100.
+- **2026-10-01 — PR #23 review fixes: F-19..F-24 (persistence boundary,
+  strict model output, exact confirmation).** F-19 (blocker): confirm()'s
+  load-then-save made enforcement's fail-closed load() ([] on corrupt
+  content) indistinguishable from a genuinely empty store — confirming a
+  new ALLOW against a corrupted document would atomically erase a persisted
+  NEVER and install the ALLOW; the unlocked read-modify-write also admitted
+  a lost-update form. Fixed in the STORE, not the compiler: RuleStore gains
+  _load_strict (missing = empty; corrupt/unreadable RAISES) and
+  append_strict (serialized same-path read-modify-write under a
+  process-wide per-path lock — the EffectLedger idiom; save() takes the
+  same lock; duplicates refuse). Regressions: corrupted NEVER+broken-entry
+  document refuses mutation with bytes byte-for-byte unchanged; a same-path
+  writer blocks while an append holds the lock (barrier test). F-20
+  (blocker): persisted TTL now begins at CONFIRMATION time
+  (UserRule.create(now=self._clock())); compiled_at stays draft/audit
+  metadata — a 60s rule confirmed two minutes late is born alive, not
+  dead-on-arrival. F-21: strict JSON loader (duplicate keys rejected,
+  NaN/Infinity literals rejected via parse_constant, 1e999→inf caught by
+  isfinite); expressible/explanation type-checked when present ("false"/0/
+  null are malformed drafts, never refusals-turned-rules; explanation null
+  or non-string or blank → invalid_shape); ttl finite/positive/≤max with
+  the omitted-TTL case clamped to min(default, configured max); the max
+  itself validated at construction. F-22: RiskMeta gains target_types (the
+  registry — the layer that owns action vocabulary — now records each
+  action's composed target types: like→post, post→none, follow→account,
+  …), and the compiler rejects selectors PROVABLY unable to match any
+  registered action (like+target "tweet"; like+tier private_reversible —
+  tier derived from the same registry the gate uses). F-23: the
+  owner-facing description is now canonical and lossless — sorted
+  quoted/escaped arrays (["a", "b"] vs ["a or b"]), exact TTL seconds
+  beside a friendly duration (86400 vs 86401 differ), and ceiling-aware
+  ALLOW semantics ("will still ASK: every named tier is above the allow
+  ceiling"); confirm() REVALIDATES the public draft dataclass (decision
+  enum, ttl contract, satisfiability, description == canonical
+  re-derivation) before touching the store. F-24: compiler_api_key is
+  repr=False in WebWireConfig (regression: the secret never appears in
+  repr(config); the field stays readable). 15 new regressions; suite 1095.
+- **2026-10-01 — PR #22 MERGED (6653fdf) + M8 LAYER 3: the rule compiler
+  (PR pending).** Layer 2 cleared the maintainer pass at 46e1227 (F-16/
+  F-17/F-18 confirmed; CI 1063 total tests — 1057 pass + 6 platform-skipped
+  on Linux, Windows jobs separately green) and squash-merged. Layer 3
+  implemented per frozen spec section 7 (m8_compiler.py): natural language
+  in; strict deterministic reduction to the frozen RuleSelector contract
+  out; inexpressible clauses REJECTED with an explanation and NOTHING
+  stored (M8-T12 — model refusal shape, unknown action/tier vocabulary,
+  blanket no-scope rules, bad decision/ttl/shape, unparseable prose);
+  unknown fields reject (strict draft schema; one mechanical tolerance — a
+  surrounding code fence is stripped before strict JSON). The owner
+  confirms the COMPILATION, not the words: describe_compiled_rule()
+  re-expresses the structure in plain words generated by code (two
+  sentences compiling to the same selector produce the identical
+  description — regression-locked), compile() stores nothing, confirm() is
+  the only persisting call (single-use via rule_id guard; preserves
+  existing hand-written rules; provenance="compiled", source_text kept).
+  Pluggable + optional: one-method CompilerModel protocol; built-in
+  ApiKeyChatModel is a plain API key against a chat-completions-style
+  endpoint (stdlib transport, injectable for tests; WebWireConfig carries
+  compiler_api_key/compiler_endpoint/compiler_model_name, all defaulting
+  off — no model configured means hand-written rules work unchanged, and
+  compile() raises CompilerUnavailable). Compile-time only: a
+  subprocess-level regression proves importing the store, kernel, or
+  dispatcher never pulls the compiler module into the interpreter. A
+  compiled+confirmed NEVER enforces through the kernel gate like any
+  hand-written rule (cites the compiled rule id). 17 new tests.
 - **2026-10-01 — PR #22 second review pass: F-16/F-17/F-18.** F-16 (blocker):
   layer 2 had re-imposed a stricter id contract than the frozen layer-1
   UserRule contract (any non-empty string), so a legal rule id with internal

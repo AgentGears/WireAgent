@@ -40,16 +40,43 @@ import json
 import logging
 import math
 import os
+import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Iterator, Optional
 from uuid import uuid4
 
 from webwire.safety.models import RiskTier
 
 logger = logging.getLogger(__name__)
+
+# -- interprocess lock helpers (F-25) ----------------------------------------
+# Both are OS-released: the lock dies with the process, so a crashed writer
+# cannot leave a stale lockfile blocking the store forever.
+
+if sys.platform == "win32":
+    import msvcrt as _msvcrt
+
+    def _lock_region(handle: Any) -> None:
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_LOCK, 1)
+
+    def _unlock_region(handle: Any) -> None:
+        handle.seek(0)
+        _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl as _fcntl
+
+    def _lock_region(handle: Any) -> None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+
+    def _unlock_region(handle: Any) -> None:
+        _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
 
 __all__ = [
     "RuleDecision",
@@ -263,6 +290,62 @@ class RuleStore:
         self._path = Path(path)
         self._clock = clock
 
+    # Same-path writers serialize through one process-wide lock (the
+    # EffectLedger idiom), and mutations additionally serialize ACROSS
+    # PROCESSES through an OS-released lock file (F-25): the rule store is a
+    # filesystem authority shared across invocations — the in-process RLock
+    # alone cannot stop two processes interleaving read-modify-write
+    # windows. Unique staging files (F-08) make each whole-store replace
+    # install exactly its own payload; the fences make read-modify-write
+    # appends atomic against every other writer, in-process or not.
+    _path_locks_guard: ClassVar[threading.Lock] = threading.Lock()
+    _path_locks: ClassVar[dict[str, threading.RLock]] = {}
+
+    def _mutation_lock(self) -> threading.RLock:
+        key = os.path.normcase(str(self._path.resolve(strict=False)))
+        with RuleStore._path_locks_guard:
+            lock = RuleStore._path_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                RuleStore._path_locks[key] = lock
+            return lock
+
+    @contextmanager
+    def _interprocess_fence(self) -> Iterator[None]:
+        """Hold an exclusive, OS-released lock on <store>.lock across one
+        mutation window. Readers never take it — enforcement reads stay
+        lock-free and see either the old or the new document (os.replace is
+        atomic); only mutations serialize."""
+        lock_path = self._path.with_name(self._path.name + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_path, "a+b")
+        except OSError as exc:
+            raise RuleStoreError(
+                f"could not open the rule store lock: {exc!r}"
+            ) from exc
+        try:
+            try:
+                _lock_region(handle)
+            except OSError as exc:
+                raise RuleStoreError(
+                    f"could not acquire the rule store lock: {exc!r}"
+                ) from exc
+            try:
+                yield
+            finally:
+                _unlock_region(handle)
+        finally:
+            handle.close()
+
+    @contextmanager
+    def _mutation_fence(self) -> Iterator[None]:
+        """Every mutating operation takes this in the same order: the
+        in-process per-path RLock, then the interprocess lock file."""
+        with self._mutation_lock():
+            with self._interprocess_fence():
+                yield
+
     # -- persistence ---------------------------------------------------------
 
     def save(self, rules: list[UserRule]) -> None:
@@ -276,7 +359,15 @@ class RuleStore:
         dupes = {i for i in ids if ids.count(i) > 1}
         if dupes:
             raise RuleStoreError(f"refusing to save duplicate rule ids: {sorted(dupes)}")
-        payload = {"schema_version": _SCHEMA_VERSION, "rules": [_rule_to_dict(r) for r in rules]}
+        with self._mutation_fence():
+            self._write_replaced(rules)
+
+    def _write_replaced(self, rules: list[UserRule]) -> None:
+        """Install one complete document (caller holds the mutation fence)."""
+        payload = {
+            "schema_version": _SCHEMA_VERSION,
+            "rules": [_rule_to_dict(r) for r in rules],
+        }
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -299,15 +390,78 @@ class RuleStore:
                 pass
             raise RuleStoreError(f"rule store save failed: {exc!r}") from exc
 
+    def _load_strict(self) -> list[UserRule]:
+        """Read for MUTATION: missing file is an empty store, but corrupt or
+        unreadable content RAISES instead of voiding to zero rules.
+
+        load() collapses both cases to [] — exactly right for enforcement
+        (corrupt policy means everything asks). A mutation computed on that
+        collapsed read would atomically replace the corrupt document — and
+        every restrictive rule inside it — with the new rule alone (F-19).
+        This reader keeps the two cases distinguishable: refuse to mutate
+        what could not be strictly read, bytes unchanged."""
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuleStoreError(
+                f"rule store unreadable — refusing mutation, bytes unchanged ({exc!r})"
+            ) from exc
+        if not isinstance(raw, dict) or raw.get("schema_version") != _SCHEMA_VERSION:
+            raise RuleStoreError(
+                "rule store schema mismatch — refusing mutation, bytes unchanged"
+            )
+        entries = raw.get("rules", [])
+        if not isinstance(entries, list):
+            raise RuleStoreError(
+                "rule store 'rules' not a list — refusing mutation, bytes unchanged"
+            )
+        rules: list[UserRule] = []
+        for i, entry in enumerate(entries):
+            try:
+                rules.append(_rule_from_dict(entry))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuleStoreError(
+                    f"rule store entry {i} invalid — refusing mutation, "
+                    f"bytes unchanged ({exc})"
+                ) from exc
+        ids = [r.rule_id for r in rules]
+        if len(set(ids)) != len(ids):
+            raise RuleStoreError(
+                "rule store has duplicate rule ids — refusing mutation, bytes unchanged"
+            )
+        return rules
+
+    def append_strict(self, rule: UserRule) -> None:
+        """Serialized, fail-closed read-modify-write append (F-19, F-25).
+
+        The strict-read → validate → replace window holds BOTH fences, so a
+        restrictive rule installed by any other writer — in this process or
+        another — during that window can never be silently dropped by this
+        append. Duplicate rule ids raise: append refuses rather than
+        duplicates. Corrupt/unreadable content raises with bytes unchanged —
+        never widen what rules permit."""
+        with self._mutation_fence():
+            existing = self._load_strict()
+            if rule.rule_id in {r.rule_id for r in existing}:
+                raise RuleStoreError(
+                    f"rule_id {rule.rule_id!r} already present — "
+                    "refusing duplicate append"
+                )
+            self._write_replaced(existing + [rule])
+
     def load(self) -> list[UserRule]:
         """All stored rules — or ZERO on any invalid content (see class doc).
-        Every call reads current persisted policy (F-02)."""
+        Every call reads current persisted policy (F-02). Invalid bytes are
+        corrupt content like any other (F-26): zero rules, everything asks —
+        the exception never escapes the enforcement path."""
         empty: list[UserRule] = []
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return empty
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             logger.warning("rule store unreadable (%s) — zero rules; everything asks", exc)
             return empty
         if not isinstance(raw, dict) or raw.get("schema_version") != _SCHEMA_VERSION:

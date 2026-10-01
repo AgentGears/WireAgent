@@ -643,9 +643,16 @@ def test_F25_two_processes_never_lose_an_append(tmp_path: Path) -> None:
 
     p = tmp_path / "rules.json"
 
-    repo_root = Path(__file__).resolve().parents[1]
+    # The child inherits the parent's exact sys.path: importing webwire.safety
+    # pulls the package __init__ → dispatcher → the browser dependency, which
+    # resolves wherever the TEST process found it (bare PYTHONPATH=src misses
+    # it and fails on CI).
+    parent_path = [os.path.abspath(entry) for entry in sys.path if entry]
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    inherited = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        parent_path + ([inherited] if inherited else [])
+    )
 
     a = subprocess.Popen(
         [sys.executable, "-c", _CHILD_APPEND, str(p), "rule-a", "slow"],

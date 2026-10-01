@@ -410,6 +410,54 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 second review pass: F-41..F-47 (the human/CLI
+  boundary).** The review's framing, accepted: the store CAS was the
+  strongest part; the remaining blockers were concentrated exactly where
+  layer 4 must establish owner-confirmation semantics. F-42 (blocker):
+  --yes was preauthorization of an unseen preview, and re-confirm displayed
+  AFTER the confirmation flag was consumed — the human decision could
+  predate the snapshot on screen. The CLI now renders FIRST and obtains
+  the decision NOW through an injectable decision_reader (terminal input
+  in production); --yes/--deny flags are removed entirely. Regressions
+  prove the decision happens after display (the reader sees the rendered
+  words + structure), a "no" mutates nothing, and the store CAS still
+  backs the displayed snapshot. F-41 (blocker): the production wiring
+  never called start() and never established a whoami-resolved actor —
+  the installed path could not reach a card at all. New
+  build_production_runtime (both factories injectable, so the WIRING is
+  tested): dispatcher.start() → whoami invoke → require ok AND a handle
+  (migrated writes refuse without a resolved actor) → return; any failure
+  stops the dispatcher before the error leaves; the card command stops it
+  in a finally (regression: stop runs even when phase 2 raises). Rules
+  commands never build a runtime (regression: a factory that fails the
+  test if invoked). F-43: the request snapshot is deep-copied BEFORE the
+  first await (regression: the invoke itself mutates the caller's nested
+  payload mid-await; the card still replays the phase-1 values). F-44:
+  the rules-only CLI is now genuinely browser-independent — the rule
+  lifecycle moved to webwire/safety/m8_rule_lifecycle.py (browser-free),
+  the CLI lazy-imports CardFlow only inside the card command, and BOTH
+  package __init__ files became PEP-562 lazy (webwire: Dispatcher/Session/
+  envelope names; safety: kill_switch, scoped_authority, write_kernel,
+  reconciliation_coordinator chain, recovery_guard — the coordinator→
+  commit_gateway→kill_switch chain was the hidden browser edge), so
+  importing a rules submodule no longer transitively imports the browser
+  SDK. Qualified by a clean subprocess with the conftest stub path
+  REMOVED: the CLI imports, asserts super_browser/envelope/dispatcher/
+  write_kernel absent from sys.modules, and runs rules list — passing
+  locally even with the real SDK installed, stronger on CI's base
+  install. F-45: the unknown-action note no longer promises ASK — it now
+  states the three facts: ceiling not verifiable (outside the active
+  registry), currently non-executable, and may AUTO-APPROVE if the action
+  is later registered below the standing-rule ceiling. F-46: CLI TTL
+  errors (0/-1/nan/inf/over-max) are caught as controlled usage failures
+  (exit 2) — and reconfirm_rule now rejects non-finite TTLs directly
+  (isfinite; NaN previously slipped past the </> comparisons into
+  UserRule's constructor). F-47: the sanitizer runs UNCONDITIONALLY before
+  any envelope branching, and the policy echo's confirmation_token is
+  removed regardless of its runtime type; a drifted envelope whose token
+  exists only in the policy echo yields NO card (fail-closed — a
+  payload-less token cannot be approved through the surface) and a
+  scrubbed result. Suite 1135 (count from the run).
 - **2026-10-01 — PR #24 review pass: F-34..F-40 (snapshot binding, token
   custody, the frozen CLI).** The review's principle, accepted: human-visible
   state, confirmation authority, and the mutation performed afterward must

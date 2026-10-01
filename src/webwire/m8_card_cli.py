@@ -3,26 +3,26 @@
 The CLI scope is exactly what cards need — this is not a workflow
 framework. Three commands:
 
-    m8 card CAPABILITY PAYLOAD_JSON [--yes | --deny]
-        Begin a write through the card surface, render the card, and — with
-        an explicit decision flag — carry it through phase 2 in the same
-        run. Without a flag the card is shown and the pending token dies
-        with the process (the card surface never reveals it).
+    m8 card CAPABILITY PAYLOAD_JSON
+        Build the LIVE runtime (dispatcher start → verified whoami), begin
+        the write, render the card, and ask the owner NOW — the decision
+        is only obtained after the preview is on screen (F-42: a decision
+        supplied before the preview exists is preauthorization of an
+        unseen snapshot). The runtime is stopped in a finally.
 
     m8 rules list
         Render every stored rule: the owner's original words, the canonical
-        current interpretation (ceiling-aware), and remaining lifetime.
+        current interpretation, and remaining lifetime. Browser-free: this
+        module imports the lifecycle surface directly and never touches the
+        browser chain for rules commands (F-44).
 
-    m8 rules reconfirm RULE_ID [--ttl SECONDS] [--yes]
-        Re-confirm one rule's TTL: display exactly what will be re-issued,
-        then — only with --yes — replace the reviewed snapshot under the
-        store's compare-and-swap fence. A rule that changed since the
-        display conflicts with zero mutation.
+    m8 rules reconfirm RULE_ID [--ttl SECONDS]
+        Load and display the CURRENT rule — words, structure, new TTL —
+        then ask the owner. Only a yes obtained after that display
+        CAS-replaces the displayed snapshot; anything else mutates nothing.
 
-The controller takes injected dependencies (an invoke callable and a rule
-store), so it is fully testable without a live session; ``main`` builds the
-live wiring from configuration. The browser session is only required by the
-``card`` command in production and is constructed lazily on first use.
+Dependencies (runtime factory, decision reader, store, clock) are all
+injectable, so the CLI is fully testable without a live session.
 """
 
 from __future__ import annotations
@@ -34,8 +34,7 @@ import time
 from typing import Any, Awaitable, Callable, Optional
 
 from webwire.config import WebWireConfig
-from webwire.m8_cards import (
-    CardFlow,
+from webwire.safety.m8_rule_lifecycle import (
     describe_rule,
     list_rules,
     reconfirm_rule,
@@ -47,12 +46,66 @@ from webwire.safety.user_rules import (
     RuleStoreError,
 )
 
-__all__ = ["CardCli", "main"]
+__all__ = ["CardCli", "build_production_runtime", "main"]
 
-_Invoke = Callable[[str, dict[str, Any]], Awaitable[Any]]
 _EXIT_OK = 0
 _EXIT_ERROR = 1
 _EXIT_USAGE = 2
+
+
+def _terminal_decision(prompt: str) -> str:
+    """The production decision reader: the owner answers at the terminal,
+    after the snapshot is displayed."""
+    try:
+        return input(f"{prompt} [y/N]: ").strip().lower()
+    except EOFError:
+        return ""
+
+
+async def build_production_runtime(
+    config: WebWireConfig,
+    *,
+    dispatcher_factory: Optional[Callable[..., Any]] = None,
+    session_factory: Optional[Callable[[WebWireConfig], Any]] = None,
+) -> Any:
+    """Build the LIVE card runtime (F-41): a started dispatcher with a
+    whoami-VERIFIED actor identity.
+
+    The lifecycle is exactly the production requirement: start() (installs
+    the M5 authority stack), then a whoami invoke whose success resolves
+    the actor handle (migrated writes refuse without it). Any failure stops
+    the dispatcher before the error leaves this function. The caller owns
+    ``stop()`` afterwards.
+
+    Both factories are injectable so the wiring itself is testable without
+    a browser."""
+    from webwire.dispatcher import Dispatcher
+    from webwire.session import SessionManager
+
+    make_dispatcher = dispatcher_factory or Dispatcher
+    make_session = session_factory or SessionManager
+    session = make_session(config)
+    dispatcher = make_dispatcher(config, session_manager=session)
+    try:
+        started = await dispatcher.start()
+        if not started.ok:
+            raise RuntimeError(f"dispatcher start failed: {getattr(started.error, 'message', 'unknown error')}")
+        whoami = await dispatcher.invoke("whoami", {})
+        if not whoami.ok:
+            raise RuntimeError(
+                "whoami failed — no verified actor identity for card writes: "
+                f"{getattr(whoami.error, 'message', 'unknown error')}"
+            )
+        handle = whoami.data.get("handle") if isinstance(whoami.data, dict) else None
+        if not handle:
+            raise RuntimeError("whoami returned no handle — no verified actor identity")
+    except BaseException:
+        try:
+            await dispatcher.stop()
+        except Exception:  # noqa: BLE001 — best-effort cleanup on failure
+            pass
+        raise
+    return dispatcher
 
 
 class CardCli:
@@ -62,19 +115,25 @@ class CardCli:
         self,
         *,
         store: RuleStore,
-        invoke: Optional[_Invoke] = None,
+        runtime_factory: Optional[Callable[[], Awaitable[Any]]] = None,
+        decision_reader: Callable[[str], str] = _terminal_decision,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._store = store
-        self._invoke = invoke
+        self._runtime_factory = runtime_factory
+        self._decision_reader = decision_reader
         self._clock = clock
+
+    def _ask(self, prompt: str) -> bool:
+        answer = self._decision_reader(prompt)
+        return answer in ("y", "yes")
 
     # -- m8 card ---------------------------------------------------------
 
-    async def cmd_card(self, capability: str, payload_json: str, decision: Optional[str]) -> int:
-        if self._invoke is None:
+    async def cmd_card(self, capability: str, payload_json: str) -> int:
+        if self._runtime_factory is None:
             print(
-                "card: no invoke route configured (a live session is required for the card command)",
+                "card: no live runtime configured (rules commands work without one)",
                 file=sys.stderr,
             )
             return _EXIT_ERROR
@@ -87,38 +146,43 @@ class CardCli:
             print("card: payload must be a JSON object", file=sys.stderr)
             return _EXIT_USAGE
 
-        flow = CardFlow(self._invoke)
-        result, card = await flow.begin(capability, payload)
-        if card is None:
-            # The kernel decided without a human (rule-ALLOW or NEVER):
-            # report the outcome, there is nothing to approve.
-            policy = {}
-            if isinstance(result.data, dict) and isinstance(result.data.get("policy"), dict):
-                policy = result.data["policy"]
-            print(f"no card: verdict={policy.get('verdict')!r} blocked_by={policy.get('blocked_by')!r}")
-            return _EXIT_OK if result.ok else _EXIT_ERROR
+        # Imported lazily: the card surface needs the browser result types,
+        # and rules-only invocations of this CLI must not (F-44).
+        from webwire.m8_cards import CardFlow
 
-        print(card.render_text())
-        if decision is None:
-            print("pending: no decision flag given; nothing was executed and the token dies with this process")
-            return _EXIT_OK
-        if decision == "deny":
-            card.deny()
-            print("denied — nothing executed")
-            return _EXIT_OK
-        final = await card.approve()
-        final_policy: dict[str, Any] = {}
-        trace: dict[str, Any] = {}
-        if isinstance(final.data, dict):
-            if isinstance(final.data.get("policy"), dict):
-                final_policy = final.data["policy"]
-            if isinstance(final.data.get("trace"), dict):
-                trace = final.data["trace"]
-        print(
-            f"approved: verdict={final_policy.get('verdict')!r} "
-            f"execute_ok={trace.get('execute_ok')}"
-        )
-        return _EXIT_OK if final.ok else _EXIT_ERROR
+        dispatcher = await self._runtime_factory()
+        try:
+            flow = CardFlow(dispatcher.invoke)
+            result, card = await flow.begin(capability, payload)
+            if card is None:
+                # The kernel decided without a human (rule-ALLOW, NEVER, or
+                # a drifted confirmation envelope): report, nothing to ask.
+                policy: dict[str, Any] = {}
+                if isinstance(result.data, dict) and isinstance(result.data.get("policy"), dict):
+                    policy = result.data["policy"]
+                print(f"no card: verdict={policy.get('verdict')!r} blocked_by={policy.get('blocked_by')!r}")
+                return _EXIT_OK if result.ok else _EXIT_ERROR
+
+            # F-42: render FIRST, obtain the decision NOW. The decision
+            # binds to exactly what is on screen above this prompt.
+            print(card.render_text())
+            if self._ask(f"approve {capability}?"):
+                final = await card.approve()
+            else:
+                card.deny()
+                print("denied — nothing executed")
+                return _EXIT_OK
+            final_policy: dict[str, Any] = {}
+            trace: dict[str, Any] = {}
+            if isinstance(final.data, dict):
+                if isinstance(final.data.get("policy"), dict):
+                    final_policy = final.data["policy"]
+                if isinstance(final.data.get("trace"), dict):
+                    trace = final.data["trace"]
+            print(f"approved: verdict={final_policy.get('verdict')!r} execute_ok={trace.get('execute_ok')}")
+            return _EXIT_OK if final.ok else _EXIT_ERROR
+        finally:
+            await dispatcher.stop()
 
     # -- m8 rules list ---------------------------------------------------
 
@@ -134,9 +198,10 @@ class CardCli:
 
     # -- m8 rules reconfirm ----------------------------------------------
 
-    def cmd_rules_reconfirm(self, rule_id: str, ttl_seconds: float, confirmed: bool) -> int:
-        # Read and display in the same breath: the snapshot shown here is
-        # the exact snapshot the compare-and-swap replace is bound to.
+    def cmd_rules_reconfirm(self, rule_id: str, ttl_seconds: float) -> int:
+        # Load and display the CURRENT rule; the owner decides on exactly
+        # what is displayed (F-42: the human decision is chronological —
+        # it cannot predate the snapshot on screen).
         expected = next((r for r in self._store.load() if r.rule_id == rule_id), None)
         if expected is None:
             print(f"reconfirm: rule_id {rule_id!r} not found — nothing to re-confirm", file=sys.stderr)
@@ -146,8 +211,9 @@ class CardCli:
         if expected.source_text:
             print(f'  owner\'s words: "{expected.source_text}"')
         print(f"  new TTL: {ttl_seconds:.0f}s (max {DEFAULT_RULE_TTL_S:.0f}s)")
-        if not confirmed:
-            print("dry run — pass --yes to re-confirm")
+
+        if not self._ask("re-confirm this exact rule?"):
+            print("declined — nothing changed")
             return _EXIT_OK
         try:
             reconfirmed = reconfirm_rule(
@@ -156,6 +222,9 @@ class CardCli:
                 ttl_seconds=ttl_seconds,
                 now=self._clock(),
             )
+        except ValueError as exc:
+            print(f"reconfirm: {exc}", file=sys.stderr)
+            return _EXIT_USAGE
         except RuleStoreError as exc:
             print(f"reconfirm: {exc}", file=sys.stderr)
             return _EXIT_ERROR
@@ -171,51 +240,37 @@ class CardCli:
         )
         sub = parser.add_subparsers(dest="command", required=True)
 
-        p_card = sub.add_parser("card", help="begin a card-mediated write")
+        p_card = sub.add_parser("card", help="begin a card-mediated write through the live runtime")
         p_card.add_argument("capability")
         p_card.add_argument("payload", help="JSON object payload")
-        group = p_card.add_mutually_exclusive_group()
-        group.add_argument(
-            "--yes", action="store_const", const="approve", dest="decision", help="approve the card now"
-        )
-        group.add_argument(
-            "--deny", action="store_const", const="deny", dest="decision", help="deny the card now"
-        )
 
-        p_list = sub.add_parser("rules", help="rule lifecycle")
+        p_list = sub.add_parser("rules", help="rule lifecycle (browser-free)")
         rules_sub = p_list.add_subparsers(dest="rules_command", required=True)
         rules_sub.add_parser("list", help="list stored rules")
 
         p_re = rules_sub.add_parser("reconfirm", help="re-confirm a rule's TTL")
         p_re.add_argument("rule_id")
         p_re.add_argument("--ttl", type=float, default=DEFAULT_RULE_TTL_S)
-        p_re.add_argument("--yes", action="store_true", help="confirm after displaying the rule")
 
         args = parser.parse_args(argv)
         if args.command == "card":
-            return await self.cmd_card(args.capability, args.payload, args.decision)
+            return await self.cmd_card(args.capability, args.payload)
         if args.rules_command == "list":
             return self.cmd_rules_list()
-        return self.cmd_rules_reconfirm(args.rule_id, args.ttl, args.yes)
+        return self.cmd_rules_reconfirm(args.rule_id, args.ttl)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Console entry point: builds live wiring from configuration."""
+    """Console entry point: builds live wiring from configuration. The
+    runtime factory is only ever invoked by the card command — rules
+    commands never touch the browser chain."""
 
     async def _run() -> int:
         config = WebWireConfig()
-        store = RuleStore(config.rules_path())
-        invoke: Optional[_Invoke] = None
-        try:
-            from webwire.dispatcher import Dispatcher
-            from webwire.session import SessionManager
-
-            session = SessionManager(config)
-            dispatcher = Dispatcher(config, session_manager=session)
-            invoke = dispatcher.invoke
-        except Exception as exc:  # noqa: BLE001 — degrade to rules-only CLI
-            print(f"m8: live session unavailable ({exc}); rules commands still work", file=sys.stderr)
-        cli = CardCli(store=store, invoke=invoke)
+        cli = CardCli(
+            store=RuleStore(config.rules_path()),
+            runtime_factory=lambda: build_production_runtime(config),
+        )
         return await cli.run(sys.argv[1:] if argv is None else argv)
 
     import asyncio

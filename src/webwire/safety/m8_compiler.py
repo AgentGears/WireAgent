@@ -288,8 +288,10 @@ def _ceiling_note(
             entry = registry.get(action)
             if entry is None:
                 return (
-                    "will still ASK: ceiling not verifiable — some named "
-                    "actions are outside the active registry"
+                    "ceiling not verifiable: some named actions are outside "
+                    "the active registry — such actions are currently "
+                    "non-executable; if one is later registered below the "
+                    "standing-rule ceiling, this ALLOW may auto-approve"
                 )
             tiers.add(entry[0].derive_tier())
     else:

@@ -3,29 +3,31 @@ section 8; layer 4 of the M8 build order).
 
 A minimal card-style interface over the existing phase-1/phase-2 flow: it
 renders the preview as a card (summary, warnings, matched rule), takes
-approve/deny, and holds the confirmation token internally. Plus the rule
-lifecycle surface the build order names: list, TTL re-confirm.
+approve/deny, and holds the confirmation token internally.
 
-The one principle carried over from Layer 3 (F-34..F-40): human-visible
+The rule lifecycle surface (list, TTL re-confirm) lives in
+``webwire.safety.m8_rule_lifecycle`` — browser-free by design so the
+rules-only CLI works without the browser dependency — and is re-exported
+here for callers that already hold the card surface.
+
+The one principle carried over from Layer 3 (F-34..F-47): human-visible
 state, confirmation authority, and the mutation performed afterward are all
 bound to one immutable snapshot.
 
 - **Token custody is an API property, not a rendering property.** The
-  phase-1 result returned to the caller has the confirmation token removed
-  (from both the payload and the policy echo); the token exists only inside
-  the card, which is bound to the invoke callable that created it —
+  result returned to the caller is sanitized UNCONDITIONALLY, before any
+  envelope branching (F-47): the confirmation token is removed from the
+  payload and the policy echo regardless of shape, so a drifted or
+  malformed envelope cannot leak it. The token exists only inside the
+  card, which is bound to the invoke callable that created it —
   ``approve()`` takes no arguments and replays phase 2 through that exact
-  route. ``deny()`` invokes nothing; the kernel token simply expires
-  unconsumed (the confirmation subsystem exposes no per-token cancellation,
-  and its bounded TTL bounds the denial).
-- **The replayed payload is the phase-1 payload.** The request is
-  deep-copied at begin and deep-copied again at replay, so later mutation
-  of the caller's nested structures cannot change what is confirmed.
-- **Re-confirmation is compare-and-swap.** Listing hands back the exact
-  immutable ``UserRule`` snapshot (with the owner's original words); TTL
-  re-confirm replaces that snapshot — and ONLY that snapshot — under the
-  store's mutation fence. A same-ID edit between display and confirmation
-  conflicts with zero mutation, forcing a fresh review.
+  route. ``deny()`` invokes nothing; the kernel token expires unconsumed
+  (the confirmation subsystem exposes no per-token cancellation, and its
+  bounded TTL bounds the denial).
+- **The replayed payload is the phase-1 payload.** The request is frozen
+  (deep-copied) BEFORE the first await (F-43) and deep-copied again at
+  replay — mutation of the caller's structures during the phase-1 await
+  window or after it cannot change what is confirmed.
 
 Scope discipline (frozen spec): the CLI scope is exactly what cards need —
 this is not a workflow framework. Rule removal is deliberately absent: the
@@ -36,19 +38,17 @@ editing the store, observed by the very next match.
 from __future__ import annotations
 
 import copy
-import time
 from typing import Any, Awaitable, Callable, Optional
 
 from super_browser.results import ActionError, ErrorCategory, action_result
 from super_browser.results.types import FailureCategory
 
 from webwire.envelope import ActionResult
-from webwire.safety.m8_compiler import describe_compiled_rule
-from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
-from webwire.safety.user_rules import (
-    DEFAULT_RULE_TTL_S,
-    RuleStore,
-    UserRule,
+from webwire.safety.m8_rule_lifecycle import (  # noqa: F401 — re-exported surface
+    RuleCard,
+    describe_rule,
+    list_rules,
+    reconfirm_rule,
 )
 
 __all__ = [
@@ -64,11 +64,12 @@ _Invoke = Callable[[str, dict[str, Any]], Awaitable[ActionResult]]
 
 
 def _scrub_token(result: ActionResult) -> ActionResult:
-    """Return a copy of the phase-1 result with the confirmation token
-    removed from every location the kernel puts it: the payload
+    """Return a copy of the result with the confirmation token removed from
+    every location the kernel may put it — the payload
     (data.data.confirmation_token) and the policy echo
-    (data.policy.confirmation_token). The raw token never leaves the card
-    surface."""
+    (data.policy.confirmation_token, regardless of its runtime type).
+    UNCONDITIONAL (F-47): called before any envelope inspection, so no
+    drifted or malformed shape can return the raw token to the caller."""
     sanitized = copy.copy(result)
     if not isinstance(result.data, dict):
         return sanitized
@@ -77,8 +78,8 @@ def _scrub_token(result: ActionResult) -> ActionResult:
     if isinstance(payload, dict):
         payload.pop("confirmation_token", None)
     policy = data.get("policy")
-    if isinstance(policy, dict) and isinstance(policy.get("confirmation_token"), dict):
-        policy["confirmation_token"] = None
+    if isinstance(policy, dict):
+        policy.pop("confirmation_token", None)
     sanitized.data = data
     return sanitized
 
@@ -115,7 +116,9 @@ class ApprovalCard:
         self.intent_hash = intent_hash
         self.expires_at = expires_at
         self._invoke = invoke
-        self._payload = copy.deepcopy(payload)  # F-39: the snapshot, frozen
+        # The frozen request snapshot (F-43): captured by CardFlow BEFORE
+        # the first await; the card never aliases caller-owned structures.
+        self._payload = copy.deepcopy(payload)
         self._token = token
         self._spent: Optional[str] = None
 
@@ -191,11 +194,13 @@ class ApprovalCard:
 class CardFlow:
     """Begin a card-mediated write through any invoke callable.
 
-    ``begin`` returns a SANITIZED phase-1 result (token removed — F-40)
-    plus a card bound to this flow's invoke when human confirmation is
-    pending; a rule-ALLOW (no confirmation carrier) or a NEVER denial
-    returns the outcome with NO card — there is nothing for an owner to
-    approve."""
+    ``begin`` returns a SANITIZED result (token removed unconditionally —
+    F-40/F-47) plus a card bound to this flow's invoke when human
+    confirmation is pending; a rule-ALLOW (no confirmation carrier) or a
+    NEVER denial returns the outcome with NO card — there is nothing for an
+    owner to approve. A confirmation-required response that has drifted so
+    far it carries no usable token returns no card either (fail-closed: it
+    cannot be approved through this surface)."""
 
     def __init__(self, invoke: _Invoke) -> None:
         self._invoke = invoke
@@ -205,17 +210,26 @@ class CardFlow:
         capability_name: str,
         payload: dict[str, Any],
     ) -> tuple[ActionResult, Optional[ApprovalCard]]:
-        result = await self._invoke(capability_name, copy.deepcopy(payload))
-        data = result.data if isinstance(result.data, dict) else {}
+        # F-43: freeze the request BEFORE the first await. Phase 1 and the
+        # token describe this snapshot; the card replays this snapshot.
+        request = copy.deepcopy(payload)
+        result = await self._invoke(capability_name, copy.deepcopy(request))
+        # Extract the token (if any) from the in-memory result, then scrub
+        # unconditionally — the returned object never carries it.
+        raw_data = result.data if isinstance(result.data, dict) else {}
+        raw_payload = raw_data.get("data", {}) if isinstance(raw_data.get("data"), dict) else {}
+        token = raw_payload.get("confirmation_token")
+        sanitized = _scrub_token(result)
+
+        data = sanitized.data if isinstance(sanitized.data, dict) else {}
         policy = data.get("policy", {}) if isinstance(data.get("policy"), dict) else {}
         phase1 = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
-        token = phase1.get("confirmation_token")
         if policy.get("verdict") != "confirmation_required" or not token:
-            return result, None
+            return sanitized, None
         card = ApprovalCard(
             invoke=self._invoke,
             capability_name=capability_name,
-            payload=payload,
+            payload=request,
             summary=str(phase1.get("preview", "")),
             token=str(token),
             target_url=str(phase1.get("target_url", "") or ""),
@@ -225,126 +239,4 @@ class CardFlow:
             intent_hash=str(phase1.get("intent_hash", "") or ""),
             expires_at=float(phase1.get("expires_at", 0.0) or 0.0),
         )
-        return _scrub_token(result), card
-
-
-# -- rule lifecycle (frozen build order: list, TTL re-confirm) ---------------
-
-
-def describe_rule(rule: UserRule, *, registry: RiskRegistry = DEFAULT_REGISTRY) -> str:
-    """The canonical structural description of ANY stored rule — the same
-    renderer the compiler's owner-confirmation uses, applied to the rule's
-    full original TTL window. Total over legal rules (F-35): unknown or
-    stale action names render an explicit unverifiable-ceiling note instead
-    of raising."""
-    return describe_compiled_rule(
-        rule.decision,
-        rule.selector,
-        rule.expires_at - rule.created_at,
-        registry=registry,
-    )
-
-
-class RuleCard:
-    """One listed rule: the display fields AND the exact immutable snapshot
-    (``rule``) that a later re-confirmation is bound to (F-34/F-36)."""
-
-    def __init__(
-        self,
-        *,
-        rule: UserRule,
-        remaining_seconds: float,
-        registry: RiskRegistry = DEFAULT_REGISTRY,
-    ) -> None:
-        self.rule = rule
-        self.rule_id = rule.rule_id
-        self.decision = rule.decision.value
-        self.provenance = rule.provenance
-        self.source_text = rule.source_text  # the owner's words (F-36)
-        self.remaining_seconds = remaining_seconds
-        self.expired = remaining_seconds <= 0
-        self._registry = registry
-
-    @property
-    def description(self) -> str:
-        return describe_rule(self.rule, registry=self._registry)
-
-    def render_text(self) -> str:
-        base = f"{self.rule_id}: {self.description}"
-        if self.source_text:
-            base += f'\n  owner\'s words: "{self.source_text}"'
-        if self.expired:
-            base += "\n  EXPIRED"
-        else:
-            base += f"\n  {self.remaining_seconds:.0f}s remaining"
-        return base
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "rule_id": self.rule_id,
-            "decision": self.decision,
-            "provenance": self.provenance,
-            "source_text": self.source_text,
-            "description": self.description,
-            "remaining_seconds": self.remaining_seconds,
-            "expired": self.expired,
-        }
-
-
-def list_rules(
-    store: RuleStore,
-    *,
-    now: Optional[float] = None,
-    registry: RiskRegistry = DEFAULT_REGISTRY,
-) -> list[RuleCard]:
-    """Every stored rule with its remaining lifetime, in store order.
-
-    Reading uses the enforcement reader: a corrupt store lists as zero
-    rules (the same fail-safe every match sees), never raises. Each card
-    carries the immutable rule snapshot the owner is reviewing."""
-    t = now if now is not None else time.time()
-    return [
-        RuleCard(
-            rule=r,
-            remaining_seconds=max(0.0, r.expires_at - t),
-            registry=registry,
-        )
-        for r in store.load()
-    ]
-
-
-def reconfirm_rule(
-    store: RuleStore,
-    expected: UserRule,
-    *,
-    ttl_seconds: float = DEFAULT_RULE_TTL_S,
-    now: Optional[float] = None,
-) -> UserRule:
-    """Re-confirm the EXACT rule the owner reviewed (F-34): compare-and-swap
-    under the store's mutation fence.
-
-    ``expected`` is the immutable snapshot handed out by listing (or read
-    fresh by the CLI in the same breath it displays it). The replacement
-    keeps the same rule_id — attribution identity — the same selector,
-    decision, provenance, and the owner's original words, with a fresh TTL
-    window starting now. If ANYTHING about the stored rule changed since
-    that snapshot (decision, scope, timestamps, deletion, corruption), the
-    store raises with zero mutation and the owner must list again."""
-    if (
-        isinstance(ttl_seconds, bool)
-        or not isinstance(ttl_seconds, (int, float))
-        or ttl_seconds <= 0
-        or ttl_seconds > DEFAULT_RULE_TTL_S
-    ):
-        raise ValueError(f"ttl_seconds must be a positive number no greater than {DEFAULT_RULE_TTL_S:.0f}")
-    t = now if now is not None else time.time()
-    replacement = UserRule(
-        rule_id=expected.rule_id,
-        decision=expected.decision,
-        created_at=t,
-        expires_at=t + float(ttl_seconds),
-        provenance=expected.provenance,
-        source_text=expected.source_text,
-        selector=expected.selector,
-    )
-    return store.replace_if_current(expected, replacement)
+        return sanitized, card

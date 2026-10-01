@@ -140,6 +140,71 @@ async def test_F39_replay_is_the_phase1_payload_not_caller_state() -> None:
     assert replayed["post"] == {"text": "A"}, "replay must be the phase-1 snapshot"
 
 
+async def test_F43_payload_frozen_before_the_first_await() -> None:
+    """The await window: the invoke itself mutates the caller's nested
+    payload WHILE phase 1 is in flight. The request snapshot is taken
+    before the await, so the card still replays the phase-1 values."""
+    victim = {"post_id": "1", "post": {"text": "A"}}
+    results = [_phase1_result(), _allow_result()]
+    calls: list[tuple[str, dict]] = []
+
+    class _MutatingInvoke:
+        async def __call__(self, capability_name: str, payload: dict):
+            # Suspended inside phase 1: the caller's dict changes NOW.
+            victim["post"]["text"] = "MUTATED-DURING-AWAIT"
+            calls.append((capability_name, dict(payload)))
+            return results.pop(0)
+
+    _, card = await CardFlow(_MutatingInvoke()).begin("like_post", victim)
+    await card.approve()
+    replayed = calls[1][1]
+    assert replayed["post"] == {"text": "A"}, "the card must replay the snapshot frozen BEFORE the await"
+
+
+async def test_F47_scrub_is_unconditional_regardless_of_envelope_shape() -> None:
+    """A drifted envelope — confirmation token present ONLY in the policy
+    echo, or a non-dict policy token — must never leak, and a payload-less
+    token cannot produce a card (fail-closed)."""
+    # Token only in the policy echo: no card, and the echo is scrubbed.
+    drifted = ok_result(
+        data={
+            "policy": {
+                "verdict": "confirmation_required",
+                "confirmation_token": {"token": "tok-x"},
+            },
+            "data": {"preview": "Will like 1"},
+            "trace": {},
+        }
+    )
+    result, card = await CardFlow(_FakeInvoke([drifted])).begin("like_post", {"post_id": "1"})
+    assert card is None, "a payload-less token cannot be approved via a card"
+    assert "confirmation_token" not in result.data["policy"]
+    assert "tok-x" not in str(result.data)
+
+    # Non-dict policy token value: removed regardless of type; the valid
+    # payload token still yields a card with full custody.
+    weird = ok_result(
+        data={
+            "policy": {
+                "verdict": "confirmation_required",
+                "confirmation_token": "tok-y",
+            },
+            "data": {
+                "preview": "Will like 1",
+                "confirmation_token": "tok-y",
+                "expires_at": 1.0,
+            },
+            "trace": {},
+        }
+    )
+    result2, card2 = await CardFlow(_FakeInvoke([weird])).begin("like_post", {"post_id": "1"})
+    assert "confirmation_token" not in result2.data["policy"]
+    assert "confirmation_token" not in result2.data["data"]
+    assert "tok-y" not in str(result2.data)
+    assert card2 is not None
+    assert "tok-y" not in repr(card2) + card2.render_text()
+
+
 async def test_deny_invokes_nothing_and_consumes_the_card() -> None:
     invoke = _FakeInvoke([_phase1_result()])
     _, card = await CardFlow(invoke).begin("like_post", {"post_id": "1"})
@@ -472,12 +537,46 @@ def test_reconfirm_revives_expired_rule_by_owner_choice(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The Card CLI (frozen build-order step 4)
+# The Card CLI (frozen build-order step 4) — chronological decisions (F-42),
+# production wiring (F-41), controlled TTL errors (F-46), browser-free rules
+# commands (F-44)
 # ---------------------------------------------------------------------------
 
 
-def _cli(tmp_path: Path, invoke=None) -> CardCli:
-    return CardCli(store=_store(tmp_path), invoke=invoke, clock=lambda: NOW)
+def _cli(tmp_path: Path, runtime_factory=None, decision_reader=None) -> CardCli:
+    return CardCli(
+        store=_store(tmp_path),
+        runtime_factory=runtime_factory,
+        decision_reader=decision_reader or (lambda prompt: "n"),
+        clock=lambda: NOW,
+    )
+
+
+def _ready(runtime):
+    async def _factory():
+        return runtime
+
+    return _factory
+
+
+class _FakeRuntime:
+    """A started fake dispatcher for cmd_card: scripted results + ordered
+    lifecycle recording (F-41 wiring at the command level)."""
+
+    def __init__(self, results: list) -> None:
+        self._results = list(results)
+        self.calls: list[str] = []
+        self.stopped = False
+
+    async def invoke(self, capability: str, payload: dict):
+        self.calls.append(f"invoke:{capability}")
+        item = self._results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def stop(self) -> None:
+        self.stopped = True
 
 
 async def test_cli_rules_list_renders_words_and_ttl(tmp_path: Path, capsys) -> None:
@@ -494,64 +593,259 @@ async def test_cli_rules_list_renders_words_and_ttl(tmp_path: Path, capsys) -> N
     assert 'actions ["like"]' in out
 
 
-async def test_cli_reconfirm_dry_run_then_confirmed(tmp_path: Path, capsys) -> None:
+async def test_cli_rules_commands_never_build_a_runtime(tmp_path: Path) -> None:
+    """Rules commands are browser-free: the runtime factory would fail the
+    test if ever invoked."""
+
+    def _forbidden_factory():
+        raise AssertionError("rules commands must never build a runtime")
+
+    cli = CardCli(
+        store=_store(tmp_path),
+        runtime_factory=_forbidden_factory,
+        decision_reader=lambda prompt: "n",
+        clock=lambda: NOW,
+    )
+    assert await cli.run(["rules", "list"]) == 0
+
+
+async def test_cli_reconfirm_decision_is_chronological(tmp_path, capsys) -> None:
     store = _store(tmp_path)
     store.save([_stored_rule("aging", ttl=60.0, source_text="temporary")])
 
-    code = await _cli(tmp_path).run(["rules", "reconfirm", "aging"])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "dry run" in out
-    assert store.load()[0].expires_at == NOW + 60.0  # nothing changed
+    seen_at_decision: dict[str, bool] = {}
 
-    code = await _cli(tmp_path).run(["rules", "reconfirm", "aging", "--ttl", "120", "--yes"])
-    out = capsys.readouterr().out
+    def reader_n(prompt: str) -> str:
+        out = capsys.readouterr().out
+        seen_at_decision["words_displayed"] = "temporary" in out
+        seen_at_decision["structure_displayed"] = 'actions ["like"]' in out
+        return "n"
+
+    code = await _cli(tmp_path, decision_reader=reader_n).run(["rules", "reconfirm", "aging"])
     assert code == 0
-    assert "re-confirmed" in out
+    assert "declined" in capsys.readouterr().out
+    assert seen_at_decision["words_displayed"], "decision must follow display"
+    assert seen_at_decision["structure_displayed"]
+    assert store.load()[0].expires_at == NOW + 60.0  # zero mutation
+
+    def reader_y(prompt: str) -> str:
+        return "y"
+
+    code = await _cli(tmp_path, decision_reader=reader_y).run(["rules", "reconfirm", "aging", "--ttl", "120"])
+    assert code == 0
+    assert "re-confirmed" in capsys.readouterr().out
     assert store.load()[0].expires_at == NOW + 120.0
-    assert "temporary" in out  # the owner's words shown before confirming
+
+
+async def test_cli_reconfirm_ttl_errors_are_controlled(tmp_path, capsys) -> None:
+    store = _store(tmp_path)
+    store.save([_stored_rule("r")])
+    for bad in ("0", "-1", "nan", "inf", "999999999"):
+        code = await _cli(tmp_path, decision_reader=lambda p: "y").run(
+            ["rules", "reconfirm", "r", "--ttl", bad]
+        )
+        assert code == 2, bad
+        assert "ttl_seconds" in capsys.readouterr().err
+    assert store.load()[0].expires_at == NOW + 3600.0  # never mutated
 
 
 async def test_cli_reconfirm_unknown_rule_is_an_error(tmp_path: Path, capsys) -> None:
-    code = await _cli(tmp_path).run(["rules", "reconfirm", "ghost", "--yes"])
+    code = await _cli(tmp_path).run(["rules", "reconfirm", "ghost"])
     assert code == 1
     assert "not found" in capsys.readouterr().err
 
 
-async def test_cli_card_pending_without_flag(tmp_path: Path, capsys) -> None:
-    invoke = _FakeInvoke([_phase1_result()])
-    code = await _cli(tmp_path, invoke).run(["card", "like_post", '{"post_id": "1"}'])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "Will like post 1" in out
-    assert "pending" in out
-    assert len(invoke.calls) == 1  # nothing executed
-    assert "confirmation_token" not in invoke.calls[0][1]
+async def test_cli_card_decision_follows_display_and_binds(tmp_path, capsys) -> None:
+    runtime = _FakeRuntime([_phase1_result(), _allow_result()])
 
+    def reader_y(prompt: str) -> str:
+        out = capsys.readouterr().out
+        assert "Will like post 1" in out, "the decision must follow display"
+        assert "confirmation_token" not in out
+        return "y"
 
-async def test_cli_card_approve_and_deny(tmp_path: Path, capsys) -> None:
-    approve_invoke = _FakeInvoke([_phase1_result(), _allow_result()])
-    code = await _cli(tmp_path, approve_invoke).run(["card", "like_post", '{"post_id": "1"}', "--yes"])
+    code = await _cli(tmp_path, runtime_factory=_ready(runtime), decision_reader=reader_y).run(
+        ["card", "like_post", '{"post_id": "1"}']
+    )
     out = capsys.readouterr().out
     assert code == 0
     assert "approved: verdict='allow'" in out
-    assert approve_invoke.calls[1][1]["confirmation_token"] == "tok-1"
+    assert runtime.calls == ["invoke:like_post", "invoke:like_post"]
+    assert runtime.stopped, "the runtime must stop after the decision"
 
-    deny_invoke = _FakeInvoke([_phase1_result()])
-    code = await _cli(tmp_path, deny_invoke).run(["card", "like_post", '{"post_id": "1"}', "--deny"])
+
+async def test_cli_card_decline_executes_nothing_and_stops_runtime(tmp_path, capsys) -> None:
+    runtime = _FakeRuntime([_phase1_result()])
+    code = await _cli(tmp_path, runtime_factory=_ready(runtime)).run(
+        ["card", "like_post", '{"post_id": "1"}']
+    )  # default reader: "n"
     out = capsys.readouterr().out
     assert code == 0
     assert "denied" in out
-    assert len(deny_invoke.calls) == 1
+    assert runtime.calls == ["invoke:like_post"]  # phase 2 never ran
+    assert runtime.stopped
+
+
+async def test_cli_card_stops_runtime_even_when_approval_raises(tmp_path, capsys) -> None:
+    class _BoomRuntime(_FakeRuntime):
+        async def invoke(self, capability, payload):
+            if len(self.calls) >= 1:
+                raise RuntimeError("phase 2 exploded")
+            return await super().invoke(capability, payload)
+
+    runtime = _BoomRuntime([_phase1_result(), _allow_result()])
+    with pytest.raises(RuntimeError, match="phase 2 exploded"):
+        await _cli(
+            tmp_path,
+            runtime_factory=_ready(runtime),
+            decision_reader=lambda p: "y",
+        ).run(["card", "like_post", '{"post_id": "1"}'])
+    assert runtime.stopped, "stop() must run in the finally"
 
 
 async def test_cli_card_bad_payload_is_usage_error(tmp_path: Path, capsys) -> None:
-    code = await _cli(tmp_path, _FakeInvoke([])).run(["card", "like_post", "not json"])
+    code = await _cli(tmp_path, runtime_factory=_ready(_FakeRuntime([]))).run(["card", "like_post", "not json"])
     assert code == 2
     assert capsys.readouterr().err
 
 
-async def test_cli_card_without_invoke_route_errors(tmp_path: Path, capsys) -> None:
-    code = await _cli(tmp_path, invoke=None).run(["card", "like_post", '{"post_id": "1"}'])
+async def test_cli_card_without_runtime_errors(tmp_path: Path, capsys) -> None:
+    code = await _cli(tmp_path).run(["card", "like_post", '{"post_id": "1"}'])
     assert code == 1
-    assert "no invoke route" in capsys.readouterr().err
+    assert "no live runtime" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# F-41: the PRODUCTION runtime factory wiring
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDispatcher:
+    """Injectable dispatcher double: records lifecycle order, can fail."""
+
+    def __init__(self, *, whoami_ok=True, whoami_handle="@owner", start_ok=True) -> None:
+        self.order: list[str] = []
+        self._whoami_ok = whoami_ok
+        self._whoami_handle = whoami_handle
+        self._start_ok = start_ok
+        self.stopped = False
+
+    async def start(self):
+        self.order.append("start")
+        from webwire.envelope import ok_result
+
+        if not self._start_ok:
+            r = ok_result(data={})
+            r.ok = False
+            r.error = type("E", (), {"message": "start failed"})()
+            return r
+        return ok_result(data={})
+
+    async def invoke(self, capability, payload):
+        self.order.append(f"invoke:{capability}")
+        from webwire.envelope import ok_result
+
+        if capability == "whoami":
+            if not self._whoami_ok:
+                r = ok_result(data={})
+                r.ok = False
+                r.error = type("E", (), {"message": "not logged in"})()
+                return r
+            return ok_result(data={"handle": self._whoami_handle})
+        raise AssertionError(f"unexpected invoke {capability}")
+
+    async def stop(self):
+        self.order.append("stop")
+        self.stopped = True
+
+
+class _FakeSession:
+    def __init__(self, config) -> None:
+        pass
+
+
+async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
+    from webwire.config import WebWireConfig
+    from webwire.m8_card_cli import build_production_runtime
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    made: list = []
+
+    def dispatcher_factory(config, *, session_manager):
+        d = _RecordingDispatcher()
+        made.append(d)
+        return d
+
+    # Success: start → whoami → verified handle; NOT stopped by the factory.
+    await build_production_runtime(
+        cfg, dispatcher_factory=dispatcher_factory, session_factory=_FakeSession
+    )
+    assert made[0].order == ["start", "invoke:whoami"]
+    assert made[0].stopped is False, "the caller owns stop()"
+
+    def bad_factory(config, *, session_manager):
+        return _RecordingDispatcher(whoami_ok=False)
+
+    with pytest.raises(RuntimeError, match="no verified actor"):
+        await build_production_runtime(cfg, dispatcher_factory=bad_factory, session_factory=_FakeSession)
+
+    def handleless_factory(config, *, session_manager):
+        return _RecordingDispatcher(whoami_handle="")
+
+    with pytest.raises(RuntimeError, match="no handle"):
+        await build_production_runtime(cfg, dispatcher_factory=handleless_factory, session_factory=_FakeSession)
+
+    start_failed = _RecordingDispatcher(start_ok=False)
+
+    def start_fail_factory(config, *, session_manager):
+        return start_failed
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        await build_production_runtime(cfg, dispatcher_factory=start_fail_factory, session_factory=_FakeSession)
+    assert start_failed.stopped
+
+
+# ---------------------------------------------------------------------------
+# F-44: the rules-only CLI is importable with NO browser dependency at all
+# ---------------------------------------------------------------------------
+
+
+def test_F44_rules_cli_imports_without_the_browser_dependency(tmp_path: Path) -> None:
+    """A clean subprocess (the conftest stub path REMOVED, as on a base
+    installation) imports the CLI and runs a rules command. Importing must
+    not pull super_browser, the envelope, or the dispatcher."""
+    import os
+    import subprocess
+    import sys
+
+    rules_path = tmp_path / "rules.json"
+    code = (
+        "import sys\n"
+        "sys.path = [p for p in sys.path if 'stubs' not in p]\n"
+        "from webwire.m8_card_cli import CardCli\n"
+        "from webwire.safety.user_rules import RuleStore\n"
+        "leaked = [m for m in sys.modules\n"
+        "          if 'super_browser' in m or m in ('webwire.envelope',\n"
+        "          'webwire.dispatcher', 'webwire.safety.write_kernel')]\n"
+        "assert not leaked, f'browser chain leaked: {leaked}'\n"
+        "import asyncio\n"
+        "cli = CardCli(store=RuleStore(__import__('pathlib').Path(sys.argv[1])),\n"
+        "              decision_reader=lambda p: 'n')\n"
+        "rc = asyncio.run(cli.run(['rules', 'list']))\n"
+        "assert rc == 0\n"
+        "print('OK')\n"
+    )
+    env = dict(os.environ)
+    parent_path = [os.path.abspath(e) for e in sys.path if e and "stubs" not in e]
+    inherited = env.get("PYTHONPATH", "")
+    combined = parent_path + ([inherited] if inherited else [])
+    env["PYTHONPATH"] = os.pathsep.join(p for p in combined if "stubs" not in p)
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(rules_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout  # rules output may precede the marker

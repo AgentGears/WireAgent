@@ -410,6 +410,30 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 MERGED (8d89827): M8 COMPLETE — all four layers
+  of the frozen build order are on main.** The final pass found no new
+  findings across the whole interaction surface (token custody,
+  caller-supplied authority rejection, chronological approval, payload
+  snapshot binding, malformed carriers, journal redaction, runtime
+  identity establishment, browser-free rule management, CAS
+  re-confirmation, TTL handling, and the ceiling renderer). CI run #575:
+  Linux 3.11 1139 passed + 6 platform-skipped = 1145; both Windows
+  durability jobs green including the rule-store qualification. M8 as
+  shipped: layer 1 the standing-decision rule store (PR #20, 80f427c +
+  hardening PR #21, 3ee9df1); layer 2 the kernel three-way gate +
+  approver lineage through the single mint seam (PR #22, 6653fdf);
+  layer 3 the rule compiler — pluggable API-key model, strict tagged
+  model-output schema, canonical owner confirmation, fenced CAS
+  persistence (PR #23, 04176da); layer 4 the card surface + Card CLI +
+  rule lifecycle (PR #24, 8d89827). Cumulative review: 57 findings
+  (F-01..F-57) across eight review rounds, all resolved before merge.
+  STANDING BOUNDARIES, stated not implied: the production m8 card path
+  is wired per the real lifecycle (start → whoami → resolved actor →
+  card → decision → stop) but has not been qualified against a real
+  logged-in browser session; per-token cancellation on deny and rule
+  removal are outside the frozen layer-4 scope; the single-process
+  doctrine (one canonical authority root per state directory, STATE
+  366) is contract and construction, not yet boot-time enforcement.
 - **2026-10-01 — PR #24 fifth review pass: F-57 (derived-tier composition).
   The one remaining renderer edge.** With unknown actions present and NO
   explicit risk_tiers, the unknown-action branch returned before deriving

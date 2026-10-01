@@ -410,6 +410,209 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #24 fifth review pass: F-57 (derived-tier composition).
+  The one remaining renderer edge.** With unknown actions present and NO
+  explicit risk_tiers, the unknown-action branch returned before deriving
+  the KNOWN actions' registry tiers — so a persisted rule like
+  {post, future_action} reported only the unknown action's latent behavior
+  and never told the owner that post (above the standing ceiling) will
+  still ASK. The renderer now partitions the vocabulary on that path:
+  known actions' tiers are derived from the registry, any above-ceiling
+  known tier adds 'the known above-ceiling actions in this rule will still
+  ASK', and the unknown-action latent warning stands beside it — composed,
+  neither masking the other. Unknown-only selectors keep the pure latent
+  warning. Three regressions: {post, future_action} (ASK + latent),
+  {like, post, future_action} (three-way: like unaccused, post ASK,
+  future latent, no blanket tier claim), and unknown-only (latent, no ASK
+  claim). SUPERSEDES the F-54..F-56 entry's implication that 'no explicit
+  tiers → latent-authority wording' is universally sufficient: it is
+  sufficient only when no KNOWN actions are present. Suite 1145 (count
+  from the run).
+- **2026-10-01 — PR #24 fourth review pass: F-54..F-56 (final semantic/
+edge hardening).** F-55 (high): the F-49 unknown-action branch MASKED the
+deterministic tier-ceiling math for mixed selectors — with explicit tiers
+all above the ceiling, the old text promised conditional auto-approval
+even though every matching registration would still ASK (impossible
+condition; frozen §5 requires above-ceiling ALLOW to be honestly ASK).
+The renderer now COMPOSES the two facts: unknown action + explicit tiers
+all above → 'will still ASK (every named tier is above the allow
+ceiling)'; tiers containing below-ceiling → 'may auto-approve only if
+later registered at one of the below-ceiling tiers matching this
+selector', plus 'matching above-ceiling tiers still ASK' when mixed; no
+explicit tiers → the F-49 latent wording stands. Regression locks all
+four compositions. F-54: the CLI rejected a caller-supplied
+confirmation_token only at CardFlow's boundary — AFTER building the live
+runtime (browser start, whoami) and via an uncontrolled traceback. The
+reserved-field check now runs immediately after JSON validation: exit 2,
+stderr message, and the regression proves runtime_factory was NEVER
+called. F-56: a non-string confirmation carrier (dict, number, empty
+string) was coerced into an unusable ApprovalCard; the card now requires
+a genuine non-empty string carrier — anything else returns the sanitized
+result with no card, flowing to the CLI's confirmation-required protocol
+error (exit 1). SUPERSEDES the F-48..F-53 entry's 'closed by F-49' claim:
+F-49 closed the structural gap only; the semantic composition is closed
+here. Suite 1142 (count from the run).
+- **2026-10-01 — PR #24 third review pass: F-48..F-53 (the card entry
+  point and the audit boundary).** F-48 (blocker): CardFlow.begin()
+  forwarded the caller's payload unchanged, so a caller holding a valid
+  token could pass it INSIDE begin() — the kernel interprets that as phase
+  2 and the mutation executes before any card is rendered or any decision
+  asked. The card entry point now REJECTS a caller-supplied
+  confirmation_token before invoking anything (reject, not strip — silent
+  stripping changes caller intent); regression proves ZERO invocations.
+  F-50: policy gates run BEFORE token consumption, so a NEVER installed
+  after phase 1 denies while the token is still LIVE — and the Dispatcher
+  journaled the token verbatim (the journal is audit data, not an authority
+  carrier). _redact_input now redacts confirmation_token BY KEY
+  irrespective of value; the regression uses a REAL kernel token, denies
+  phase 2 pre-consumption via a late NEVER, proves the SAME token still
+  executes after the ban is removed (pre-consumption denial), and asserts
+  the exact token bytes never appear in the journal while the redacted
+  marker does. F-49: the unknown-action vocabulary check is now
+  ORTHOGONAL to risk_tiers — a mixed action+tier selector naming an
+  unknown action gets the latent warning too, with the precise conditional
+  ("if later registered at a tier matching this selector and below the
+  standing-rule ceiling, this ALLOW may auto-approve"). F-51: the
+  production runtime now verifies session.resolved_handle after whoami —
+  the state the write path actually trusts — not merely the response data
+  (a whitespace-only response handle is truthy data but set_resolved_handle
+  refuses it; regression covers the blank case). F-52: a
+  confirmation-required response with no usable card is now an explicit
+  protocol error in the CLI (non-zero exit, stderr message); it previously
+  exited 0 via the generic no-card path. F-53: update_strict() REMOVED —
+  an unconditional same-ID replace is exactly the stale-write shape F-34
+  invalidated, left behind as an attractive footgun; replace_if_current is
+  the only lifecycle mutation. Evidence corrections to the entries below:
+  the F-41..F-47 entry's claim that "the token exists only inside the
+  card" overstated custody (F-48: callers could previously SUPPLY their
+  own; F-50: live tokens could reach the journal — both now closed), and
+  "F-45 closed" was premature for mixed selectors (closed by F-49).
+  Suite 1139 (count from the run).
+- **2026-10-01 — PR #24 second review pass: F-41..F-47 (the human/CLI
+  boundary).** The review's framing, accepted: the store CAS was the
+  strongest part; the remaining blockers were concentrated exactly where
+  layer 4 must establish owner-confirmation semantics. F-42 (blocker):
+  --yes was preauthorization of an unseen preview, and re-confirm displayed
+  AFTER the confirmation flag was consumed — the human decision could
+  predate the snapshot on screen. The CLI now renders FIRST and obtains
+  the decision NOW through an injectable decision_reader (terminal input
+  in production); --yes/--deny flags are removed entirely. Regressions
+  prove the decision happens after display (the reader sees the rendered
+  words + structure), a "no" mutates nothing, and the store CAS still
+  backs the displayed snapshot. F-41 (blocker): the production wiring
+  never called start() and never established a whoami-resolved actor —
+  the installed path could not reach a card at all. New
+  build_production_runtime (both factories injectable, so the WIRING is
+  tested): dispatcher.start() → whoami invoke → require ok AND a handle
+  (migrated writes refuse without a resolved actor) → return; any failure
+  stops the dispatcher before the error leaves; the card command stops it
+  in a finally (regression: stop runs even when phase 2 raises). Rules
+  commands never build a runtime (regression: a factory that fails the
+  test if invoked). F-43: the request snapshot is deep-copied BEFORE the
+  first await (regression: the invoke itself mutates the caller's nested
+  payload mid-await; the card still replays the phase-1 values). F-44:
+  the rules-only CLI is now genuinely browser-independent — the rule
+  lifecycle moved to webwire/safety/m8_rule_lifecycle.py (browser-free),
+  the CLI lazy-imports CardFlow only inside the card command, and BOTH
+  package __init__ files became PEP-562 lazy (webwire: Dispatcher/Session/
+  envelope names; safety: kill_switch, scoped_authority, write_kernel,
+  reconciliation_coordinator chain, recovery_guard — the coordinator→
+  commit_gateway→kill_switch chain was the hidden browser edge), so
+  importing a rules submodule no longer transitively imports the browser
+  SDK. Qualified by a clean subprocess with the conftest stub path
+  REMOVED: the CLI imports, asserts super_browser/envelope/dispatcher/
+  write_kernel absent from sys.modules, and runs rules list — passing
+  locally even with the real SDK installed, stronger on CI's base
+  install. F-45: the unknown-action note no longer promises ASK — it now
+  states the three facts: ceiling not verifiable (outside the active
+  registry), currently non-executable, and may AUTO-APPROVE if the action
+  is later registered below the standing-rule ceiling. F-46: CLI TTL
+  errors (0/-1/nan/inf/over-max) are caught as controlled usage failures
+  (exit 2) — and reconfirm_rule now rejects non-finite TTLs directly
+  (isfinite; NaN previously slipped past the </> comparisons into
+  UserRule's constructor). F-47: the sanitizer runs UNCONDITIONALLY before
+  any envelope branching, and the policy echo's confirmation_token is
+  removed regardless of its runtime type; a drifted envelope whose token
+  exists only in the policy echo yields NO card (fail-closed — a
+  payload-less token cannot be approved through the surface) and a
+  scrubbed result. Suite 1135 (count from the run).
+- **2026-10-01 — PR #24 review pass: F-34..F-40 (snapshot binding, token
+  custody, the frozen CLI).** The review's principle, accepted: human-visible
+  state, confirmation authority, and the mutation performed afterward must
+  all bind to ONE immutable snapshot. F-34 (blocker): TTL re-confirm was
+  id-keyed only — a same-id ALLOW→NEVER edit between the owner's read and
+  the fenced write would be silently overwritten by the stale re-confirm
+  (the fence serialized the write but not the read→confirm→write
+  transaction). Fixed with compare-and-swap: RuleStore.replace_if_current
+  (expected, replacement) under the existing mutation fence — the stored
+  rule must EQUAL the reviewed snapshot on every field (decision, selector,
+  provenance, source text, timestamps); any change, deletion, or corruption
+  conflicts with zero mutation; identity can never be rewritten.
+  reconfirm_rule now takes the reviewed UserRule itself, and listing hands
+  out the exact immutable snapshot (RuleCard.rule). Regressions lock the
+  review's exact race (stale ALLOW re-confirm can never overwrite a newer
+  NEVER) and the deleted-rule conflict. F-40 (blocker): begin() returned
+  the RAW kernel phase-1 result beside the card — token custody was a
+  rendering property, not an API property. The returned result is now
+  SANITIZED (deep-copied, token removed from BOTH the payload and the
+  policy echo); the token exists only inside the card. deny() still invokes
+  nothing; the confirmation subsystem exposes no per-token cancellation, so
+  the denial's bound is the token's existing TTL — stated, not implied.
+  F-38: the card is bound to the invoke route that created it;
+  approve() is parameterless (no caller-selected phase-2 transport). F-39:
+  the payload is deep-copied at begin and again at replay — nested caller
+  mutation after phase 1 cannot change what is confirmed (regression
+  locked). F-35: lifecycle rendering is TOTAL over legal rules — an ALLOW
+  naming an action outside the active registry renders 'ceiling not
+  verifiable … outside the active registry' instead of raising (a tier is
+  never inferred for an unknown action; management display is more total
+  than enforcement configuration). F-36: RuleCard carries source_text (the
+  owner's original words) and renders them beside the canonical
+  description; re-confirm displays words + structure + new TTL. F-37
+  (blocker/spec): the frozen Card CLI is now IMPLEMENTED (m8_card_cli.py;
+  console entry `m8`): `m8 card CAPABILITY PAYLOAD [--yes|--deny]` (render,
+  and decide in-run; without a flag the card is shown and the token dies
+  with the process), `m8 rules list`, and `m8 rules reconfirm RULE_ID
+  --ttl S [--yes]` (display then CAS-replace; dry-run without --yes).
+  Dependencies are injectable — the CLI is fully tested without a live
+  session. This SUPERSEDES the previous entry's 'library-only' scope claim,
+  which silently redefined layer 4: that was wrong, the frozen build order
+  names a CLI and now has one. Rule removal remains deliberately absent
+  (the build order names exactly list + TTL re-confirm). 12 net-new tests;
+  suite 1128 (count from the run).
+- **2026-10-01 — PR #23 MERGED (04176da) + M8 LAYER 4: the card surface +
+  rule lifecycle (PR pending).** Layer 3 cleared the maintainer pass at
+  6fc5467 (no new blockers; the reviewer's own log check confirmed the
+  Windows rule-store step: 147 durability + 57 rule-store tests) and
+  squash-merged. Layer 4 implemented per frozen section 8 (m8_cards.py,
+  top-level — presentation, not enforcement): CardFlow.begin() wraps any
+  invoke callable (the Dispatcher in production) and returns a phase-1
+  result plus an ApprovalCard when human confirmation is pending; rule-ALLOW
+  and NEVER outcomes return with NO card (nothing to approve). The card
+  renders summary/target/current-state/warnings/matched-rule (+ ceiling
+  note) via to_dict()/render_text(); the confirmation token is held
+  INTERNALLY — never in to_dict, render_text, or repr. approve() replays the
+  exact original payload with the held token (phase 2); deny() invokes
+  nothing and returns a defined declined outcome; a card is single-use (the
+  spent message names which decision consumed it). No new authority: every
+  verdict still comes from the kernel through the invoke callable. Rule
+  lifecycle per the build order's named two operations: list_rules()
+  (enforcement-reader fail-safe — corrupt store lists as empty; canonical
+  descriptions via the SAME renderer the compiler's owner-confirmation
+  uses; live remaining-TTL/expired state) and reconfirm_rule() (same
+  rule_id — attribution identity preserved; same selector/decision/
+  provenance; fresh TTL starting at the re-confirm call; TTL bounded by
+  the 7-day contract; unknown id fails closed; the write goes through a NEW
+  store primitive update_strict — fenced in-place replacement, corrupt
+  store refuses with bytes unchanged, every other rule keeps its position;
+  re-confirming an expired rule re-establishes it by owner choice).
+  Integration test drives the REAL dispatcher phase-1 → card → phase-2
+  through the M5 executor + gateway (fake bookmark broker) to a executed
+  bookmark. Deliberate scope limits, stated: no rule removal (the build
+  order names exactly list + TTL re-confirm; revocation remains editing the
+  store, observed by the next match); the surface is a library (a CLI
+  program wrapping it against a live session is out of CI-qualifiable
+  scope here). 14 new tests; suite 1116.
 - **2026-10-01 — PR #23 third review pass: F-30..F-33 (present-null
   widening, deterministic fence falsification, Windows lock qualification,
   closed fences).** F-30 (blocker): the rule-field reducers used

@@ -270,13 +270,79 @@ def _ceiling_note(
 ) -> str:
     """The honest effective-policy line (frozen spec: an above-ceiling ALLOW
     is reported as 'that will still ask'), derived from the same tier
-    vocabulary the layer-2 gate enforces at match time."""
+    vocabulary the layer-2 gate enforces at match time.
+
+    TOTAL over stored rules (F-35): an action outside the supplied registry
+    (a custom, stale, or removed capability) renders an explicit
+    unverifiable-ceiling note — a tier is never INFERRED for an unknown
+    action, and management display never raises on legal rules. The
+    compiler itself rejects unknown actions before rendering, so this path
+    exists for lifecycle rendering of already-stored rules."""
     if decision is not RuleDecision.ALLOW:
         return ""
+    # F-49: the action vocabulary is checked WHENEVER action_types is
+    # present — independently of whether risk_tiers is also specified. A
+    # mixed action+tier selector with an unknown action is exactly as
+    # latent (currently non-executable, possibly live authority after a
+    # future registration) as an action-only selector.
+    unknown_actions = (
+        [a for a in selector.action_types if registry.get(a) is None]
+        if selector.action_types is not None
+        else []
+    )
+    if unknown_actions:
+        # F-55: compose the two facts — unknown action AND effective tier
+        # ceiling — rather than choosing one. With explicit tiers, whether
+        # auto-approval is even possible is DETERMINED by those tiers: all
+        # above the ceiling means any future matching registration still
+        # ASKs; below-ceiling tiers are the only auto-approval route.
+        prefix = (
+            "ceiling not verifiable: some named actions are outside "
+            "the active registry — such actions are currently "
+            "non-executable"
+        )
+        if selector.risk_tiers is None:
+            # F-57: no explicit tiers — derive the KNOWN actions' registry
+            # tiers and compose them with the unknown-action warning. A
+            # rule like {post, future_action} must say BOTH: the unknown
+            # action's latent behavior AND that post (above ceiling) will
+            # still ASK — the unknown must not mask known behavior.
+            latent = (
+                f"{prefix}; such actions may auto-approve only if later "
+                "registered below the standing-rule ceiling"
+            )
+            known_tiers = {
+                registry.require(a)[0].derive_tier()
+                for a in (selector.action_types or frozenset())
+                if registry.get(a) is not None
+            }
+            if known_tiers - ALLOW_CEILING_TIERS:
+                return (
+                    f"{latent}; the known above-ceiling actions in this "
+                    "rule will still ASK"
+                )
+            return latent
+        below = selector.risk_tiers & ALLOW_CEILING_TIERS
+        above = selector.risk_tiers - ALLOW_CEILING_TIERS
+        if not below:
+            return (
+                f"{prefix}; if one is later registered at a tier matching "
+                "this selector, it will still ASK (every named tier is "
+                "above the allow ceiling)"
+            )
+        note = (
+            f"{prefix}; it may auto-approve only if later registered at "
+            "one of the below-ceiling tiers matching this selector"
+        )
+        if above:
+            note += "; matching above-ceiling tiers still ASK"
+        return note
     if selector.risk_tiers is not None:
         tiers = set(selector.risk_tiers)
     elif selector.action_types is not None:
-        tiers = {registry.require(a)[0].derive_tier() for a in selector.action_types}
+        tiers = {
+            registry.require(a)[0].derive_tier() for a in selector.action_types
+        }
     else:
         return "actions above the allow ceiling will still ASK"
     if not tiers & ALLOW_CEILING_TIERS:

@@ -828,7 +828,14 @@ def _redact_target(input: dict[str, Any]) -> Optional[str]:
 def _redact_input(input: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in input.items():
-        if isinstance(value, str) and "://" in value:
+        if key == "confirmation_token":
+            # Authority is never audit data (F-50): a live confirmation
+            # token is redacted BY KEY — policy gates (a newly installed
+            # NEVER, rate limits, dedupe) can deny before the confirmation
+            # gate consumes it, so the value may still be live when this
+            # record is written.
+            out[key] = "<redacted>"
+        elif isinstance(value, str) and "://" in value:
             scheme, rest = value.split("://", 1)
             path = rest.split("?", 1)[0].split("#", 1)[0]
             out[key] = f"{scheme}://{path}"

@@ -29,6 +29,10 @@ dependencies = [
     # absent (enforced shape-parity locally by tests/test_stub_parity.py).
 ]
 
+[project.scripts]
+# The frozen M8 layer-4 Card CLI (docs/M8_DESIGN.md section 8).
+m8 = "webwire.m8_card_cli:main"
+
 [project.optional-dependencies]
 browser = [
     # Local path dependency — the user's own SDK. Editable install.

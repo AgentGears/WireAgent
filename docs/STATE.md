@@ -487,6 +487,42 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #25 second review pass: F-43..F-48 — the frozen
+  session/lifecycle architecture, implemented.** The review's diagnosis,
+  accepted: all six blockers pointed at one missing abstraction — Layer 2
+  as built attached the raw lock to the Dispatcher lifecycle instead of
+  the frozen AuthoritySession + AuthorityServiceLifecycle topology. The
+  repair implements it: canonical absolute state_dir is frozen BEFORE any
+  M5/M6 construction (F-46; a CWD change can no longer split the lock
+  domain from the safety-state domain); the AuthoritySession
+  (webwire/authority_session.py, stdlib-only) is the owner-wide fence —
+  STARTING → READY → DRAINING → TERMINAL, admission state-gated, owner-
+  wide drain on one active count, revokers run before terminalization,
+  TERMINAL is permanent; start() acquires ownership, constructs the
+  session, registers the confirmation-epoch revoker, and starts the root
+  under an ASYNC lifecycle gate so start/stop can never interleave (F-45;
+  the gate must be asyncio, not threading — a threading lock taken by a
+  waiting coroutine blocks the loop itself); create_reconciliation_
+  operator_session is gated on a READY session and every operator
+  operation is admitted owner work (F-43); a failed/cancelled start
+  releases only after the session manager proves the partial root
+  quiescent — SessionManager hardened to stop a partial _sb and to clean
+  up a cancelled browser start (F-44); stop() runs the shutdown law in
+  order — begin_drain → invoke-lock + session drain (the blocking drain
+  runs in an executor thread so the loop stays live for the in-flight
+  work) → revoke (epoch advance; F-47) → retire browser → terminalize →
+  release the owner lock LAST; and a TERMINAL session never restarts
+  (F-47). The offline recovery owner (webwire/offline_recovery.py)
+  implements the standalone entrypoint: acquire-or-refuse the domain,
+  build the authority root under the lock, admitted operator access,
+  same shutdown law on close. Session-layer invocations are admitted
+  through the session too (F-48). Pre-Layer-2 test fixtures that drove
+  unstarted Dispatchers were updated to the started lifecycle
+  (serialization + M6 composition); three of my own build bugs were
+  caught before push (M5-stack stub shape, asyncio-vs-threading gate,
+  blocking drain freezing the loop). 8 new regressions, one per finding
+  plus the offline-owner subprocess qualification. Suite 1182 (count from
+  the run).
 - **2026-10-01 — M7 LAYER 2 BUILT (PR pending): ownership is mandatory
   around the runtime authority root.** Dispatcher.start() now acquires the
   AuthorityOwnerLock FIRST — before recovery hydration and before any

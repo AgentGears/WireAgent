@@ -85,18 +85,24 @@ class _StopInsideRead:
         return await self.dispatcher.stop()
 
 
-def _dispatcher(tmp_path: Path) -> Dispatcher:
+async def _dispatcher(tmp_path: Path) -> Dispatcher:
+    from types import SimpleNamespace
+
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     session = _Session(cfg)
     dispatcher = Dispatcher(cfg, session_manager=session)  # type: ignore[arg-type]
-    # Custom test capabilities do not touch this broker, but Dispatcher requires
-    # the started boundary to be present before dispatching any capability.
-    dispatcher._broker = object()  # type: ignore[assignment]
+    # M7 Layer 2: invocations require a started owner session. Start through
+    # the real lifecycle with a stub M5 stack install.
+    dispatcher._install_m5_live_stack = (  # type: ignore[method-assign]
+        lambda sb: setattr(dispatcher, "_m5_stack", SimpleNamespace(read_broker=object()))
+    )
+    started = await dispatcher.start()
+    assert started.ok, getattr(started.error, "message", started)
     return dispatcher
 
 
 async def test_sibling_dispatcher_invocations_are_serialized(tmp_path: Path) -> None:
-    dispatcher = _dispatcher(tmp_path)
+    dispatcher = await _dispatcher(tmp_path)
     entered = asyncio.Event()
     release = asyncio.Event()
     events: list[str] = []
@@ -120,7 +126,7 @@ async def test_sibling_dispatcher_invocations_are_serialized(tmp_path: Path) -> 
 
 
 async def test_same_task_dispatcher_reentry_does_not_deadlock(tmp_path: Path) -> None:
-    dispatcher = _dispatcher(tmp_path)
+    dispatcher = await _dispatcher(tmp_path)
     events: list[str] = []
     dispatcher._registry.register(_ProbeRead(events))
     dispatcher._registry.register(_ReentrantRead(dispatcher, events))
@@ -132,7 +138,7 @@ async def test_same_task_dispatcher_reentry_does_not_deadlock(tmp_path: Path) ->
 
 
 async def test_sibling_stop_waits_for_active_invocation(tmp_path: Path) -> None:
-    dispatcher = _dispatcher(tmp_path)
+    dispatcher = await _dispatcher(tmp_path)
     entered = asyncio.Event()
     release = asyncio.Event()
     events: list[str] = []
@@ -157,7 +163,7 @@ async def test_sibling_stop_waits_for_active_invocation(tmp_path: Path) -> None:
 
 
 async def test_stop_from_inside_active_invocation_fails_closed(tmp_path: Path) -> None:
-    dispatcher = _dispatcher(tmp_path)
+    dispatcher = await _dispatcher(tmp_path)
     dispatcher._registry.register(_StopInsideRead(dispatcher))
 
     result = await dispatcher.invoke(_StopInsideRead.name)

@@ -19,32 +19,52 @@ def _evidence() -> dict[str, object]:
     }
 
 
-def test_dispatcher_owns_one_coherent_reconciliation_authority_domain(
+async def _started_dispatcher(tmp_path: Path) -> Dispatcher:
+    from types import SimpleNamespace
+
+    from webwire.session import SessionManager
+
+    class _StubSB:
+        _page = None
+        _controller = None
+
+    class _StubSessionManager(SessionManager):
+        def __init__(self, config) -> None:
+            super().__init__(config)
+            self._sb = _StubSB()  # type: ignore[assignment]
+            self._started = True
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    sm = _StubSessionManager(cfg)
+    dispatcher = Dispatcher(cfg, session_manager=sm)  # type: ignore[arg-type]
+    dispatcher._install_m5_live_stack = (  # type: ignore[method-assign]
+        lambda sb: setattr(dispatcher, "_m5_stack", SimpleNamespace(read_broker=object()))
+    )
+    started = await dispatcher.start()
+    assert started.ok, getattr(started.error, "message", started)
+    return dispatcher
+
+
+async def test_dispatcher_owns_one_coherent_reconciliation_authority_domain(
     tmp_path: Path,
 ) -> None:
-    dispatcher = Dispatcher(WebWireConfig(state_dir=tmp_path))
+    dispatcher = await _started_dispatcher(tmp_path)
     session = dispatcher.create_reconciliation_operator_session("local-admin")
 
     assert session._coordinator is dispatcher._m6_reconciliation
-    assert (
-        dispatcher._m6_reconciliation.confirmation_state
-        is dispatcher._write_kernel.confirmation_state
-    )
+    assert dispatcher._m6_reconciliation.confirmation_state is dispatcher._write_kernel.confirmation_state
     assert dispatcher._m6_reconciliation.commit_gateway is dispatcher._m5_gateway
     assert dispatcher._m6_reconciliation.recovery_guard is dispatcher._m5_recovery
 
     # Reconciliation remains local operator bookkeeping authority. It is not a
     # registered capability and therefore cannot acquire a hidden invoke() route.
-    assert not any(
-        name.startswith("recovery") or "reconcil" in name
-        for name in dispatcher.capabilities
-    )
+    assert not any(name.startswith("recovery") or "reconcil" in name for name in dispatcher.capabilities)
 
 
-def test_dispatcher_reconciliation_revokes_real_writekernel_confirmation(
+async def test_dispatcher_reconciliation_revokes_real_writekernel_confirmation(
     tmp_path: Path,
 ) -> None:
-    dispatcher = Dispatcher(WebWireConfig(state_dir=tmp_path))
+    dispatcher = await _started_dispatcher(tmp_path)
     raw = EffectLedgerRecord(
         effect_id="fx-dispatcher-shared-epoch",
         semantic_key="actor|like|post|shared-epoch|",

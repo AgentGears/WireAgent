@@ -18,6 +18,11 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
+if TYPE_CHECKING:
+    from webwire.authority_operators import (
+        OwnedReconciliationOperatorSession,
+    )
+
 from webwire.broker import ReadOnlyBroker
 from webwire.capabilities.base import Capability, CapabilityTier
 from webwire.capabilities.health import HealthCapability
@@ -39,7 +44,6 @@ if TYPE_CHECKING:
     from webwire.safety.m5_post_text_adapter import M5PostTextCapabilityAdapter
     from webwire.safety.m5_quote_adapter import M5QuoteCapabilityAdapter
     from webwire.safety.m5_reply_adapter import M5ReplyCapabilityAdapter
-    from webwire.safety.reconciliation_operator import ReconciliationOperatorSession
     from webwire.safety.write_kernel import WriteCapability
 
 logger = logging.getLogger(__name__)
@@ -89,7 +93,14 @@ class Dispatcher:
         config: Optional[WebWireConfig] = None,
         session_manager: Optional[SessionManager] = None,
     ) -> None:
-        self._config = config or WebWireConfig()
+        # M7-RV11 / F-46: resolve state_dir ONCE, before ANY authority-root
+        # construction. Every derived path — journal, effect ledger, rules
+        # store, lock file — uses this exact canonical absolute domain, so a
+        # later CWD change can never split the lock domain from the safety
+        # state domain.
+        from webwire.offline_recovery import canonical_config
+
+        self._config = canonical_config(config or WebWireConfig())
         self._session = session_manager or SessionManager(self._config)
         self._kill = KillSwitch(self._config)
         self._journal = Journal(self._config)
@@ -100,10 +111,18 @@ class Dispatcher:
         # Dispatcher invocations so no sibling task can navigate over an owned
         # M5 composer. Same-task re-entry is allowed for trusted orchestration.
         self._invoke_lock = asyncio.Lock()
-        # M7 Layer 2: authority ownership for this state directory. Acquired
-        # first in start(), released last in stop() after admitted invocation
-        # work has drained. None while this Dispatcher holds no authority.
+        # M7 Layer 2: the authority session is the owner-wide lifecycle
+        # fence (STARTING → READY → DRAINING → TERMINAL). Ownership is
+        # acquired before the session exists and released after it is
+        # terminal. A TERMINAL session never becomes active again: build a
+        # new Dispatcher for a new owner session.
         self._owner_lock: Optional[Any] = None
+        self._authority_session: Optional[Any] = None
+        # The lifecycle fence between start() and stop(). Asyncio (not
+        # threading): a threading lock acquired by a waiting coroutine would
+        # block the event loop thread itself; this lock is only ever taken
+        # inside async lifecycle methods.
+        self._lifecycle_gate: Any = asyncio.Lock()
         self._invoke_lock_owner: Optional[asyncio.Task[Any]] = None
 
         from webwire.safety import (
@@ -177,14 +196,26 @@ class Dispatcher:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> ActionResult:
-        """Take authority ownership, hydrate recovery, install the live stack.
+        """Take authority ownership, build the session, start the root.
 
-        M7 Layer 2: the AuthorityOwnerLock is acquired FIRST — before recovery
-        hydration and before any browser/session activity — so a losing
-        process fails before production browser or safety-write authority
-        exists. Ownership is held until the end of stop(); controlled release
-        is last and never overtakes admitted mutation work (stop() drains the
-        invocation lock before releasing)."""
+        The frozen Layer-2 ordering, enforced by the lifecycle gate and the
+        AuthoritySession fence (STARTING → READY):
+
+        1. acquire the AuthorityOwnerLock FIRST — before recovery hydration
+           and before any browser/session activity, so a losing process
+           fails before production browser or safety-write authority;
+        2. construct the AuthoritySession in STARTING and register the
+           confirmation-epoch revoker, so pending owner-side confirmation
+           authority can never survive ownership replacement (F-47);
+        3. start the authority root under the gate — a concurrent stop()
+           cannot interleave with a half-started root (F-45);
+        4. activate (READY) only on success.
+
+        On failure or cancellation, ownership is released only after the
+        partially constructed root is demonstrably quiescent — the session
+        manager is stopped and its stop must succeed; otherwise the domain
+        stays locked fail-closed (F-44). A TERMINAL session never restarts:
+        build a new Dispatcher for a new owner session."""
         from super_browser.results.types import FailureCategory
 
         from webwire.authority import (
@@ -192,39 +223,83 @@ class Dispatcher:
             AuthorityOwnerError,
             AuthorityOwnerLock,
         )
+        from webwire.authority_session import AuthoritySession
         from webwire.envelope import hard_failure
 
-        if self._owner_lock is not None:
-            return hard_failure(
-                "Dispatcher.start() called while already started",
-                failure_category=FailureCategory.SECURITY,
-            )
+        async with self._lifecycle_gate:
+            if self._authority_session is not None:
+                state = self._authority_session.state.value
+                if state == "terminal":
+                    return hard_failure(
+                        "this runtime's authority session is TERMINAL: a "
+                        "terminal session never becomes active again — "
+                        "construct a new Dispatcher for a new owner session",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+                return hard_failure(
+                    "Dispatcher.start() called while already started or starting",
+                    failure_category=FailureCategory.SECURITY,
+                )
+            try:
+                owner_lock = AuthorityOwnerLock(self._config.state_dir).acquire()
+            except AuthorityBusyError:
+                return hard_failure(
+                    "authority_busy: another WireAgent runtime owns this state "
+                    f"directory ({self._config.state_dir}); "
+                    "stop the other runtime before starting a second one",
+                    failure_category=FailureCategory.SECURITY,
+                )
+            except AuthorityOwnerError as exc:
+                return hard_failure(
+                    f"could not establish authority ownership for this state directory: {exc}",
+                    failure_category=FailureCategory.SECURITY,
+                )
+
+            session = AuthoritySession(authority_domain=self._config.state_dir)
+            # F-47: advancing the confirmation epoch synchronously revokes
+            # every pending token; registered as the session revoker it runs
+            # before terminalization and before ownership release.
+            session.register_revoker(self._write_kernel.confirmation_state.advance_epoch)
+            self._owner_lock = owner_lock
+            self._authority_session = session
+            try:
+                result = await self._start_locked()
+            except BaseException:
+                await self._teardown_failed_start(session)
+                raise
+            if result.ok:
+                session.activate()
+                return result
+            await self._teardown_failed_start(session)
+            return result
+
+    async def _teardown_failed_start(self, session: Any) -> None:
+        """F-44: a failed/cancelled start releases ownership only after the
+        partially constructed root is demonstrably quiescent. The session
+        manager must stop cleanly; if it cannot, the domain stays locked
+        fail-closed and the process owner must investigate."""
+
+        session.revoke_authority()
         try:
-            self._owner_lock = AuthorityOwnerLock(self._config.state_dir).acquire()
-        except AuthorityBusyError:
-            self._owner_lock = None
-            return hard_failure(
-                "authority_busy: another WireAgent runtime owns this state "
-                f"directory ({self._config.state_dir.resolve(strict=False)}); "
-                "stop the other runtime before starting a second one",
-                failure_category=FailureCategory.SECURITY,
+            quiesce = await self._session.stop()
+        except BaseException as exc:
+            self._authority_session = session  # keep for diagnostics
+            logger.error(
+                "failed-start cleanup could not prove the root quiescent "
+                "(session stop raised %r); authority domain stays locked "
+                "fail-closed",
+                exc,
             )
-        except AuthorityOwnerError as exc:
-            self._owner_lock = None
-            return hard_failure(
-                f"could not establish authority ownership for this state directory: {exc}",
-                failure_category=FailureCategory.SECURITY,
+            return
+        if not quiesce.ok:
+            self._authority_session = session
+            logger.error(
+                "failed-start cleanup could not prove the root quiescent "
+                "(%s); authority domain stays locked fail-closed",
+                getattr(quiesce.error, "message", quiesce),
             )
-        try:
-            result = await self._start_locked()
-        except BaseException:
-            # A failed start must not strand the authority domain: release
-            # ownership so a retry or a successor can proceed cleanly.
-            self._release_authority()
-            raise
-        if not result.ok:
-            self._release_authority()
-        return result
+            return
+        self._release_authority()
 
     def _release_authority(self) -> None:
         """Release authority ownership (idempotent; M7 Layer 2)."""
@@ -315,7 +390,16 @@ class Dispatcher:
         return r
 
     async def stop(self) -> ActionResult:
-        """Stop only after any sibling Dispatcher invocation leaves the browser."""
+        """The owner shutdown law (frozen Layer 2, in order):
+
+        reject new admission → drain ALL admitted owner work (Dispatcher
+        invocations AND reconciliation operator operations) → revoke
+        ephemeral confirmation authority → retire the browser/operator
+        root → mark the session TERMINAL → close the owner lock LAST.
+
+        The lifecycle gate serializes against start(), so a stop can never
+        interleave with a half-started root (F-45), and a TERMINAL session
+        never restarts (F-47)."""
         current_task = asyncio.current_task()
         if current_task is self._invoke_lock_owner:
             from super_browser.results.types import FailureCategory
@@ -326,24 +410,57 @@ class Dispatcher:
                 "Dispatcher.stop() cannot run from inside an active invocation",
                 failure_category=FailureCategory.SECURITY,
             )
-        async with self._invoke_lock:
-            # Drain first: acquiring the invocation lock waits for any
-            # admitted invocation to complete, and blocks new ones — no
-            # mutation work can be overtaken by shutdown (M7 Layer 2).
-            self._m5_stack = None
-            self._m5_canary_adapters.clear()
-            self._m5_post_text_adapter = None
-            self._m5_reply_adapter = None
-            self._m5_quote_adapter = None
-            self._m5_delete_adapter = None
-            self._m5_media_adapters.clear()
-            self._broker = None
-            result = await self._session.stop()
-            # Controlled release is LAST: ownership outlives the browser and
-            # every drained mutation so a successor can never start while
-            # admitted work might still be in flight.
-            self._release_authority()
-            return result
+        from webwire.envelope import ok_result
+
+        async with self._lifecycle_gate:
+            session = self._authority_session
+            if session is None or self._owner_lock is None:
+                # Never started, or a failed start already cleaned up.
+                return ok_result(data={"already_stopped": True})
+            if session.state.value == "terminal":
+                return ok_result(data={"already_stopped": True})
+            # 1. Reject new admission owner-wide.
+            session.begin_drain()
+            # 2. Drain all admitted owner work. The invocation lock waits
+            #    for in-flight invokes (and blocks new ones); the session
+            #    drain waits for admitted reconciliation operations.
+            async with self._invoke_lock:
+                # The session drain is a blocking condition wait — run it in
+                # an executor thread so the event loop stays live: the
+                # in-flight admitted work (and its releasers) may need this
+                # loop to progress before it can complete.
+                drained = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: session.wait_drained(timeout=300.0)
+                )
+                if not drained:
+                    # Fail closed: admission stays closed and ownership
+                    # stays held; the caller must resolve the stuck work.
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    return hard_failure(
+                        "authority drain timed out with admitted owner work "
+                        "still active; ownership is retained fail-closed",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+                # 3. Revoke ephemeral confirmation authority (F-47): every
+                #    pending phase-1 token dies with this owner session.
+                session.revoke_authority()
+                # 4. Retire the operator/browser root.
+                self._m5_stack = None
+                self._m5_canary_adapters.clear()
+                self._m5_post_text_adapter = None
+                self._m5_reply_adapter = None
+                self._m5_quote_adapter = None
+                self._m5_delete_adapter = None
+                self._m5_media_adapters.clear()
+                self._broker = None
+                result = await self._session.stop()
+                # 5. Terminal, then 6. release LAST.
+                session.terminalize()
+                self._release_authority()
+                return result
 
     # -- invocation ----------------------------------------------------------
 
@@ -352,7 +469,34 @@ class Dispatcher:
         name: str,
         input: Optional[dict[str, Any]] = None,
     ) -> ActionResult:
-        """Invoke a capability by name through the appropriate trust boundary."""
+        """Invoke a capability by name through the appropriate trust boundary.
+
+        M7 Layer 2: an invocation is admitted owner work. While a session
+        exists it is admitted through the AuthoritySession — draining or
+        terminal sessions refuse new invocations, and stop() drains on the
+        same admission count before releasing ownership."""
+        from super_browser.results.types import FailureCategory
+
+        from webwire.authority_session import AuthorityAdmissionClosedError
+        from webwire.envelope import hard_failure
+
+        session = self._authority_session
+        if session is None:
+            return await self._invoke_inner(name, input)
+        try:
+            with session.admit():
+                return await self._invoke_inner(name, input)
+        except AuthorityAdmissionClosedError as exc:
+            return hard_failure(
+                f"invocation refused: {exc}",
+                failure_category=FailureCategory.SECURITY,
+            )
+
+    async def _invoke_inner(
+        self,
+        name: str,
+        input: Optional[dict[str, Any]] = None,
+    ) -> ActionResult:
         current_task = asyncio.current_task()
         if current_task is not self._invoke_lock_owner and self._kill.tripped():
             from webwire.envelope import kill_switched
@@ -376,7 +520,7 @@ class Dispatcher:
             async with self._invoke_lock:
                 self._invoke_lock_owner = current_task
                 try:
-                    return await self.invoke(name, input)
+                    return await self._invoke_inner(name, input)
                 finally:
                     self._invoke_lock_owner = None
 
@@ -587,8 +731,28 @@ class Dispatcher:
     def create_reconciliation_operator_session(
         self,
         operator_id: str,
-    ) -> "ReconciliationOperatorSession":
-        """Create local M6 operator workflow on this runtime's exact authority state."""
+    ) -> "OwnedReconciliationOperatorSession":
+        """Create the M6 operator workflow on this runtime's authority state.
+
+        M7 Layer 2 / F-43: reconciliation is owner-side safety work — the
+        factory is gated on an ACTIVE (READY) authority session, and every
+        operator operation is admitted owner work that stop() drains before
+        releasing ownership. Without an active session (never started,
+        draining, or terminal) access is refused; use the offline recovery
+        owner when no runtime holds the domain."""
+        from webwire.authority_operators import (
+            OwnedReconciliationOperatorSession,
+            require_ready_session,
+        )
+
+        session = require_ready_session(self._authority_session)
+        return OwnedReconciliationOperatorSession(
+            session=session,
+            operator_id=operator_id,
+            delegate_factory=self._make_reconciliation_operator_session,
+        )
+
+    def _make_reconciliation_operator_session(self, operator_id: str) -> Any:
         from webwire.safety.reconciliation_operator import ReconciliationOperatorSession
 
         return ReconciliationOperatorSession(

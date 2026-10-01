@@ -79,7 +79,9 @@ class WebWireConfig:
     # Optional by design: with no API key / endpoint configured, the compiler
     # is simply unavailable and hand-written rules work unchanged. The model
     # runs at compile time only — never during matching, gating, or approval.
-    compiler_api_key: Optional[str] = None
+    # repr=False: the key is a credential and must not leak into logs or
+    # config representations (F-24).
+    compiler_api_key: Optional[str] = field(default=None, repr=False)
     compiler_endpoint: Optional[str] = None
     compiler_model_name: str = "default"
 

@@ -9,9 +9,15 @@ never fuzzified.
 Safety properties load-bearing here (frozen spec + standing decisions):
 
 - **The model never writes rules.** The model returns a JSON draft; strict
-  deterministic validation reduces it to a ``RuleSelector`` + decision, and
-  the description the owner confirms is re-generated FROM that structure by
-  code, never echoed from the model's words.
+  deterministic validation (duplicate keys, non-finite numbers, malformed
+  refusals — all rejected, F-21) reduces it to a ``RuleSelector`` +
+  decision. The description the owner confirms is re-generated FROM that
+  structure by code — canonical and lossless (F-23) — never echoed from the
+  model's words.
+- **Impossible rules are rejected, not stored.** A selector provably unable
+  to match any registered action — wrong target type for the named action,
+  contradictory action/tier conjunction — would be a silent no-op rule, so
+  it is rejected against the registry's deterministic vocabulary (F-22).
 - **Compile-time only.** Nothing in this module is imported by the store,
   the matcher, the kernel, or any enforcement path. A subprocess-level
   regression locks that import graph.
@@ -19,21 +25,27 @@ Safety properties load-bearing here (frozen spec + standing decisions):
   the built-in implementation is a plain API-key chat client. With no model
   configured, hand-written rules work exactly as before.
 - **Ambiguity surfaces once, at creation.** ``compile()`` produces a draft
-  and stores nothing; ``confirm()`` is the only call that persists, and the
-  owner confirms the compilation (the re-expressed structure), not the words.
+  and stores nothing; ``confirm()`` is the only call that persists. The
+  owner confirms the COMPILATION (the canonical re-expression), the rule's
+  lifetime begins at confirmation (F-20), and persistence goes through the
+  store's strict serialized append (F-19): a corrupt store refuses mutation
+  with bytes unchanged — a rule-store failure can never widen what rules
+  permit.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from webwire.safety.models import RiskTier
-from webwire.safety.risk_registry import RiskRegistry
+from webwire.safety.risk_registry import DEFAULT_REGISTRY, RiskRegistry
 from webwire.safety.user_rules import (
+    ALLOW_CEILING_TIERS,
     DEFAULT_RULE_TTL_S,
     RuleDecision,
     RuleSelector,
@@ -189,7 +201,11 @@ def model_from_config(
 class CompiledRuleDraft:
     """The compile result: NOT a rule. Nothing is stored until the owner
     confirms — and the owner confirms ``description``, which code generated
-    from the structure below, not from the model's words."""
+    from the structure below, not from the model's words.
+
+    Public and constructible by design (layer 4 surfaces it); ``confirm()``
+    therefore revalidates it against the compiler's own constraints instead
+    of trusting it (F-23)."""
 
     rule_id: str
     decision: RuleDecision
@@ -200,35 +216,112 @@ class CompiledRuleDraft:
     compiled_at: float
 
 
+# -- strict JSON (F-21) ------------------------------------------------------
+
+class _StrictJsonError(ValueError):
+    """A strict-loader violation: duplicate keys or a non-standard constant."""
+
+
+def _reject_constant(name: str) -> Any:
+    raise _StrictJsonError(f"non-standard JSON constant {name!r}")
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise _StrictJsonError(f"duplicate JSON key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _loads_strict(text: str) -> Any:
+    """json.loads with the two silent-tolerance holes closed: duplicate
+    object keys (last-value-wins hides ambiguity) and NaN/Infinity
+    literals (non-finite numbers must never reach a TTL)."""
+    return json.loads(
+        text, object_pairs_hook=_no_duplicate_keys, parse_constant=_reject_constant
+    )
+
+
+# -- the canonical owner-facing representation (F-23) ------------------------
+
+def _friendly_duration(ttl_seconds: float) -> str:
+    if ttl_seconds >= 86400.0:
+        return f"{ttl_seconds / 86400.0:.1f} days"
+    if ttl_seconds >= 3600.0:
+        return f"{ttl_seconds / 3600.0:.1f} hours"
+    if ttl_seconds >= 60.0:
+        return f"{ttl_seconds / 60.0:.1f} minutes"
+    return f"{ttl_seconds:.1f} seconds"
+
+
+def _quoted_array(values: Any) -> str:
+    """Sorted, individually quoted/escaped values — ["a", "b"] is never
+    confusable with ["a or b"] (F-23: the confirmation text must uniquely
+    represent the compiled rule)."""
+    return "[" + ", ".join(json.dumps(str(v)) for v in sorted(values)) + "]"
+
+
+def _ceiling_note(
+    decision: RuleDecision,
+    selector: RuleSelector,
+    registry: RiskRegistry,
+) -> str:
+    """The honest effective-policy line (frozen spec: an above-ceiling ALLOW
+    is reported as 'that will still ask'), derived from the same tier
+    vocabulary the layer-2 gate enforces at match time."""
+    if decision is not RuleDecision.ALLOW:
+        return ""
+    if selector.risk_tiers is not None:
+        tiers = set(selector.risk_tiers)
+    elif selector.action_types is not None:
+        tiers = {registry.require(a)[0].derive_tier() for a in selector.action_types}
+    else:
+        return "actions above the allow ceiling will still ASK"
+    if not tiers & ALLOW_CEILING_TIERS:
+        return "will still ASK: every named tier is above the allow ceiling"
+    if tiers - ALLOW_CEILING_TIERS:
+        return "actions above the allow ceiling will still ASK"
+    return ""
+
+
 def describe_compiled_rule(
     decision: RuleDecision,
     selector: RuleSelector,
     ttl_seconds: float,
+    *,
+    registry: RiskRegistry = DEFAULT_REGISTRY,
 ) -> str:
-    """Deterministically re-express a compiled selector in plain words.
+    """The canonical, lossless owner-facing representation of a compiled
+    rule (F-23).
 
-    Generated only from the structure — two different source sentences that
-    compile to the same selector produce the identical description (locked
-    by regression). This is the text the owner actually confirms."""
-
-    def dim(name: str, values: frozenset[Any]) -> str:
-        return f"{name} {' or '.join(sorted(str(v) for v in values))}"
-
+    Generated only from the structure: sorted quoted/escaped arrays (so
+    {"a","b"} and {"a or b"} render differently), the exact TTL seconds
+    alongside a friendly duration (86400 and 86401 render differently), and
+    explicit effective-ceiling semantics for ALLOW. Two structures produce
+    the same description only if they are the same rule; the owner confirms
+    THIS text, and confirm() re-derives it before persisting."""
     parts: list[str] = []
     if selector.action_types is not None:
-        parts.append(dim("actions", selector.action_types))
+        parts.append(f"actions {_quoted_array(selector.action_types)}")
     if selector.risk_tiers is not None:
-        parts.append(dim("risk tiers", selector.risk_tiers))
+        parts.append(f"risk tiers {_quoted_array(selector.risk_tiers)}")
     if selector.target_types is not None:
-        parts.append(dim("target types", selector.target_types))
+        parts.append(f"target types {_quoted_array(selector.target_types)}")
     if selector.target_ids is not None:
-        parts.append(dim("target ids", selector.target_ids))
+        parts.append(f"target ids {_quoted_array(selector.target_ids)}")
     if selector.actors is not None:
-        parts.append(dim("actors", selector.actors))
-    days = ttl_seconds / 86400.0
-    ttl = f"{days:.1f} days" if days >= 1.0 else f"{ttl_seconds:.0f} seconds"
+        parts.append(f"actors {_quoted_array(selector.actors)}")
     scope = "; ".join(parts) if parts else "nothing named"
-    return f"{decision.value.upper()} when {scope} — expires in {ttl}"
+    text = (
+        f"{decision.value.upper()} when {scope} — expires in "
+        f"{json.dumps(float(ttl_seconds))}s ({_friendly_duration(ttl_seconds)})"
+    )
+    note = _ceiling_note(decision, selector, registry)
+    if note:
+        text += f" — {note}"
+    return text
 
 
 _SYSTEM_PROMPT = (
@@ -266,12 +359,17 @@ class RuleCompiler:
         clock: Callable[[], float],
         max_ttl_seconds: float = DEFAULT_RULE_TTL_S,
     ) -> None:
-        if max_ttl_seconds <= 0:
-            raise ValueError("max_ttl_seconds must be > 0")
+        if (
+            isinstance(max_ttl_seconds, bool)
+            or not isinstance(max_ttl_seconds, (int, float))
+            or not math.isfinite(max_ttl_seconds)
+            or max_ttl_seconds <= 0
+        ):
+            raise ValueError("max_ttl_seconds must be a finite positive number")
         self._model = model
         self._registry = registry
         self._clock = clock
-        self._max_ttl = max_ttl_seconds
+        self._max_ttl = float(max_ttl_seconds)
 
     async def compile(self, text: str) -> CompiledRuleDraft:
         """Draft a rule from natural language. Stores NOTHING.
@@ -286,12 +384,18 @@ class RuleCompiler:
 
         known_actions = self._registry.known_actions()
         known_tiers = [t.value for t in RiskTier]
+        target_vocab = ", ".join(
+            f"{a}={sorted(self._registry.require(a)[0].target_types)}"
+            for a in known_actions
+            if self._registry.require(a)[0].target_types
+        )
         prompt = "\n".join(
             [
                 "Allowed vocabulary:",
                 f"- decisions: {', '.join(sorted(_KNOWN_DECISIONS))}",
                 f"- action_types: {', '.join(known_actions)}",
                 f"- risk_tiers: {', '.join(known_tiers)}",
+                f"- valid target types by action: {target_vocab}",
                 (
                     "Fields (all optional except decision): expressible(bool), "
                     "explanation(str), decision(str), "
@@ -306,22 +410,13 @@ class RuleCompiler:
             ]
         )
         raw = await self._model.complete(system=_SYSTEM_PROMPT, prompt=prompt)
-        draft = self._reduce(text.strip(), raw)
-        return draft
+        return self._reduce(text.strip(), raw)
 
     # -- deterministic reduction ------------------------------------------
 
     def _reduce(self, source_text: str, raw: str) -> CompiledRuleDraft:
         payload = self._parse_json(raw)
-        if payload.get("expressible") is False:
-            explanation = payload.get("explanation")
-            explanation = (
-                explanation
-                if isinstance(explanation, str) and explanation.strip()
-                else "the model judged the clause inexpressible"
-            )
-            raise RuleCompileRejected("inexpressible", explanation)
-
+        self._reduce_refusal(payload)
         decision = self._reduce_decision(payload)
         selector = self._reduce_selector(payload)
         ttl = self._reduce_ttl(payload.get("ttl_seconds"))
@@ -334,7 +429,9 @@ class RuleCompiler:
             selector=selector,
             ttl_seconds=ttl,
             source_text=source_text,
-            description=describe_compiled_rule(decision, selector, ttl),
+            description=describe_compiled_rule(
+                decision, selector, ttl, registry=self._registry
+            ),
             compiled_at=self._clock(),
         )
 
@@ -350,11 +447,11 @@ class RuleCompiler:
             if text.rstrip().endswith("```"):
                 text = text.rstrip()[:-3]
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
+            payload = _loads_strict(text)
+        except (_StrictJsonError, json.JSONDecodeError) as exc:
             raise RuleCompileRejected(
                 "unparseable_response",
-                f"the model did not return JSON ({exc.msg}); nothing was stored",
+                f"the model did not return strict JSON ({exc}); nothing was stored",
             ) from exc
         if not isinstance(payload, dict):
             raise RuleCompileRejected(
@@ -368,6 +465,31 @@ class RuleCompiler:
                 f"unknown fields {unknown} in the compiled draft; nothing was stored",
             )
         return payload
+
+    def _reduce_refusal(self, payload: dict[str, Any]) -> None:
+        """The refusal shape is strict (F-21): expressible, when present,
+        must be a real JSON boolean — "false"/0/null are malformed, not
+        refusals, and must never fall through into a rule."""
+        if "expressible" not in payload:
+            return
+        expressible = payload["expressible"]
+        if not isinstance(expressible, bool):
+            raise RuleCompileRejected(
+                "invalid_shape",
+                "expressible must be a boolean; nothing was stored",
+            )
+        if expressible is not False:
+            return
+        if "explanation" in payload:
+            explanation = payload["explanation"]
+            if not isinstance(explanation, str) or not explanation.strip():
+                raise RuleCompileRejected(
+                    "invalid_shape",
+                    "explanation must be a non-empty string; nothing was stored",
+                )
+        else:
+            explanation = "the model judged the clause inexpressible"
+        raise RuleCompileRejected("inexpressible", explanation)
 
     def _reduce_decision(self, payload: dict[str, Any]) -> RuleDecision:
         value = payload.get("decision")
@@ -397,7 +519,9 @@ class RuleCompiler:
                 "blanket rules are not supported: a rule must name at least one "
                 "dimension (action, risk tier, target, or actor); nothing was stored",
             )
-        return RuleSelector(**dims)
+        selector = RuleSelector(**dims)
+        self._check_satisfiable(selector)
+        return selector
 
     def _string_dim(
         self, payload: dict[str, Any], name: str
@@ -449,9 +573,50 @@ class RuleCompiler:
             tiers.append(RiskTier(item))
         return frozenset(tiers)
 
+    def _check_satisfiable(self, selector: RuleSelector) -> None:
+        """F-22: a selector provably unable to match any registered action
+        would be a silent no-op rule — reject it as inexpressible.
+
+        Provable means: across the named actions (or every registered action
+        when none is named), no candidate satisfies the tier and target
+        constraints together — e.g. like with target 'tweet' (like targets
+        posts), or like with tier private_reversible (like deterministically
+        derives public_reversible_engagement). An action with no recorded
+        target_types imposes no provable target constraint: absence of
+        recorded truth is not permission, and unsatisfiability is only
+        asserted when the vocabulary proves it."""
+        candidates = (
+            sorted(selector.action_types)
+            if selector.action_types is not None
+            else self._registry.known_actions()
+        )
+        for action in candidates:
+            meta, _ = self._registry.require(action)
+            if (
+                selector.risk_tiers is not None
+                and meta.derive_tier() not in selector.risk_tiers
+            ):
+                continue
+            if (
+                selector.target_types is not None
+                and meta.target_types
+                and not (set(meta.target_types) & set(selector.target_types))
+            ):
+                continue
+            return  # one satisfiable candidate is enough
+        raise RuleCompileRejected(
+            "inexpressible",
+            "the named action/tier/target conjunction matches no registered "
+            "action — a rule that can never match would be a silent no-op; "
+            "nothing was stored",
+        )
+
     def _reduce_ttl(self, value: Any) -> float:
         if value is None:
-            return DEFAULT_RULE_TTL_S
+            # Omitted TTL takes the standard default, clamped to this
+            # compiler's configured maximum (F-21: an omitted field must
+            # not bypass a tighter cap).
+            return min(DEFAULT_RULE_TTL_S, self._max_ttl)
         # bools are ints in Python (the layer-1 parse lesson): reject them
         # rather than letting True parse as 1 second.
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -460,6 +625,11 @@ class RuleCompiler:
                 "ttl_seconds must be a number; nothing was stored",
             )
         ttl = float(value)
+        if not math.isfinite(ttl):
+            raise RuleCompileRejected(
+                "inexpressible",
+                "ttl must be a finite duration; nothing was stored",
+            )
         if ttl <= 0:
             raise RuleCompileRejected(
                 "inexpressible",
@@ -475,18 +645,49 @@ class RuleCompiler:
 
     # -- the confirm-compile surface ---------------------------------------
 
+    def _revalidate_draft(self, draft: CompiledRuleDraft) -> None:
+        """F-23: CompiledRuleDraft is public and constructible — confirm()
+        must not trust it. Re-check every compiler constraint against the
+        structural fields, and require the description to be exactly the
+        canonical form of those fields."""
+        if not isinstance(draft.decision, RuleDecision):
+            raise RuleCompileError(
+                "draft failed revalidation: decision is not a RuleDecision"
+            )
+        ttl = draft.ttl_seconds
+        if (
+            isinstance(ttl, bool)
+            or not isinstance(ttl, (int, float))
+            or not math.isfinite(ttl)
+            or ttl <= 0
+            or ttl > self._max_ttl
+        ):
+            raise RuleCompileError(
+                "draft failed revalidation: ttl is outside this compiler's contract"
+            )
+        self._check_satisfiable(draft.selector)
+        canonical = describe_compiled_rule(
+            draft.decision, draft.selector, ttl, registry=self._registry
+        )
+        if draft.description != canonical:
+            raise RuleCompileError(
+                "draft failed revalidation: description is not the canonical "
+                "compiled form of the structural fields"
+            )
+
     def confirm(self, draft: CompiledRuleDraft, store: RuleStore) -> UserRule:
         """Persist one confirmed draft. The ONLY call that stores.
 
-        The owner has confirmed ``draft.description`` — the code-generated
-        re-expression of the compiled structure — not the source words.
-        Confirmation is single-use: the rule_id guard makes a double
-        confirm an error instead of a duplicate rule."""
-        existing = store.load()
-        if draft.rule_id in {r.rule_id for r in existing}:
-            raise RuleCompileError(
-                f"draft {draft.rule_id} is already confirmed; nothing stored"
-            )
+        The owner has confirmed ``draft.description`` — the canonical
+        code-generated form, revalidated here because the draft dataclass is
+        public and must not be trusted (F-23). The rule's TTL begins at
+        CONFIRMATION time (F-20): ``compiled_at`` is draft/audit metadata
+        and never owns the authority lifetime. Persistence goes through
+        ``RuleStore.append_strict`` (F-19): a corrupt or unreadable store
+        refuses mutation with bytes unchanged, duplicate ids refuse, and
+        the read-modify-write is serialized against other same-path
+        writers — a store failure can never widen what rules permit."""
+        self._revalidate_draft(draft)
         rule = UserRule.create(
             selector=draft.selector,
             decision=draft.decision,
@@ -494,7 +695,7 @@ class RuleCompiler:
             provenance="compiled",
             source_text=draft.source_text,
             ttl_seconds=draft.ttl_seconds,
-            now=draft.compiled_at,
+            now=self._clock(),  # F-20: the rule's lifetime starts here
         )
-        store.save(existing + [rule])
+        store.append_strict(rule)
         return rule

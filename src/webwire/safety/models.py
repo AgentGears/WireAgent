@@ -54,6 +54,11 @@ class RiskMeta:
     amplification: Amplification
     content_creation: bool = False
     residual_side_effects: tuple[str, ...] = ()
+    # The target_type values live capabilities actually compose for this
+    # action — the single deterministic vocabulary the M8 compiler checks
+    # compiled selectors against (F-22). Empty means no live capability
+    # records a target fact: absence of truth, not permission.
+    target_types: tuple[str, ...] = ()
 
     def derive_tier(self) -> RiskTier:
         if self.content_creation:

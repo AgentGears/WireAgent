@@ -76,6 +76,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "bookmark",
         RiskMeta(
+            target_types=("post",),  # bookmark.py compose
             visibility=Visibility.PRIVATE,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.NONE,
@@ -88,6 +89,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "remove_bookmark",
         RiskMeta(
+            target_types=("post",),  # same target as the action it compensates
             visibility=Visibility.PRIVATE,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.NONE,
@@ -98,6 +100,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "like",
         RiskMeta(
+            target_types=("post",),  # like.py compose
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.ENGAGEMENT_SIGNAL,
@@ -112,6 +115,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "unlike",
         RiskMeta(
+            target_types=("post",),  # same target as the action it compensates
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.ENGAGEMENT_SIGNAL,
@@ -123,6 +127,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "follow",
         RiskMeta(
+            target_types=("account",),
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.ENGAGEMENT_SIGNAL,
@@ -132,6 +137,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "unfollow",
         RiskMeta(
+            target_types=("account",),
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.ENGAGEMENT_SIGNAL,
@@ -143,6 +149,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "repost",
         RiskMeta(
+            target_types=("post",),
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.BROADCAST,
@@ -157,6 +164,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "unrepost",
         RiskMeta(
+            target_types=("post",),
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.REVERSIBLE,
             amplification=Amplification.BROADCAST,
@@ -168,6 +176,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "post",
         RiskMeta(
+            target_types=("none",),  # a post targets no specific post (post_text.py compose)
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.COMPENSATABLE,  # can delete, but...
             amplification=Amplification.BROADCAST,
@@ -183,6 +192,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "reply",
         RiskMeta(
+            target_types=("post",),  # a reply targets the replied-to post
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.COMPENSATABLE,
             amplification=Amplification.BROADCAST,
@@ -198,6 +208,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "quote",
         RiskMeta(
+            target_types=("post",),  # a quote targets the quoted post
             visibility=Visibility.PUBLIC,
             reversibility=Reversibility.COMPENSATABLE,
             amplification=Amplification.BROADCAST,
@@ -219,6 +230,7 @@ def _build_default() -> RiskRegistry:
     reg.register(
         "delete_post",
         RiskMeta(
+            target_types=("post",),  # delete_post.py compose
             visibility=Visibility.PUBLIC,          # the effect is publicly visible
             reversibility=Reversibility.IRREVERSIBLE,
             amplification=Amplification.NONE,       # it de-amplifies

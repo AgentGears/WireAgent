@@ -410,6 +410,43 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #23 review fixes: F-19..F-24 (persistence boundary,
+  strict model output, exact confirmation).** F-19 (blocker): confirm()'s
+  load-then-save made enforcement's fail-closed load() ([] on corrupt
+  content) indistinguishable from a genuinely empty store — confirming a
+  new ALLOW against a corrupted document would atomically erase a persisted
+  NEVER and install the ALLOW; the unlocked read-modify-write also admitted
+  a lost-update form. Fixed in the STORE, not the compiler: RuleStore gains
+  _load_strict (missing = empty; corrupt/unreadable RAISES) and
+  append_strict (serialized same-path read-modify-write under a
+  process-wide per-path lock — the EffectLedger idiom; save() takes the
+  same lock; duplicates refuse). Regressions: corrupted NEVER+broken-entry
+  document refuses mutation with bytes byte-for-byte unchanged; a same-path
+  writer blocks while an append holds the lock (barrier test). F-20
+  (blocker): persisted TTL now begins at CONFIRMATION time
+  (UserRule.create(now=self._clock())); compiled_at stays draft/audit
+  metadata — a 60s rule confirmed two minutes late is born alive, not
+  dead-on-arrival. F-21: strict JSON loader (duplicate keys rejected,
+  NaN/Infinity literals rejected via parse_constant, 1e999→inf caught by
+  isfinite); expressible/explanation type-checked when present ("false"/0/
+  null are malformed drafts, never refusals-turned-rules; explanation null
+  or non-string or blank → invalid_shape); ttl finite/positive/≤max with
+  the omitted-TTL case clamped to min(default, configured max); the max
+  itself validated at construction. F-22: RiskMeta gains target_types (the
+  registry — the layer that owns action vocabulary — now records each
+  action's composed target types: like→post, post→none, follow→account,
+  …), and the compiler rejects selectors PROVABLY unable to match any
+  registered action (like+target "tweet"; like+tier private_reversible —
+  tier derived from the same registry the gate uses). F-23: the
+  owner-facing description is now canonical and lossless — sorted
+  quoted/escaped arrays (["a", "b"] vs ["a or b"]), exact TTL seconds
+  beside a friendly duration (86400 vs 86401 differ), and ceiling-aware
+  ALLOW semantics ("will still ASK: every named tier is above the allow
+  ceiling"); confirm() REVALIDATES the public draft dataclass (decision
+  enum, ttl contract, satisfiability, description == canonical
+  re-derivation) before touching the store. F-24: compiler_api_key is
+  repr=False in WebWireConfig (regression: the secret never appears in
+  repr(config); the field stays readable). 15 new regressions; suite 1095.
 - **2026-10-01 — PR #22 MERGED (6653fdf) + M8 LAYER 3: the rule compiler
   (PR pending).** Layer 2 cleared the maintainer pass at 46e1227 (F-16/
   F-17/F-18 confirmed; CI 1063 total tests — 1057 pass + 6 platform-skipped

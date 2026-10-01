@@ -425,11 +425,16 @@ def test_save_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
 
 def test_F08_concurrent_saves_no_cross_contamination(tmp_path: Path,
                                                       monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deterministic barrier interleave: both writers stage BEFORE either
-    replaces. Every successful os.replace must install that CALLER's payload
-    — with a shared staging file, writer A's replace installs writer B's
-    bytes while A reports success (and B's replace fails on the vanished
-    tmp). Unique staging gives last-writer-wins linearization instead."""
+    """F-08's locked property under the F-19 serialization: every successful
+    os.replace installs exactly that CALLER'S payload — with a shared staging
+    file, writer A's replace installs writer B's bytes while A reports
+    success. The original forced-simultaneity barrier (both writers stage
+    before either replaces) is no longer reachable through save(): F-19 gave
+    same-path mutations a process-wide lock, so concurrent saves serialize —
+    a strictly stronger guarantee. Unique staging remains load-bearing (and
+    is still asserted): each install carries its own writer's bytes, both
+    saves succeed, the final file holds exactly one complete payload, and no
+    staging litter remains."""
     import threading
 
     import webwire.safety.user_rules as ur_mod
@@ -437,19 +442,17 @@ def test_F08_concurrent_saves_no_cross_contamination(tmp_path: Path,
     p = tmp_path / "rules.json"
     marker = threading.local()
     real_replace = os.replace
-    barrier = threading.Barrier(2, timeout=10)
     captured: list[tuple[str, bytes]] = []
     lock = threading.Lock()
 
     def slow_replace(src, dst):
         with open(src, "rb") as f:
             data = f.read()
-        # Gate only the FIRST attempt per thread — the Windows retry helper
-        # re-enters os.replace on transient sharing violations, and those
-        # retries must pass straight through.
+        # Capture only the FIRST attempt per thread — the Windows retry
+        # helper re-enters os.replace on transient sharing violations, and
+        # those retries must pass straight through.
         if not getattr(marker, "entered", False):
             marker.entered = True
-            barrier.wait()  # both payloads staged before either installs
             with lock:
                 captured.append((marker.owner, data))
         return real_replace(src, dst)

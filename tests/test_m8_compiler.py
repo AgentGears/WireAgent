@@ -35,9 +35,25 @@ from webwire.safety.m8_compiler import (
     model_from_config,
 )
 from webwire.safety.models import RiskTier
-from webwire.safety.user_rules import RuleStore
+from webwire.safety.user_rules import (
+    RuleDecision,
+    RuleSelector,
+    RuleStore,
+    RuleStoreError,
+    UserRule,
+)
 
 NOW = 2000.0
+
+
+class _Clock:
+    """Mutable test clock: compile at one time, confirm at another (F-20)."""
+
+    def __init__(self, t: float) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
 
 
 class _FakeModel:
@@ -57,8 +73,10 @@ class _RaisingModel:
         raise CompilerUnavailable("model endpoint failed: test")
 
 
-def _compiler(model) -> RuleCompiler:
-    return RuleCompiler(model, registry=DEFAULT_REGISTRY, clock=lambda: NOW)
+def _compiler(model, clock=None) -> RuleCompiler:
+    return RuleCompiler(
+        model, registry=DEFAULT_REGISTRY, clock=clock or (lambda: NOW)
+    )
 
 
 def _store(tmp_path: Path) -> RuleStore:
@@ -184,7 +202,9 @@ async def test_description_is_structural_not_model_words(tmp_path: Path) -> None
     d2 = await _compiler(two).compile("no more likes ever again")
     assert d1.description == d2.description
     assert d1.description == describe_compiled_rule(d1.decision, d1.selector, d1.ttl_seconds)
-    assert d1.description == "NEVER when actions like — expires in 7.0 days"
+    assert d1.description == (
+        'NEVER when actions ["like"] — expires in 604800.0s (7.0 days)'
+    )
     assert "please" not in d1.description and "stop" not in d1.description
 
 
@@ -194,7 +214,7 @@ async def test_double_confirm_is_an_error_not_a_duplicate(tmp_path: Path) -> Non
     draft = await compiler.compile("allow likes")
     store = _store(tmp_path)
     compiler.confirm(draft, store)
-    with pytest.raises(RuleCompileError, match="already confirmed"):
+    with pytest.raises(RuleStoreError, match="duplicate"):
         compiler.confirm(draft, store)
     assert len(store.load()) == 1
 
@@ -382,3 +402,349 @@ def test_enforcement_path_never_imports_the_compiler() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "OK"
+
+
+# ---------------------------------------------------------------------------
+# F-19: strict, serialized store mutation — a store failure can never widen
+# what rules permit
+# ---------------------------------------------------------------------------
+
+
+def _hand_rule(rule_id: str, decision: RuleDecision) -> UserRule:
+    return UserRule(
+        rule_id=rule_id,
+        decision=decision,
+        created_at=NOW,
+        expires_at=NOW + 3600.0,
+        selector=RuleSelector(action_types=frozenset({"like"})),
+        source_text="hand written",
+    )
+
+
+async def test_F19_confirm_refuses_corrupt_store_bytes_unchanged(
+    tmp_path: Path,
+) -> None:
+    """The widening sequence from the review: a real NEVER plus a malformed
+    entry makes load() void the whole read (correct for enforcement).
+    confirm() must REFUSE to mutate — computing []+new and saving would
+    atomically erase the persisted NEVER and install the ALLOW."""
+    store = _store(tmp_path)
+    store.save([_hand_rule("never-keep", RuleDecision.NEVER)])
+    p = tmp_path / "rules.json"
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    doc["rules"].append({"rule_id": "broken"})  # invalid entry → read voids
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    before = p.read_text(encoding="utf-8")
+
+    compiler = _compiler(_FakeModel(json.dumps(
+        {"decision": "allow", "action_types": ["like"]}
+    )))
+    draft = await compiler.compile("allow likes")
+    with pytest.raises(RuleStoreError, match="refusing mutation"):
+        compiler.confirm(draft, store)
+    assert p.read_text(encoding="utf-8") == before, (
+        "a refused mutation must not touch a single byte"
+    )
+    # The NEVER still cannot be erased by a later read-modify-write either.
+    with pytest.raises(RuleStoreError, match="refusing mutation"):
+        store.append_strict(_hand_rule("allow-2", RuleDecision.ALLOW))
+    assert p.read_text(encoding="utf-8") == before
+
+
+async def test_F19_missing_store_is_not_corrupt(tmp_path: Path) -> None:
+    """Missing file = genuinely empty store (pre-M8 behavior) — mutation
+    proceeds. Only corrupt/unreadable content refuses."""
+    compiler = _compiler(_FakeModel(json.dumps(
+        {"decision": "allow", "action_types": ["like"]}
+    )))
+    draft = await compiler.compile("allow likes")
+    assert not (tmp_path / "rules.json").exists()
+    compiler.confirm(draft, _store(tmp_path))
+    assert [r.rule_id for r in _store(tmp_path).load()] == [draft.rule_id]
+
+
+def test_F19_append_strict_serializes_same_path_writers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lost-update window: while one writer holds the path lock
+    mid-read-modify-write, another writer to the SAME path must block —
+    an intervening NEVER can no longer be silently dropped by a stale
+    base list."""
+    import threading
+
+    p = tmp_path / "rules.json"
+    store_a, store_b = RuleStore(p), RuleStore(p)
+    never = _hand_rule("never-1", RuleDecision.NEVER)
+    store_a.save([never])
+
+    entered, release = threading.Event(), threading.Event()
+    original_load = RuleStore._load_strict
+
+    def slow_load(self_inner: RuleStore) -> list[UserRule]:
+        result = original_load(self_inner)
+        if self_inner is store_a and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "test barrier never released"
+        return result
+
+    monkeypatch.setattr(RuleStore, "_load_strict", slow_load)
+    append_thread = threading.Thread(
+        target=store_a.append_strict,
+        args=(_hand_rule("allow-1", RuleDecision.ALLOW),),
+    )
+    append_thread.start()
+    assert entered.wait(2), "append never reached its strict load"
+
+    other_started, other_done = threading.Event(), threading.Event()
+
+    def other_writer() -> None:
+        other_started.set()
+        store_b.save([never])
+        other_done.set()
+
+    writer_thread = threading.Thread(target=other_writer)
+    writer_thread.start()
+    assert other_started.wait(2)
+    assert not other_done.wait(0.4), (
+        "a same-path save must serialize behind the in-flight append"
+    )
+    release.set()
+    append_thread.join(5)
+    assert other_done.wait(5)
+    assert not append_thread.is_alive() and not writer_thread.is_alive()
+    # save() is a documented whole-store replacement: the later writer wins.
+    assert {r.rule_id for r in RuleStore(p).load()} == {"never-1"}
+
+
+# ---------------------------------------------------------------------------
+# F-20: the rule's lifetime begins at confirmation
+# ---------------------------------------------------------------------------
+
+
+async def test_F20_ttl_starts_at_confirmation_not_compilation(
+    tmp_path: Path,
+) -> None:
+    """A 60-second rule compiled at t=1000 and confirmed at t=5000 must be
+    born at 5000 (alive until 5060) — not already-expired on arrival."""
+    clock = _Clock(1000.0)
+    compiler = RuleCompiler(
+        _FakeModel(json.dumps(
+            {"decision": "allow", "action_types": ["like"], "ttl_seconds": 60}
+        )),
+        registry=DEFAULT_REGISTRY,
+        clock=clock,
+    )
+    draft = await compiler.compile("allow likes for a minute")
+    assert draft.compiled_at == 1000.0
+
+    clock.t = 5000.0  # the owner confirms much later
+    rule = compiler.confirm(draft, _store(tmp_path))
+    assert rule.created_at == 5000.0
+    assert rule.expires_at == 5060.0
+    assert not rule.is_expired(now=5059.0)
+    assert rule.is_expired(now=5061.0)
+
+
+# ---------------------------------------------------------------------------
+# F-21: strict JSON and schema — no silent tolerance at the model boundary
+# ---------------------------------------------------------------------------
+
+
+async def test_F21_strict_json_rejects_ambiguity(tmp_path: Path) -> None:
+    dup_keys = _FakeModel(
+        '{"decision": "never", "decision": "allow", "action_types": ["like"]}'
+    )
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(dup_keys).compile("never likes")
+    assert exc.value.reason == "unparseable_response"
+    assert "duplicate" in exc.value.explanation
+
+    nan_ttl = _FakeModel(
+        '{"decision": "allow", "action_types": ["like"], "ttl_seconds": NaN}'
+    )
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(nan_ttl).compile("allow likes")
+    assert exc.value.reason == "unparseable_response"
+    assert "NaN" in exc.value.explanation
+
+    # 1e999 parses to +inf WITHOUT tripping the literal-constant hook — the
+    # finite check must catch it (the layer-1 non-finite-number lesson).
+    huge_ttl = _FakeModel(
+        '{"decision": "allow", "action_types": ["like"], "ttl_seconds": 1e999}'
+    )
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(huge_ttl).compile("allow likes")
+    assert exc.value.reason == "inexpressible"
+    assert "finite" in exc.value.explanation
+    assert _store(tmp_path).load() == []
+
+
+async def test_F21_malformed_refusal_shapes_never_become_rules(
+    tmp_path: Path,
+) -> None:
+    """expressible must be a real JSON boolean: "false"/0/null are malformed
+    drafts, not refusals, and must never reduce into a rule."""
+    for raw in (
+        '{"expressible": "false", "decision": "allow", "action_types": ["like"]}',
+        '{"expressible": 0, "decision": "allow", "action_types": ["like"]}',
+        '{"expressible": null, "decision": "allow", "action_types": ["like"]}',
+        '{"expressible": false, "explanation": 5}',
+        '{"expressible": false, "explanation": null}',
+    ):
+        with pytest.raises(RuleCompileRejected) as exc:
+            await _compiler(_FakeModel(raw)).compile("some clause")
+        assert exc.value.reason == "invalid_shape", raw
+    assert _store(tmp_path).load() == []
+
+
+async def test_F21_omitted_ttl_respects_custom_cap(tmp_path: Path) -> None:
+    """An omitted ttl_seconds must not bypass a tighter configured maximum."""
+    compiler = RuleCompiler(
+        _FakeModel(json.dumps({"decision": "ask", "action_types": ["post"]})),
+        registry=DEFAULT_REGISTRY,
+        clock=lambda: NOW,
+        max_ttl_seconds=3600,
+    )
+    draft = await compiler.compile("ask before posting")
+    assert draft.ttl_seconds == 3600.0  # the cap, not the 7-day default
+
+
+def test_F21_max_ttl_constructor_validated() -> None:
+    for bad in (True, 0, -1, float("inf"), float("nan"), "x"):
+        with pytest.raises(ValueError):
+            RuleCompiler(
+                None, registry=DEFAULT_REGISTRY, clock=lambda: NOW,
+                max_ttl_seconds=bad,  # type: ignore[arg-type]
+            )
+
+
+# ---------------------------------------------------------------------------
+# F-22: a compiled selector must be able to match a real action
+# ---------------------------------------------------------------------------
+
+
+async def test_F22_target_type_mismatch_is_inexpressible(tmp_path: Path) -> None:
+    """like targets posts (registry vocabulary) — a never-like with
+    target_types ["tweet"] can never match: a silent no-op ban."""
+    model = _FakeModel(json.dumps(
+        {"decision": "never", "action_types": ["like"], "target_types": ["tweet"]}
+    ))
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(model).compile("never like tweets")
+    assert exc.value.reason == "inexpressible"
+    assert "no registered action" in exc.value.explanation
+    assert _store(tmp_path).load() == []
+
+
+async def test_F22_tier_contradiction_is_inexpressible(tmp_path: Path) -> None:
+    """like deterministically derives public_reversible_engagement — pairing
+    it with private_reversible is an impossible conjunction."""
+    model = _FakeModel(json.dumps(
+        {"decision": "never", "action_types": ["like"],
+         "risk_tiers": ["private_reversible"]}
+    ))
+    with pytest.raises(RuleCompileRejected) as exc:
+        await _compiler(model).compile("never like privately")
+    assert exc.value.reason == "inexpressible"
+    assert _store(tmp_path).load() == []
+
+
+async def test_F22_satisfiable_conjunctions_compile(tmp_path: Path) -> None:
+    for payload in (
+        {"decision": "never", "action_types": ["like"], "target_types": ["post"]},
+        {"decision": "ask", "action_types": ["post"], "target_types": ["none"]},
+        {"decision": "allow", "action_types": ["like"],
+         "risk_tiers": ["public_reversible_engagement"]},
+        {"decision": "never", "target_types": ["post"]},
+    ):
+        draft = await _compiler(_FakeModel(json.dumps(payload))).compile("clause")
+        assert draft.selector is not None
+
+
+# ---------------------------------------------------------------------------
+# F-23: the confirmation text is canonical, lossless, ceiling-aware — and
+# confirm() revalidates it
+# ---------------------------------------------------------------------------
+
+
+def test_F23_description_is_lossless() -> None:
+    """{"a","b"} and {"a or b"} must render differently; 86400s and 86401s
+    must render differently — the owner confirms exact values."""
+    sel_pair = RuleSelector(target_ids=frozenset({"a", "b"}))
+    sel_single = RuleSelector(target_ids=frozenset({"a or b"}))
+    d_pair = describe_compiled_rule(RuleDecision.NEVER, sel_pair, 3600.0)
+    d_single = describe_compiled_rule(RuleDecision.NEVER, sel_single, 3600.0)
+    assert d_pair != d_single
+    assert '["a", "b"]' in d_pair
+    assert '["a or b"]' in d_single
+
+    d_day = describe_compiled_rule(RuleDecision.NEVER, sel_pair, 86400.0)
+    d_day2 = describe_compiled_rule(RuleDecision.NEVER, sel_pair, 86401.0)
+    assert d_day != d_day2
+    assert "86400.0s" in d_day and "86401.0s" in d_day2
+
+
+def test_F23_allow_descriptions_are_ceiling_aware() -> None:
+    """An above-ceiling ALLOW is honestly reported as still asking."""
+    like_only = RuleSelector(action_types=frozenset({"like"}))
+    post_only = RuleSelector(action_types=frozenset({"post"}))
+    assert "ASK" not in describe_compiled_rule(RuleDecision.ALLOW, like_only, 3600.0)
+
+    post_desc = describe_compiled_rule(RuleDecision.ALLOW, post_only, 3600.0)
+    assert "will still ASK" in post_desc
+    assert "above the allow ceiling" in post_desc
+
+    tier_above = RuleSelector(risk_tiers=frozenset({RiskTier.PUBLIC_CONTENT_IRREVERSIBLE}))
+    assert "will still ASK" in describe_compiled_rule(
+        RuleDecision.ALLOW, tier_above, 3600.0
+    )
+    # No action/tier dimension named: honestly conditional.
+    actor_only = RuleSelector(actors=frozenset({"infaag"}))
+    assert "actions above the allow ceiling will still ASK" in describe_compiled_rule(
+        RuleDecision.ALLOW, actor_only, 3600.0
+    )
+
+
+async def test_F23_confirm_revalidates_manufactured_drafts(tmp_path: Path) -> None:
+    """CompiledRuleDraft is public and constructible — confirm() must not
+    trust it: misleading descriptions, out-of-contract TTLs, and non-enum
+    decisions are refused before the store is touched."""
+    from dataclasses import replace
+
+    model = _FakeModel(json.dumps({"decision": "allow", "action_types": ["like"]}))
+    compiler = _compiler(model)
+    good = await compiler.compile("allow likes")
+
+    lied = replace(good, description="ALLOW everything forever")
+    with pytest.raises(RuleCompileError, match="canonical"):
+        compiler.confirm(lied, _store(tmp_path))
+
+    not_a_decision = replace(good, decision="allow")  # type: ignore[arg-type]
+    with pytest.raises(RuleCompileError, match="decision"):
+        compiler.confirm(not_a_decision, _store(tmp_path))
+
+    capped = RuleCompiler(
+        model, registry=DEFAULT_REGISTRY, clock=lambda: NOW, max_ttl_seconds=3600
+    )
+    capped_draft = await capped.compile("allow likes")
+    over = replace(capped_draft, ttl_seconds=7200.0)
+    with pytest.raises(RuleCompileError, match="ttl"):
+        capped.confirm(over, _store(tmp_path))
+    assert _store(tmp_path).load() == []
+
+
+# ---------------------------------------------------------------------------
+# F-24: the API key never appears in the config representation
+# ---------------------------------------------------------------------------
+
+
+def test_F24_api_key_absent_from_config_repr() -> None:
+    from webwire.config import WebWireConfig
+
+    cfg = WebWireConfig(
+        state_dir=Path(".webwire"),
+        compiler_api_key="hunter2-secret",
+        compiler_endpoint="https://example.invalid/v1/chat",
+    )
+    assert "hunter2-secret" not in repr(cfg)
+    assert cfg.compiler_api_key == "hunter2-secret"  # still readable by the owner

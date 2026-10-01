@@ -40,11 +40,12 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Optional
 from uuid import uuid4
 
 from webwire.safety.models import RiskTier
@@ -263,6 +264,23 @@ class RuleStore:
         self._path = Path(path)
         self._clock = clock
 
+    # Same-path writers serialize through one process-wide lock (the
+    # EffectLedger idiom). Unique staging files (F-08) make each whole-store
+    # replace install exactly its own payload; the lock additionally makes
+    # read-modify-write appends atomic against other RuleStore instances
+    # targeting the same path (F-19). No cross-process claim is made.
+    _path_locks_guard: ClassVar[threading.Lock] = threading.Lock()
+    _path_locks: ClassVar[dict[str, threading.RLock]] = {}
+
+    def _mutation_lock(self) -> threading.RLock:
+        key = os.path.normcase(str(self._path.resolve(strict=False)))
+        with RuleStore._path_locks_guard:
+            lock = RuleStore._path_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                RuleStore._path_locks[key] = lock
+            return lock
+
     # -- persistence ---------------------------------------------------------
 
     def save(self, rules: list[UserRule]) -> None:
@@ -272,32 +290,98 @@ class RuleStore:
         duplicate rule ids (F-07): ambiguous attribution is refused at the
         write boundary, not discovered at match time.
         """
-        ids = [r.rule_id for r in rules]
-        dupes = {i for i in ids if ids.count(i) > 1}
-        if dupes:
-            raise RuleStoreError(f"refusing to save duplicate rule ids: {sorted(dupes)}")
-        payload = {"schema_version": _SCHEMA_VERSION, "rules": [_rule_to_dict(r) for r in rules]}
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise RuleStoreError(f"could not create rule store directory: {exc!r}") from exc
-        # F-08: each save stages through a UNIQUE per-writer temporary file.
-        # A shared "<store>.tmp" let two concurrent savers cross-contaminate:
-        # writer A's os.replace could install writer B's bytes while A reports
-        # success — believing a restrictive policy was installed while a
-        # permissive one persists. Unique staging gives concurrent whole-store
-        # saves normal last-writer-wins linearization: every successful
-        # replace installs exactly that caller's payload.
-        tmp = self._path.with_name(f"{self._path.name}.{uuid4().hex}.tmp")
-        try:
-            tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-            _replace_with_windows_retry(tmp, self._path)
-        except OSError as exc:
+        with self._mutation_lock():
+            ids = [r.rule_id for r in rules]
+            dupes = {i for i in ids if ids.count(i) > 1}
+            if dupes:
+                raise RuleStoreError(
+                    f"refusing to save duplicate rule ids: {sorted(dupes)}"
+                )
+            payload = {
+                "schema_version": _SCHEMA_VERSION,
+                "rules": [_rule_to_dict(r) for r in rules],
+            }
             try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise RuleStoreError(f"rule store save failed: {exc!r}") from exc
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise RuleStoreError(f"could not create rule store directory: {exc!r}") from exc
+            # F-08: each save stages through a UNIQUE per-writer temporary file.
+            # A shared "<store>.tmp" let two concurrent savers cross-contaminate:
+            # writer A's os.replace could install writer B's bytes while A reports
+            # success — believing a restrictive policy was installed while a
+            # permissive one persists. Unique staging gives concurrent whole-store
+            # saves normal last-writer-wins linearization: every successful
+            # replace installs exactly that caller's payload.
+            tmp = self._path.with_name(f"{self._path.name}.{uuid4().hex}.tmp")
+            try:
+                tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+                _replace_with_windows_retry(tmp, self._path)
+            except OSError as exc:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuleStoreError(f"rule store save failed: {exc!r}") from exc
+
+    def _load_strict(self) -> list[UserRule]:
+        """Read for MUTATION: missing file is an empty store, but corrupt or
+        unreadable content RAISES instead of voiding to zero rules.
+
+        load() collapses both cases to [] — exactly right for enforcement
+        (corrupt policy means everything asks). A mutation computed on that
+        collapsed read would atomically replace the corrupt document — and
+        every restrictive rule inside it — with the new rule alone (F-19).
+        This reader keeps the two cases distinguishable: refuse to mutate
+        what could not be strictly read, bytes unchanged."""
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuleStoreError(
+                f"rule store unreadable — refusing mutation, bytes unchanged ({exc!r})"
+            ) from exc
+        if not isinstance(raw, dict) or raw.get("schema_version") != _SCHEMA_VERSION:
+            raise RuleStoreError(
+                "rule store schema mismatch — refusing mutation, bytes unchanged"
+            )
+        entries = raw.get("rules", [])
+        if not isinstance(entries, list):
+            raise RuleStoreError(
+                "rule store 'rules' not a list — refusing mutation, bytes unchanged"
+            )
+        rules: list[UserRule] = []
+        for i, entry in enumerate(entries):
+            try:
+                rules.append(_rule_from_dict(entry))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuleStoreError(
+                    f"rule store entry {i} invalid — refusing mutation, "
+                    f"bytes unchanged ({exc})"
+                ) from exc
+        ids = [r.rule_id for r in rules]
+        if len(set(ids)) != len(ids):
+            raise RuleStoreError(
+                "rule store has duplicate rule ids — refusing mutation, bytes unchanged"
+            )
+        return rules
+
+    def append_strict(self, rule: UserRule) -> None:
+        """Serialized, fail-closed read-modify-write append (F-19).
+
+        The load-validate-save window holds the same-path mutation lock, so
+        a restrictive rule installed by another writer in that window can
+        never be silently dropped by this append. Duplicate rule ids raise:
+        append refuses rather than duplicates. Corrupt/unreadable content
+        raises with bytes unchanged — never widen what rules permit."""
+        with self._mutation_lock():
+            existing = self._load_strict()
+            if rule.rule_id in {r.rule_id for r in existing}:
+                raise RuleStoreError(
+                    f"rule_id {rule.rule_id!r} already present — "
+                    "refusing duplicate append"
+                )
+            self.save(existing + [rule])
 
     def load(self) -> list[UserRule]:
         """All stored rules — or ZERO on any invalid content (see class doc).

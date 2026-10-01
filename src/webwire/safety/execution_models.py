@@ -80,6 +80,46 @@ __all__ = [
 DEFAULT_GRANT_TTL_S = 300.0
 DEFAULT_MAX_PRECOMMIT_ATTEMPTS = 3
 
+def validate_approver(value: Any, *, allow_none: bool = False) -> None:
+    """The canonical M8 attribution vocabulary (spec 6.1 / F-12, F-16):
+
+    "human" | "rule:<rule-id>"
+
+    where ``<rule-id>`` satisfies the ONE shared rule-id invariant
+    (``user_rules.validate_rule_id`` — the frozen layer-1 ``UserRule``
+    contract: any non-empty string). The rule layer and this authority layer
+    cannot disagree about what a valid rule identity is, because they call
+    the same validator.
+
+    Ledger deserialization additionally permits None for pre-M8 history.
+    One validator for the entire lineage: mint seam, grant construction,
+    ledger validate, and ledger parse all enforce the same domain.
+    """
+    if value is None:
+        if allow_none:
+            return
+        raise ValueError("approver must not be None")
+    if not isinstance(value, str):
+        raise ValueError(f"approver must be a string, got {type(value).__name__}")
+    if value == "human":
+        return
+    if value.startswith("rule:"):
+        from webwire.safety.user_rules import validate_rule_id
+
+        try:
+            validate_rule_id(value[len("rule:"):])
+        except ValueError:
+            raise ValueError(
+                f"approver {value!r} is outside the attribution vocabulary "
+                "(expected 'human' or 'rule:<non-empty-rule-id>')"
+            ) from None
+        return
+    raise ValueError(
+        f"approver {value!r} is outside the attribution vocabulary "
+        "(expected 'human' or 'rule:<non-empty-rule-id>')"
+    )
+
+
 _GRANT_PUBLIC_FIELDS = frozenset(
     {
         "intent_hash",
@@ -89,6 +129,7 @@ _GRANT_PUBLIC_FIELDS = frozenset(
         "target_id",
         "policy_binding",
         "authorization_epoch",
+        "approver",
         "grant_id",
         "issued_at",
         "expires_at",
@@ -190,6 +231,11 @@ class ApprovalGrant:
     state: GrantState = GrantState.ACTIVE
     claimed_by: Optional[str] = None
     precommit_attempts: int = 0
+    # M8 attribution (spec 6.1): who supplied the approval — "human" or
+    # "rule:<rule_id>". Set once at the single mint seam; descends
+    # grant -> permit -> ledger. "human" default keeps every pre-M8
+    # caller correct.
+    approver: str = "human"
     clock: Callable[[], float] = field(
         default_factory=lambda: time.monotonic,
         repr=False,
@@ -479,6 +525,7 @@ class ApprovalGrantStore:
     def mint(
         self,
         *,
+        approver: str = "human",
         intent_hash: str,
         actor_id: str,
         action_type: str,
@@ -487,7 +534,9 @@ class ApprovalGrantStore:
         policy_binding: str,
         authorization_epoch: int,
     ) -> ApprovalGrant:
+        validate_approver(approver)
         grant = ApprovalGrant(
+            approver=approver,
             intent_hash=intent_hash,
             actor_id=actor_id,
             action_type=action_type,

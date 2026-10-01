@@ -461,6 +461,537 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-01 — M8 layer 2 review fixes (PR #22): F-09..F-15 resolved.**
+  The maintainer-first pass at exact head 81ced8c found three blockers, two
+  contract gaps, and an evidence gap; every finding verified against the code
+  before fixing. F-09 (blocker): the live Dispatcher never installed a
+  RuleStore — the M8 gate was unreachable from ordinary construction. Fixed:
+  WebWireConfig.rules_path() added; the Dispatcher constructs ONE RuleStore at
+  the authority root and passes it to WriteKernel (long-lived instance safe —
+  Layer 1 reloads on every match); dispatcher-level regression proves a
+  persisted NEVER denies through normal construction. F-10 (blocker): approver
+  was mutable after mint (not in _GRANT_PUBLIC_FIELDS) — sealed; reassignment
+  raises GrantStateError (regression-locked). F-11 (blocker): approver was in
+  the ledger but NOT in _LINEAGE_FIELDS — reserved/terminal records could
+  disagree on provenance without contradiction, and a changed-approver retry
+  counted as the same fact. approver added to canonical lineage + exact-fact
+  identity; None remains its own legacy lineage (never upgraded to "human");
+  both regressions locked. F-12: canonical validate_approver (human |
+  rule:<id>, None only for pre-M8 reads) wired at the validator, grant-store
+  mint, runtime.issue, ledger validate, and ledger parse. F-13: rule_gate
+  metadata now emitted ONLY when a rule matched — no-match responses are
+  byte-for-byte pre-M8. F-14: the four weak tests replaced with real
+  lifecycle qualification through a real runtime + gateway + file-backed
+  ledger (T20 real policy drift, T21 real epoch advancement, T22
+  durable-record approver identity, T24 human end-to-end); no
+  inspect.getsource remains. F-15: the execute_with_approver seam exposed on
+  ALL six migrated adapters (post-text, reply, quote, media, delete adapters
+  now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — M8 LAYER 4 LIVE-SESSION QUALIFICATION (record only; no
+  architectural changes).** Qualification executed against a real logged-in
+  X session per the directed sequence. Environment: Windows 11 (10.0.26200),
+  Python 3.12.1, live Super-Browser SDK (C:/Next-Era/Super-Browser,
+  LAUNCH mode), account **infaag**, isolated state dir with a copy of the
+  persisted session; harnesses: scripts/qualify_m8_layer4_live.py (full)
+  and scripts/qualify_m8_sc67_live.py (focused 6/7b re-verification).
+  Action types: like (executed), post_text (card-only, denied — nothing
+  published), bookmark (not executed). Real effects, disclosed: FOUR
+  public likes on ordinary home-timeline posts (one human-approved via
+  card; one standing-ALLOW auto-executed; two raw-route token-pair first
+  uses). Likes are not reversible through the current capability surface.
+  Scenarios, all PASS across the two runs: (0) whoami resolved
+  handle=infaag with resolved_handle set; (1) ASK → card rendered
+  ('Will like post …', token scrubbed from the returned result) →
+  operator approve → verdict allow, execute_ok, ledger
+  RESERVED+EFFECT_CONFIRMED approver=human; (2) ASK → deny → zero ledger
+  change, phase 2 never invoked; (3) standing ALLOW (like) → NO card,
+  one invocation, trace approver=rule:qual-allow-like, ledger pair
+  approver=rule:qual-allow-like; (4) NEVER → blocked_by=user_rule BEFORE
+  any confirmation carrier, no card, ledger unchanged; (5) above-ceiling
+  ALLOW (post) → confirmation_required with ceiling_downgraded=True and
+  the honest still-asks card note → denied, nothing posted; (6) rule
+  changed between phase 1 and phase 2 → the token-bearing replay was
+  denied by the re-evaluated NEVER (blocked_by=user_rule), zero like
+  lifecycles in the ledger; (7) malformed token denied (consumed_token),
+  reused token denied fail-closed (run A: token_bucket — the rate gate
+  precedes token validation; run B: dedupe), caller-supplied token at
+  the card boundary raised ValueError; (8) journal carries
+  '"confirmation_token":"<redacted>"' with ZERO raw token bytes, and
+  every ledger row's approver is exactly human or rule:qual-allow-like.
+  Browser-specific findings recorded: (a) whoami identity resolution is
+  INTERMITTENT across loads (~1 in 3 observed failures; hydration race —
+  markers AppTabBar_Profile_Link/SideNav_AccountSwitcher_Button present
+  when resolved; bounded retry in the harness) — a pre-existing known
+  fragility, not an M8 defect; (b) timeline permalink availability
+  varies per load (3-6 on first viewport; scroll-harvest required);
+  (c) the dedupe gate fires BEFORE preview and the rule gate on
+  same-target repeats within TTL — each phase-1+ scenario therefore
+  needed a distinct real post; (d) BEST_EFFORT actions (bookmark) write
+  no ledger rows by design, so ledger attribution evidence requires a
+  fenced action (like). The first full run recorded FAILs on scenarios
+  6/7b from harness assertion bugs (ledger rows counted instead of
+  lifecycles; an over-specified denial reason) — the product outcomes
+  were correct in that run and the focused rerun passed both cleanly.
+- **2026-10-01 — PR #24 MERGED (8d89827): M8 COMPLETE — all four layers
+  of the frozen build order are on main.** The final pass found no new
+  findings across the whole interaction surface (token custody,
+  caller-supplied authority rejection, chronological approval, payload
+  snapshot binding, malformed carriers, journal redaction, runtime
+  identity establishment, browser-free rule management, CAS
+  re-confirmation, TTL handling, and the ceiling renderer). CI run #575:
+  Linux 3.11 1139 passed + 6 platform-skipped = 1145; both Windows
+  durability jobs green including the rule-store qualification. M8 as
+  shipped: layer 1 the standing-decision rule store (PR #20, 80f427c +
+  hardening PR #21, 3ee9df1); layer 2 the kernel three-way gate +
+  approver lineage through the single mint seam (PR #22, 6653fdf);
+  layer 3 the rule compiler — pluggable API-key model, strict tagged
+  model-output schema, canonical owner confirmation, fenced CAS
+  persistence (PR #23, 04176da); layer 4 the card surface + Card CLI +
+  rule lifecycle (PR #24, 8d89827). Cumulative review: 57 findings
+  (F-01..F-57) across eight review rounds, all resolved before merge.
+  STANDING BOUNDARIES, stated not implied: the production m8 card path
+  is wired per the real lifecycle (start → whoami → resolved actor →
+  card → decision → stop) but has not been qualified against a real
+  logged-in browser session; per-token cancellation on deny and rule
+  removal are outside the frozen layer-4 scope; the single-process
+  doctrine (one canonical authority root per state directory, STATE
+  366) is contract and construction, not yet boot-time enforcement.
+- **2026-10-01 — PR #24 fifth review pass: F-57 (derived-tier composition).
+  The one remaining renderer edge.** With unknown actions present and NO
+  explicit risk_tiers, the unknown-action branch returned before deriving
+  the KNOWN actions' registry tiers — so a persisted rule like
+  {post, future_action} reported only the unknown action's latent behavior
+  and never told the owner that post (above the standing ceiling) will
+  still ASK. The renderer now partitions the vocabulary on that path:
+  known actions' tiers are derived from the registry, any above-ceiling
+  known tier adds 'the known above-ceiling actions in this rule will still
+  ASK', and the unknown-action latent warning stands beside it — composed,
+  neither masking the other. Unknown-only selectors keep the pure latent
+  warning. Three regressions: {post, future_action} (ASK + latent),
+  {like, post, future_action} (three-way: like unaccused, post ASK,
+  future latent, no blanket tier claim), and unknown-only (latent, no ASK
+  claim). SUPERSEDES the F-54..F-56 entry's implication that 'no explicit
+  tiers → latent-authority wording' is universally sufficient: it is
+  sufficient only when no KNOWN actions are present. Suite 1145 (count
+  from the run).
+- **2026-10-01 — PR #24 fourth review pass: F-54..F-56 (final semantic/
+edge hardening).** F-55 (high): the F-49 unknown-action branch MASKED the
+deterministic tier-ceiling math for mixed selectors — with explicit tiers
+all above the ceiling, the old text promised conditional auto-approval
+even though every matching registration would still ASK (impossible
+condition; frozen §5 requires above-ceiling ALLOW to be honestly ASK).
+The renderer now COMPOSES the two facts: unknown action + explicit tiers
+all above → 'will still ASK (every named tier is above the allow
+ceiling)'; tiers containing below-ceiling → 'may auto-approve only if
+later registered at one of the below-ceiling tiers matching this
+selector', plus 'matching above-ceiling tiers still ASK' when mixed; no
+explicit tiers → the F-49 latent wording stands. Regression locks all
+four compositions. F-54: the CLI rejected a caller-supplied
+confirmation_token only at CardFlow's boundary — AFTER building the live
+runtime (browser start, whoami) and via an uncontrolled traceback. The
+reserved-field check now runs immediately after JSON validation: exit 2,
+stderr message, and the regression proves runtime_factory was NEVER
+called. F-56: a non-string confirmation carrier (dict, number, empty
+string) was coerced into an unusable ApprovalCard; the card now requires
+a genuine non-empty string carrier — anything else returns the sanitized
+result with no card, flowing to the CLI's confirmation-required protocol
+error (exit 1). SUPERSEDES the F-48..F-53 entry's 'closed by F-49' claim:
+F-49 closed the structural gap only; the semantic composition is closed
+here. Suite 1142 (count from the run).
+- **2026-10-01 — PR #24 third review pass: F-48..F-53 (the card entry
+  point and the audit boundary).** F-48 (blocker): CardFlow.begin()
+  forwarded the caller's payload unchanged, so a caller holding a valid
+  token could pass it INSIDE begin() — the kernel interprets that as phase
+  2 and the mutation executes before any card is rendered or any decision
+  asked. The card entry point now REJECTS a caller-supplied
+  confirmation_token before invoking anything (reject, not strip — silent
+  stripping changes caller intent); regression proves ZERO invocations.
+  F-50: policy gates run BEFORE token consumption, so a NEVER installed
+  after phase 1 denies while the token is still LIVE — and the Dispatcher
+  journaled the token verbatim (the journal is audit data, not an authority
+  carrier). _redact_input now redacts confirmation_token BY KEY
+  irrespective of value; the regression uses a REAL kernel token, denies
+  phase 2 pre-consumption via a late NEVER, proves the SAME token still
+  executes after the ban is removed (pre-consumption denial), and asserts
+  the exact token bytes never appear in the journal while the redacted
+  marker does. F-49: the unknown-action vocabulary check is now
+  ORTHOGONAL to risk_tiers — a mixed action+tier selector naming an
+  unknown action gets the latent warning too, with the precise conditional
+  ("if later registered at a tier matching this selector and below the
+  standing-rule ceiling, this ALLOW may auto-approve"). F-51: the
+  production runtime now verifies session.resolved_handle after whoami —
+  the state the write path actually trusts — not merely the response data
+  (a whitespace-only response handle is truthy data but set_resolved_handle
+  refuses it; regression covers the blank case). F-52: a
+  confirmation-required response with no usable card is now an explicit
+  protocol error in the CLI (non-zero exit, stderr message); it previously
+  exited 0 via the generic no-card path. F-53: update_strict() REMOVED —
+  an unconditional same-ID replace is exactly the stale-write shape F-34
+  invalidated, left behind as an attractive footgun; replace_if_current is
+  the only lifecycle mutation. Evidence corrections to the entries below:
+  the F-41..F-47 entry's claim that "the token exists only inside the
+  card" overstated custody (F-48: callers could previously SUPPLY their
+  own; F-50: live tokens could reach the journal — both now closed), and
+  "F-45 closed" was premature for mixed selectors (closed by F-49).
+  Suite 1139 (count from the run).
+- **2026-10-01 — PR #24 second review pass: F-41..F-47 (the human/CLI
+  boundary).** The review's framing, accepted: the store CAS was the
+  strongest part; the remaining blockers were concentrated exactly where
+  layer 4 must establish owner-confirmation semantics. F-42 (blocker):
+  --yes was preauthorization of an unseen preview, and re-confirm displayed
+  AFTER the confirmation flag was consumed — the human decision could
+  predate the snapshot on screen. The CLI now renders FIRST and obtains
+  the decision NOW through an injectable decision_reader (terminal input
+  in production); --yes/--deny flags are removed entirely. Regressions
+  prove the decision happens after display (the reader sees the rendered
+  words + structure), a "no" mutates nothing, and the store CAS still
+  backs the displayed snapshot. F-41 (blocker): the production wiring
+  never called start() and never established a whoami-resolved actor —
+  the installed path could not reach a card at all. New
+  build_production_runtime (both factories injectable, so the WIRING is
+  tested): dispatcher.start() → whoami invoke → require ok AND a handle
+  (migrated writes refuse without a resolved actor) → return; any failure
+  stops the dispatcher before the error leaves; the card command stops it
+  in a finally (regression: stop runs even when phase 2 raises). Rules
+  commands never build a runtime (regression: a factory that fails the
+  test if invoked). F-43: the request snapshot is deep-copied BEFORE the
+  first await (regression: the invoke itself mutates the caller's nested
+  payload mid-await; the card still replays the phase-1 values). F-44:
+  the rules-only CLI is now genuinely browser-independent — the rule
+  lifecycle moved to webwire/safety/m8_rule_lifecycle.py (browser-free),
+  the CLI lazy-imports CardFlow only inside the card command, and BOTH
+  package __init__ files became PEP-562 lazy (webwire: Dispatcher/Session/
+  envelope names; safety: kill_switch, scoped_authority, write_kernel,
+  reconciliation_coordinator chain, recovery_guard — the coordinator→
+  commit_gateway→kill_switch chain was the hidden browser edge), so
+  importing a rules submodule no longer transitively imports the browser
+  SDK. Qualified by a clean subprocess with the conftest stub path
+  REMOVED: the CLI imports, asserts super_browser/envelope/dispatcher/
+  write_kernel absent from sys.modules, and runs rules list — passing
+  locally even with the real SDK installed, stronger on CI's base
+  install. F-45: the unknown-action note no longer promises ASK — it now
+  states the three facts: ceiling not verifiable (outside the active
+  registry), currently non-executable, and may AUTO-APPROVE if the action
+  is later registered below the standing-rule ceiling. F-46: CLI TTL
+  errors (0/-1/nan/inf/over-max) are caught as controlled usage failures
+  (exit 2) — and reconfirm_rule now rejects non-finite TTLs directly
+  (isfinite; NaN previously slipped past the </> comparisons into
+  UserRule's constructor). F-47: the sanitizer runs UNCONDITIONALLY before
+  any envelope branching, and the policy echo's confirmation_token is
+  removed regardless of its runtime type; a drifted envelope whose token
+  exists only in the policy echo yields NO card (fail-closed — a
+  payload-less token cannot be approved through the surface) and a
+  scrubbed result. Suite 1135 (count from the run).
+- **2026-10-01 — PR #24 review pass: F-34..F-40 (snapshot binding, token
+  custody, the frozen CLI).** The review's principle, accepted: human-visible
+  state, confirmation authority, and the mutation performed afterward must
+  all bind to ONE immutable snapshot. F-34 (blocker): TTL re-confirm was
+  id-keyed only — a same-id ALLOW→NEVER edit between the owner's read and
+  the fenced write would be silently overwritten by the stale re-confirm
+  (the fence serialized the write but not the read→confirm→write
+  transaction). Fixed with compare-and-swap: RuleStore.replace_if_current
+  (expected, replacement) under the existing mutation fence — the stored
+  rule must EQUAL the reviewed snapshot on every field (decision, selector,
+  provenance, source text, timestamps); any change, deletion, or corruption
+  conflicts with zero mutation; identity can never be rewritten.
+  reconfirm_rule now takes the reviewed UserRule itself, and listing hands
+  out the exact immutable snapshot (RuleCard.rule). Regressions lock the
+  review's exact race (stale ALLOW re-confirm can never overwrite a newer
+  NEVER) and the deleted-rule conflict. F-40 (blocker): begin() returned
+  the RAW kernel phase-1 result beside the card — token custody was a
+  rendering property, not an API property. The returned result is now
+  SANITIZED (deep-copied, token removed from BOTH the payload and the
+  policy echo); the token exists only inside the card. deny() still invokes
+  nothing; the confirmation subsystem exposes no per-token cancellation, so
+  the denial's bound is the token's existing TTL — stated, not implied.
+  F-38: the card is bound to the invoke route that created it;
+  approve() is parameterless (no caller-selected phase-2 transport). F-39:
+  the payload is deep-copied at begin and again at replay — nested caller
+  mutation after phase 1 cannot change what is confirmed (regression
+  locked). F-35: lifecycle rendering is TOTAL over legal rules — an ALLOW
+  naming an action outside the active registry renders 'ceiling not
+  verifiable … outside the active registry' instead of raising (a tier is
+  never inferred for an unknown action; management display is more total
+  than enforcement configuration). F-36: RuleCard carries source_text (the
+  owner's original words) and renders them beside the canonical
+  description; re-confirm displays words + structure + new TTL. F-37
+  (blocker/spec): the frozen Card CLI is now IMPLEMENTED (m8_card_cli.py;
+  console entry `m8`): `m8 card CAPABILITY PAYLOAD [--yes|--deny]` (render,
+  and decide in-run; without a flag the card is shown and the token dies
+  with the process), `m8 rules list`, and `m8 rules reconfirm RULE_ID
+  --ttl S [--yes]` (display then CAS-replace; dry-run without --yes).
+  Dependencies are injectable — the CLI is fully tested without a live
+  session. This SUPERSEDES the previous entry's 'library-only' scope claim,
+  which silently redefined layer 4: that was wrong, the frozen build order
+  names a CLI and now has one. Rule removal remains deliberately absent
+  (the build order names exactly list + TTL re-confirm). 12 net-new tests;
+  suite 1128 (count from the run).
+- **2026-10-01 — PR #23 MERGED (04176da) + M8 LAYER 4: the card surface +
+  rule lifecycle (PR pending).** Layer 3 cleared the maintainer pass at
+  6fc5467 (no new blockers; the reviewer's own log check confirmed the
+  Windows rule-store step: 147 durability + 57 rule-store tests) and
+  squash-merged. Layer 4 implemented per frozen section 8 (m8_cards.py,
+  top-level — presentation, not enforcement): CardFlow.begin() wraps any
+  invoke callable (the Dispatcher in production) and returns a phase-1
+  result plus an ApprovalCard when human confirmation is pending; rule-ALLOW
+  and NEVER outcomes return with NO card (nothing to approve). The card
+  renders summary/target/current-state/warnings/matched-rule (+ ceiling
+  note) via to_dict()/render_text(); the confirmation token is held
+  INTERNALLY — never in to_dict, render_text, or repr. approve() replays the
+  exact original payload with the held token (phase 2); deny() invokes
+  nothing and returns a defined declined outcome; a card is single-use (the
+  spent message names which decision consumed it). No new authority: every
+  verdict still comes from the kernel through the invoke callable. Rule
+  lifecycle per the build order's named two operations: list_rules()
+  (enforcement-reader fail-safe — corrupt store lists as empty; canonical
+  descriptions via the SAME renderer the compiler's owner-confirmation
+  uses; live remaining-TTL/expired state) and reconfirm_rule() (same
+  rule_id — attribution identity preserved; same selector/decision/
+  provenance; fresh TTL starting at the re-confirm call; TTL bounded by
+  the 7-day contract; unknown id fails closed; the write goes through a NEW
+  store primitive update_strict — fenced in-place replacement, corrupt
+  store refuses with bytes unchanged, every other rule keeps its position;
+  re-confirming an expired rule re-establishes it by owner choice).
+  Integration test drives the REAL dispatcher phase-1 → card → phase-2
+  through the M5 executor + gateway (fake bookmark broker) to a executed
+  bookmark. Deliberate scope limits, stated: no rule removal (the build
+  order names exactly list + TTL re-confirm; revocation remains editing the
+  store, observed by the next match); the surface is a library (a CLI
+  program wrapping it against a live session is out of CI-qualifiable
+  scope here). 14 new tests; suite 1116.
+- **2026-10-01 — PR #23 third review pass: F-30..F-33 (present-null
+  widening, deterministic fence falsification, Windows lock qualification,
+  closed fences).** F-30 (blocker): the rule-field reducers used
+  payload.get() — an explicit JSON null was indistinguishable from an
+  omitted field, so {"actors": null} widened an ALLOW to every actor and
+  {"ttl_seconds": null} silently took the default lifetime. All rule fields
+  now use presence checks: omitted = unspecified; present = must satisfy
+  the declared type (null is not a list, not a tier list, not a number).
+  Regression matrix covers null for all six fields with the store proven
+  empty. F-31: the F-25 two-process test was probabilistic (a scheduler
+  could run B to completion before A entered its window, passing
+  vacuously). Rewritten as a deterministic lost-update FALSIFICATION: A
+  signals READY from inside its held fence after the strict load; B signals
+  STARTED at its append call; the parent then asserts B is still alive —
+  blocked on the OS lock (without the fence, B completes in milliseconds
+  and the assertion fails) — releases A, and both rules survive. F-32: the
+  Windows CI jobs ran only the effect/recovery durability files — the
+  msvcrt.locking branch of the interprocess fence was never qualified by
+  CI. The windows job now also runs tests/test_user_rules.py (the full
+  suite covers flock on Linux; the store suite covers msvcrt here; offline
+  imports resolve through the conftest super_browser stub). F-33: the code-
+  fence tolerance now accepts bare JSON or one COMPLETELY surrounding
+  fence; a half-open fence (opening line, no closing marker) or a bare
+  "```" rejects as unparseable_response. Evidence corrections to the
+  entries below: F-25's original qualification text overstated the
+  interleaving (now deterministic per F-31); F-27's "every mixed shape
+  rejects" claim was true of refusal/rule tagging but not of explicit null
+  in rule fields (closed by F-30). 2 new regressions; suite 1102 (count
+  from the run).
+- **2026-10-01 — PR #23 second review pass: F-25..F-29 (the process
+  boundary, the byte boundary, and two strictness completions).** F-25
+  (blocker): the F-19 mutation lock was process-local — two PROCESSES could
+  still interleave read-modify-write windows and silently drop a NEVER
+  (atomic os.replace serializes each install, not the read-write around
+  it). Fixed: every rule-store mutation now takes a two-level fence in one
+  order — the in-process per-path RLock, then an OS-RELEASED interprocess
+  lock file (<store>.lock via flock/msvcrt.locking; the lock dies with the
+  process, so a crashed writer cannot leave a stale lock). save() and
+  append_strict() share the fence (save factored to _write_replaced);
+  enforcement reads stay lock-free. Qualified with two REAL processes:
+  process A holds its append window open (slow strict load), process B
+  appends inside it, both rules survive. F-26 (blocker): read_text's
+  UnicodeDecodeError escaped both readers' except tuples — invalid UTF-8
+  bytes raised out of the enforcement path instead of voiding to zero
+  rules. Both paths now treat undecodable bytes as corrupt content:
+  load() → zero rules (no raise); _load_strict() → RuleStoreError, bytes
+  untouched. Regression writes real invalid bytes (b"\\xff\\xfe...").
+  F-27: the model output is now TAGGED, not merged — refusal = expressible
+  false + non-empty string explanation + NO rule fields; rule = no
+  refusal fields at all. Every mixed shape (explanation floating through
+  rule fields, expressible beside a decision, refusal without its
+  explanation) rejects as invalid_shape; only the two pure shapes
+  interpret. F-28: empty RiskMeta.target_types is UNKNOWN vocabulary and
+  can never ESTABLISH satisfiability — a selector naming a custom action
+  (pre-Layer-3 constructor shape) plus any target type now rejects; naming
+  the action without a target claim remains expressible. F-29: the F-08
+  serialization rewrite kept, plus a NEW direct regression locking the
+  unique-staging invariant itself — two saves' os.replace source paths are
+  recorded and must be two distinct rules.json.<32-hex>.tmp files (never a
+  shared rules.json.tmp), a check the serialized concurrency test can no
+  longer provide. 5 new regressions; suite 1100.
+- **2026-10-01 — PR #23 review fixes: F-19..F-24 (persistence boundary,
+  strict model output, exact confirmation).** F-19 (blocker): confirm()'s
+  load-then-save made enforcement's fail-closed load() ([] on corrupt
+  content) indistinguishable from a genuinely empty store — confirming a
+  new ALLOW against a corrupted document would atomically erase a persisted
+  NEVER and install the ALLOW; the unlocked read-modify-write also admitted
+  a lost-update form. Fixed in the STORE, not the compiler: RuleStore gains
+  _load_strict (missing = empty; corrupt/unreadable RAISES) and
+  append_strict (serialized same-path read-modify-write under a
+  process-wide per-path lock — the EffectLedger idiom; save() takes the
+  same lock; duplicates refuse). Regressions: corrupted NEVER+broken-entry
+  document refuses mutation with bytes byte-for-byte unchanged; a same-path
+  writer blocks while an append holds the lock (barrier test). F-20
+  (blocker): persisted TTL now begins at CONFIRMATION time
+  (UserRule.create(now=self._clock())); compiled_at stays draft/audit
+  metadata — a 60s rule confirmed two minutes late is born alive, not
+  dead-on-arrival. F-21: strict JSON loader (duplicate keys rejected,
+  NaN/Infinity literals rejected via parse_constant, 1e999→inf caught by
+  isfinite); expressible/explanation type-checked when present ("false"/0/
+  null are malformed drafts, never refusals-turned-rules; explanation null
+  or non-string or blank → invalid_shape); ttl finite/positive/≤max with
+  the omitted-TTL case clamped to min(default, configured max); the max
+  itself validated at construction. F-22: RiskMeta gains target_types (the
+  registry — the layer that owns action vocabulary — now records each
+  action's composed target types: like→post, post→none, follow→account,
+  …), and the compiler rejects selectors PROVABLY unable to match any
+  registered action (like+target "tweet"; like+tier private_reversible —
+  tier derived from the same registry the gate uses). F-23: the
+  owner-facing description is now canonical and lossless — sorted
+  quoted/escaped arrays (["a", "b"] vs ["a or b"]), exact TTL seconds
+  beside a friendly duration (86400 vs 86401 differ), and ceiling-aware
+  ALLOW semantics ("will still ASK: every named tier is above the allow
+  ceiling"); confirm() REVALIDATES the public draft dataclass (decision
+  enum, ttl contract, satisfiability, description == canonical
+  re-derivation) before touching the store. F-24: compiler_api_key is
+  repr=False in WebWireConfig (regression: the secret never appears in
+  repr(config); the field stays readable). 15 new regressions; suite 1095.
+- **2026-10-01 — PR #22 MERGED (6653fdf) + M8 LAYER 3: the rule compiler
+  (PR pending).** Layer 2 cleared the maintainer pass at 46e1227 (F-16/
+  F-17/F-18 confirmed; CI 1063 total tests — 1057 pass + 6 platform-skipped
+  on Linux, Windows jobs separately green) and squash-merged. Layer 3
+  implemented per frozen spec section 7 (m8_compiler.py): natural language
+  in; strict deterministic reduction to the frozen RuleSelector contract
+  out; inexpressible clauses REJECTED with an explanation and NOTHING
+  stored (M8-T12 — model refusal shape, unknown action/tier vocabulary,
+  blanket no-scope rules, bad decision/ttl/shape, unparseable prose);
+  unknown fields reject (strict draft schema; one mechanical tolerance — a
+  surrounding code fence is stripped before strict JSON). The owner
+  confirms the COMPILATION, not the words: describe_compiled_rule()
+  re-expresses the structure in plain words generated by code (two
+  sentences compiling to the same selector produce the identical
+  description — regression-locked), compile() stores nothing, confirm() is
+  the only persisting call (single-use via rule_id guard; preserves
+  existing hand-written rules; provenance="compiled", source_text kept).
+  Pluggable + optional: one-method CompilerModel protocol; built-in
+  ApiKeyChatModel is a plain API key against a chat-completions-style
+  endpoint (stdlib transport, injectable for tests; WebWireConfig carries
+  compiler_api_key/compiler_endpoint/compiler_model_name, all defaulting
+  off — no model configured means hand-written rules work unchanged, and
+  compile() raises CompilerUnavailable). Compile-time only: a
+  subprocess-level regression proves importing the store, kernel, or
+  dispatcher never pulls the compiler module into the interpreter. A
+  compiled+confirmed NEVER enforces through the kernel gate like any
+  hand-written rule (cites the compiled rule id). 17 new tests.
+- **2026-10-01 — PR #22 second review pass: F-16/F-17/F-18.** F-16 (blocker):
+  layer 2 had re-imposed a stricter id contract than the frozen layer-1
+  UserRule contract (any non-empty string), so a legal rule id with internal
+  whitespace became an invalid approver at the mint boundary. Fixed with ONE
+  invariant: user_rules.validate_rule_id is now the single rule-id authority
+  (UserRule construction and validate_approver both call it); spaced ids such
+  as "rule:allow likes" are legal attribution, cross-layer regression locks
+  the full lineage (store round-trip → kernel attribution → mint → durable
+  ledger). F-17: the acceptance tests rewritten to the scenarios the frozen
+  matrix names — T20/T21 now mutate the LIVE shared registry / the gateway
+  epoch after mint and deny on the actual commit path (scope_effect) with
+  policy_mismatch / epoch_mismatch, and the epoch denial is terminal (the
+  grant is REVOKED; every later attempt denies grant_not_active); T22
+  requires BOTH the durable RESERVED reservation and the terminal
+  confirmation (the like policy is fenced — ReplaySemantics.UNKNOWN); T24
+  crosses actual kernel human confirmation (token issued and consumed) →
+  adapter → runtime → permit → ledger; T16 compares the full response
+  byte-for-byte (only the volatile token mint fields normalized); the
+  invalid-approver ledger parse regression uses a canonical UPPERCASE state
+  so the approver vocabulary is provably the rejection. F-18: the five
+  non-engagement adapters no longer park the approver in mutable instance
+  state (_m8_approver removed) — execute() delegates to
+  execute_with_approver(approver="human") exactly like the engagement
+  adapter; approval provenance is per-call throughout.
+- **2026-10-01 — M8 LAYER 2 (PR #22): the kernel rule gate + approver
+  lineage.** Implemented per the corrected section 6 topology: the gate sits
+  after preview and before the confirmation section, so it is re-evaluated
+  on EVERY invocation including the token-bearing one (T14: a NEVER
+  installed after token issuance still denies — the gate dominates tokens).
+  NEVER denies with blocked_by=user_rule and the rule cited; ASK/no-match
+  uses the existing human confirmation path with the matched rule cited in
+  the card payload; below-ceiling ALLOW establishes approver="rule:<id>"
+  with NO confirmation carrier and flows to execution in ONE invocation.
+  The critical rule honored: approval source is an explicit trusted value —
+  the kernel passes approver through a new execute_with_approver adapter
+  seam, the six M5 executors thread it to M5ExecutionRuntime.issue, and the
+  runtime stamps it on the grant at the SINGLE mint seam. Capabilities
+  without the seam are denied standing approval
+  (approver_unsupported_adapter). Attribution descends monotonically:
+  ApprovalGrant.approver -> EffectPermit.approver -> EffectLedgerRecord
+  .approver (top-level lineage field; optional on read for pre-M8 rows —
+  T23 locks old rows parse with None). Human default "human" keeps every
+  pre-M8 caller correct (T24). Also landed: the reviewer's two cleanups
+  (section 6.1 typo; the Windows retry now inspects winerror 5/32, retrying
+  only the transient sharing violation per the stated contract). T13-T24
+  all covered (tests/test_m8_rule_gate.py, 13 tests). Suite 1057 (count
+  from the run). Kernel with rule_store=None is byte-for-byte pre-M8 (T16).
+- **2026-10-01 — M8 layer 1 hardening + section 6 amendment (PR #21).** The
+  post-merge fallback pass found one new blocker and one falsified design
+  assumption. F-08 (blocker): concurrent saves shared one staging file —
+  writer A's os.replace could install writer B's bytes while A reported
+  success (believing a restrictive policy installed while a permissive one
+  persisted). Each save now stages through a unique per-writer temp file;
+  a bounded retry absorbs the Windows transient sharing violation on the
+  destination; a deterministic barrier-based concurrency test proves every
+  successful replace installs that caller's payload (run 5x for flake).
+  Hardening: selector annotations became runtime contracts (exact non-empty
+  frozensets of the exact element type — strings/RiskTier enums; plain
+  strings, mutable sets, empty dimensions, empty-string elements all
+  rejected); bool timestamps rejected at construction (parity with the
+  parser — bool is numeric in Python). Doc repair: target_types added to
+  the frozen selector diagram. SECTION 6 REWRITTEN per the corrected
+  authority topology: the kernel does NOT mint ApprovalGrants — the
+  execution runtime is the single mint seam; rule-ALLOW establishes
+  approver attribution with no human carrier; the rule gate is
+  re-evaluated on every invocation including the token invocation (a new
+  NEVER defeats an old human token); attribution descends
+  grant→permit→ledger with approver as a top-level ledger lineage field
+  (optional on read for pre-M8 rows). Acceptance matrix extended
+  M8-T13..T24. Suite 1044 (count from the run).
+- **2026-10-01 — M8 layer 1 review fixes (PR #20, fallback pass).** The
+  external reviewer quota was unavailable, so the project's fallback rule
+  applied: a first-pass plus adversarial review, seven findings (F-01..F-07,
+  three blocking), every one verified against the code before fixing.
+  F-01 (blocker): invalid-entry skipping could WIDEN authority — a broken
+  NEVER left a valid ALLOW live; the old T7d tested only the safe direction.
+  Now any invalid entry voids the entire read to zero rules. F-02 (blocker):
+  enforcement caching could serve revoked authority; the cache is removed —
+  every match reads current persisted policy, making revocation freshness a
+  store invariant rather than integrator discipline. F-03 (blocker): NaN/±inf
+  timestamps (JSON accepts them as literals) made rules effectively
+  non-expiring; TTLs now finite and strictly forward, both at construction
+  and parse. F-04: save() raises RuleStoreError instead of swallowing write
+  failures. F-05: strict parse — provenance and source_text mandatory,
+  never manufactured. F-06: the frozen matcher signature (with target_type)
+  implemented and test-locked; target_types selector dimension added.
+  F-07: rule ids non-empty and unique; save() refuses duplicates. The
+  review-required test list is implemented in full, including the widening
+  case (malformed NEVER + valid ALLOW → no auto-approval) and both cache
+  revocation directions. Suite 1034 (count from the run).
+- **2026-10-01 — M8 design FROZEN + layer 1 (PR #20).** M8 adds the user
+  rule layer: standing decisions in the owner's own words, compiled once to
+  structured selectors, enforced deterministically at the approval gate.
+  docs/M8_DESIGN.md is normative and self-contained (four layers; negative
+  guarantees; M8-T1..T12 acceptance table). Two standing decisions recorded:
+  the compile-time model uses a plain API key (pluggable, optional —
+  hand-written rules need no model); no model ever runs in the enforcement
+  path. Layer 1 (this PR): RuleSelector (every specified dimension must
+  match; empty scope rejected at construction), UserRule with mandatory TTL
+  and provenance, deterministic matcher with never>ask>allow precedence,
+  the risk-tier ceiling enforced as a MATCH-TIME downgrade (an ALLOW match
+  above the ceiling yields ask — no store content can bypass it), and a
+  file-backed store with atomic writes and fail-open-equals-everything-asks
+  semantics (missing/corrupt/schema-mismatch → zero rules; one invalid entry
+  skipped without disabling the owner's bans). 18 tests (M8-T1..T9 covered).
+  Suite 1008 (count from the run). House rule adopted 2026-10-01: repository
+  content names no external products — reviews are "external review,"
+  patterns are described generically.
 - **2026-09-28 — M7 Layer 1 owner-lock candidate (PR #19).** Started from the
   exact M7-design merge `65e3961ed32d090b6a47983901d153838cf99267`.
   Maintainer-first review froze the canonical-domain/process-registry/OS-lock

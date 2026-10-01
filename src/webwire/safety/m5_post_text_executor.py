@@ -72,11 +72,13 @@ class M5PostTextExecutor:
         self._runtime = runtime
         self._evidence = evidence_reader
 
-    async def execute(self, intent: WriteIntent) -> M5PostTextExecution:
+    async def execute(
+        self, intent: WriteIntent, *, approver: str = "human"
+    ) -> M5PostTextExecution:
         # Freeze before handing anything to the runtime and never re-read the
         # caller-owned intent after this point.
         frozen = deepcopy(intent)
-        session = self._runtime.issue(frozen)
+        session = self._runtime.issue(frozen, approver=approver)
         if session.action_type != "post":
             session.resolve_no_external_effect(reason="post_text_executor_wrong_action")
             return self._clean_failure(

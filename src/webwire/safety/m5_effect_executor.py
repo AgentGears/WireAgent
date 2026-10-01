@@ -96,8 +96,10 @@ class M5EffectExecutor:
         self._runtime = runtime
         self._evidence = evidence_reader
 
-    async def execute(self, intent: WriteIntent) -> M5EffectExecution:
-        session = self._runtime.issue(intent)
+    async def execute(
+        self, intent: WriteIntent, *, approver: str = "human"
+    ) -> M5EffectExecution:
+        session = self._runtime.issue(intent, approver=approver)
         action = session.action_type
         if action not in _SUPPORTED_ACTIONS:
             session.resolve_no_external_effect(reason="effect_executor_unsupported_action")

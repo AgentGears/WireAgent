@@ -75,6 +75,16 @@ class WebWireConfig:
     # verified whoami. Treated as a secret: gitignored, restrictive perms.
     session_file: str = "session.json"
 
+    # -- M8 rule compiler (layer 3; frozen spec 7) ----------------------------
+    # Optional by design: with no API key / endpoint configured, the compiler
+    # is simply unavailable and hand-written rules work unchanged. The model
+    # runs at compile time only — never during matching, gating, or approval.
+    # repr=False: the key is a credential and must not leak into logs or
+    # config representations (F-24).
+    compiler_api_key: Optional[str] = field(default=None, repr=False)
+    compiler_endpoint: Optional[str] = None
+    compiler_model_name: str = "default"
+
     def kill_path(self) -> Path:
         """Absolute path to the kill hot file."""
         return self.state_dir / self.kill_file
@@ -102,3 +112,7 @@ class WebWireConfig:
     def session_path(self) -> Path:
         """Absolute path to the session-persistence file (cookie jar)."""
         return self.state_dir / self.session_file
+
+    def rules_path(self) -> Path:
+        """Canonical M8 user-rule store path under the state directory."""
+        return self.state_dir / "rules.json"

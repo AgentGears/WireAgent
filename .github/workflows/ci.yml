@@ -65,3 +65,9 @@ jobs:
           tests/test_m7_authority_owner_lock_setup_failures.py
           tests/test_m7_authority_owner_lock_callback_failures.py
           tests/test_m7_authority_owner_lock_failstop_processes.py
+      - name: Windows rule-store qualification (F-32)
+        # The rule store's interprocess fence has a platform-specific lock
+        # branch (msvcrt.locking here, flock on Linux); the full suite only
+        # exercises the flock side in CI. Run the store suite — including
+        # the two-process fence falsification — on Windows too.
+        run: python -m pytest -q tests/test_user_rules.py

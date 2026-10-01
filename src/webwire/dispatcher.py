@@ -110,6 +110,7 @@ class Dispatcher:
         )
         from webwire.safety.commit_gateway import CommitGateway
         from webwire.safety.execution_models import AuthorizationEpoch
+        from webwire.safety.user_rules import RuleStore
 
         # These two controls are process-local defense in depth. Layer 7 no
         # longer rebuilds either one from the best-effort invocation journal.
@@ -150,6 +151,7 @@ class Dispatcher:
             journal=self._journal,
             write_broker_factory=_make_write_broker,
             recovery_guard=self._m5_recovery,
+            rule_store=RuleStore(self._config.rules_path()),
         )
 
         # M6 reconciliation is local bookkeeping authority, not a Dispatcher
@@ -826,7 +828,14 @@ def _redact_target(input: dict[str, Any]) -> Optional[str]:
 def _redact_input(input: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in input.items():
-        if isinstance(value, str) and "://" in value:
+        if key == "confirmation_token":
+            # Authority is never audit data (F-50): a live confirmation
+            # token is redacted BY KEY — policy gates (a newly installed
+            # NEVER, rate limits, dedupe) can deny before the confirmation
+            # gate consumes it, so the value may still be live when this
+            # record is written.
+            out[key] = "<redacted>"
+        elif isinstance(value, str) and "://" in value:
             scheme, rest = value.split("://", 1)
             path = rest.split("?", 1)[0].split("#", 1)[0]
             out[key] = f"{scheme}://{path}"

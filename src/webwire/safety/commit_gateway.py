@@ -126,6 +126,8 @@ class EffectPermit:
     fenced: bool
     issued_at: float
     expires_at: float
+    # M8 attribution descending from the grant (spec 6.1).
+    approver: str = "human"
     permit_id: str = field(default_factory=lambda: secrets.token_urlsafe(16))
     _use: _PermitUse = field(default_factory=_PermitUse, repr=False, compare=False)
 
@@ -345,6 +347,7 @@ class CommitGateway:
             effect_id=attempt.effect_id,
             semantic_key=snapshot.semantic_key,
             state=EffectState.RESERVED,
+            approver=grant.approver,
             action_type=snapshot.action_type,
             intent_hash=snapshot.intent_hash,
             policy_binding=policy_binding,
@@ -690,6 +693,7 @@ class CommitGateway:
                     action_type=snapshot.action_type,
                     intent_hash=snapshot.intent_hash,
                     policy_binding=policy_binding,
+                    approver=grant.approver,
                     actor_id=snapshot.actor_id,
                     target_type=snapshot.target_type,
                     target_id=snapshot.target_id,
@@ -824,6 +828,7 @@ class CommitGateway:
                                             mint_now = self._clock()
                                             permit = EffectPermit(
                                                 grant_id=grant.grant_id,
+                                                approver=grant.approver,
                                                 attempt_id=attempt.attempt_id,
                                                 effect_id=effect_id,
                                                 semantic_key=semantic_key,
@@ -1026,6 +1031,7 @@ class CommitGateway:
                 action_type=permit.action_type,
                 intent_hash=permit.intent_hash,
                 policy_binding=permit.policy_binding,
+                approver=permit.approver,
                 actor_id=permit.actor_id,
                 target_type=permit.target_type,
                 target_id=permit.target_id,

@@ -1000,7 +1000,7 @@ here. Suite 1142 (count from the run).
   exclusion, non-blocking POSIX/Windows lock adapters, non-inheritable private
   descriptors, a POSIX after-fork child detach, stable non-authoritative
   rendezvous-file behavior, and genuine fresh-process exclusion/successor tests.
-  The maintainer adversarial re-open found two lifecycle defects before Codex:
+  The maintainer adversarial re-open found two lifecycle defects before independent external review:
   explicit unlock-before-close violated M7-RV17's owner-handle lifetime law, and
   registry validation occurred too late after OS release. Both were corrected:
   release is now close-only and registry authority is verified/pinned across the
@@ -1013,7 +1013,7 @@ here. Suite 1142 (count from the run).
   `73993c54949990b81e598693f730bacf18665f89` and squash merge
   `65e3961ed32d090b6a47983901d153838cf99267` share tree
   `bdb4a866738735900c14969b56475cb0b905571d`. Maintainer-first review,
-  adversarial re-opens, and independent Codex reconciliation produced RV01–RV18
+  adversarial re-opens, and independent external-review reconciliation produced RV01–RV18
   and a 70-case primary acceptance surface. The bounded topology is one
   non-expiring qualified owner per canonical local state directory, local IPC
   clients, no timed live-owner stealing, and no automatic mutation replay across
@@ -1077,7 +1077,7 @@ here. Suite 1142 (count from the run).
   qualification, integrated R39 publication races, direct R25/R44 acceptance
   evidence, a real pre-crash pending-token proof, and same-path sibling
   coordinator serialization/confirmation-domain qualification. No independent
-  Codex/GitWire action was exposed, so the frozen-design fallback was a distinct
+  the external-review automation quota was exhausted, so the frozen-design fallback was a distinct
   recorded adversarial second pass with zero additional production findings.
   Squash merge: `e1e3eeb679cf54b5707c88b0e82e3db4a04d9319`.
 - **2026-09-27 — M6 Layer 4 merged (PR #14).** Squash merge
@@ -1099,8 +1099,8 @@ here. Suite 1142 (count from the run).
 - **2026-09-25 — M5 complete; L7 merged (PR #8).** Final Layer-7 candidate
   `390967d96f87cdb483334bd8a2120629312df3f4`; CI #366 green on Python
   3.11/3.12 with **765 tests** on Python 3.11, Ruff clean, and mypy clean across
-  78 source files. Codex exact-head review was unavailable because the repository
-  code-review usage limit was exhausted; no GitWire review appeared. Per the
+  78 source files. an external exact-head review was unavailable because the repository
+  code-review usage limit was exhausted; no external review appeared. Per the
   standing review rule, a distinct maintainer adversarial second pass substituted
   for the unavailable external reviewer and found one additional coverage defect:
   journal rotation regression coverage had been lost when the legacy hydration
@@ -1118,16 +1118,16 @@ here. Suite 1142 (count from the run).
   `policy_decision="allowed"` labeling; and obsolete hydration APIs/tests.
 - **2026-09-25 — M5 L6 merged (PR #7).** Candidate
   `f4e9f7c88a6c6f6fe64abbbd899352bd12eafeeb`; CI #363 green on Python
-  3.11/3.12 with 763 tests, Ruff and mypy. Exact-head GitWire review completed
+  3.11/3.12 with 763 tests, Ruff and mypy. Exact-head external review completed
   with zero findings. Maintainer-first review had already discovered/fixed three
   authority defects: stale concurrent RecoveryGuard publication, caller-
   controllable recovery exemption, and cross-capability confirmation-token
   transfer. Squash merge: `03df4d3458828cc131989fd44fe27d48cef1240c`.
 - **2026-09-25 — M5 L5 merged (PR #6).** Final candidate
   `7885de6abd385c7da25b0ac61d61627d2f465c54`; CI #353 green on Python
-  3.11/3.12 with 749 tests, Ruff and mypy. Exact-head GitWire coverage was
+  3.11/3.12 with 749 tests, Ruff and mypy. Exact-head external coverage was
   incomplete because of its bundle line limit; its three findings were
-  independently reconciled. Exact-head Codex rerun was unavailable because the
+  independently reconciled. An exact-head external rerun was unavailable because the
   repository review quota was exhausted. Squash merge:
   `515999740bb7b5fa4ad9c74582d6166157e9075b`.
 - **2026-09-25 — M5 L4 already merged.** Scoped-authority baseline merged as

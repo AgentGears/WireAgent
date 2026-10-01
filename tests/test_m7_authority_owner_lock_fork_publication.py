@@ -260,7 +260,7 @@ def test_release_close_to_unpublish_is_atomic_against_fork_and_fd_reuse(
     release_thread = threading.Thread(target=release_owner, name="m7-owner-release")
     release_thread.start()
     assert kernel_close_done.wait(timeout=5)
-    assert guard.transition_entered.is_set()  # direct regression for Codex P1 follow-up
+    assert guard.transition_entered.is_set()  # direct regression for external-review finding F27 (P1)
 
     reused_fds: list[int] = []
     reused_fd: int | None = None

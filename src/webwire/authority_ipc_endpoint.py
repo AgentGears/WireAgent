@@ -16,7 +16,7 @@ security properties now (frozen contract item 1).
 
 from __future__ import annotations
 
-import ctypes
+import ctypes  # noqa: F401 — used by _win32() via vars(ctypes)
 import hashlib
 import os
 import socket
@@ -274,7 +274,6 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
 
     def accept(self) -> Any:
         """Wait for a client connection on the named pipe."""
-        import ctypes
 
         kernel32 = _win32().kernel32
         assert self._handle is not None

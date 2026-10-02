@@ -103,9 +103,15 @@ class AuthoritySession:
         self._state = AuthoritySessionState.STARTING
         self._active = 0
         self._revokers: list[Callable[[], None]] = []
-        # F-57: revocation completion is tracked PER REVOKER — "_revoked"
-        # semantics are "all required revokers completed", not "attempted".
+        # F-57/F-59: revocation is a lifecycle sub-state/transaction, not
+        # just a completed-set. _started closes activation/admission
+        # permanently; _running makes execution single-flight (concurrent
+        # callers join the in-flight operation instead of rerunning
+        # pending revokers); _complete means every required revoker
+        # SUCCEEDED. TERMINAL is unreachable until _complete.
         self._revoker_success: set[int] = set()
+        self._revocation_started = False
+        self._revocation_running = False
         self._revocation_complete = False
 
     @property
@@ -141,8 +147,18 @@ class AuthoritySession:
     # -- lifecycle transitions ---------------------------------------------
 
     def activate(self) -> None:
-        """STARTING → READY: the authority root is live and may admit work."""
+        """STARTING → READY: the authority root is live and may admit work.
+
+        F-59: once revocation has begun (a failed-start teardown started
+        closing this session), activation is permanently impossible — the
+        abort/activate race can never produce a READY session carrying
+        completed or partial revocation."""
         with self._condition:
+            if self._revocation_started:
+                raise AuthoritySessionError(
+                    "cannot activate: revocation has already begun during "
+                    "STARTING teardown — this session can only terminalize"
+                )
             if self._state is not AuthoritySessionState.STARTING:
                 raise AuthoritySessionError(f"authority session cannot activate from {self._state.value}")
             self._state = AuthoritySessionState.READY
@@ -172,45 +188,88 @@ class AuthoritySession:
         F-57: registering a NEW revocation obligation after revocation has
         already completed is refused — the "authority died with this
         session" guarantee would otherwise be silently incomplete for the
-        late registration."""
+        late registration. F-59: registering while a revocation pass is
+        EXECUTING is also refused (racy against the in-flight snapshot);
+        registering between retries of an incomplete revocation stays
+        legal and the retry picks the obligation up."""
         with self._condition:
-            if self._revocation_complete:
+            if self._revocation_complete or self._revocation_running:
                 raise AuthoritySessionError(
-                    "cannot register a revoker after revocation has "
-                    "completed; the owner is already shutting down"
+                    "cannot register a revoker now: revocation has "
+                    "completed or is executing; the owner is shutting down"
                 )
             self._revokers.append(revoker)
 
     def revoke_authority(self) -> None:
-        """Run every registered revoker to COMPLETION (F-57).
+        """Run every registered revoker to COMPLETION (F-57/F-59).
 
-        Revocation is idempotent only in the completed sense: if a revoker
-        raises, revocation is NOT complete, shutdown stays fail-closed,
-        and a retry runs the UNFINISHED revokers (each revoker is retried
-        until it has succeeded once). Pending owner-side
+        Lifecycle-atomic: revocation is legal only from STARTING
+        (failed-start teardown) or DRAINING (shutdown) — calling it on a
+        freely admitting READY session is REFUSED with zero side effects,
+        because authority minted after a premature revocation could
+        otherwise survive the final shutdown boundary. Beginning
+        revocation permanently blocks activation and admission for this
+        session.
+
+        Single-flight (F-59): only one caller executes revokers at a
+        time; concurrent callers JOIN the in-flight operation (they wait
+        on the condition and re-check completion) rather than rerunning
+        pending callbacks. A raising revoker leaves revocation
+        INCOMPLETE and retryable; succeeded revokers are never executed
+        twice, including under concurrency. Pending owner-side
         confirmation/reconciliation authority does not outlive a
         COMPLETED call."""
         while True:
             with self._condition:
                 if self._revocation_complete:
                     return
+                while self._revocation_running:
+                    # Join the in-flight revocation pass: never rerun
+                    # pending revokers beside the executing caller.
+                    self._condition.wait()
+                    if self._revocation_complete:
+                        return
+                if self._state is AuthoritySessionState.READY:
+                    raise AuthoritySessionError(
+                        "cannot revoke authority on a freely admitting "
+                        "READY session — revocation closes a session "
+                        "(begin_drain or abort first); refused with zero "
+                        "side effects"
+                    )
+                if self._state is AuthoritySessionState.TERMINAL:
+                    # TERMINAL requires completed revocation by
+                    # construction; treat as the completed no-op.
+                    self._revocation_complete = True
+                    return
+                # Legal: STARTING (failed-start teardown) or DRAINING
+                # (shutdown). Beginning revocation permanently closes this
+                # session (F-59): activate() and admission can never
+                # succeed afterwards.
+                self._revocation_started = True
+                self._revocation_running = True
                 pending = [
                     (i, revoker) for i, revoker in enumerate(self._revokers) if i not in self._revoker_success
                 ]
-            if not pending:
+            try:
+                # Revokers run OUTSIDE the condition lock: they may take
+                # their own locks (e.g. the ConfirmationState lock) and
+                # must not deadlock against an admission exit that needs
+                # this condition. A raising revoker propagates: the
+                # finally releases single-flight and marks completion only
+                # when EVERY required revoker has succeeded.
+                for i, revoker in pending:
+                    revoker()
+                    with self._condition:
+                        self._revoker_success.add(i)
+            finally:
                 with self._condition:
-                    self._revocation_complete = True
+                    self._revocation_running = False
+                    if len(self._revoker_success) >= len(self._revokers):
+                        self._revocation_complete = True
                     self._condition.notify_all()
-                return
-            # Revokers run OUTSIDE the condition lock: they may take their
-            # own locks (e.g. the ConfirmationState lock) and must not
-            # deadlock against an admission exit that needs this condition.
-            # A raising revoker propagates: revocation stays incomplete and
-            # the next call retries exactly the unfinished set.
-            for i, revoker in pending:
-                revoker()
-                with self._condition:
-                    self._revoker_success.add(i)
+            # Loop: re-derive pending (a mid-run late registration or a
+            # retry after a raised revoker both converge here; completion
+            # short-circuits the next entry).
 
     def terminalize(self) -> None:
         """DRAINING → TERMINAL (permanent).

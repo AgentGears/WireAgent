@@ -619,6 +619,7 @@ def test_F57_raising_revoker_stays_incomplete_and_retry_finishes() -> None:
 
     session.register_revoker(ok_revoker)
     session.register_revoker(flaky_revoker)
+    session.begin_drain()  # F-59: revocation is legal only while closing
 
     with pytest.raises(RuntimeError, match="revoker exploded"):
         session.revoke_authority()
@@ -635,10 +636,9 @@ def test_F57_raising_revoker_stays_incomplete_and_retry_finishes() -> None:
     # Completed: idempotent, and late registration is now refused.
     session.revoke_authority()
     assert calls.count("flaky") == 2
-    with pytest.raises(AuthoritySessionError, match="after revocation has"):
+    with pytest.raises(AuthoritySessionError, match="completed or is executing"):
         session.register_revoker(lambda: None)
-    session.begin_drain()
-    session.terminalize()  # revocation already completed → TERMINAL proceeds
+    session.terminalize()  # draining + revocation completed → TERMINAL proceeds
 
 
 def test_F58_dispatcher_release_failure_retains_ownership_for_retry(
@@ -776,3 +776,159 @@ def test_F58_offline_close_retry_path_releases_when_clean(tmp_path: Path) -> Non
     assert owner._owner_lock is None
     successor = AuthorityOwnerLock(tmp_path).acquire()
     successor.release()
+
+
+# ---------------------------------------------------------------------------
+# F-59 (third review round): revocation is lifecycle-atomic and single-flight
+# ---------------------------------------------------------------------------
+
+
+def test_F59_ready_direct_revoke_refused_with_zero_side_effects() -> None:
+    """revoke_authority() on a freely admitting READY session is REFUSED
+    with zero revoker calls: authority minted after a premature revocation
+    could otherwise survive the final shutdown boundary. The session
+    remains safely READY and admitting."""
+    session = AuthoritySession(authority_domain=Path("x"))
+    session.activate()
+    ran = []
+    session.register_revoker(lambda: ran.append(1))
+
+    with pytest.raises(AuthoritySessionError, match="freely admitting"):
+        session.revoke_authority()
+    assert ran == [], "the refusal must have zero side effects"
+    assert session.state.value == "ready"
+    assert session.admitting, "the session remains safely READY"
+    with session.admit(expected_instance_id=session.authority_instance_id):
+        pass  # admission still works — nothing was consumed
+
+    # The legal shutdown still revokes exactly once.
+    session.begin_drain()
+    session.terminalize()
+    assert ran == [1]
+
+
+def test_F59_abort_vs_activate_race_never_yields_ready_with_revocation() -> None:
+    """The STARTING abort/activate TOCTOU: while abort_from_starting() is
+    mid-revocation (revokers executing outside the condition lock), a
+    racing activate() must FAIL — exactly one legal ordering exists, and a
+    READY session with completed/partial revocation is impossible."""
+    session = AuthoritySession(authority_domain=Path("x"))
+    revoking = threading.Event()
+    release_revoker = threading.Event()
+    ran = []
+
+    def blocking_revoker() -> None:
+        ran.append(1)
+        revoking.set()
+        release_revoker.wait(timeout=5)
+
+    session.register_revoker(blocking_revoker)
+
+    abort_result: list = []
+
+    def do_abort() -> None:
+        try:
+            session.abort_from_starting()
+            abort_result.append("ok")
+        except Exception as exc:  # noqa: BLE001 — recorded for the test
+            abort_result.append(f"raised:{exc!r}")
+
+    thread = threading.Thread(target=do_abort)
+    thread.start()
+    assert revoking.wait(timeout=5), "abort began revoking"
+
+    # The race window: revocation started, revoker executing. Activation
+    # must now be PERMANENTLY impossible.
+    with pytest.raises(AuthoritySessionError, match="revocation has already begun"):
+        session.activate()
+
+    release_revoker.set()
+    thread.join(timeout=5)
+    assert abort_result == ["ok"], abort_result
+    assert ran == [1]
+    assert session.state.value == "terminal"
+    # And the session can never activate afterwards.
+    with pytest.raises(AuthoritySessionError):
+        session.activate()
+
+
+def test_F59_concurrent_revoke_terminalize_each_revoker_once() -> None:
+    """Single-flight: two concurrent revoke/terminalize callers — each
+    revoker executes EXACTLY ONCE, and both callers observe one coherent
+    completion (both terminalize calls succeed; the state lands
+    TERMINAL)."""
+    session = AuthoritySession(authority_domain=Path("x"))
+    session.activate()
+    counts = {"a": 0, "b": 0}
+    lock = threading.Lock()
+
+    def revoker_a() -> None:
+        with lock:
+            counts["a"] += 1
+        time.sleep(0.05)  # widen the race window
+
+    def revoker_b() -> None:
+        with lock:
+            counts["b"] += 1
+        time.sleep(0.05)
+
+    session.register_revoker(revoker_a)
+    session.register_revoker(revoker_b)
+    session.begin_drain()
+
+    errors: list = []
+
+    def closer() -> None:
+        try:
+            session.terminalize()
+        except Exception as exc:  # noqa: BLE001 — recorded for the test
+            errors.append(exc)
+
+    t1 = threading.Thread(target=closer)
+    t2 = threading.Thread(target=closer)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert errors == [], errors
+    assert counts == {"a": 1, "b": 1}, "each revoker executed exactly once"
+    assert session.state.value == "terminal"
+    # A joined concurrent revoke call observes the coherent completion.
+    session.revoke_authority()  # no-op: complete
+    assert counts == {"a": 1, "b": 1}
+
+
+def test_F59_concurrent_plain_revoke_callers_join_not_rerun() -> None:
+    """Two concurrent bare revoke_authority() callers (DRAINING): the
+    joiner waits for the in-flight pass instead of rerunning pending
+    revokers — exactly one execution per revoker."""
+    session = AuthoritySession(authority_domain=Path("x"))
+    session.activate()
+    executions = []
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def slow_revoker() -> None:
+        with lock:
+            executions.append(1)
+        release.wait(timeout=5)
+
+    session.register_revoker(slow_revoker)
+    session.begin_drain()
+
+    def revoker_caller() -> None:
+        session.revoke_authority()
+
+    t1 = threading.Thread(target=revoker_caller)
+    t2 = threading.Thread(target=revoker_caller)
+    t1.start()
+    t2.start()
+    time.sleep(0.3)  # t1 (or t2) is executing; the other is joined
+    assert len(executions) == 1, "single-flight: the joiner does not rerun"
+    release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert len(executions) == 1
+    session.terminalize()
+    assert session.state.value == "terminal"

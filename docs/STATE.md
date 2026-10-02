@@ -487,6 +487,38 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #26 second repair round: F-59 — revocation is
+  lifecycle-atomic and single-flight.** The F-57 repair made completion
+  durable but left revoke_authority() legal on a freely admitting READY
+  session — a direct call completed revocation, the session stayed READY
+  and admitting, and authority minted afterwards could survive the final
+  shutdown boundary (the same defect through a different entry point);
+  revoke was also not single-flight (two concurrent callers could both
+  snapshot and execute the same unfinished revoker), and abort-vs-
+  activate had a TOCTOU (abort validated STARTING, released the
+  condition to run revokers, a racing activate reached READY, the final
+  state check raised — a REJECTED abort that had revoked on a READY
+  session). Repaired with an internal revocation sub-state/transaction
+  (started/running/complete + per-revoker success): revoke from a freely
+  admitting READY session is REFUSED with zero side effects (revocation
+  is legal only from STARTING teardown or DRAINING shutdown); beginning
+  revocation permanently blocks activation (activate raises once
+  started — the abort/activate race now has exactly one legal ordering)
+  and admission stays closed; single-flight execution with concurrent
+  callers JOINING the in-flight pass (condition wait + completion
+  re-check) instead of rerunning pending revokers; a raising revoker
+  leaves revocation incomplete and retryable with succeeded revokers
+  never re-executed, including under concurrency; TERMINAL remains
+  unreachable until revocation completed; registering while a pass is
+  EXECUTING is refused (between retries of an incomplete revocation it
+  stays legal and the retry picks it up). Four regressions: READY
+  direct-revoke refused zero-effects then legal shutdown still revokes;
+  the deterministic abort-vs-activate race (blocking revoker; activation
+  fails mid-revocation; abort completes to TERMINAL; post-terminal
+  activation impossible); two concurrent terminalize callers (each
+  revoker exactly once, both succeed, coherent completion); two
+  concurrent bare revoke callers (the joiner does not rerun the pending
+  revoker — exactly one execution). Suite 1217 (count from the run).
 - **2026-10-02 — PR #26 review pass: F-57/F-58 — revocation completion
   and failed-release retention.** F-57 (blocker): terminalize() and
   abort_from_starting() now VALIDATE the lifecycle transition FIRST — an

@@ -16,6 +16,7 @@ security properties now (frozen contract item 1).
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import socket

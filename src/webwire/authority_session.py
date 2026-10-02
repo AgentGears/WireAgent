@@ -103,7 +103,10 @@ class AuthoritySession:
         self._state = AuthoritySessionState.STARTING
         self._active = 0
         self._revokers: list[Callable[[], None]] = []
-        self._revoked = False
+        # F-57: revocation completion is tracked PER REVOKER — "_revoked"
+        # semantics are "all required revokers completed", not "attempted".
+        self._revoker_success: set[int] = set()
+        self._revocation_complete = False
 
     @property
     def authority_domain(self) -> Any:
@@ -162,28 +165,68 @@ class AuthoritySession:
 
     def register_revoker(self, revoker: Callable[[], None]) -> None:
         """Register ephemeral-authority revocation (e.g. confirmation-epoch
-        advancement). Revokers run exactly once, before terminalization."""
+        advancement). Revokers run before terminalization, and revocation
+        must COMPLETE (all revokers succeed) before the owner handle may
+        close.
+
+        F-57: registering a NEW revocation obligation after revocation has
+        already completed is refused — the "authority died with this
+        session" guarantee would otherwise be silently incomplete for the
+        late registration."""
         with self._condition:
+            if self._revocation_complete:
+                raise AuthoritySessionError(
+                    "cannot register a revoker after revocation has "
+                    "completed; the owner is already shutting down"
+                )
             self._revokers.append(revoker)
 
     def revoke_authority(self) -> None:
-        """Run every registered revoker. Idempotent; safe to call during
-        DRAINING. Pending owner-side confirmation/reconciliation authority
-        does not outlive this call."""
-        with self._condition:
-            if self._revoked:
+        """Run every registered revoker to COMPLETION (F-57).
+
+        Revocation is idempotent only in the completed sense: if a revoker
+        raises, revocation is NOT complete, shutdown stays fail-closed,
+        and a retry runs the UNFINISHED revokers (each revoker is retried
+        until it has succeeded once). Pending owner-side
+        confirmation/reconciliation authority does not outlive a
+        COMPLETED call."""
+        while True:
+            with self._condition:
+                if self._revocation_complete:
+                    return
+                pending = [
+                    (i, revoker) for i, revoker in enumerate(self._revokers) if i not in self._revoker_success
+                ]
+            if not pending:
+                with self._condition:
+                    self._revocation_complete = True
+                    self._condition.notify_all()
                 return
-            self._revoked = True
-            revokers = list(self._revokers)
-        # Revokers run OUTSIDE the condition lock: they may take their own
-        # locks (e.g. the ConfirmationState lock) and must not deadlock
-        # against an admission exit that needs this condition.
-        for revoker in revokers:
-            revoker()
+            # Revokers run OUTSIDE the condition lock: they may take their
+            # own locks (e.g. the ConfirmationState lock) and must not
+            # deadlock against an admission exit that needs this condition.
+            # A raising revoker propagates: revocation stays incomplete and
+            # the next call retries exactly the unfinished set.
+            for i, revoker in pending:
+                revoker()
+                with self._condition:
+                    self._revoker_success.add(i)
 
     def terminalize(self) -> None:
-        """DRAINING → TERMINAL (permanent). Revokes authority first."""
-        self.revoke_authority()
+        """DRAINING → TERMINAL (permanent).
+
+        F-57: the lifecycle transition is validated FIRST — an illegal
+        call has ZERO revocation side effects. Revocation runs only for a
+        legal transition, and TERMINAL is entered only after revocation
+        COMPLETED (all revokers succeeded)."""
+        with self._condition:
+            if self._state is AuthoritySessionState.TERMINAL:
+                return
+            if self._state is not AuthoritySessionState.DRAINING:
+                raise AuthoritySessionError(
+                    f"authority session cannot terminalize from {self._state.value} (drain first)"
+                )
+        self.revoke_authority()  # must COMPLETE before TERMINAL is entered
         with self._condition:
             if self._state is AuthoritySessionState.TERMINAL:
                 return
@@ -197,11 +240,21 @@ class AuthoritySession:
     def abort_from_starting(self) -> None:
         """STARTING → TERMINAL for a FAILED startup (F-52).
 
-        Only valid from STARTING, after the caller has proven the partially
-        constructed root quiescent and revoked ephemeral authority: a clean
-        failed start still terminalizes before the owner handle closes, so
-        no Dispatcher ever reports a live session it no longer owns."""
-        self.revoke_authority()
+        F-57: the transition is validated FIRST — an illegal abort has
+        zero revocation side effects. Only valid from STARTING, after the
+        caller has proven the partially constructed root quiescent; a
+        clean failed start still terminalizes before the owner handle
+        closes, so no Dispatcher ever reports a live session it no longer
+        owns."""
+        with self._condition:
+            if self._state is AuthoritySessionState.TERMINAL:
+                return
+            if self._state is not AuthoritySessionState.STARTING:
+                raise AuthoritySessionError(
+                    f"authority session cannot abort from {self._state.value} "
+                    "(abort is the failed-startup transition from STARTING)"
+                )
+        self.revoke_authority()  # must COMPLETE before TERMINAL is entered
         with self._condition:
             if self._state is AuthoritySessionState.TERMINAL:
                 return

@@ -556,3 +556,223 @@ def test_hung_owner_is_never_stolen_from(tmp_path: Path) -> None:
         if holder.poll() is None:
             holder.kill()
             holder.wait(timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# F-57 / F-58 (second review round): revocation completion semantics and
+# failed-release ownership retention
+# ---------------------------------------------------------------------------
+
+
+def test_F57_illegal_terminalize_has_zero_revocation_side_effects() -> None:
+    """An illegal terminalize() from READY raises AND runs no revoker —
+    the revocation obligation survives for the eventual LEGAL shutdown,
+    so a rejected lifecycle call cannot defeat 'confirmation authority
+    dies with the owner session'."""
+    session = AuthoritySession(authority_domain=Path("x"))
+    session.activate()
+    ran = []
+    session.register_revoker(lambda: ran.append(1))
+
+    with pytest.raises(AuthoritySessionError, match="cannot terminalize"):
+        session.terminalize()  # READY -> TERMINAL is illegal (drain first)
+    assert ran == [], "illegal transition must have ZERO revocation effects"
+    assert session.state.value == "ready"
+
+    # The legal shutdown still revokes — the guarantee was not consumed.
+    session.begin_drain()
+    session.terminalize()
+    assert ran == [1]
+    assert session.state.value == "terminal"
+
+
+def test_F57_illegal_abort_from_ready_has_zero_revocation_effects() -> None:
+    session = AuthoritySession(authority_domain=Path("x"))
+    session.activate()
+    ran = []
+    session.register_revoker(lambda: ran.append(1))
+    with pytest.raises(AuthoritySessionError, match="cannot abort"):
+        session.abort_from_starting()  # illegal from READY
+    assert ran == []
+    session.begin_drain()
+    session.terminalize()
+    assert ran == [1]
+
+
+def test_F57_raising_revoker_stays_incomplete_and_retry_finishes() -> None:
+    """A revoker that raises leaves revocation INCOMPLETE: a retry runs the
+    unfinished set (the succeeded revoker is not re-run), and completion is
+    marked only after every revoker has succeeded."""
+    session = AuthoritySession(authority_domain=Path("x"))
+    session.activate()
+    calls: list[str] = []
+    failures = {"boom": 1}  # fail once, succeed on retry
+
+    def ok_revoker() -> None:
+        calls.append("ok")
+
+    def flaky_revoker() -> None:
+        calls.append("flaky")
+        if failures["boom"] > 0:
+            failures["boom"] -= 1
+            raise RuntimeError("revoker exploded")
+
+    session.register_revoker(ok_revoker)
+    session.register_revoker(flaky_revoker)
+
+    with pytest.raises(RuntimeError, match="revoker exploded"):
+        session.revoke_authority()
+    assert calls.count("ok") == 1
+    assert calls.count("flaky") == 1
+    # NOT complete: late registration is still legal, retry still owed.
+    session.register_revoker(lambda: calls.append("late"))
+
+    session.revoke_authority()  # retry completes the unfinished set
+    assert calls.count("flaky") == 2  # retried, succeeded
+    assert calls.count("ok") == 1  # NOT re-run
+    assert calls.count("late") == 1  # the late obligation ran too
+
+    # Completed: idempotent, and late registration is now refused.
+    session.revoke_authority()
+    assert calls.count("flaky") == 2
+    with pytest.raises(AuthoritySessionError, match="after revocation has"):
+        session.register_revoker(lambda: None)
+    session.begin_drain()
+    session.terminalize()  # revocation already completed → TERMINAL proceeds
+
+
+def test_F58_dispatcher_release_failure_retains_ownership_for_retry(
+    tmp_path: Path,
+) -> None:
+    """Injected owner-fd close failure → stop() FAILS, the handle is
+    retained, a same-domain contender stays busy, and a later stop() is a
+    release RETRY — never already-stopped. When the failure heals, the
+    retry releases and reports released_on_retry."""
+    from webwire.authority import AuthorityBusyError
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    d = Dispatcher(cfg, session_manager=_StubSessionManager(cfg))  # type: ignore[arg-type]
+    d._install_m5_live_stack = lambda sb: setattr(  # type: ignore[method-assign]
+        d, "_m5_stack", _StubStack()
+    )
+    assert asyncio_run(d.start()).ok
+    lock = d._owner_lock
+    assert lock is not None
+
+    fail = {"on": True}
+
+    def flaky_close(fd: int) -> None:
+        if fail["on"]:
+            raise OSError("injected owner-fd close failure")
+        os.close(fd)
+
+    lock._close_owner_fd = flaky_close  # type: ignore[assignment]
+
+    r1 = asyncio_run(d.stop())
+    assert r1.ok is False
+    assert "release FAILED" in r1.error.message
+    assert d._owner_lock is lock, "failed release RETAINS the handle"
+    assert d._authority_session.state.value == "terminal"
+
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()  # the domain is still owned
+
+    # Layer 1 is deliberately FAIL-STOP: a failed owner-fd close sets the
+    # lock's permanent broken state, so release retries keep refusing
+    # (terminate-the-process is the qualified outcome). What must NEVER
+    # happen is already-stopped over the retained ownership.
+    for _ in range(2):
+        r2 = asyncio_run(d.stop())
+        assert r2.ok is False
+        assert "already_stopped" not in (r2.data or {})
+        assert "release" in r2.error.message
+        assert d._owner_lock is lock
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()  # still owned
+
+
+def test_F58_dispatcher_release_retry_path_releases_when_clean(
+    tmp_path: Path,
+) -> None:
+    """The positive retry path: a TERMINAL session with a RETAINED lock
+    (a release that failed for a transient reason, without Layer-1's
+    permanent broken flag) is a release RETRY on the next stop — it
+    releases and reports released_on_retry, never already-stopped."""
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    d = Dispatcher(cfg, session_manager=_StubSessionManager(cfg))  # type: ignore[arg-type]
+    d._install_m5_live_stack = lambda sb: setattr(  # type: ignore[method-assign]
+        d, "_m5_stack", _StubStack()
+    )
+    assert asyncio_run(d.start()).ok
+    # Simulate a transient release failure: terminalize + drain manually,
+    # leaving the handle retained (exactly the F-58 retained state).
+    session = d._authority_session
+    session.begin_drain()
+    session.terminalize()
+    assert d._owner_lock is not None
+
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()
+
+    r = asyncio_run(d.stop())
+    assert r.ok, getattr(r.error, "message", r)
+    assert (r.data or {}).get("released_on_retry") is True
+    assert d._owner_lock is None
+    successor = AuthorityOwnerLock(tmp_path).acquire()  # the domain is free
+    successor.release()
+
+
+def test_F58_offline_close_release_failure_retains_for_retry(
+    tmp_path: Path,
+) -> None:
+    from webwire.offline_recovery import OfflineRecoveryAuthority
+
+    owner = OfflineRecoveryAuthority(WebWireConfig(state_dir=tmp_path)).acquire()
+    lock = owner._owner_lock
+    assert lock is not None
+    fail = {"on": True}
+
+    def flaky_close(fd: int) -> None:
+        if fail["on"]:
+            raise OSError("injected offline owner-fd close failure")
+        os.close(fd)
+
+    lock._close_owner_fd = flaky_close  # type: ignore[assignment]
+
+    from webwire.authority import AuthorityOwnerError
+
+    with pytest.raises(AuthorityOwnerError):
+        owner.close()
+    assert owner._owner_lock is lock, "failed release retains offline state"
+    assert owner._session is not None
+
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()
+
+    # Retry while broken: Layer 1 is fail-stop, so close() keeps raising
+    # and keeps its retained state — never nothing-to-close.
+    with pytest.raises(AuthorityOwnerError):
+        owner.close()
+    assert owner._owner_lock is lock
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()
+
+
+def test_F58_offline_close_retry_path_releases_when_clean(tmp_path: Path) -> None:
+    """The positive offline retry path: a TERMINAL session with a RETAINED
+    lock closes by retrying the release — the domain is freed."""
+    from webwire.offline_recovery import OfflineRecoveryAuthority
+
+    owner = OfflineRecoveryAuthority(WebWireConfig(state_dir=tmp_path)).acquire()
+    session = owner._session
+    session.begin_drain()
+    session.terminalize()  # transient-failure state: terminal, lock retained
+    assert owner._owner_lock is not None
+
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()
+
+    owner.close()  # the retry releases
+    assert owner._owner_lock is None
+    successor = AuthorityOwnerLock(tmp_path).acquire()
+    successor.release()

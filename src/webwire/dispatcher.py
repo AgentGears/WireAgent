@@ -345,7 +345,13 @@ class Dispatcher:
         RETAINS ownership — the session cannot be orphaned alive, and
         ownership cannot be deliberately released before the session is
         terminal (frozen contract item 3; the lock object itself stays
-        encapsulated)."""
+        encapsulated).
+
+        F-58: ownership state is discarded ONLY AFTER the lock release
+        SUCCEEDS. If release raises (Layer 1's qualified ambiguous
+        fail-stop state), the handle is retained and the exception
+        propagates — a later stop() retries the release rather than
+        reporting already-stopped over possibly-still-held ownership."""
         session = self._authority_session
         if session is not None and session.state.value != "terminal":
             raise __import__(
@@ -356,9 +362,10 @@ class Dispatcher:
                 "TERMINAL before the owner handle closes); ownership retained"
             )
         lock = self._owner_lock
-        self._owner_lock = None
-        if lock is not None:
-            lock.release()
+        if lock is None:
+            return
+        lock.release()  # raises → handle retained, state retained (F-58)
+        self._owner_lock = None  # discarded only after successful release
 
     async def _start_locked(self) -> ActionResult:
         """Start under held authority ownership (caller releases on failure)."""
@@ -470,7 +477,25 @@ class Dispatcher:
                 # Never started, or a failed start already cleaned up.
                 return ok_result(data={"already_stopped": True})
             if session.state.value == "terminal":
-                return ok_result(data={"already_stopped": True})
+                # F-58: a TERMINAL session with a RETAINED owner lock means
+                # a previous release FAILED (the handle is discarded only
+                # after a successful release). This stop is a release
+                # RETRY, not already-stopped — never report success over
+                # possibly-still-held ownership.
+                try:
+                    self._release_authority()
+                except Exception as exc:
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    return hard_failure(
+                        "authority release retry failed; ownership state is "
+                        f"ambiguous and retained — terminate the process "
+                        f"({exc!r})",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+                return ok_result(data={"released_on_retry": True})
             # 1. Reject new admission owner-wide. A session already
             # DRAINING is a RETRY of a failed fail-closed stop: admission
             # is already closed; continue the shutdown law.
@@ -526,9 +551,25 @@ class Dispatcher:
                         "ownership is retained fail-closed",
                         failure_category=FailureCategory.SECURITY,
                     )
-                # 5. Terminal, then 6. release LAST.
+                # 5. Terminal, then 6. release LAST. A release failure
+                # (F-58) is fail-stop: the owner handle is RETAINED (the
+                # release-retry path above handles a later stop) and the
+                # process should be terminated — never report a clean stop
+                # over possibly-still-held ownership.
                 session.terminalize()
-                self._release_authority()
+                try:
+                    self._release_authority()
+                except Exception as exc:
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    return hard_failure(
+                        "authority release FAILED; ownership state is "
+                        f"ambiguous and retained — terminate the process "
+                        f"({exc!r})",
+                        failure_category=FailureCategory.SECURITY,
+                    )
                 return result
 
     # -- invocation ----------------------------------------------------------

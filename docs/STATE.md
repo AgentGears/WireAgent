@@ -487,6 +487,34 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #26 review pass: F-57/F-58 — revocation completion
+  and failed-release retention.** F-57 (blocker): terminalize() and
+  abort_from_starting() now VALIDATE the lifecycle transition FIRST — an
+  illegal call has ZERO revocation side effects (regression: an illegal
+  terminalize from READY raises, runs no revoker, and the later LEGAL
+  shutdown still revokes — a rejected lifecycle call can no longer
+  consume the revocation and defeat "confirmation authority dies with
+  the owner session"). Revocation completion is tracked PER REVOKER:
+  _revocation_complete means every required revoker SUCCEEDED, not
+  "attempted" — a raising revoker leaves revocation incomplete, shutdown
+  stays fail-closed, and a retry runs exactly the UNFINISHED set
+  (succeeded revokers are not re-run; regression covers flaky-revoker
+  explode→retry→complete, with a late-registered obligation included).
+  Registering a new revoker after completed revocation is refused.
+  TERMINAL is entered only after revocation COMPLETED. F-58 (high):
+  ownership state is discarded ONLY AFTER the lock release SUCCEEDS —
+  Dispatcher._release_authority retains the handle on a raising release;
+  stop() over a TERMINAL session with a RETAINED lock is a release
+  RETRY (never already-stopped; returns released_on_retry on success,
+  hard failure while ambiguous); the normal-path release failure inside
+  stop() returns a terminate-the-process hard failure with the handle
+  retained. OfflineRecoveryAuthority.close() mirrors the same ordering
+  and retry path. Regressions inject an owner-fd close failure (Layer 1
+  semantics are deliberately FAIL-STOP: a broken release retries keep
+  refusing and the contender stays busy — the positive retry paths are
+  exercised via the transient TERMINAL+retained state, releasing cleanly
+  and freeing the domain). 7 new regressions. Suite 1213 (count from
+  the run).
 - **2026-10-02 — M7 LAYER 3 BUILT (PR pending): owner instance
   identity, stale-session denial, lifecycle qualification, and
   crash-takeover/no-stealing.** Built per the frozen four-item contract

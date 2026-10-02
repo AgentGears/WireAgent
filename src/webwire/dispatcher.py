@@ -293,6 +293,13 @@ class Dispatcher:
                 raise
             if result.ok:
                 session.activate()
+                try:
+                    # `is not None`, not `or {}`: an empty-but-present data
+                    # dict must be enriched IN PLACE, not replaced.
+                    data = result.data if result.data is not None else {}
+                    data["authority_instance_id"] = session.authority_instance_id
+                except Exception:  # noqa: BLE001 — diagnostic enrichment only
+                    pass
                 return result
             await self._teardown_failed_start(session)
             return result
@@ -330,7 +337,24 @@ class Dispatcher:
         self._release_authority()
 
     def _release_authority(self) -> None:
-        """Release authority ownership (idempotent; M7 Layer 2)."""
+        """Release authority ownership (idempotent; M7 Layer 2).
+
+        M7 Layer 3 semantic invariant, runtime-enforced: deliberate
+        ownership release requires a TERMINAL (or absent) authority
+        session. A release attempt over a live session refuses and
+        RETAINS ownership — the session cannot be orphaned alive, and
+        ownership cannot be deliberately released before the session is
+        terminal (frozen contract item 3; the lock object itself stays
+        encapsulated)."""
+        session = self._authority_session
+        if session is not None and session.state.value != "terminal":
+            raise __import__(
+                "webwire.authority_session", fromlist=["AuthoritySessionError"]
+            ).AuthoritySessionError(
+                "refusing to release authority ownership: the authority "
+                f"session is still {session.state.value} (a session must be "
+                "TERMINAL before the owner handle closes); ownership retained"
+            )
         lock = self._owner_lock
         self._owner_lock = None
         if lock is not None:
@@ -764,6 +788,17 @@ class Dispatcher:
     @property
     def capabilities(self) -> list[str]:
         return self._registry.names()
+
+    @property
+    def authority_instance_id(self) -> Optional[str]:
+        """This runtime's owner-session identity (diagnostic; M7 Layer 3).
+
+        None while this runtime owns no authority domain — a loser that
+        never acquired has no instance identity (no READY without
+        ownership). After a clean stop the TERMINAL session retains its
+        id for diagnostics; a successor acquisition mints a fresh one."""
+        session = self._authority_session
+        return None if session is None else session.authority_instance_id
 
     @property
     def kill_switch(self) -> KillSwitch:

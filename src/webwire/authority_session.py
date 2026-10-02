@@ -40,7 +40,9 @@ This module is stdlib-only so the rules path stays browser-independent.
 
 from __future__ import annotations
 
+import secrets
 import threading
+import time
 from contextlib import contextmanager
 from enum import StrEnum
 from typing import Any, Callable, Iterator, Optional
@@ -49,6 +51,7 @@ __all__ = [
     "AuthoritySessionState",
     "AuthoritySessionError",
     "AuthorityAdmissionClosedError",
+    "AuthorityStaleInstanceError",
     "AuthoritySession",
 ]
 
@@ -68,6 +71,16 @@ class AuthorityAdmissionClosedError(AuthoritySessionError):
     """New owner work was refused: the session is not admitting."""
 
 
+class AuthorityStaleInstanceError(AuthorityAdmissionClosedError):
+    """Admission carried the instance id of a PREVIOUS owner session.
+
+    Distinct from a closed session: the caller's expected owner is not
+    this owner. Layer 4's transport will surface this as the
+    stale-instance refusal; nothing about the admission counter, active
+    work, or durable state changes — the rejection happens BEFORE any of
+    them (M7 Layer 3, frozen contract item 2)."""
+
+
 class AuthoritySession:
     """One owner session over a held authority domain.
 
@@ -78,6 +91,14 @@ class AuthoritySession:
 
     def __init__(self, *, authority_domain: Any) -> None:
         self._authority_domain = authority_domain
+        # M7 Layer 3 / frozen contract item 1: a fresh cryptographically
+        # random 256-bit owner instance identity, minted before READY and
+        # immutable for this session. Diagnostic/protocol identity ONLY —
+        # never M5/M6 lineage, never persisted, never recovered from disk.
+        # Clean reacquisition and crash takeover both produce a different
+        # id because each acquisition constructs a new session.
+        self._instance_id = secrets.token_hex(32)
+        self._acquired_at = time.time()
         self._condition = threading.Condition(threading.RLock())
         self._state = AuthoritySessionState.STARTING
         self._active = 0
@@ -87,6 +108,17 @@ class AuthoritySession:
     @property
     def authority_domain(self) -> Any:
         return self._authority_domain
+
+    @property
+    def authority_instance_id(self) -> str:
+        """The 256-bit hex identity of THIS owner session (read-only)."""
+        return self._instance_id
+
+    @property
+    def acquired_at(self) -> float:
+        """Provenance timestamp of this session's construction (epoch
+        seconds; diagnostic only, not a lease — no TTL derives from it)."""
+        return self._acquired_at
 
     @property
     def state(self) -> AuthoritySessionState:
@@ -184,16 +216,29 @@ class AuthoritySession:
     # -- admission -----------------------------------------------------------
 
     @contextmanager
-    def admit(self) -> Iterator[None]:
+    def admit(self, expected_instance_id: Optional[str] = None) -> Iterator[None]:
         """Admit one unit of owner work while READY.
 
         Raises AuthorityAdmissionClosedError when the session is not
-        admitting (STARTING / DRAINING / TERMINAL / no session). The count
-        is the owner-wide drain barrier: stop() drains on it."""
+        admitting (STARTING / DRAINING / TERMINAL / no session). With an
+        ``expected_instance_id`` (the Layer-4 caller's stale-session
+        check), the comparison happens in THIS same lifecycle critical
+        section — a wrong/old id raises AuthorityStaleInstanceError
+        BEFORE the active-work counter increments, before any execution,
+        confirmation handling, reconciliation, or durable mutation (M7
+        Layer 3, frozen contract item 2). Without an expected id this is
+        the internal local-owner admission path.
+
+        The count is the owner-wide drain barrier: stop() drains on it."""
         with self._condition:
             if self._state is not AuthoritySessionState.READY:
                 raise AuthorityAdmissionClosedError(
                     f"authority session is {self._state.value}: new owner work is refused"
+                )
+            if expected_instance_id is not None and expected_instance_id != self._instance_id:
+                raise AuthorityStaleInstanceError(
+                    "stale authority instance: admission expected a previous "
+                    "owner session; this owner's instance differs"
                 )
             self._active += 1
         try:

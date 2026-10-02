@@ -487,6 +487,53 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — M7 LAYER 3 BUILT (PR pending): owner instance
+  identity, stale-session denial, lifecycle qualification, and
+  crash-takeover/no-stealing.** Built per the frozen four-item contract
+  from exact main b87c673, tests written first (the suite failed to
+  collect until the implementation existed). (1) Owner instance identity:
+  every AuthoritySession mints a fresh cryptographically random 256-bit
+  authority_instance_id (secrets.token_hex(32)) at construction — before
+  READY — immutable for the session (read-only property; assignment
+  raises), with acquired_at as provenance only (no lease derives from
+  it). Diagnostic/protocol identity only: never M5/M6 lineage, never
+  persisted, never recovered from disk. Clean reacquisition and crash
+  takeover both mint different ids because each acquisition constructs a
+  new session; the Dispatcher exposes authority_instance_id as a
+  diagnostic (None while owning nothing — a loser has NO identity; the
+  start result carries it) and the id stays with the TERMINAL session
+  after a clean stop. (2) Stale-session denial before IPC: admit()
+  accepts an expected_instance_id and compares it INSIDE the same
+  lifecycle critical section as the READY check and the active-work
+  increment — a wrong/old id raises the new AuthorityStaleInstanceError
+  BEFORE the counter increments (locked regression: stale rejected with
+  active_work still 0; the current owner's id admits). No transport, no
+  handshake schema, no request table — the primitive Layer 4 will call.
+  (3) Controlled lifecycle qualification: STARTING→READY→DRAINING→
+  TERMINAL proven irreversible in order (skip/reflexive transitions
+  refused; TERMINAL absorbing; terminalize idempotent); id stable
+  throughout; READY→DRAINING atomic with admission (a thread inside
+  admitted work begins the drain; new admission refused; the in-flight
+  work completes under still-held ownership). The session/lock
+  relationship is now RUNTIME-ENFORCED rather than conventional:
+  Dispatcher._release_authority refuses to release over a non-TERMINAL
+  session and retains ownership (AuthoritySessionError) — ownership
+  cannot be deliberately released before the session is terminal, and
+  session-before-ownership is impossible by construction (the session is
+  created only after lock acquisition; a busy loser has no session and
+  no id). (4) Crash/forced-death takeover and NO stealing, with genuine
+  sibling processes: a READY owner force-killed without controlled
+  shutdown leaves the retained authority.lock rendezvous in place — a
+  raw acquisition succeeds over it, and a full successor runtime
+  acquires, HYDRATES (proven real: a successor facing corrupt durable
+  history refuses to start), mints a different id, and reaches READY;
+  and a hung owner holding the lock through a 12-second contention
+  interval (10+ acquisition attempts) is never stolen from — every
+  contender stays authority_busy, the rendezvous file's size/inode/mtime
+  are untouched (no lease/heartbeat/mtime writing), and takeover becomes
+  possible the moment the owner actually terminates. Layer-2 behavior
+  untouched: all existing suites unchanged and green. 14 new tests.
+  Suite 1206 (count from the run).
 - **2026-10-02 — M7 LAYER 2 LIVE QUALIFICATION (record only; no
   architectural changes).** The one empirical gap closed per the directed
   pre-Layer-3 sequence: a live production owner excludes a second real

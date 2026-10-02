@@ -52,6 +52,12 @@ class IPCEndpoint:
         raise NotImplementedError
 
 
+def _win32() -> Any:
+    """ctypes.windll resolved at runtime (Windows-only; runtime dict
+    resolution keeps mypy portable per platform - the M8 F-25 lesson)."""
+    return vars(ctypes).get("windll")
+
+
 def create_endpoint(authority_domain: Path) -> IPCEndpoint:
     """The platform adapter: POSIX domain socket or Windows named pipe."""
     if sys.platform == "win32":
@@ -149,11 +155,6 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         """Create the named pipe with a current-user-only DACL."""
         import ctypes
 
-
-def _win32() -> Any:
-    """ctypes.windll resolved at runtime (Windows-only; runtime dict
-    resolution keeps mypy portable per platform - the M8 F-25 lesson)."""
-    return vars(ctypes).get("windll")
 
         dacl_bytes = self._build_current_user_dacl()
         handle = self._create_pipe(dacl_bytes)

@@ -487,6 +487,51 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — M7 LAYER 2 LIVE QUALIFICATION (record only; no
+  architectural changes).** The one empirical gap closed per the directed
+  pre-Layer-3 sequence: a live production owner excludes a second real
+  production runtime BEFORE that loser creates browser authority, and
+  clean ownership transfer works after termination. Harness:
+  scripts/qualify_m7_layer2_live.py (three real subprocesses; the parent
+  observes only files and processes and never constructs authority
+  state). 9/9 PASS. Identities exercised: layer-2 squash 7ad21ad, merge
+  record 372bf0d, exact main SHA 372bf0d75fa98bd59489f90f47d2733e7db8cde4.
+  Environment: Windows 11 (10.0.26200), Python 3.12.1, canonical state
+  dir C:/Next-Era/Agent-WebWire/.webwire, owner PID 6532, identity handle
+  infaag (whoami first attempt). Evidence, phase by phase: (2) the real
+  production runtime reached READY and resolved whoami on the live
+  logged-in session; (2b) it spawned 11 browser/driver processes (the
+  patchright node.exe driver plus the ms-playwright chromium-1208 chrome
+  tree) — observable process evidence, not inference; (3) a second REAL
+  production runtime in a fresh process was refused by raw
+  Dispatcher.start() with authority_busy, its session never started
+  (session_started=False, sb=None), no owner lock retained; (4) the real
+  `m8 card` CLI surfaced the controlled one-line authority_busy error —
+  exit 1, no traceback, NO card rendered — and the frozen relative-root
+  warning (relative input + resolved absolute domain) appeared on the
+  real canonicalization path; (5a) the browser-process census across both
+  loser runs was IDENTICAL to the post-owner census (new_pids=none) and
+  all 11 owner processes stayed alive — the losers created zero browser/
+  session processes; (5b) the state directory was byte-identical across
+  the entire loser window — journal, effects, reconciliations, rules,
+  session.json, authority.lock all unchanged (no loser-side confirmation
+  authority, no checkpoint, no journal entries); (6) the owner stopped
+  cleanly (exit 0) and (6b) 0 of its 11 browser/driver processes
+  remained; (7) a successor runtime in a fresh process then acquired the
+  SAME canonical domain (the retained authority.lock rendezvous),
+  resolved whoami, and stopped cleanly — clean transfer, not permanent
+  exclusion. No remote effects: whoami reads only (owner + successor);
+  journal gains are owner/successor-attributable diagnostic entries.
+  Disclosed: two earlier harness iterations — run 1 crashed reading
+  authority.lock while held (Windows mandatory byte-range lock: reading
+  the owner-locked byte is a lock violation; the snapshot now falls back
+  to stat-only there), run 2 recorded 8/9 because the process census
+  counted ITS OWN powershell process (its command text matches the
+  browser filter; the census now excludes self-observation). Neither was
+  a product finding. M7 Layer 2 is EMPIRICALLY closed. NEXT: M7 Layer 3
+  with the user-frozen scope — fresh authority_instance_id per
+  acquisition, stale-session denial, controlled lifecycle qualification,
+  and crash/forced-death takeover with no heartbeat/TTL stealing.
 - **2026-10-02 — PR #25 MERGED (7ad21ad): M7 LAYER 2 COMPLETE — authority
   ownership is mandatory at the runtime root.** Cleared through five
   review rounds (F-43..F-56: the AuthoritySession/lifecycle topology, the

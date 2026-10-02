@@ -514,7 +514,8 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   leak fixed — one handler instance, added and removed. Housekeeping: a
   blanket `ruff format src/ tests/` during this round reformatted 130+
   unrelated files; the collateral was reverted before commit (the diff is
-  four files). Suite 1192 (count from the run).
+  four implementation/test files plus this STATE entry — five files
+  total). Suite 1192 (count from the run).
 - **2026-10-01 — PR #25 third review pass: F-49/F-50/F-52/F-53/F-54 —
   non-bypassable boundaries and genuinely fail-closed teardown.** F-49
   (blocker): teardown failure is now fail-closed END TO END — a browser

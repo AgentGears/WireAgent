@@ -168,8 +168,8 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         import ctypes
         import ctypes.wintypes as wt
 
-        advapi32 = ctypes.windll.advapi32
-        kernel32 = ctypes.windll.kernel32
+        advapi32 = _win32().advapi32
+        kernel32 = _win32().kernel32
 
         # Get the current process token.
         token = wt.HANDLE()
@@ -255,7 +255,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         """Call CreateNamedPipeW with the DACL-backed security attributes."""
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _win32().kernel32
         PIPE_ACCESS_DUPLEX = 0x3
         FILE_FLAG_FIRST_PIPE_INSTANCE = 0x80000
         PIPE_TYPE_BYTE = 0x1
@@ -276,7 +276,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         """Wait for a client connection on the named pipe."""
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _win32().kernel32
         assert self._handle is not None
         connected = kernel32.ConnectNamedPipe(self._handle, None)
         if not connected:

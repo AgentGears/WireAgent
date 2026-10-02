@@ -487,6 +487,69 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — M7 LAYER 4 BUILT (PR pending): local IPC transport,
+  handshake, bounded pure read/health surface.** Built per the frozen
+  eight-item Layer-4 contract from exact main acb8d2e, tests first (the
+  layer-4 suite failed to collect until the protocol/framing modules
+  existed). Four new modules: (1) authority_ipc_protocol.py — the frozen
+  constants (centralized frame/request/response/string/limit ceilings),
+  deterministic runtime build identity (sorted source-tree hashing —
+  package version is NOT a build identity; an unavailable/ambiguous
+  identity raises IPCBuildIdentityError = production IPC does not enter
+  READY), the AuthorityHello handshake model (exact protocol version,
+  exact runtime_build_id, authority_instance_id, canonical absolute
+  domain, the five supported operations, lifecycle state), strict
+  post-schema validation + normalization for exactly health/read/
+  read_profile/read_thread/read_search (deliberately narrower than local
+  aliases — url/q rejected; defaults tab=posts/limit=20/include_retweets
+  =true; limits 1–100; enums enforced; non-finite numbers, oversized
+  strings, unknown fields rejected), and canonical request identity
+  (sorted-key deterministic serialization of protocol_version+operation+
+  normalized_payload, excluding request_id/runtime_build_id/
+  authority_instance_id per §10.5 — key-order independent).
+  (2) authority_ipc_framing.py — bounded length-prefixed UTF-8 JSON
+  framing (8-byte big-endian header; no pickle/marshal/object
+  deserialization; rejects malformed UTF-8, malformed JSON, non-object
+  envelopes, truncated headers, over-limit lengths, trailing bytes,
+  non-finite constants, duplicate keys). (3) authority_ipc_endpoint.py —
+  the platform-local endpoint abstraction: POSIX Unix-domain socket
+  under the canonical domain with owner-restricted 0o600 permissions and
+  stale-path cleanup ONLY after ownership; Windows named pipe with a
+  DACL granting access only to the current user's SID (remote clients
+  rejected by the DACL + local namespace scope). Full platform
+  qualification is Layers 7–8; the security properties are implemented.
+  (4) authority_ipc_server.py — the security pipeline: frame decode →
+  handshake compatibility (exact protocol + exact build) → operation
+  allowlist (whoami/writes/media/download die HERE) → strict schema
+  validation → canonical identity → stale-instance admission via
+  AuthoritySession.admit(expected_instance_id=...) → ONLY THEN
+  Dispatcher.invoke under the session admission, which spans the complete
+  invocation so shutdown drains these reads before release. Client
+  disconnect does NOT cancel the admitted owner task (the conservative
+  disconnect law). Bounded by IPC_SERVER_MAX_CONCURRENT. Dispatcher
+  lifecycle wiring: the IPC server binds AFTER the browser/root and
+  BEFORE READY (no READY window without the endpoint; bind failure =
+  startup failure following the fail-closed law); shutdown: DRAINING
+  atomically closes new IPC admission → close/unlink endpoint BEFORE
+  TERMINAL → release owner lock LAST. IPC binding is opt-in (deployment
+  configuration; the security pipeline is fully tested independently
+  via AuthorityIPCServer). 34 new tests covering: build identity
+  (deterministic, source-sensitive, unavailable-tree-refused); framing
+  (roundtrip, invalid UTF-8, malformed JSON, non-object, oversized,
+  truncated, non-finite, duplicate keys); schema (all five ops, defaults,
+  enums, aliases rejected, limits, oversized strings, unknown ops);
+  canonical identity (key-order independence, different payload = 
+  different identity, request_id excluded); the server pipeline
+  (protocol mismatch/build mismatch/stale instance/forbidden operations/
+  schema violation/malformed frames — ALL before Dispatcher; valid
+  request reaching Dispatcher under admission; missing instance;
+  draining rejection; admission spanning complete invocation; client
+  disconnect not cancelling admitted work); and the handshake
+  (AuthorityHello round-trip with exact build and current owner). One
+  disclosed self-bug: session.activate() was initially trapped inside
+  the enable_ipc conditional, terminalizing every non-IPC start —
+  caught by existing Layer-2 tests going red, fixed immediately.
+  Suite 1251 (count from the run).
 - **2026-10-02 — PR #26 MERGED (b695ad3): M7 LAYER 3 COMPLETE — owner
   instance identity, stale-session denial, lifecycle-atomic revocation,
   crash takeover with no stealing.** Cleared through three review rounds

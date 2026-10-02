@@ -93,6 +93,8 @@ class Dispatcher:
         self,
         config: Optional[WebWireConfig] = None,
         session_manager: Optional[SessionManager] = None,
+        *,
+        enable_ipc: bool = False,
     ) -> None:
         # M7-RV11 / F-46: resolve state_dir ONCE, before ANY authority-root
         # construction. Every derived path — journal, effect ledger, rules
@@ -142,6 +144,10 @@ class Dispatcher:
         # new Dispatcher for a new owner session.
         self._owner_lock: Optional[Any] = None
         self._authority_session: Optional[Any] = None
+        # M7 Layer 4: the IPC server binds after the browser/root and
+        # before READY; closes before TERMINAL in the shutdown law.
+        self._ipc_server: Optional[Any] = None
+        self._enable_ipc = enable_ipc
         # The lifecycle fence between start() and stop(). Asyncio (not
         # threading): a threading lock acquired by a waiting coroutine would
         # block the event loop thread itself; this lock is only ever taken
@@ -292,6 +298,35 @@ class Dispatcher:
                 await self._teardown_failed_start(session)
                 raise
             if result.ok:
+                if self._enable_ipc:
+                    # M7 Layer 4: bind the secured IPC endpoint AFTER the
+                    # browser/root and BEFORE READY — no READY window with
+                    # the production endpoint missing. Bind/security failure
+                    # is a startup failure following the fail-closed law.
+                    # Opt-in: the security pipeline is fully tested via
+                    # AuthorityIPCServer independently; endpoint transport
+                    # activation is a deployment configuration.
+                    try:
+                        from webwire.authority_ipc_server import AuthorityIPCServer
+
+                        self._ipc_server = AuthorityIPCServer(
+                            session=session,
+                            authority_domain=self._config.state_dir,
+                            invoke=self._invoke_admitted,
+                        )
+                        self._ipc_server.start()
+                    except BaseException as exc:
+                        logger.exception("IPC endpoint bind failed")
+                        await self._teardown_failed_start(session)
+                        from super_browser.results.types import FailureCategory
+
+                        from webwire.envelope import hard_failure
+
+                        return hard_failure(
+                            f"IPC endpoint bind failed: {exc!r}; startup refused "
+                            "(no READY window without the production endpoint)",
+                            failure_category=FailureCategory.SECURITY,
+                        )
                 session.activate()
                 try:
                     # `is not None`, not `or {}`: an empty-but-present data
@@ -303,6 +338,10 @@ class Dispatcher:
                 return result
             await self._teardown_failed_start(session)
             return result
+
+    async def _invoke_admitted(self, name: str, input: dict[str, Any]) -> Any:
+        """The IPC server's bounded execution seam into the Dispatcher."""
+        return await self._invoke_inner(name, input)
 
     async def _teardown_failed_start(self, session: Any) -> None:
         """F-44: a failed/cancelled start releases ownership only after the
@@ -333,6 +372,14 @@ class Dispatcher:
         # F-52: proven quiescent + revoked — mark the failed session
         # TERMINAL before closing the owner handle, so the Dispatcher never
         # reports a live session it no longer owns.
+        # M7 Layer 4: close the IPC endpoint if a bind happened or was
+        # partially attempted — no endpoint outlives the owner session.
+        if self._ipc_server is not None:
+            try:
+                self._ipc_server.stop()
+            except Exception:  # noqa: BLE001 — cleanup during teardown
+                logger.warning("IPC endpoint cleanup during failed start")
+            self._ipc_server = None
         session.abort_from_starting()
         self._release_authority()
 
@@ -501,6 +548,11 @@ class Dispatcher:
             # is already closed; continue the shutdown law.
             if session.state.value == "ready":
                 session.begin_drain()
+            # M7 Layer 4: stop accepting new IPC work at DRAINING, and
+            # close/unlink the endpoint BEFORE retire/terminalize —
+            # already-open connections cannot submit fresh work.
+            if self._ipc_server is not None:
+                self._ipc_server.begin_drain()
             # 2. Drain all admitted owner work. The invocation lock waits
             #    for in-flight invokes (and blocks new ones); the session
             #    drain waits for admitted reconciliation operations.
@@ -551,6 +603,11 @@ class Dispatcher:
                         "ownership is retained fail-closed",
                         failure_category=FailureCategory.SECURITY,
                     )
+                # 4b. M7 Layer 4: close/unlink the IPC endpoint BEFORE
+                # TERMINAL — the endpoint never outlives the owner session.
+                if self._ipc_server is not None:
+                    self._ipc_server.stop()
+                    self._ipc_server = None
                 # 5. Terminal, then 6. release LAST. A release failure
                 # (F-58) is fail-stop: the owner handle is RETAINED (the
                 # release-retry path above handles a later stop) and the

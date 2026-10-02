@@ -561,7 +561,8 @@ async def test_F54_production_factory_pins_one_domain_across_cwd_change(
         def emit(self, record: logging.LogRecord) -> None:
             captured.append(record.getMessage())
 
-    logging.getLogger("webwire.dispatcher").addHandler(_WarnCollector())
+    handler = _WarnCollector()
+    logging.getLogger("webwire.dispatcher").addHandler(handler)
     try:
         cfg = WebWireConfig(state_dir=Path("../prod-root"), kill_env_var=None)
         expected = (workdir / "../prod-root").resolve(strict=False)
@@ -599,7 +600,7 @@ async def test_F54_production_factory_pins_one_domain_across_cwd_change(
         )
         await runtime.stop()
     finally:
-        logging.getLogger("webwire.dispatcher").removeHandler(_WarnCollector())
+        logging.getLogger("webwire.dispatcher").removeHandler(handler)
 
 
 class _RecordingDispatcherBase:
@@ -638,5 +639,107 @@ async def test_F54_mismatched_injected_manager_is_refused(tmp_path: Path) -> Non
     good_cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     other_cfg = WebWireConfig(state_dir=tmp_path / "elsewhere", kill_env_var=None)
     sm = SessionManager(other_cfg)
-    with pytest.raises(ValueError, match="does not match the canonical"):
+    with pytest.raises(ValueError, match="retains state root"):
         Dispatcher(good_cfg, session_manager=sm)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Third-round additions (F-53 retry proof, F-54 strict identity + real
+# factory warning, F-55 fixed above)
+# ---------------------------------------------------------------------------
+
+
+async def test_F53_same_process_retry_after_ledger_repair(tmp_path: Path) -> None:
+    """The ordering that matters: corrupt ledger → acquisition fails →
+    operator repairs the ledger → a NEW OfflineRecoveryAuthority in the
+    SAME Python process succeeds end to end. Hydration must precede any
+    M6 authority construction so the failed attempt leaves no coordinator
+    protocol registration bound to its ConfirmationState behind."""
+    from webwire.offline_recovery import OfflineRecoveryAuthority
+    from webwire.safety.recovery_guard import RecoveryGuardUnavailable
+
+    effects = tmp_path / "effects.ndjson"
+    effects.write_bytes(b"\xff\xfe not json")
+
+    first = OfflineRecoveryAuthority(WebWireConfig(state_dir=tmp_path))
+    with pytest.raises(RecoveryGuardUnavailable):
+        first.acquire()
+
+    # Repair the durable history.
+    effects.write_text("", encoding="utf-8")
+
+    # Same process, fresh owner: acquire → READY → operator works → close.
+    with OfflineRecoveryAuthority(WebWireConfig(state_dir=tmp_path)) as owner:
+        op = owner.operator_session("repair-op")
+        targets = op.list_targets()
+        assert isinstance(targets, tuple)
+    successor = AuthorityOwnerLock(tmp_path).acquire()
+    successor.release()
+
+
+async def test_F54_real_factory_warns_with_relative_and_absolute_domain(tmp_path: Path, monkeypatch) -> None:
+    """Drive the REAL build_production_runtime with a relative state root
+    and verify the frozen warning — containing BOTH the relative input and
+    the resolved absolute domain — is emitted on the production path
+    itself (not by a separately constructed Dispatcher)."""
+    import logging
+
+    from webwire.m8_card_cli import build_production_runtime
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    captured: list[str] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _Collector()
+    logging.getLogger("webwire.dispatcher").addHandler(handler)
+    try:
+        cfg = WebWireConfig(state_dir=Path("../warn-root"), kill_env_var=None)
+        expected_abs = (workdir / "../warn-root").resolve(strict=False)
+
+        class _FactoryRecorder(_RecordingDispatcherBase):
+            async def start(self):
+                # Domain pinning: the manager and the dispatcher were both
+                # constructed from the CANONICAL config.
+                assert self._config.state_dir == expected_abs
+                assert self._session._ww_config.state_dir == expected_abs
+                return await super().start()
+
+        runtime = await build_production_runtime(
+            cfg,
+            dispatcher_factory=lambda c, *, session_manager: _FactoryRecorder(
+                c, session_manager=session_manager
+            ),
+        )
+        assert runtime is not None
+        assert any("relative state_dir" in m and str(expected_abs) in m for m in captured), captured
+        await runtime.stop()
+    finally:
+        logging.getLogger("webwire.dispatcher").removeHandler(handler)
+
+
+async def test_F54_injected_relative_manager_refused_even_when_it_resolves_equal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The injected-manager hole: a manager RETAINING a relative state root
+    is refused even though it resolves equal to the canonical domain at
+    construction time — after a CWD change that manager would re-resolve
+    its session paths elsewhere, recreating the domain split."""
+    from webwire.session import SessionManager
+
+    workdir = tmp_path / "cwd-a"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    relative_cfg = WebWireConfig(state_dir=Path("state"), kill_env_var=None)
+    sm = SessionManager(relative_cfg)  # retains the RELATIVE root
+
+    # The canonical config for the same directory (absolute).
+    absolute_cfg = WebWireConfig(state_dir=relative_cfg.state_dir.resolve(strict=False), kill_env_var=None)
+    with pytest.raises(ValueError, match="retains state root"):
+        Dispatcher(absolute_cfg, session_manager=sm)  # type: ignore[arg-type]

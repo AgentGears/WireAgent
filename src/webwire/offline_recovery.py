@@ -28,11 +28,28 @@ def canonical_config(config: Any) -> Any:
     """M7-RV11 / F-46: resolve state_dir ONCE, before any authority-root
     construction, and use that exact canonical domain throughout the owner
     — a later CWD change can never split the lock domain from the safety
-    state domain."""
+    state domain.
+
+    Frozen production diagnostic: a relative state_dir emits a warning
+    carrying BOTH the relative input and the resolved absolute authority
+    domain the runtime pins to from here on. Emitted here so EVERY
+    canonicalization path (Dispatcher, production factory, offline owner)
+    warns identically."""
+    import logging
+
     resolved = config.state_dir.resolve(strict=False)
-    if resolved == config.state_dir:
-        return config
-    return _dc_replace(config, state_dir=resolved)
+    if resolved != config.state_dir:
+        if not config.state_dir.is_absolute():
+            logging.getLogger("webwire.dispatcher").warning(
+                "relative state_dir %s configured; the authority domain is "
+                "resolved ONCE to the absolute form %s and the runtime "
+                "stays pinned there regardless of later working-directory "
+                "changes",
+                config.state_dir,
+                resolved,
+            )
+        return _dc_replace(config, state_dir=resolved)
+    return config
 
 
 class OfflineRecoveryAuthority:
@@ -67,6 +84,18 @@ class OfflineRecoveryAuthority:
         try:
             ledger = EffectLedger(self._config)
             guard = RecoveryGuard(ledger)
+            # F-53 / frozen §14.2 ordering: hydrate the durable recovery
+            # truth BEFORE constructing ANY M6 authority state. The
+            # coordinator registers a strong process-wide protocol state
+            # bound to its ConfirmationState at construction; building it
+            # before hydration would leave that registration behind when
+            # corrupt history fails the acquisition, and a same-process
+            # retry (after repair) would then die on the coordinator's
+            # same-path one-ConfirmationState rule. Hydrate first; nothing
+            # registers until the history is proven readable.
+            # RecoveryGuard.hydrate projects BOTH safety ledgers (effect +
+            # reconciliation) through the publication fence.
+            guard.hydrate()
             gateway = CommitGateway(
                 ledger=ledger,
                 kill_switch=KillSwitch(self._config),
@@ -81,15 +110,6 @@ class OfflineRecoveryAuthority:
                 confirmation_state=ConfirmationState(),
                 commit_gateway=gateway,
             )
-            # F-53 / frozen §14.2 ordering: acquisition → HYDRATE the
-            # durable recovery truth (both safety ledgers) → construct the
-            # canonical M6 authority root → activate. A corrupt effect or
-            # reconciliation history fails ACQUISITION, before any operator
-            # authority is exposed.
-            # RecoveryGuard.hydrate projects BOTH safety ledgers (effect +
-            # reconciliation) through the publication fence; corrupt history
-            # raises RecoveryGuardUnavailable here, before activation.
-            guard.hydrate()
             session = AuthoritySession(authority_domain=self._config.state_dir)
             session.activate()
         except BaseException:

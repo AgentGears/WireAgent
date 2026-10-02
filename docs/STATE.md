@@ -487,6 +487,34 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #25 fourth review pass: finishing F-53/F-54 + F-55.**
+  F-53 completed: OfflineRecoveryAuthority.acquire() now hydrates BEFORE
+  constructing any M6 authority state (lock → EffectLedger → RecoveryGuard
+  → hydrate → CommitGateway → fresh ConfirmationState → coordinator →
+  session → READY) — the coordinator's process-wide protocol registration
+  (strong, bound to its ConfirmationState) is no longer left behind when
+  corrupt history fails acquisition, so a same-process retry after repair
+  works. The regression proves the reviewer's exact sequence: corrupt
+  ledger → acquisition fails → repair → a NEW OfflineRecoveryAuthority in
+  the SAME process acquires, exposes the operator surface, and closes.
+  F-54 completed on both remaining holes: (a) the injected-manager check is
+  now an IDENTITY check — the manager's RETAINED state root must already
+  BE the frozen canonical absolute Path (Path equality, not
+  resolve-at-validation equality), so a still-relative or un-frozen
+  symlinked manager root is refused even when it resolves equal at
+  construction time; regression covers the injected-relative-root case
+  under chdir. (b) the frozen relative-root warning now carries BOTH the
+  relative input and the resolved absolute authority domain, and the
+  warning site moved into canonical_config() itself — the single
+  canonicalization point — so the REAL build_production_runtime path
+  emits it (canonicalizing before constructing both objects); the
+  regression drives the actual factory and asserts the warning contains
+  both values, replacing the previous workaround that constructed a
+  separate Dispatcher just to produce a warning. F-55: the logging-handler
+  leak fixed — one handler instance, added and removed. Housekeeping: a
+  blanket `ruff format src/ tests/` during this round reformatted 130+
+  unrelated files; the collateral was reverted before commit (the diff is
+  four files). Suite 1192 (count from the run).
 - **2026-10-01 — PR #25 third review pass: F-49/F-50/F-52/F-53/F-54 —
   non-bypassable boundaries and genuinely fail-closed teardown.** F-49
   (blocker): teardown failure is now fail-closed END TO END — a browser

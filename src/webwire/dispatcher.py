@@ -102,34 +102,30 @@ class Dispatcher:
         from webwire.offline_recovery import canonical_config
 
         raw_config = config or WebWireConfig()
-        if not raw_config.state_dir.is_absolute():
-            logger.warning(
-                "relative state_dir %s configured; the authority domain is "
-                "resolved ONCE to its absolute form and the runtime stays "
-                "pinned there regardless of later working-directory changes",
-                raw_config.state_dir,
-            )
+        # canonical_config emits the frozen relative-root warning (relative
+        # input + resolved absolute domain) when the input is relative.
         self._config = canonical_config(raw_config)
         self._session = session_manager or SessionManager(self._config)
         if session_manager is not None:
-            # F-54: an injected manager must be pinned to the SAME
-            # canonical authority domain — a manager carrying a different
-            # (e.g. still-relative) state root would split session
-            # persistence from the lock/safety domain.
+            # F-54: an injected manager's RETAINED state root must already
+            # BE the frozen canonical absolute domain — not merely resolve
+            # equal at validation time. A manager still holding a relative
+            # root (or an un-frozen symlinked path) re-resolves its
+            # session/profile paths on every use, so a CWD change would
+            # split session persistence from the lock/safety domain even
+            # though construction-time equality held.
             manager_state = getattr(getattr(session_manager, "_ww_config", None), "state_dir", None)
             if manager_state is None:
                 manager_state = getattr(getattr(session_manager, "_config", None), "state_dir", None)
             if manager_state is None:
                 manager_state = getattr(session_manager, "state_dir", None)
-            if manager_state is not None:
-                manager_canonical = Path(manager_state).resolve(strict=False)
-                if manager_canonical != self._config.state_dir:
-                    raise ValueError(
-                        "injected session manager state root "
-                        f"{manager_canonical} does not match the canonical "
-                        f"authority domain {self._config.state_dir}; "
-                        "construct the manager from the canonical config"
-                    )
+            if manager_state is not None and Path(manager_state) != self._config.state_dir:
+                raise ValueError(
+                    "injected session manager retains state root "
+                    f"{manager_state!s}, which is not the frozen canonical "
+                    f"authority domain {self._config.state_dir}; construct "
+                    "the manager from the canonical (absolute) config"
+                )
         self._kill = KillSwitch(self._config)
         self._journal = Journal(self._config)
         self._registry = CapabilityRegistry()

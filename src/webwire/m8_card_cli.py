@@ -89,6 +89,8 @@ async def build_production_runtime(
     # the session manager's persistence paths and the Dispatcher's safety
     # state share the exact same absolute authority domain even if the
     # caller supplied a relative state_dir and the CWD later changes.
+    # canonical_config emits the frozen relative-root warning (relative
+    # input + resolved absolute domain) on this real path.
     config = canonical_config(config)
     session = make_session(config)
     dispatcher = make_dispatcher(config, session_manager=session)

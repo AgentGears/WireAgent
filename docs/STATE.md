@@ -487,6 +487,37 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #26 MERGED (b695ad3): M7 LAYER 3 COMPLETE — owner
+  instance identity, stale-session denial, lifecycle-atomic revocation,
+  crash takeover with no stealing.** Cleared through three review rounds
+  (F-57/F-58/F-59; the reviewer verified the abort/activate interleavings
+  in both orderings, the single-flight condition protocol, the
+  registration semantics between failed passes, and confirmed the hung-
+  revoker behavior matches M7's fail-closed availability tradeoff).
+  What shipped: a fresh cryptographically random 256-bit
+  authority_instance_id per owner acquisition (immutable per session,
+  never persisted, diagnostic/protocol identity only, with acquired_at
+  provenance); stale-instance admission denial inside the same lifecycle
+  critical section as READY and the active-work increment
+  (AuthorityStaleInstanceError before any work counts); the irreversible
+  STARTING→READY→DRAINING→TERMINAL lifecycle with revocation as a
+  lifecycle-atomic single-flight transaction (READY direct-revoke
+  refused zero-effects; activation permanently blocked once revocation
+  begins; concurrent callers join; per-revoker completion; TERMINAL
+  unreachable until complete); runtime-enforced terminal-before-release
+  with failed-release handle retention and stop-retry; and crash/
+  forced-death takeover with real sibling processes (retained rendezvous
+  doesn't impede, successor hydrates for real, fresh id) with no
+  heartbeat/TTL/PID-age/mtime stealing (12-second hung-owner
+  qualification). Cumulative Layer-3 review: 3 findings across three
+  rounds, all resolved before merge. Merged-tree qualification: local
+  gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
+  and rule-store 57; mypy clean on 95 files both platform resolutions.
+  M7 STATUS: layers 1-3 on main. NEXT BUILD (M7 Layer 4): local IPC
+  transport + handshake + bounded pure read/health surface (health,
+  read, read_profile, read_thread, read_search only; whoami, writes,
+  media, download_image withheld to Layers 5-6). Second adapter remains
+  deferred until the M7 boundary is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

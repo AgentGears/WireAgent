@@ -487,6 +487,35 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #25 MERGED (7ad21ad): M7 LAYER 2 COMPLETE — authority
+  ownership is mandatory at the runtime root.** Cleared through five
+  review rounds (F-43..F-56: the AuthoritySession/lifecycle topology, the
+  six follow-on boundary repairs, the F-53/F-54 completions, and the F-56
+  provenance cleanup; the mechanism was cleared at 43132c3 with the
+  reviewer's explicit finding of "no remaining Layer-2 correctness,
+  concurrency, authority, recovery, teardown, canonical-domain, or
+  portability finding"). What shipped: the AuthoritySession fence
+  (STARTING→READY→DRAINING→TERMINAL, owner-wide admission, revokers,
+  permanent terminality); Dispatcher acquire-first start under the async
+  lifecycle gate with fail-closed quiescing teardown; the shutdown law
+  (drain-all → revoke → retire → terminalize → release last) with
+  ownership retained over unproven roots and DRAINING as a valid retry;
+  owner-gated reconciliation with no raw-delegate escape; the offline
+  recovery owner (lock → hydrate-both-histories → construct → READY,
+  same-process retry after repair proven); one canonical absolute domain
+  end to end (identity-checked injected managers, the frozen
+  relative+absolute warning from canonical_config, production factory
+  canonicalization); and the m8 CLI's controlled authority_busy path.
+  Merged-tree qualification: local gate 1192 + 9 skipped; Linux 3.11 CI
+  1195 + 6 = 1201; Windows durability 170 + 4 and rule-store 57; mypy
+  clean on 95 files on both platform resolutions. Cumulative Layer-2
+  review: 14 findings across five rounds, all resolved before merge.
+  NEXT BUILD (M7 Layer 3): lifecycle/stale-session/crash-takeover
+  qualification. The single-authority doctrine is now enforced by
+  construction AND by runtime topology — a second runtime over one state
+  directory is refused before its browser exists, in-process or
+  cross-process. Second adapter remains deferred until the M7 boundary is
+  stable.
 - **2026-10-01 — PR #25 fourth review pass: finishing F-53/F-54 + F-55.**
   F-53 completed: OfflineRecoveryAuthority.acquire() now hydrates BEFORE
   constructing any M6 authority state (lock → EffectLedger → RecoveryGuard

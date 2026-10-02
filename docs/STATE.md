@@ -487,6 +487,113 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #26 second repair round: F-59 — revocation is
+  lifecycle-atomic and single-flight.** The F-57 repair made completion
+  durable but left revoke_authority() legal on a freely admitting READY
+  session — a direct call completed revocation, the session stayed READY
+  and admitting, and authority minted afterwards could survive the final
+  shutdown boundary (the same defect through a different entry point);
+  revoke was also not single-flight (two concurrent callers could both
+  snapshot and execute the same unfinished revoker), and abort-vs-
+  activate had a TOCTOU (abort validated STARTING, released the
+  condition to run revokers, a racing activate reached READY, the final
+  state check raised — a REJECTED abort that had revoked on a READY
+  session). Repaired with an internal revocation sub-state/transaction
+  (started/running/complete + per-revoker success): revoke from a freely
+  admitting READY session is REFUSED with zero side effects (revocation
+  is legal only from STARTING teardown or DRAINING shutdown); beginning
+  revocation permanently blocks activation (activate raises once
+  started — the abort/activate race now has exactly one legal ordering)
+  and admission stays closed; single-flight execution with concurrent
+  callers JOINING the in-flight pass (condition wait + completion
+  re-check) instead of rerunning pending revokers; a raising revoker
+  leaves revocation incomplete and retryable with succeeded revokers
+  never re-executed, including under concurrency; TERMINAL remains
+  unreachable until revocation completed; registering while a pass is
+  EXECUTING is refused (between retries of an incomplete revocation it
+  stays legal and the retry picks it up). Four regressions: READY
+  direct-revoke refused zero-effects then legal shutdown still revokes;
+  the deterministic abort-vs-activate race (blocking revoker; activation
+  fails mid-revocation; abort completes to TERMINAL; post-terminal
+  activation impossible); two concurrent terminalize callers (each
+  revoker exactly once, both succeed, coherent completion); two
+  concurrent bare revoke callers (the joiner does not rerun the pending
+  revoker — exactly one execution). Suite 1217 (count from the run).
+- **2026-10-02 — PR #26 review pass: F-57/F-58 — revocation completion
+  and failed-release retention.** F-57 (blocker): terminalize() and
+  abort_from_starting() now VALIDATE the lifecycle transition FIRST — an
+  illegal call has ZERO revocation side effects (regression: an illegal
+  terminalize from READY raises, runs no revoker, and the later LEGAL
+  shutdown still revokes — a rejected lifecycle call can no longer
+  consume the revocation and defeat "confirmation authority dies with
+  the owner session"). Revocation completion is tracked PER REVOKER:
+  _revocation_complete means every required revoker SUCCEEDED, not
+  "attempted" — a raising revoker leaves revocation incomplete, shutdown
+  stays fail-closed, and a retry runs exactly the UNFINISHED set
+  (succeeded revokers are not re-run; regression covers flaky-revoker
+  explode→retry→complete, with a late-registered obligation included).
+  Registering a new revoker after completed revocation is refused.
+  TERMINAL is entered only after revocation COMPLETED. F-58 (high):
+  ownership state is discarded ONLY AFTER the lock release SUCCEEDS —
+  Dispatcher._release_authority retains the handle on a raising release;
+  stop() over a TERMINAL session with a RETAINED lock is a release
+  RETRY (never already-stopped; returns released_on_retry on success,
+  hard failure while ambiguous); the normal-path release failure inside
+  stop() returns a terminate-the-process hard failure with the handle
+  retained. OfflineRecoveryAuthority.close() mirrors the same ordering
+  and retry path. Regressions inject an owner-fd close failure (Layer 1
+  semantics are deliberately FAIL-STOP: a broken release retries keep
+  refusing and the contender stays busy — the positive retry paths are
+  exercised via the transient TERMINAL+retained state, releasing cleanly
+  and freeing the domain). 7 new regressions. Suite 1213 (count from
+  the run).
+- **2026-10-02 — M7 LAYER 3 BUILT (PR pending): owner instance
+  identity, stale-session denial, lifecycle qualification, and
+  crash-takeover/no-stealing.** Built per the frozen four-item contract
+  from exact main b87c673, tests written first (the suite failed to
+  collect until the implementation existed). (1) Owner instance identity:
+  every AuthoritySession mints a fresh cryptographically random 256-bit
+  authority_instance_id (secrets.token_hex(32)) at construction — before
+  READY — immutable for the session (read-only property; assignment
+  raises), with acquired_at as provenance only (no lease derives from
+  it). Diagnostic/protocol identity only: never M5/M6 lineage, never
+  persisted, never recovered from disk. Clean reacquisition and crash
+  takeover both mint different ids because each acquisition constructs a
+  new session; the Dispatcher exposes authority_instance_id as a
+  diagnostic (None while owning nothing — a loser has NO identity; the
+  start result carries it) and the id stays with the TERMINAL session
+  after a clean stop. (2) Stale-session denial before IPC: admit()
+  accepts an expected_instance_id and compares it INSIDE the same
+  lifecycle critical section as the READY check and the active-work
+  increment — a wrong/old id raises the new AuthorityStaleInstanceError
+  BEFORE the counter increments (locked regression: stale rejected with
+  active_work still 0; the current owner's id admits). No transport, no
+  handshake schema, no request table — the primitive Layer 4 will call.
+  (3) Controlled lifecycle qualification: STARTING→READY→DRAINING→
+  TERMINAL proven irreversible in order (skip/reflexive transitions
+  refused; TERMINAL absorbing; terminalize idempotent); id stable
+  throughout; READY→DRAINING atomic with admission (a thread inside
+  admitted work begins the drain; new admission refused; the in-flight
+  work completes under still-held ownership). The session/lock
+  relationship is now RUNTIME-ENFORCED rather than conventional:
+  Dispatcher._release_authority refuses to release over a non-TERMINAL
+  session and retains ownership (AuthoritySessionError) — ownership
+  cannot be deliberately released before the session is terminal, and
+  session-before-ownership is impossible by construction (the session is
+  created only after lock acquisition; a busy loser has no session and
+  no id). (4) Crash/forced-death takeover and NO stealing, with genuine
+  sibling processes: a READY owner force-killed without controlled
+  shutdown leaves the retained authority.lock rendezvous in place — a
+  raw acquisition succeeds over it, and a full successor runtime
+  acquires, HYDRATES (proven real: a successor facing corrupt durable
+  history refuses to start), mints a different id, and reaches READY;
+  and a hung owner holding the lock through a 12-second contention
+  interval (10+ acquisition attempts) is never stolen from — every
+  contender stays authority_busy, the rendezvous file's size/inode/mtime
+  are untouched (no lease/heartbeat/mtime writing), and takeover becomes
+  possible the moment the owner actually terminates. Layer-2 behavior
+  untouched: all existing suites unchanged and green. 14 new tests.
+  Suite 1206 (count from the run).
 - **2026-10-02 — M7 LAYER 2 LIVE QUALIFICATION (record only; no
   architectural changes).** The one empirical gap closed per the directed
   pre-Layer-3 sequence: a live production owner excludes a second real

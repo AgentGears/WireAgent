@@ -293,6 +293,13 @@ class Dispatcher:
                 raise
             if result.ok:
                 session.activate()
+                try:
+                    # `is not None`, not `or {}`: an empty-but-present data
+                    # dict must be enriched IN PLACE, not replaced.
+                    data = result.data if result.data is not None else {}
+                    data["authority_instance_id"] = session.authority_instance_id
+                except Exception:  # noqa: BLE001 — diagnostic enrichment only
+                    pass
                 return result
             await self._teardown_failed_start(session)
             return result
@@ -330,11 +337,35 @@ class Dispatcher:
         self._release_authority()
 
     def _release_authority(self) -> None:
-        """Release authority ownership (idempotent; M7 Layer 2)."""
+        """Release authority ownership (idempotent; M7 Layer 2).
+
+        M7 Layer 3 semantic invariant, runtime-enforced: deliberate
+        ownership release requires a TERMINAL (or absent) authority
+        session. A release attempt over a live session refuses and
+        RETAINS ownership — the session cannot be orphaned alive, and
+        ownership cannot be deliberately released before the session is
+        terminal (frozen contract item 3; the lock object itself stays
+        encapsulated).
+
+        F-58: ownership state is discarded ONLY AFTER the lock release
+        SUCCEEDS. If release raises (Layer 1's qualified ambiguous
+        fail-stop state), the handle is retained and the exception
+        propagates — a later stop() retries the release rather than
+        reporting already-stopped over possibly-still-held ownership."""
+        session = self._authority_session
+        if session is not None and session.state.value != "terminal":
+            raise __import__(
+                "webwire.authority_session", fromlist=["AuthoritySessionError"]
+            ).AuthoritySessionError(
+                "refusing to release authority ownership: the authority "
+                f"session is still {session.state.value} (a session must be "
+                "TERMINAL before the owner handle closes); ownership retained"
+            )
         lock = self._owner_lock
-        self._owner_lock = None
-        if lock is not None:
-            lock.release()
+        if lock is None:
+            return
+        lock.release()  # raises → handle retained, state retained (F-58)
+        self._owner_lock = None  # discarded only after successful release
 
     async def _start_locked(self) -> ActionResult:
         """Start under held authority ownership (caller releases on failure)."""
@@ -446,7 +477,25 @@ class Dispatcher:
                 # Never started, or a failed start already cleaned up.
                 return ok_result(data={"already_stopped": True})
             if session.state.value == "terminal":
-                return ok_result(data={"already_stopped": True})
+                # F-58: a TERMINAL session with a RETAINED owner lock means
+                # a previous release FAILED (the handle is discarded only
+                # after a successful release). This stop is a release
+                # RETRY, not already-stopped — never report success over
+                # possibly-still-held ownership.
+                try:
+                    self._release_authority()
+                except Exception as exc:
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    return hard_failure(
+                        "authority release retry failed; ownership state is "
+                        f"ambiguous and retained — terminate the process "
+                        f"({exc!r})",
+                        failure_category=FailureCategory.SECURITY,
+                    )
+                return ok_result(data={"released_on_retry": True})
             # 1. Reject new admission owner-wide. A session already
             # DRAINING is a RETRY of a failed fail-closed stop: admission
             # is already closed; continue the shutdown law.
@@ -502,9 +551,25 @@ class Dispatcher:
                         "ownership is retained fail-closed",
                         failure_category=FailureCategory.SECURITY,
                     )
-                # 5. Terminal, then 6. release LAST.
+                # 5. Terminal, then 6. release LAST. A release failure
+                # (F-58) is fail-stop: the owner handle is RETAINED (the
+                # release-retry path above handles a later stop) and the
+                # process should be terminated — never report a clean stop
+                # over possibly-still-held ownership.
                 session.terminalize()
-                self._release_authority()
+                try:
+                    self._release_authority()
+                except Exception as exc:
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    return hard_failure(
+                        "authority release FAILED; ownership state is "
+                        f"ambiguous and retained — terminate the process "
+                        f"({exc!r})",
+                        failure_category=FailureCategory.SECURITY,
+                    )
                 return result
 
     # -- invocation ----------------------------------------------------------
@@ -764,6 +829,17 @@ class Dispatcher:
     @property
     def capabilities(self) -> list[str]:
         return self._registry.names()
+
+    @property
+    def authority_instance_id(self) -> Optional[str]:
+        """This runtime's owner-session identity (diagnostic; M7 Layer 3).
+
+        None while this runtime owns no authority domain — a loser that
+        never acquired has no instance identity (no READY without
+        ownership). After a clean stop the TERMINAL session retains its
+        id for diagnostics; a successor acquisition mints a fresh one."""
+        session = self._authority_session
+        return None if session is None else session.authority_instance_id
 
     @property
     def kill_switch(self) -> KillSwitch:

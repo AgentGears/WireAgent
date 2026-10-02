@@ -142,20 +142,33 @@ class OfflineRecoveryAuthority:
 
     def close(self) -> None:
         """The shutdown law: reject admission, drain owner-wide, revoke,
-        terminalize, release the owner lock last."""
+        terminalize, release the owner lock last.
+
+        F-58: owner state is discarded ONLY AFTER the lock release
+        SUCCEEDS. A raising release retains the handle and propagates —
+        a retry re-enters close() and re-attempts the release rather
+        than reporting nothing-to-close over possibly-held ownership."""
         session = self._session
         lock = self._owner_lock
         if session is None or lock is None:
             raise AuthoritySessionError("offline recovery owner has nothing to close")
+        if session.state.value == "terminal":
+            # A previous close() reached TERMINAL but its release FAILED
+            # (state retained by design). This close is a release RETRY.
+            lock.release()  # raises → state retained again (F-58)
+            self._session = None
+            self._coordinator = None
+            self._owner_lock = None
+            return
         session.begin_drain()
         if not session.wait_drained(timeout=60.0):
             raise AuthoritySessionError("offline recovery owner failed to drain admitted work")
         session.revoke_authority()
         session.terminalize()
+        lock.release()  # raises → session/lock state retained (F-58)
         self._session = None
         self._coordinator = None
         self._owner_lock = None
-        lock.release()
 
     def __enter__(self) -> "OfflineRecoveryAuthority":
         return self.acquire()

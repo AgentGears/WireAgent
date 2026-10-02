@@ -15,7 +15,11 @@ from webwire.session import SessionManager
 
 
 class _SB:
-    pass
+    # M7 Layer 2 / F-49: the shutdown law requires the browser object to be
+    # stoppable — teardown failure is now fail-closed, so the double must
+    # implement a succeeding stop().
+    async def stop(self) -> None:
+        pass
 
 
 class _Session(SessionManager):

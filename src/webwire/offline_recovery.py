@@ -81,6 +81,15 @@ class OfflineRecoveryAuthority:
                 confirmation_state=ConfirmationState(),
                 commit_gateway=gateway,
             )
+            # F-53 / frozen §14.2 ordering: acquisition → HYDRATE the
+            # durable recovery truth (both safety ledgers) → construct the
+            # canonical M6 authority root → activate. A corrupt effect or
+            # reconciliation history fails ACQUISITION, before any operator
+            # authority is exposed.
+            # RecoveryGuard.hydrate projects BOTH safety ledgers (effect +
+            # reconciliation) through the publication fence; corrupt history
+            # raises RecoveryGuardUnavailable here, before activation.
+            guard.hydrate()
             session = AuthoritySession(authority_domain=self._config.state_dir)
             session.activate()
         except BaseException:

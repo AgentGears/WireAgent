@@ -16,6 +16,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -100,8 +101,35 @@ class Dispatcher:
         # state domain.
         from webwire.offline_recovery import canonical_config
 
-        self._config = canonical_config(config or WebWireConfig())
+        raw_config = config or WebWireConfig()
+        if not raw_config.state_dir.is_absolute():
+            logger.warning(
+                "relative state_dir %s configured; the authority domain is "
+                "resolved ONCE to its absolute form and the runtime stays "
+                "pinned there regardless of later working-directory changes",
+                raw_config.state_dir,
+            )
+        self._config = canonical_config(raw_config)
         self._session = session_manager or SessionManager(self._config)
+        if session_manager is not None:
+            # F-54: an injected manager must be pinned to the SAME
+            # canonical authority domain — a manager carrying a different
+            # (e.g. still-relative) state root would split session
+            # persistence from the lock/safety domain.
+            manager_state = getattr(getattr(session_manager, "_ww_config", None), "state_dir", None)
+            if manager_state is None:
+                manager_state = getattr(getattr(session_manager, "_config", None), "state_dir", None)
+            if manager_state is None:
+                manager_state = getattr(session_manager, "state_dir", None)
+            if manager_state is not None:
+                manager_canonical = Path(manager_state).resolve(strict=False)
+                if manager_canonical != self._config.state_dir:
+                    raise ValueError(
+                        "injected session manager state root "
+                        f"{manager_canonical} does not match the canonical "
+                        f"authority domain {self._config.state_dir}; "
+                        "construct the manager from the canonical config"
+                    )
         self._kill = KillSwitch(self._config)
         self._journal = Journal(self._config)
         self._registry = CapabilityRegistry()
@@ -292,13 +320,17 @@ class Dispatcher:
             )
             return
         if not quiesce.ok:
-            self._authority_session = session
+            self._authority_session = session  # ambiguous: stays locked
             logger.error(
                 "failed-start cleanup could not prove the root quiescent "
                 "(%s); authority domain stays locked fail-closed",
                 getattr(quiesce.error, "message", quiesce),
             )
             return
+        # F-52: proven quiescent + revoked — mark the failed session
+        # TERMINAL before closing the owner handle, so the Dispatcher never
+        # reports a live session it no longer owns.
+        session.abort_from_starting()
         self._release_authority()
 
     def _release_authority(self) -> None:
@@ -419,8 +451,11 @@ class Dispatcher:
                 return ok_result(data={"already_stopped": True})
             if session.state.value == "terminal":
                 return ok_result(data={"already_stopped": True})
-            # 1. Reject new admission owner-wide.
-            session.begin_drain()
+            # 1. Reject new admission owner-wide. A session already
+            # DRAINING is a RETRY of a failed fail-closed stop: admission
+            # is already closed; continue the shutdown law.
+            if session.state.value == "ready":
+                session.begin_drain()
             # 2. Drain all admitted owner work. The invocation lock waits
             #    for in-flight invokes (and blocks new ones); the session
             #    drain waits for admitted reconciliation operations.
@@ -457,6 +492,20 @@ class Dispatcher:
                 self._m5_media_adapters.clear()
                 self._broker = None
                 result = await self._session.stop()
+                if not result.ok:
+                    # F-49: the browser root is not proven retired. Do NOT
+                    # terminalize or release — ownership stays held
+                    # fail-closed over an ambiguous mutation-capable root.
+                    from super_browser.results.types import FailureCategory
+
+                    from webwire.envelope import hard_failure
+
+                    return hard_failure(
+                        "authority release refused: the browser root could "
+                        f"not be proven retired ({getattr(result.error, 'message', result)}); "
+                        "ownership is retained fail-closed",
+                        failure_category=FailureCategory.SECURITY,
+                    )
                 # 5. Terminal, then 6. release LAST.
                 session.terminalize()
                 self._release_authority()

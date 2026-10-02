@@ -162,6 +162,25 @@ class AuthoritySession:
             self._state = AuthoritySessionState.TERMINAL
             self._condition.notify_all()
 
+    def abort_from_starting(self) -> None:
+        """STARTING → TERMINAL for a FAILED startup (F-52).
+
+        Only valid from STARTING, after the caller has proven the partially
+        constructed root quiescent and revoked ephemeral authority: a clean
+        failed start still terminalizes before the owner handle closes, so
+        no Dispatcher ever reports a live session it no longer owns."""
+        self.revoke_authority()
+        with self._condition:
+            if self._state is AuthoritySessionState.TERMINAL:
+                return
+            if self._state is not AuthoritySessionState.STARTING:
+                raise AuthoritySessionError(
+                    f"authority session cannot abort from {self._state.value} "
+                    "(abort is the failed-startup transition from STARTING)"
+                )
+            self._state = AuthoritySessionState.TERMINAL
+            self._condition.notify_all()
+
     # -- admission -----------------------------------------------------------
 
     @contextmanager

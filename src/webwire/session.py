@@ -168,12 +168,22 @@ class SessionManager:
             # created the browser but before _started is set. Best-effort
             # stop of the partial browser, then re-raise — the authority
             # layer decides fail-closed vs release (M7 Layer 2 / F-44).
-            partial, self._sb = self._sb, None
+            partial = self._sb
             if partial is not None:
                 try:
                     await partial.stop()
-                except Exception:  # noqa: BLE001 — cleanup must not mask
-                    logger.warning("partial browser stop during interrupted start failed")
+                except BaseException:
+                    # F-49: the partial browser could NOT be proven
+                    # stopped. KEEP the reference so a later stop() retries
+                    # the same object instead of reporting success over a
+                    # possibly-live browser — ambiguous teardown must stay
+                    # observable to the authority layer.
+                    logger.error(
+                        "partial browser stop during interrupted start FAILED; "
+                        "browser state is ambiguous and retained for retry"
+                    )
+                else:
+                    self._sb = None
             if isinstance(exc, Exception):
                 logger.exception("SessionManager start failed")
                 return hard_failure(
@@ -318,13 +328,26 @@ class SessionManager:
                 logger.warning("checkpoint during stop failed: %r", exc)
         try:
             await self._sb.stop()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error during SessionManager.stop(): %r", exc)
-        finally:
-            self._sb = None
-            self._started = False
-            self._authenticated = False
-            self._resolved_handle = None
+        except BaseException as exc:
+            # F-49: browser teardown FAILED — the mutation-capable root is
+            # not proven retired. Keep every reference (the retry path sees
+            # the same object) and report a hard failure so the authority
+            # layer retains ownership fail-closed instead of releasing over
+            # an ambiguous browser state.
+            logger.error(
+                "SessionManager.stop(): browser stop FAILED; state is ambiguous and retained for retry: %r",
+                exc,
+            )
+            from webwire.envelope import hard_failure
+
+            return hard_failure(
+                f"browser stop failed; root not proven retired ({exc!r}) — session state retained for retry",
+                failure_category=FailureCategory.BROWSER_CRASH,
+            )
+        self._sb = None
+        self._started = False
+        self._authenticated = False
+        self._resolved_handle = None
         return ok_result(data={"stopped": True})
 
     # -- accessors -----------------------------------------------------------

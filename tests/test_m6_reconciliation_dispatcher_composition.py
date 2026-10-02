@@ -51,7 +51,11 @@ async def test_dispatcher_owns_one_coherent_reconciliation_authority_domain(
     dispatcher = await _started_dispatcher(tmp_path)
     session = dispatcher.create_reconciliation_operator_session("local-admin")
 
-    assert session._coordinator is dispatcher._m6_reconciliation
+    # F-50: the owned wrapper exposes no raw coordinator/delegate escape.
+    assert not hasattr(session, "delegate")
+    assert not hasattr(session, "_coordinator")
+    assert session.operator_id == "local-admin"
+    assert isinstance(session.list_targets(), tuple)
     assert dispatcher._m6_reconciliation.confirmation_state is dispatcher._write_kernel.confirmation_state
     assert dispatcher._m6_reconciliation.commit_gateway is dispatcher._m5_gateway
     assert dispatcher._m6_reconciliation.recovery_guard is dispatcher._m5_recovery

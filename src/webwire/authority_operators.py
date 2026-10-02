@@ -6,9 +6,11 @@ access through a live runtime's exposed coordinator), and (b) count as
 admitted owner work in the owner-wide drain (F-48: draining Dispatcher
 invocations alone is not a drain).
 
-The wrapper is deliberately thin: it admits through the session and
-delegates to the real ReconciliationOperatorSession. It is used by BOTH
-the Dispatcher's gated factory and the offline recovery owner.
+F-50: the wrapper deliberately exposes NO raw authority escape path —
+no ``delegate``, no coordinator. Every supported operator operation
+(including the read-only ``list_targets``/``show_target`` surface) is
+admitted delegation, so a caller cannot capture the raw session while
+READY and drive it after the owner has drained and released.
 """
 
 from __future__ import annotations
@@ -42,9 +44,12 @@ def require_ready_session(
 
 class OwnedReconciliationOperatorSession:
     """A reconciliation operator session whose every operation is admitted
-    owner work: creation is gated on a READY session, and each
-    prepare/confirm/resolve call holds an admission until it returns, so
-    stop() cannot release ownership while reconciliation is in flight."""
+    owner work: creation is gated on a READY session, and each supported
+    operation holds an admission until it returns, so stop() cannot release
+    ownership while reconciliation is in flight.
+
+    F-50: there is no way OUT of this wrapper to the raw delegate or the
+    coordinator — every route to reconciliation authority is admitted."""
 
     def __init__(
         self,
@@ -58,13 +63,16 @@ class OwnedReconciliationOperatorSession:
         self._delegate = delegate_factory(operator_id)
 
     @property
-    def delegate(self) -> Any:
-        return self._delegate
+    def operator_id(self) -> str:
+        return self._delegate.operator_id
 
-    @property
-    def _coordinator(self) -> Any:
-        """Pass-through: the coordinator this operator session drives."""
-        return self._delegate._coordinator
+    def list_targets(self) -> Any:
+        with self._session.admit():
+            return self._delegate.list_targets()
+
+    def show_target(self, effect_id: str) -> Any:
+        with self._session.admit():
+            return self._delegate.show_target(effect_id)
 
     def prepare_resolution(self, *args: Any, **kwargs: Any) -> Any:
         with self._session.admit():

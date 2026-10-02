@@ -487,6 +487,42 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-01 — PR #25 third review pass: F-49/F-50/F-52/F-53/F-54 —
+  non-bypassable boundaries and genuinely fail-closed teardown.** F-49
+  (blocker): teardown failure is now fail-closed END TO END — a browser
+  whose stop() raises is RETAINED (references kept for retry, never
+  reported already-stopped over), SessionManager.stop() returns a hard
+  failure instead of swallowing, and Dispatcher.stop() refuses to
+  terminalize or release over an unproven root (ownership retained; a
+  healed retry completes the shutdown law; a DRAINING session is a valid
+  retry, not an error). The interrupted-start path keeps the partial
+  browser reference when its stop fails so the authority layer sees the
+  ambiguity. Regressions: failing SB.stop() on BOTH paths proves
+  ownership retained; the healed-retry then completes. F-50 (blocker):
+  OwnedReconciliationOperatorSession exposes NO raw authority escape —
+  delegate and coordinator pass-throughs REMOVED; the full supported
+  surface (operator_id, list_targets, show_target, prepare_resolution,
+  confirm_resolution, resolve) is admitted delegation. M6 composition
+  assertions updated to escape-free (hasattr checks + admitted reads).
+  F-52: a cleanly quiesced failed start terminalizes the session
+  (abort_from_starting: STARTING → TERMINAL after revoke) BEFORE the
+  owner handle closes; regression asserts TERMINAL at the release
+  boundary and already-stopped thereafter. F-53: the offline recovery
+  owner follows frozen §14.2 — acquire → guard.hydrate() (projects BOTH
+  safety ledgers) → construct root → activate; corrupt effect OR corrupt
+  reconciliation history fails ACQUISITION with RecoveryGuardUnavailable
+  before any operator authority exists, and the lock is released for a
+  successor (both regressions added; the reconciliation ledger file is
+  reconciliations.ndjson). F-54: build_production_runtime canonicalizes
+  the config BEFORE constructing the session manager AND the dispatcher;
+  Dispatcher.__init__ warns on a relative state_dir (the frozen
+  production diagnostic) and REFUSES an injected session manager whose
+  state root does not match the canonical authority domain (reads
+  _ww_config); regressions pin one absolute domain across a CWD change
+  on the real factory path and refuse a mismatched manager. Test-double
+  updates: the serialization _SB double now implements stop() (the
+  fail-closed contract requires a stoppable browser object); the gate SM
+  mirrors the real stop contract. Suite 1189 (count from the run).
 - **2026-10-01 — PR #25 second review pass: F-43..F-48 — the frozen
   session/lifecycle architecture, implemented.** The review's diagnosis,
   accepted: all six blockers pointed at one missing abstraction — Layer 2

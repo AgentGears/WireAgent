@@ -80,10 +80,19 @@ class _GateSessionManager(SessionManager):
     async def stop(self) -> Any:
         self.stop_calls += 1
         sb = self._stub_sb
+        if sb is None:
+            self._started = False
+            return ok_result(data={"already_stopped": True})
+        try:
+            await sb.stop()
+        except BaseException as exc:
+            # Mirrors the REAL SessionManager contract (F-49): teardown
+            # failure keeps the browser reference and reports hard failure.
+            from webwire.envelope import hard_failure
+
+            return hard_failure(f"browser stop failed; root not proven retired ({exc!r})")
         self._stub_sb = None
         self._started = False
-        if sb is not None:
-            await sb.stop()
         return ok_result(data={"stopped": True})
 
 
@@ -145,7 +154,7 @@ def _run_offline_child(tmp_path: Path) -> None:
             "with OfflineRecoveryAuthority(",
             "        WebWireConfig(state_dir=Path(sys.argv[1]))) as owner:",
             "    op = owner.operator_session('offline-op')",
-            "    assert op.delegate is not None",
+            "    targets = op.list_targets()",
             "print('CLOSED')",
         ]
     )
@@ -393,3 +402,241 @@ async def test_F48_active_reconciliation_blocks_ownership_release(
     assert order == ["reconciliation-completed"]
     assert d._owner_lock is None
     assert d._authority_session.state.value == "terminal"
+
+
+# ---------------------------------------------------------------------------
+# F-49 / F-52 / F-53 / F-54 (third review round): genuinely fail-closed
+# teardown, failed-start terminality, hydrated offline acquisition, one
+# canonical domain on the production path
+# ---------------------------------------------------------------------------
+
+
+class _FailingStopSB(_StubSB):
+    """A browser whose stop() RAISES: teardown can never prove retirement."""
+
+    async def stop(self) -> None:
+        raise RuntimeError("browser teardown exploded")
+
+
+class _QuiesceGateSM(_GateSessionManager):
+    """Gate session whose browser object can be scripted to fail teardown."""
+
+    def __init__(self, config: WebWireConfig, *, sb: Any) -> None:
+        super().__init__(config)
+        self._stub_sb = sb
+        self._started = True
+
+    async def start(self) -> Any:
+        self.start_calls += 1
+        return ok_result(data={})
+
+
+async def test_F49_failed_browser_stop_retains_ownership(tmp_path: Path) -> None:
+    """A runtime whose browser cannot be proven retired keeps ownership
+    fail-closed — stop() returns a failure and the owner lock stays held,
+    on BOTH the normal stop path and the failed-start teardown path."""
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    failing_sb = _FailingStopSB()
+    sm = _QuiesceGateSM(cfg, sb=failing_sb)
+    d = Dispatcher(cfg, session_manager=sm)  # type: ignore[arg-type]
+    d._install_m5_live_stack = lambda sb_: setattr(  # type: ignore[method-assign]
+        d, "_m5_stack", __import__("types").SimpleNamespace(read_broker=object())
+    )
+    assert (await d.start()).ok
+
+    r = await d.stop()
+    assert r.ok is False, "stop over an unproven root must fail"
+    assert "could not be proven retired" in r.error.message
+    assert d._owner_lock is not None, "ownership retained fail-closed"
+    assert d._authority_session.state.value == "draining"
+    # The domain is NOT free: a rival is refused.
+    from webwire.authority import AuthorityBusyError
+
+    with pytest.raises(AuthorityBusyError):
+        AuthorityOwnerLock(tmp_path).acquire()
+
+    # A retry after the browser heals completes the shutdown law.
+    async def _healed_stop() -> None:
+        pass
+
+    failing_sb.stop = _healed_stop  # type: ignore[method-assign]
+    r2 = await d.stop()
+    assert r2.ok
+    assert d._owner_lock is None
+    assert d._authority_session.state.value == "terminal"
+
+
+async def test_F49_failed_start_teardown_failure_retains_ownership(
+    tmp_path: Path,
+) -> None:
+    """The failed-start path: session start returns a failure AND the
+    partial browser's stop raises — ownership must stay held."""
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    failing_sb = _FailingStopSB()
+    sm = _GateSessionManager(cfg, start_ok=False)
+    sm._stub_sb = failing_sb  # a partial browser exists at teardown time
+    d = Dispatcher(cfg, session_manager=sm)  # type: ignore[arg-type]
+    d._install_m5_live_stack = lambda sb_: None  # type: ignore[method-assign]
+
+    r = await d.start()
+    assert r.ok is False
+    # session.stop() was attempted and FAILED (the browser raises):
+    # ownership is retained, not released over an ambiguous root.
+    assert sm.stop_calls >= 1
+    assert d._owner_lock is not None, "ambiguous teardown keeps ownership"
+
+
+async def test_F52_failed_start_marks_session_terminal_before_release(
+    tmp_path: Path,
+) -> None:
+    """A cleanly quiesced failed start terminalizes the session BEFORE the
+    owner handle closes: the Dispatcher never reports a live (STARTING)
+    session it no longer owns."""
+    d, sm = _dispatcher(tmp_path, start_ok=False)
+    r = await d.start()
+    assert r.ok is False
+    assert sm.stop_calls == 1, "quiesce attempted"
+    assert d._owner_lock is None, "proven quiescent → released"
+    assert d._authority_session.state.value == "terminal", (
+        "the failed session is TERMINAL at the release boundary"
+    )
+    # The dispatcher does not pretend to own anything anymore.
+    r2 = await d.stop()
+    assert r2.ok and r2.data.get("already_stopped") is True
+
+
+async def test_F53_offline_owner_refuses_corrupt_effect_history(tmp_path: Path) -> None:
+    """Frozen §14.2: acquisition → hydrate → activate. A corrupt effect
+    ledger makes ACQUISITION fail — no READY owner, no operator access."""
+    from webwire.offline_recovery import OfflineRecoveryAuthority
+    from webwire.safety.recovery_guard import RecoveryGuardUnavailable
+
+    (tmp_path / "effects.ndjson").write_bytes(b"\xff\xfe not json")
+    offline = OfflineRecoveryAuthority(WebWireConfig(state_dir=tmp_path))
+    with pytest.raises(RecoveryGuardUnavailable):
+        offline.acquire()
+    assert offline._session is None, "never activated"
+    # The failed acquisition released the lock: a successor may acquire.
+    successor = AuthorityOwnerLock(tmp_path).acquire()
+    successor.release()
+
+
+async def test_F53_offline_owner_refuses_corrupt_reconciliation_history(
+    tmp_path: Path,
+) -> None:
+    from webwire.offline_recovery import OfflineRecoveryAuthority
+    from webwire.safety.recovery_guard import RecoveryGuardUnavailable
+
+    # A valid effect ledger, but a corrupt reconciliation ledger — the
+    # composite projection must refuse acquisition just the same.
+    (tmp_path / "effects.ndjson").write_text("", encoding="utf-8")
+    (tmp_path / "reconciliations.ndjson").write_bytes(b"\xff\xfe broken")
+    offline = OfflineRecoveryAuthority(WebWireConfig(state_dir=tmp_path))
+    with pytest.raises(RecoveryGuardUnavailable):
+        offline.acquire()
+    successor = AuthorityOwnerLock(tmp_path).acquire()
+    successor.release()
+
+
+async def test_F54_production_factory_pins_one_domain_across_cwd_change(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The REAL production path: build_production_runtime with a RELATIVE
+    state root canonicalizes before constructing the session manager and
+    dispatcher — after a CWD change, the session manager's persistence
+    paths and the Dispatcher's authority domain are the SAME absolute
+    directory, and the relative-root warning was emitted."""
+    import logging
+
+    from webwire.config import WebWireConfig
+    from webwire.m8_card_cli import build_production_runtime
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    captured = []
+
+    class _WarnCollector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    logging.getLogger("webwire.dispatcher").addHandler(_WarnCollector())
+    try:
+        cfg = WebWireConfig(state_dir=Path("../prod-root"), kill_env_var=None)
+        expected = (workdir / "../prod-root").resolve(strict=False)
+
+        made = {}
+
+        class _RecordingDispatcher(_RecordingDispatcherBase):
+            async def start(self):
+                made["dispatcher_config_state"] = self._config.state_dir
+                made["session_config_state"] = self._session._ww_config.state_dir
+                return await super().start()
+
+        runtime = await build_production_runtime(
+            cfg,
+            dispatcher_factory=lambda c, *, session_manager: _RecordingDispatcher(
+                c, session_manager=session_manager
+            ),
+        )
+        # CWD changes AFTER construction: the recorded domains must already
+        # be pinned to the same absolute path.
+        monkeypatch.chdir(tmp_path)
+        assert made["dispatcher_config_state"] == expected
+        assert made["session_config_state"] == expected
+        assert made["dispatcher_config_state"] is made["session_config_state"] or (
+            made["dispatcher_config_state"] == made["session_config_state"]
+        )
+        # The warning is emitted by the REAL Dispatcher construction with a
+        # relative root (the recording factory above bypasses __init__):
+        # construct one real Dispatcher inside the same captured-log scope.
+        from webwire.dispatcher import Dispatcher as _RealDispatcher
+
+        _RealDispatcher(WebWireConfig(state_dir=Path("../prod-root"), kill_env_var=None))
+        assert any("relative state_dir" in m for m in captured), (
+            "the frozen relative-root warning must be emitted"
+        )
+        await runtime.stop()
+    finally:
+        logging.getLogger("webwire.dispatcher").removeHandler(_WarnCollector())
+
+
+class _RecordingDispatcherBase:
+    """A recording stand-in for the production wiring test."""
+
+    def __init__(self, config, *, session_manager) -> None:
+        self._config = config
+        self._session = session_manager
+        self.stopped = False
+
+    async def start(self):
+        from webwire.envelope import ok_result
+
+        return ok_result(data={})
+
+    async def invoke(self, capability, payload):
+        from webwire.envelope import ok_result
+
+        if capability == "whoami":
+            self._session._resolved_handle = "@owner"  # mirror the post-whoami hook
+            return ok_result(data={"handle": "@owner"})
+        raise AssertionError(f"unexpected invoke {capability}")
+
+    async def stop(self):
+        self.stopped = True
+        from webwire.envelope import ok_result
+
+        return ok_result(data={})
+
+
+async def test_F54_mismatched_injected_manager_is_refused(tmp_path: Path) -> None:
+    """Defense in depth: a manager carrying a DIFFERENT state root than the
+    canonical authority domain is refused at Dispatcher construction."""
+    from webwire.session import SessionManager
+
+    good_cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    other_cfg = WebWireConfig(state_dir=tmp_path / "elsewhere", kill_env_var=None)
+    sm = SessionManager(other_cfg)
+    with pytest.raises(ValueError, match="does not match the canonical"):
+        Dispatcher(good_cfg, session_manager=sm)  # type: ignore[arg-type]

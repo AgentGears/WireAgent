@@ -80,10 +80,16 @@ async def build_production_runtime(
     Both factories are injectable so the wiring itself is testable without
     a browser."""
     from webwire.dispatcher import Dispatcher
+    from webwire.offline_recovery import canonical_config
     from webwire.session import SessionManager
 
     make_dispatcher = dispatcher_factory or Dispatcher
     make_session = session_factory or SessionManager
+    # F-54 / RV11: canonicalize ONCE, BEFORE constructing either object, so
+    # the session manager's persistence paths and the Dispatcher's safety
+    # state share the exact same absolute authority domain even if the
+    # caller supplied a relative state_dir and the CWD later changes.
+    config = canonical_config(config)
     session = make_session(config)
     dispatcher = make_dispatcher(config, session_manager=session)
     try:

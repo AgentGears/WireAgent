@@ -149,10 +149,16 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         """Create the named pipe with a current-user-only DACL."""
         import ctypes
 
+
+def _win32() -> Any:
+    """ctypes.windll resolved at runtime (Windows-only; runtime dict
+    resolution keeps mypy portable per platform - the M8 F-25 lesson)."""
+    return vars(ctypes).get("windll")
+
         dacl_bytes = self._build_current_user_dacl()
         handle = self._create_pipe(dacl_bytes)
         if handle in (0, -1):
-            err = ctypes.windll.kernel32.GetLastError()  # type: ignore[attr-defined]
+            err = _win32().kernel32.GetLastError()  
             raise RuntimeError(f"CreateNamedPipeW failed for {self._pipe_name}: error {err}")
         self._handle = handle
 
@@ -162,8 +168,8 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         import ctypes
         import ctypes.wintypes as wt
 
-        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        advapi32 = ctypes.windll.advapi32  
+        kernel32 = ctypes.windll.kernel32  
 
         # Get the current process token.
         token = wt.HANDLE()
@@ -249,7 +255,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         """Call CreateNamedPipeW with the DACL-backed security attributes."""
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  
         PIPE_ACCESS_DUPLEX = 0x3
         FILE_FLAG_FIRST_PIPE_INSTANCE = 0x80000
         PIPE_TYPE_BYTE = 0x1
@@ -270,7 +276,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         """Wait for a client connection on the named pipe."""
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  
         assert self._handle is not None
         connected = kernel32.ConnectNamedPipe(self._handle, None)
         if not connected:
@@ -283,6 +289,6 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         if self._handle is not None:
             import ctypes
 
-            ctypes.windll.kernel32.CloseHandle(self._handle)  # type: ignore[attr-defined]
+            _win32().kernel32.CloseHandle(self._handle)  
             self._handle = None
         # Named pipes disappear when the last handle closes — no unlink.

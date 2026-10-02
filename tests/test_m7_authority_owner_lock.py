@@ -41,13 +41,20 @@ def _probe(state_dir: Path) -> tuple[subprocess.CompletedProcess[str], dict[str,
 
 def _wait_for_result(path: Path, *, timeout: float = 15.0) -> dict[str, object]:
     deadline = time.monotonic() + timeout
-    while not path.exists():
+    # Poll until the file exists AND parses: on Windows a worker's result
+    # file can be observed existing before its content lands (create-then-
+    # write race), which reads as an empty document. Tolerate that window
+    # instead of failing on it.
+    while True:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            return payload
         if time.monotonic() >= deadline:
             raise AssertionError(f"timed out waiting for worker result {path}")
         time.sleep(0.01)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert isinstance(payload, dict)
-    return payload
 
 
 def test_canonical_domain_freezes_absolute_path_at_construction(

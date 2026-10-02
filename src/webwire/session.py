@@ -135,6 +135,7 @@ class SessionManager:
                     failure_category=FailureCategory.BROWSER_CRASH,
                 )
             from dataclasses import replace as _replace
+
             new_browser = _replace(self._sb_config.browser, cdp_ws_url=resolved)
             self._sb_config = _replace(self._sb_config, browser=new_browser)
             logger.info("Resolved browser CDP WS: %s", resolved)
@@ -148,19 +149,48 @@ class SessionManager:
             # X navigation). Non-fatal if it fails — whoami is the real gate.
             self._restore_session()
 
-            logger.info("SessionManager started (mode=%s, ownership=%s, session=%s)",
-                        self._sb_config.browser.mode.value, self.ownership, self._session_loaded_state)
-            return ok_result(data={
-                "started": True, "mode": self._sb_config.browser.mode.value,
-                "ownership": self.ownership, "session": self._session_loaded_state,
-            })
-        except Exception as exc:  # noqa: BLE001 — surface as envelope, don't raise
-            logger.exception("SessionManager start failed")
-            self._sb = None
-            return hard_failure(
-                f"Failed to start Super-Browser session: {exc!r}",
-                failure_category=FailureCategory.BROWSER_CRASH,
+            logger.info(
+                "SessionManager started (mode=%s, ownership=%s, session=%s)",
+                self._sb_config.browser.mode.value,
+                self.ownership,
+                self._session_loaded_state,
             )
+            return ok_result(
+                data={
+                    "started": True,
+                    "mode": self._sb_config.browser.mode.value,
+                    "ownership": self.ownership,
+                    "session": self._session_loaded_state,
+                }
+            )
+        except BaseException as exc:
+            # Cancellation/async interruption can land after the kernel
+            # created the browser but before _started is set. Best-effort
+            # stop of the partial browser, then re-raise — the authority
+            # layer decides fail-closed vs release (M7 Layer 2 / F-44).
+            partial = self._sb
+            if partial is not None:
+                try:
+                    await partial.stop()
+                except BaseException:
+                    # F-49: the partial browser could NOT be proven
+                    # stopped. KEEP the reference so a later stop() retries
+                    # the same object instead of reporting success over a
+                    # possibly-live browser — ambiguous teardown must stay
+                    # observable to the authority layer.
+                    logger.error(
+                        "partial browser stop during interrupted start FAILED; "
+                        "browser state is ambiguous and retained for retry"
+                    )
+                else:
+                    self._sb = None
+            if isinstance(exc, Exception):
+                logger.exception("SessionManager start failed")
+                return hard_failure(
+                    f"Failed to start Super-Browser session: {exc!r}",
+                    failure_category=FailureCategory.BROWSER_CRASH,
+                )
+            raise
 
     async def checkpoint_session(self) -> ActionResult:
         """Atomically save the current cookie jar to session.json.
@@ -185,10 +215,12 @@ class SessionManager:
                 return r
             # Atomic replace on POSIX; on Windows os.replace is atomic too.
             import os
+
             os.replace(tmp, target)
             # Restrictive permissions where practical (best-effort, Windows).
             try:
                 import stat
+
                 os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
             except OSError:
                 pass
@@ -201,6 +233,7 @@ class SessionManager:
         """Load persisted cookies if the session file exists. Synchronous-ish:
         runs an async save_session via the running loop. Sets _session_loaded_state."""
         import asyncio
+
         target = self._ww_config.session_path()
         if not target.exists():
             self._session_loaded_state = "no_file"
@@ -252,12 +285,13 @@ class SessionManager:
         """
         import json as _json
         import urllib.request
+
         # Derive http://host:port from ws://host:port or http://host:port.
         raw = ws_or_http_url
         if raw.startswith("ws://"):
-            origin = "http://" + raw[len("ws://"):]
+            origin = "http://" + raw[len("ws://") :]
         elif raw.startswith("wss://"):
-            origin = "https://" + raw[len("wss://"):]
+            origin = "https://" + raw[len("wss://") :]
         elif raw.startswith("http"):
             origin = raw
         else:
@@ -280,9 +314,12 @@ class SessionManager:
 
         Saves session cookies before stopping IF authenticated, so a clean run
         refreshes the saved jar. Never saves an unauthenticated jar."""
-        if not self._started or self._sb is None:
+        if self._sb is None:
             self._started = False
             return ok_result(data={"already_stopped": True})
+        # A browser object with _started still False is a partially started
+        # root (cancellation window): stopping it IS the quiesce — never
+        # report already-stopped over a live browser (M7 Layer 2 / F-44).
         # Checkpoint if we have a verified identity (review Q3).
         if self._authenticated:
             try:
@@ -291,13 +328,26 @@ class SessionManager:
                 logger.warning("checkpoint during stop failed: %r", exc)
         try:
             await self._sb.stop()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Error during SessionManager.stop(): %r", exc)
-        finally:
-            self._sb = None
-            self._started = False
-            self._authenticated = False
-            self._resolved_handle = None
+        except BaseException as exc:
+            # F-49: browser teardown FAILED — the mutation-capable root is
+            # not proven retired. Keep every reference (the retry path sees
+            # the same object) and report a hard failure so the authority
+            # layer retains ownership fail-closed instead of releasing over
+            # an ambiguous browser state.
+            logger.error(
+                "SessionManager.stop(): browser stop FAILED; state is ambiguous and retained for retry: %r",
+                exc,
+            )
+            from webwire.envelope import hard_failure
+
+            return hard_failure(
+                f"browser stop failed; root not proven retired ({exc!r}) — session state retained for retry",
+                failure_category=FailureCategory.BROWSER_CRASH,
+            )
+        self._sb = None
+        self._started = False
+        self._authenticated = False
+        self._resolved_handle = None
         return ok_result(data={"stopped": True})
 
     # -- accessors -----------------------------------------------------------
@@ -309,7 +359,6 @@ class SessionManager:
         Intended for trusted internal callers only (dispatcher, broker setup).
         """
         return self._sb
-
 
     # -- internals -----------------------------------------------------------
 

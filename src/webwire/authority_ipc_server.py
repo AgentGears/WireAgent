@@ -83,6 +83,8 @@ _SAFETY_SCALAR_FIELDS = (
 _PROJECTION_MAX_DEPTH = 4
 _PROJECTION_MAX_ITEMS = 32
 _PROJECTION_MAX_STR = 512
+# F-77: the fixed TOTAL byte budget optional diagnostics may consume.
+_SAFETY_OPTIONAL_BUDGET_BYTES = 64 * 1024
 
 
 def _json_safe(value: Any, depth: int = 0) -> Any:
@@ -90,7 +92,9 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
 
     Non-finite floats become None (the strict encoder would reject them);
     over-long strings truncate; over-deep/over-wide containers truncate
-    with a marker; unknown object types reduce to a bounded repr (StrEnum
+    with a marker; unsupported object types reduce to a STABLE REDACTION
+    MARKER naming the type — never a repr, whose incidental contents
+    could leak authority-object state across the boundary (StrEnum
     members are strings, so verdicts/tiers keep their exact values)."""
     if value is None or isinstance(value, bool):
         return value
@@ -113,7 +117,105 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
         for key, item in list(value.items())[:_PROJECTION_MAX_ITEMS]:
             out[str(key)[:128]] = _json_safe(item, depth + 1)
         return out
-    return repr(value)[:_PROJECTION_MAX_STR]
+    return f"<redacted:{type(value).__name__}>"
+
+
+# F-77: the mandatory safety facts — extracted independently of the
+# general projection, hard-capped, and therefore guaranteed to encode.
+_MANDATORY_SAFETY_FIELDS = ("public_side_effect", "reconciliation_required", "m5_effect_state")
+
+
+def _mandatory_safety(result: Any) -> dict[str, Any]:
+    """The minimal guaranteed safety envelope (F-77): the three outcome
+    facts a client needs to decide whether reconciliation is required,
+    pulled straight from the failed result (top level or the kernel's
+    nested payload), each hard-capped. This ALWAYS fits the wire."""
+    mandatory: dict[str, Any] = {}
+    data = getattr(result, "data", None)
+    if not isinstance(data, dict):
+        return mandatory
+    sources = [data]
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        sources.append(nested)
+    for field in _MANDATORY_SAFETY_FIELDS:
+        for source in sources:
+            if field in source:
+                value = source[field]
+                if isinstance(value, str):
+                    value = value[:64]
+                elif isinstance(value, bool):
+                    pass
+                else:
+                    continue
+                mandatory[field] = value
+                break
+    return mandatory
+
+
+def _fit_optional_budget(safety: dict[str, Any]) -> dict[str, Any]:
+    """F-77: optional diagnostics consume a FIXED TOTAL BYTE BUDGET.
+    Mandatory safety facts are never budget-limited. If the optional
+    blocks (capability data, trace stages, policy verdict) exceed the
+    budget they are dropped deterministically — data first, then trace
+    stages, then policy — before any encode is attempted."""
+    optional_keys = tuple(key for key in ("data", "trace_stages", "policy") if key in safety)
+    if not optional_keys:
+        return safety
+
+    def _size(keys: tuple[str, ...]) -> int:
+        try:
+            import json as _json
+
+            return len(
+                _json.dumps(
+                    {key: safety[key] for key in keys},
+                    allow_nan=False,
+                    default=str,
+                )
+            )
+        except (TypeError, ValueError):
+            return _SAFETY_OPTIONAL_BUDGET_BYTES + 1  # unencodable = over budget
+
+    if _size(optional_keys) <= _SAFETY_OPTIONAL_BUDGET_BYTES:
+        return safety
+    remaining = list(optional_keys)
+    while remaining:
+        remaining.pop(0)  # data first, then trace_stages, then policy
+        if _size(tuple(remaining)) <= _SAFETY_OPTIONAL_BUDGET_BYTES:
+            return {key: value for key, value in safety.items() if key not in optional_keys or key in remaining}
+    return {key: value for key, value in safety.items() if key not in optional_keys}
+
+
+def _failure_frame(code: str, message: str, safety: dict[str, Any]) -> bytes:
+    """F-77: encode a failure envelope through a DETERMINISTIC DEGRADATION
+    LADDER — the budgeted projection, then without the optional diagnostic
+    blocks entirely, then the minimal mandatory envelope. Mandatory safety
+    facts always reach the client; optional diagnostics are dropped
+    first, and a failed failure-frame NEVER becomes a generic internal."""
+    budgeted = _fit_optional_budget(safety)
+    candidates = [budgeted]
+    without_optionals = {
+        key: value for key, value in budgeted.items() if key not in ("data", "trace_stages", "policy")
+    }
+    if without_optionals and without_optionals != budgeted:
+        candidates.append(without_optionals)
+    candidates.append(_MANDATORY_ONLY_MERGE(budgeted))
+    for candidate in candidates:
+        try:
+            return encode_json_frame(IPCRequestOutcome.failure(code, message, candidate), is_response=True)
+        except IPCProtocolError:
+            continue
+    # The mandatory envelope is booleans plus ≤64-char strings; this
+    # encode cannot realistically fail, but the law is absolute — never
+    # let a failed failure-frame become a generic internal.
+    return encode_json_frame(IPCRequestOutcome.failure(code, message, {}), is_response=True)
+
+
+def _MANDATORY_ONLY_MERGE(safety: dict[str, Any]) -> dict[str, Any]:
+    merged = {key: safety[key] for key in _MANDATORY_SAFETY_FIELDS if key in safety}
+    merged["semantic_key"] = safety.get("semantic_key", "")
+    return merged
 
 
 def _safety_projection(result: Any) -> dict[str, Any]:
@@ -191,6 +293,11 @@ class IPCRequestOutcome:
 # objects PRIVATE to the owner — the client only ever sees opaque ids,
 # serializable display data, and terminal results.
 IPC_MAX_RECONCILIATION_SESSIONS = 4
+# F-78: bounded per-session proposal/authority state — repeated prepares
+# cannot grow the logical session indefinitely.
+IPC_MAX_RECONCILIATION_PROPOSALS = 32
+# F-78: bounded list contract — one page of targets per request.
+IPC_RECONCILIATION_LIST_DEFAULT_LIMIT = 50
 
 
 class _ReconciliationWireSession:
@@ -602,13 +709,10 @@ class AuthorityIPCServer:
             # public_side_effect / reconciliation_required / m5_effect_state
             # and friends must survive the boundary so a client can tell an
             # uncertain external mutation from a clean denial.
-            return encode_json_frame(
-                IPCRequestOutcome.failure(
-                    "capability",
-                    error_msg or "capability failed",
-                    _safety_projection(result),
-                ),
-                is_response=True,
+            return _failure_frame(
+                "capability",
+                error_msg or "capability failed",
+                _safety_projection(result),
             )
         try:
             return encode_json_frame(IPCRequestOutcome.ok(data), is_response=True)
@@ -629,6 +733,12 @@ class AuthorityIPCServer:
         confirmation, and terminal resolution through the owner's stored
         authority. The ReconciliationAuthority (and every coordinator/
         delegate object) never crosses the wire."""
+        from webwire.safety.reconciliation_coordinator import (
+            ReconciliationCoordinatorError,
+            ReconciliationDenied,
+            ReconciliationPersistenceError,
+            ReconciliationPublicationError,
+        )
         from webwire.safety.reconciliation_ledger import ReconciliationVerdict
         from webwire.safety.reconciliation_operator import ReconciliationOperatorError
 
@@ -648,7 +758,7 @@ class AuthorityIPCServer:
                 if len(self._reconciliation_sessions) >= IPC_MAX_RECONCILIATION_SESSIONS:
                     return _error(
                         "reconciliation_busy",
-                        "the bounded operator-session registry is full",
+                        "the bounded operator-session registry is full (close a session to reclaim a slot)",
                     )
                 operator_session = self._reconciliation_provider(payload["operator_id"])
                 wire_session = _ReconciliationWireSession(
@@ -657,6 +767,21 @@ class AuthorityIPCServer:
                 )
                 self._reconciliation_sessions[wire_session.id] = wire_session
                 return _ok({"reconciliation_session_id": wire_session.id})
+
+            if operation == "reconciliation_close":
+                # F-78: reclaimable logical sessions — an explicit close
+                # frees the registry slot (and discards any uncommitted
+                # proposal/authority state) before owner drain/restart.
+                close_id = payload.get("reconciliation_session_id")
+                closed = (
+                    self._reconciliation_sessions.pop(close_id, None) if isinstance(close_id, str) else None
+                )
+                if closed is None:
+                    return _error(
+                        "reconciliation_session_unknown",
+                        "unknown, drained, or restarted reconciliation session",
+                    )
+                return _ok({"closed": True})
 
             session_id = payload.get("reconciliation_session_id")
             current: Optional[_ReconciliationWireSession] = (
@@ -670,14 +795,36 @@ class AuthorityIPCServer:
             op = current.operator_session
 
             if operation == "reconciliation_list":
+                # F-78: a bounded list contract — keyset pagination by
+                # effect_id with an explicit limit; never an unbounded page.
                 targets = op.list_targets()
-                return _ok({"targets": [_serialize_target(t) for t in targets]})
+                after = payload.get("after_effect_id")
+                limit = payload.get("limit", IPC_RECONCILIATION_LIST_DEFAULT_LIMIT)
+                if after:
+                    targets = tuple(target for target in targets if target.effect_id > after)
+                ordered = sorted(targets, key=lambda target: target.effect_id)
+                page = ordered[:limit]
+                return _ok(
+                    {
+                        "targets": [_serialize_target(t) for t in page],
+                        "total": len(targets),
+                        "limit": limit,
+                        "has_more": len(ordered) > len(page),
+                    }
+                )
 
             if operation == "reconciliation_show":
                 target = op.show_target(payload["effect_id"])
                 return _ok({"target": _serialize_target(target)})
 
             if operation == "reconciliation_prepare":
+                if len(current.proposals) >= IPC_MAX_RECONCILIATION_PROPOSALS:
+                    return _error(
+                        "reconciliation_proposal_limit",
+                        "this logical session holds the bounded maximum of "
+                        f"{IPC_MAX_RECONCILIATION_PROPOSALS} proposals; resolve or "
+                        "close the session",
+                    )
                 verdict = ReconciliationVerdict(payload["verdict"])
                 proposal = op.prepare_resolution(
                     effect_id=payload["effect_id"],
@@ -714,6 +861,60 @@ class AuthorityIPCServer:
                 return _ok({"resolution": _serialize_resolution(resolution)})
 
             return _error("unsupported_operation", f"unknown reconciliation operation {operation!r}")
+        except ReconciliationDenied as exc:
+            # F-75: denied BEFORE persistence — a stable wire state. An
+            # expired authority explicitly requires fresh confirmation.
+            if exc.reason == "authority_expired":
+                return _error(
+                    "reconciliation_authority_expired",
+                    "the confirmation authority expired before persistence; M6 "
+                    "requires a FRESH explicit confirmation (re-confirm the same "
+                    "proposal text) before resolving",
+                )
+            return _error(
+                "reconciliation_denied",
+                f"reconciliation denied: {exc.reason}" + (f" — {exc.detail}" if exc.detail else ""),
+            )
+        except ReconciliationPersistenceError as exc:
+            # F-75: persistence of an ALREADY-COMMITTED frozen fact did not
+            # complete. The epoch has advanced and the authority is bound
+            # to one exact fact — expose the frozen identity, whether
+            # durability is ambiguous, and the continuation requirement.
+            return _failure_frame(
+                "reconciliation_persistence_failed",
+                "reconciliation persistence failed"
+                + (" ambiguously" if exc.ambiguous else " cleanly")
+                + f": {exc}",
+                {
+                    "record": _record_identity(exc.record),
+                    "ambiguous_durability": exc.ambiguous,
+                    "continuation_required": (
+                        "continue the SAME proposal/authority — do not re-confirm "
+                        "or re-prepare a new proposal for this fact"
+                    ),
+                },
+            )
+        except ReconciliationPublicationError as exc:
+            # F-75: the reconciliation fact is DURABLE and the authority is
+            # consumed, but composite RecoveryGuard publication failed
+            # closed. The durable record — not this transport response —
+            # is the truth a retry will observe.
+            return _failure_frame(
+                "reconciliation_publication_failed",
+                "the reconciliation fact is durable but composite recovery-guard "
+                f"publication failed closed: {exc}",
+                {
+                    "record": _record_identity(exc.record),
+                    "fact_durable": True,
+                    "guard_publication": "failed_closed",
+                    "retry_note": (
+                        "recovery hydration/refresh reconciles the durable fact; "
+                        "the proposal is resolved and cannot be re-resolved"
+                    ),
+                },
+            )
+        except ReconciliationCoordinatorError as exc:
+            return _error("reconciliation_failed", f"reconciliation coordinator failure: {exc}")
         except ReconciliationOperatorError as exc:
             return _error("reconciliation", f"{getattr(exc, 'reason', None) or exc}")
         except (KeyError, ValueError, TypeError) as exc:
@@ -722,12 +923,13 @@ class AuthorityIPCServer:
 
 # -- F-73: the reconciliation operator wire route (frozen §14.3) ------------
 
-# The six reconciliation operations. They are routed INSIDE the same
-# admission/stale/table gates as capabilities; the owner-side registry
-# holds the logical sessions.
+# The reconciliation operations (F-78 adds the reclaiming close). They
+# are routed INSIDE the same admission/stale/table gates as capabilities;
+# the owner-side registry holds the logical sessions.
 IPC_RECONCILIATION_OPERATIONS = frozenset(
     {
         "reconciliation_open",
+        "reconciliation_close",
         "reconciliation_list",
         "reconciliation_show",
         "reconciliation_prepare",
@@ -738,18 +940,36 @@ IPC_RECONCILIATION_OPERATIONS = frozenset(
 
 
 def _serialize_target(target: Any) -> dict[str, Any]:
+    """F-76: the operator display is faithful to M6 truth — the FULL
+    frozen lineage (semantic_key, action_type, intent_hash,
+    policy_binding, actor_id, target_type, target_id) plus EXPLICIT
+    first/current states and timestamps. ``state`` is the CURRENT state
+    (the last durable record), never the first-record state the
+    lifecycle started from."""
     first = target.first_record
-    state = getattr(first, "state", None)
+    last = target.last_record
+
+    def _state(record: Any) -> Any:
+        value = getattr(record, "state", None)
+        return getattr(value, "value", value)
+
     return {
         "effect_id": target.effect_id,
+        # The M6 lineage — exactly the fields the terminal-resolution
+        # display must present before explicit confirmation.
         "semantic_key": getattr(first, "semantic_key", None),
         "action_type": getattr(first, "action_type", None),
         "intent_hash": getattr(first, "intent_hash", None),
+        "policy_binding": getattr(first, "policy_binding", None),
         "actor_id": getattr(first, "actor_id", None),
         "target_type": getattr(first, "target_type", None),
         "target_id": getattr(first, "target_id", None),
-        "state": getattr(state, "value", state),
-        "timestamp": getattr(first, "timestamp", None),
+        # Explicit lifecycle: first vs current, no ambiguous overload.
+        "state": _state(last),
+        "first_state": _state(first),
+        "current_state": _state(last),
+        "first_timestamp": getattr(first, "timestamp", None),
+        "current_timestamp": getattr(last, "timestamp", None),
     }
 
 
@@ -761,6 +981,8 @@ def _serialize_proposal(proposal: Any) -> dict[str, Any]:
         "semantic_key": proposal.semantic_key,
         "action_type": proposal.action_type,
         "intent_hash": proposal.intent_hash,
+        # F-76: the complete M6 lineage on the confirmation display too.
+        "policy_binding": proposal.policy_binding,
         "actor_id": proposal.actor_id,
         "target_type": proposal.target_type,
         "target_id": proposal.target_id,
@@ -775,14 +997,34 @@ def _serialize_proposal(proposal: Any) -> dict[str, Any]:
 def _serialize_resolution(resolution: Any) -> dict[str, Any]:
     record = getattr(resolution, "record", None)
     status = getattr(resolution, "recovery_status", None)
-    record_data = _json_safe(vars(record)) if hasattr(record, "__dict__") else repr(record)[:512]
+    record_data = _json_safe(vars(record)) if hasattr(record, "__dict__") else "<redacted:record>"
+    # F-78: the unresolved-key collection is BOUNDED — a capped prefix
+    # plus the true count, never an unbounded key list.
+    keys = list(getattr(status, "unresolved_semantic_keys", ()) or ())
     return {
         "confirmation_epoch": resolution.confirmation_epoch,
         "record": record_data,
         "recovery_status": {
             "hydrated": getattr(status, "hydrated", None),
             "available": getattr(status, "available", None),
-            "unresolved_semantic_keys": list(getattr(status, "unresolved_semantic_keys", ()) or ()),
+            "unresolved_semantic_keys": keys[:16],
+            "unresolved_semantic_key_count": len(keys),
+            "unresolved_keys_truncated": len(keys) > 16,
             "unresolved_effect_count": getattr(status, "unresolved_effect_count", None),
         },
+    }
+
+
+def _record_identity(record: Any) -> dict[str, Any]:
+    """F-75: the frozen record identity an exceptional M6 outcome must
+    expose — committed/durable fact identity, bounded."""
+    if record is None:
+        return {}
+    verdict = getattr(record, "verdict", None)
+    return {
+        "reconciliation_id": getattr(record, "reconciliation_id", None),
+        "effect_id": getattr(record, "effect_id", None),
+        "semantic_key": getattr(record, "semantic_key", None),
+        "verdict": getattr(verdict, "value", verdict),
+        "operator_id": getattr(record, "operator_id", None),
     }

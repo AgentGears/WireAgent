@@ -461,6 +461,49 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — M7 Layer 5 third repair round (PR #28, F-75/F-76/F-77/F-78):
+  exceptional M6 wire states, faithful display, guaranteed safety
+  envelope, bounded reconciliation resources.** F-75 (blocker, fixed):
+  the reconciliation route catches the M6 exceptional outcomes and
+  projects them into STABLE wire states — ReconciliationDenied →
+  reconciliation_denied (authority_expired →
+  reconciliation_authority_expired requiring a FRESH confirmation; the
+  same proposal re-confirms and resolves after expiry);
+  ReconciliationPersistenceError → reconciliation_persistence_failed
+  with the frozen record identity, the ambiguous_durability flag, and
+  the same-proposal/authority continuation requirement;
+  ReconciliationPublicationError → reconciliation_publication_failed
+  with fact_durable + guard failed_closed (and the retry genuinely
+  observes proposal_resolved — the successor state the first response
+  announced); the coordinator base → reconciliation_failed. All three
+  are injected-fault regressions against the REAL coordinator over the
+  real transport (short-TTL authority; ambiguous ledger append;
+  fail-closed guard refresh). F-76 (blocker, fixed): the operator
+  display is faithful to M6 truth — targets and proposals carry the
+  FULL lineage (semantic_key, action_type, intent_hash, policy_binding,
+  actor_id, target_type, target_id) with EXPLICIT first/current states
+  and timestamps; state is the CURRENT (last durable) record. The real
+  two-record RESERVED → EFFECT_UNKNOWN regression proves the operator
+  sees EFFECT_UNKNOWN, not the stale reserved. F-77 (blocker, fixed):
+  optional failure diagnostics consume a FIXED 64 KiB total byte budget
+  and drop deterministically (data → trace_stages → policy) before any
+  encode; the failure branch encodes through a degradation ladder whose
+  floor is a minimal mandatory envelope — the three mandatory facts
+  (public_side_effect, reconciliation_required, m5_effect_state) plus
+  the semantic key ALWAYS reach the client, never a generic internal.
+  Unsupported projected types redact to a stable <redacted:TypeName>
+  marker, not repr. Oversized uncertain-effect regression included.
+  F-78 (high, fixed): reconciliation_close reclaims registry slots;
+  per-session proposal state capped at 32 (reconciliation_proposal_
+  limit); reconciliation_list is a bounded keyset-paginated contract
+  (limit + after_effect_id, total/has_more); resolution status reports
+  a 16-key capped prefix plus the true count. Real pagination
+  regression over three seeded effects. Module headers updated to the
+  real advertised surface; the PR body's stale §14.3 deferral note
+  corrected. 10 new tests (5 portable + 5 real-stack transport). Gate
+  ALL GREEN: 1334 passed + 27 platform-skipped, ruff clean, mypy clean
+  on 101 files.
+
 - **2026-10-06 — M7 Layer 5 second repair round (PR #28, F-72/F-73/F-74):
   mutation safety state, task-owning retention, reconciliation over
   owner IPC.** F-72 (blocker, fixed): FAILED ActionResults no longer

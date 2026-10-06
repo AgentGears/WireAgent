@@ -245,15 +245,22 @@ class _FakeOperatorSession:
             semantic_key = "actor|like|post|t1"
             action_type = "like"
             intent_hash = "h1"
+            policy_binding = "policy-t1"
             actor_id = "actor"
             target_type = "post"
             target_id = "t1"
-            timestamp = "2026-10-06T00:00:00+00:00"
-            state = type("S", (), {"value": "effect_unknown"})()
+
+        first = _Rec()
+        first.timestamp = "2026-10-06T00:00:00+00:00"
+        first.state = type("S", (), {"value": "reserved"})()
+        last = _Rec()
+        last.timestamp = "2026-10-06T01:00:00+00:00"
+        last.state = type("S", (), {"value": "effect_unknown"})()
 
         class _Target:
             effect_id = "fx-1"
-            first_record = _Rec()
+            first_record = first
+            last_record = last
 
         return (_Target(),)
 
@@ -270,6 +277,7 @@ class _FakeOperatorSession:
             semantic_key = "actor|like|post|t1"
             action_type = "like"
             intent_hash = "h1"
+            policy_binding = "policy-t1"
             actor_id = "actor"
             target_type = "post"
             target_id = "t1"
@@ -320,9 +328,11 @@ async def test_reconciliation_wire_round_trip_authority_stays_private() -> None:
     client confirms by exact text and addresses the proposal by id."""
     session = _session_ready()
     opened: list = []
+
     def provider(operator_id: str) -> Any:
         opened.append(operator_id)
         return _FakeOperatorSession(operator_id)
+
     server = _server(session, invoke=_noop_invoke, provider=provider)
     instance = session.authority_instance_id
 
@@ -332,8 +342,15 @@ async def test_reconciliation_wire_round_trip_authority_stays_private() -> None:
 
     r = await _recon(server, instance, "reconciliation_list", {"reconciliation_session_id": wire_id})
     assert r["ok"] is True
-    assert r["data"]["targets"][0]["effect_id"] == "fx-1"
-    assert r["data"]["targets"][0]["state"] == "effect_unknown"
+    target = r["data"]["targets"][0]
+    assert target["effect_id"] == "fx-1"
+    # F-76: state is the CURRENT (last) record; first/current explicit;
+    # the full lineage (incl. policy_binding) is present.
+    assert target["state"] == "effect_unknown"
+    assert target["first_state"] == "reserved"
+    assert target["current_state"] == "effect_unknown"
+    assert target["current_timestamp"] == "2026-10-06T01:00:00+00:00"
+    assert target["policy_binding"] == "policy-t1"
 
     r = await _recon(
         server,
@@ -363,6 +380,7 @@ async def test_reconciliation_wire_round_trip_authority_stays_private() -> None:
     proposal = r["data"]["proposal"]
     assert proposal["proposal_id"] == "prop-1"
     assert proposal["confirmation_text"].startswith("CONFIRM fx-1")
+    assert proposal["policy_binding"] == "policy-t1"
 
     r = await _recon(
         server,
@@ -486,3 +504,210 @@ async def test_reconciliation_prepare_schema_strict(payload: dict) -> None:
     r = await _recon(server, instance, "reconciliation_prepare", payload)
     assert r["ok"] is False
     assert r["error"]["code"] == "schema"
+
+
+# ---------------------------------------------------------------------------
+# F-77: the mandatory safety envelope survives oversized diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _oversized_uncertain_failure() -> Any:
+    """An uncertain-effect failure whose projected diagnostic data is
+    deliberately enormous — a 32-wide, 4-deep nested structure (over a
+    million bounded strings) that dwarfs the 1 MiB response ceiling."""
+
+    def _grow(_depth: int) -> Any:
+        # Hundreds of 512-char strings in nested lists: every per-node cap
+        # (items/depth/length) is satisfied, yet the projected optional
+        # block is ~131 KiB — over the 64 KiB total diagnostic budget.
+        return {"blobs": [["x" * 512 for _ in range(32)] for _ in range(8)]}
+
+    result = action_result(
+        ok=False,
+        error=ActionError(
+            category=ErrorCategory.UNKNOWN,
+            message="submit clicked; verification pending",
+            recoverable=False,
+        ),
+    )
+    result.data = {
+        "policy": {"verdict": "allow", "blocked_by": None},
+        "trace": {"stages": ["intent_created", "submit_clicked_verification_pending"]},
+        "public_side_effect": True,
+        "reconciliation_required": True,
+        "m5_effect_state": "effect_unknown",
+        "semantic_key": "actor|post|none|big",
+        "data": {"diagnostic_blobs": _grow(4), "failure_code": "submit_clicked_verification_pending"},
+    }
+    return result
+
+
+async def test_oversized_failure_still_delivers_mandatory_safety_facts() -> None:
+    """F-77: when the projected diagnostics would overflow the response
+    ceiling, the degradation ladder drops them and the THREE MANDATORY
+    safety facts (plus the semantic key) still reach the client — never
+    a generic internal."""
+    session = _session_ready()
+
+    async def invoke(name: str, payload: dict) -> Any:
+        return _oversized_uncertain_failure()
+
+    server = _server(session, invoke)
+    frame = _frame("post_text", {"text": "big"}, instance_id=session.authority_instance_id)
+    response = await _respond(server, frame)
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "capability"
+    safety = response["safety"]
+    assert safety["public_side_effect"] is True
+    assert safety["reconciliation_required"] is True
+    assert safety["m5_effect_state"] == "effect_unknown"
+    assert safety["semantic_key"] == "actor|post|none|big"
+    # The oversized optional diagnostics were dropped by the ladder.
+    assert "diagnostic_blobs" not in safety.get("data", {})
+
+
+def test_unsupported_objects_redact_not_repr() -> None:
+    """F-77: unsupported object types in projected data reduce to a
+    STABLE REDACTION MARKER naming the type — a repr could leak
+    authority-object state across the boundary."""
+    from webwire.authority_ipc_server import _json_safe
+
+    class _SecretAuthority:
+        def __repr__(self) -> str:  # pragma: no cover - must never reach the wire
+            return "SecretAuthority(token='abc123')"
+
+    safe = _json_safe({"authority": _SecretAuthority(), "nested": [_SecretAuthority()]})
+    assert safe["authority"] == "<redacted:_SecretAuthority>"
+    assert safe["nested"] == ["<redacted:_SecretAuthority>"]
+
+
+# ---------------------------------------------------------------------------
+# F-78: bounded and reclaimable reconciliation resources
+# ---------------------------------------------------------------------------
+
+
+async def test_reconciliation_close_reclaims_the_registry_slot() -> None:
+    """F-78: four opens fill the bounded registry; an explicit close
+    frees the slot for a fifth open (before drain/restart)."""
+    session = _session_ready()
+    server = _server(session, invoke=_noop_invoke, provider=lambda oid: _FakeOperatorSession(oid))
+    instance = session.authority_instance_id
+
+    ids = []
+    for _ in range(4):
+        r = await _recon(server, instance, "reconciliation_open", {"operator_id": "op"})
+        assert r["ok"] is True
+        ids.append(r["data"]["reconciliation_session_id"])
+    busy = await _recon(server, instance, "reconciliation_open", {"operator_id": "op"})
+    assert busy["error"]["code"] == "reconciliation_busy"
+
+    closed = await _recon(server, instance, "reconciliation_close", {"reconciliation_session_id": ids[0]})
+    assert closed["ok"] is True and closed["data"]["closed"] is True
+    fifth = await _recon(server, instance, "reconciliation_open", {"operator_id": "op"})
+    assert fifth["ok"] is True
+
+    # The closed session is gone: its id is unknown afterwards.
+    gone = await _recon(server, instance, "reconciliation_list", {"reconciliation_session_id": ids[0]})
+    assert gone["error"]["code"] == "reconciliation_session_unknown"
+
+
+async def test_reconciliation_prepare_is_capped_per_session() -> None:
+    """F-78: the per-session proposal map is bounded — the 33rd prepare
+    is refused with a stable code."""
+    from webwire.authority_ipc_server import IPC_MAX_RECONCILIATION_PROPOSALS
+
+    session = _session_ready()
+
+    class _ManyProposalSession(_FakeOperatorSession):
+        counter = 0
+
+        def prepare_resolution(
+            self, *, effect_id: str, verdict: Any, evidence: dict, evidence_summary: str
+        ) -> Any:
+            _ManyProposalSession.counter += 1
+            proposal = super().prepare_resolution(
+                effect_id=effect_id, verdict=verdict, evidence=evidence, evidence_summary=evidence_summary
+            )
+            proposal.proposal_id = f"prop-{_ManyProposalSession.counter}"
+            return proposal
+
+    server = _server(session, invoke=_noop_invoke, provider=lambda oid: _ManyProposalSession(oid))
+    instance = session.authority_instance_id
+    wire_id = (await _recon(server, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+        "reconciliation_session_id"
+    ]
+    for i in range(IPC_MAX_RECONCILIATION_PROPOSALS):
+        r = await _recon(
+            server,
+            instance,
+            "reconciliation_prepare",
+            {
+                "reconciliation_session_id": wire_id,
+                "effect_id": "fx-1",
+                "verdict": "CONFIRMED_EFFECT",
+                "evidence": {"n": i},
+                "evidence_summary": f"summary {i}",
+            },
+        )
+        assert r["ok"] is True, r
+    overflow = await _recon(
+        server,
+        instance,
+        "reconciliation_prepare",
+        {
+            "reconciliation_session_id": wire_id,
+            "effect_id": "fx-1",
+            "verdict": "CONFIRMED_EFFECT",
+            "evidence": {"n": 99},
+            "evidence_summary": "one too many",
+        },
+    )
+    assert overflow["ok"] is False
+    assert overflow["error"]["code"] == "reconciliation_proposal_limit"
+
+
+async def test_reconciliation_list_is_paginated() -> None:
+    """F-78: list returns a bounded page with an explicit limit and
+    keyset pagination by effect_id — never an unbounded target list."""
+    session = _session_ready()
+
+    class _MultiTargetSession(_FakeOperatorSession):
+        def list_targets(self) -> Any:
+            self.calls.append("list")
+            base = super().list_targets()[0]
+            targets = []
+            for suffix in ("a", "b", "c"):
+                target = type("T", (), {})()
+                target.effect_id = f"fx-1-{suffix}"
+                target.first_record = base.first_record
+                target.last_record = base.last_record
+                targets.append(target)
+            return tuple(targets)
+
+    server = _server(session, invoke=_noop_invoke, provider=lambda oid: _MultiTargetSession(oid))
+    instance = session.authority_instance_id
+    wire_id = (await _recon(server, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+        "reconciliation_session_id"
+    ]
+
+    page1 = await _recon(
+        server,
+        instance,
+        "reconciliation_list",
+        {"reconciliation_session_id": wire_id, "limit": 2},
+    )
+    assert page1["ok"] is True
+    assert [t["effect_id"] for t in page1["data"]["targets"]] == ["fx-1-a", "fx-1-b"]
+    assert page1["data"]["total"] == 3
+    assert page1["data"]["limit"] == 2
+    assert page1["data"]["has_more"] is True
+
+    page2 = await _recon(
+        server,
+        instance,
+        "reconciliation_list",
+        {"reconciliation_session_id": wire_id, "limit": 2, "after_effect_id": "fx-1-b"},
+    )
+    assert [t["effect_id"] for t in page2["data"]["targets"]] == ["fx-1-c"]
+    assert page2["data"]["has_more"] is False

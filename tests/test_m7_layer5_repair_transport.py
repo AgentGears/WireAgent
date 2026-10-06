@@ -27,6 +27,14 @@ from webwire.envelope import ok_result
 
 BUILD_ID = compute_runtime_build_id()
 
+# The M6-valid operator evidence shape (prepare_resolution validates and
+# freezes it; minimal ad-hoc shapes die as invalid_evidence).
+_M6_EVIDENCE = {
+    "basis": "operator-review",
+    "observed_at": "2026-10-06T00:00:00+00:00",
+    "observations": [{"kind": "operator", "value": "verified"}],
+}
+
 
 def _wire_request(path: str, instance: str, operation: str, payload: dict) -> dict:
     client = IPCClient(path, expected_build_id=BUILD_ID)
@@ -105,9 +113,7 @@ async def test_timeout_is_request_in_progress_work_survives_and_joins(tmp_path: 
     ipc = AuthorityIPCServer(
         session=session, authority_domain=tmp_path, invoke=invoke, runtime_build_id=BUILD_ID
     )
-    transport = IPCTransportServer(
-        ipc_server=ipc, authority_domain=tmp_path, loop=loop, request_timeout_s=1.0
-    )
+    transport = IPCTransportServer(ipc_server=ipc, authority_domain=tmp_path, loop=loop, request_timeout_s=1.0)
     transport.start()
     path = str(transport.endpoint_path or "")
     instance = session.authority_instance_id
@@ -115,9 +121,7 @@ async def test_timeout_is_request_in_progress_work_survives_and_joins(tmp_path: 
 
     try:
         # The blocked mutation; the handler wait expires at 1s.
-        timed_out = _wire_request_id(
-            path, instance, "post_text", {"text": "uncertain"}, rid
-        )
+        timed_out = _wire_request_id(path, instance, "post_text", {"text": "uncertain"}, rid)
         assert timed_out["ok"] is False
         assert timed_out["error"]["code"] == "request_in_progress", timed_out
         assert "UNCERTAIN" in timed_out["error"]["message"]
@@ -439,5 +443,371 @@ async def test_ipc_to_writekernel_uncertain_effect_end_to_end(tmp_path: Path) ->
 
         states = [record.state for record in dispatcher._m5_ledger.read_records()]
         assert EffectState.EFFECT_UNKNOWN in states
+    finally:
+        await dispatcher.stop()
+
+
+# ---------------------------------------------------------------------------
+# Third-review repairs over the real stack: F-76 faithful display, F-75
+# exceptional M6 outcomes, F-78 real pagination
+# ---------------------------------------------------------------------------
+
+
+def _seed_effect(dispatcher: Any, effect_id: str, semantic_key: str, states: list) -> None:
+    from webwire.safety.effect_ledger import EffectLedgerRecord
+
+    for index, state in enumerate(states):
+        dispatcher._m5_ledger.append_durable(
+            EffectLedgerRecord(
+                effect_id=effect_id,
+                semantic_key=semantic_key,
+                state=state,
+                action_type="like",
+                intent_hash=f"intent-{effect_id}",
+                policy_binding=f"policy-{effect_id}",
+                actor_id="actor",
+                target_type="post",
+                target_id=effect_id,
+                timestamp=f"2026-10-06T0{index}:00:00+00:00",
+            )
+        )
+    dispatcher._m5_recovery.hydrate()
+
+
+async def test_F76_real_two_record_display_and_full_lineage(tmp_path: Path) -> None:
+    """F-76 against the REAL coordinator: a RESERVED → EFFECT_UNKNOWN
+    lifecycle displays the CURRENT state (not the first-record reserved),
+    exposes explicit first/current states and timestamps, and carries the
+    full M6 lineage — including policy_binding — on the target AND the
+    prepare/confirmation display."""
+    from webwire.safety.effect_ledger import EffectState
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        _seed_effect(
+            dispatcher,
+            "fx-f76",
+            "actor|like|post|f76|",
+            [EffectState.RESERVED, EffectState.EFFECT_UNKNOWN],
+        )
+        transport = dispatcher._ipc_transport
+        path = str(transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        listed = await _wire(path, instance, "reconciliation_list", {"reconciliation_session_id": "?"})
+        assert listed["ok"] is False  # unknown session guard sanity
+        opened = await _wire(path, instance, "reconciliation_open", {"operator_id": "op"})
+        wire_id = opened["data"]["reconciliation_session_id"]
+        listed = await _wire(path, instance, "reconciliation_list", {"reconciliation_session_id": wire_id})
+        target = listed["data"]["targets"][0]
+        assert target["effect_id"] == "fx-f76"
+        assert target["state"] == "EFFECT_UNKNOWN", "state must be the CURRENT record"
+        assert target["first_state"] == "RESERVED"
+        assert target["current_state"] == "EFFECT_UNKNOWN"
+        assert target["policy_binding"] == "policy-fx-f76"
+        assert target["current_timestamp"] == "2026-10-06T01:00:00+00:00"
+
+        prepared = await _wire(
+            path,
+            instance,
+            "reconciliation_prepare",
+            {
+                "reconciliation_session_id": wire_id,
+                "effect_id": "fx-f76",
+                "verdict": "CONFIRMED_EFFECT",
+                "evidence": _M6_EVIDENCE,
+                "evidence_summary": "verified",
+            },
+        )
+        assert prepared["ok"] is True, prepared
+        proposal = prepared["data"]["proposal"]
+        assert proposal["policy_binding"] == "policy-fx-f76"
+        assert proposal["semantic_key"] == "actor|like|post|f76|"
+    finally:
+        await dispatcher.stop()
+
+
+async def test_F75_authority_expired_requires_fresh_confirmation(tmp_path: Path) -> None:
+    """F-75: an expired authority is denied BEFORE persistence with a
+    STABLE wire state that explicitly requires fresh confirmation — and
+    the same proposal CAN be re-confirmed (M6 drops only the expired
+    authority, never the proposal)."""
+    import time as _time
+
+    from webwire.safety.reconciliation_operator import ReconciliationOperatorSession
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        from webwire.safety.effect_ledger import EffectState
+
+        _seed_effect(dispatcher, "fx-exp", "actor|like|post|exp|", [EffectState.EFFECT_UNKNOWN])
+        # Short-lived authority: the REAL coordinator, TTL injected.
+        dispatcher._ipc_server._reconciliation_provider = lambda operator_id: ReconciliationOperatorSession(
+            coordinator=dispatcher._m6_reconciliation,
+            operator_id=operator_id,
+            authority_ttl_seconds=0.05,
+        )
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+        proposal = (
+            await _wire(
+                path,
+                instance,
+                "reconciliation_prepare",
+                {
+                    "reconciliation_session_id": wire_id,
+                    "effect_id": "fx-exp",
+                    "verdict": "CONFIRMED_EFFECT",
+                    "evidence": _M6_EVIDENCE,
+                    "evidence_summary": "verified",
+                },
+            )
+        )["data"]["proposal"]
+        confirmed = await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+        assert confirmed["ok"] is True
+
+        _time.sleep(0.2)  # noqa: ASYNC251 — the authority expiry wait IS the test
+        expired = await _wire(
+            path,
+            instance,
+            "reconciliation_resolve",
+            {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+        )
+        assert expired["ok"] is False
+        assert expired["error"]["code"] == "reconciliation_authority_expired"
+        assert "FRESH explicit confirmation" in expired["error"]["message"]
+
+        # The proposal itself survives: a fresh confirmation mints new
+        # authority and resolves normally.
+        reconfirmed = await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+        assert reconfirmed["ok"] is True, reconfirmed
+        resolved = await _wire(
+            path,
+            instance,
+            "reconciliation_resolve",
+            {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+        )
+        assert resolved["ok"] is True, resolved
+    finally:
+        await dispatcher.stop()
+
+
+async def test_F75_persistence_failure_exposes_frozen_identity(tmp_path: Path) -> None:
+    """F-75: an AMBIGUOUS persistence failure after the epoch advanced and
+    the authority committed reaches the client as a stable
+    reconciliation_persistence_failed state carrying the frozen record
+    identity, the ambiguity flag, and the same-proposal continuation
+    requirement."""
+    from webwire.safety.effect_ledger import EffectState
+    from webwire.safety.reconciliation_ledger import ReconciliationLedgerAmbiguousError
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        _seed_effect(dispatcher, "fx-pers", "actor|like|post|pers|", [EffectState.EFFECT_UNKNOWN])
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+        proposal = (
+            await _wire(
+                path,
+                instance,
+                "reconciliation_prepare",
+                {
+                    "reconciliation_session_id": wire_id,
+                    "effect_id": "fx-pers",
+                    "verdict": "CONFIRMED_EFFECT",
+                    "evidence": _M6_EVIDENCE,
+                    "evidence_summary": "verified",
+                },
+            )
+        )["data"]["proposal"]
+        await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+
+        # Inject an ambiguous durable-append failure on the REAL ledger.
+        ledger = dispatcher._m6_reconciliation._reconciliation_ledger
+        original_append = ledger.append_durable
+
+        def _ambiguous_append(record: Any) -> None:
+            raise ReconciliationLedgerAmbiguousError("injected ambiguous durability")
+
+        ledger.append_durable = _ambiguous_append  # type: ignore[method-assign]
+        try:
+            failed = await _wire(
+                path,
+                instance,
+                "reconciliation_resolve",
+                {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+            )
+        finally:
+            ledger.append_durable = original_append  # type: ignore[method-assign]
+
+        assert failed["ok"] is False
+        assert failed["error"]["code"] == "reconciliation_persistence_failed", failed
+        safety = failed["safety"]
+        assert safety["ambiguous_durability"] is True
+        assert safety["record"]["effect_id"] == "fx-pers"
+        assert safety["record"]["semantic_key"] == "actor|like|post|pers|"
+        assert "SAME proposal/authority" in safety["continuation_required"]
+    finally:
+        await dispatcher.stop()
+
+
+async def test_F75_publication_failure_says_durable_guard_closed(tmp_path: Path) -> None:
+    """F-75: a durable-but-unpublished reconciliation reaches the client
+    as reconciliation_publication_failed with the frozen identity and
+    fact_durable — and the RETRY observes proposal_resolved, the successor
+    state the first response already announced."""
+    from webwire.safety.effect_ledger import EffectState
+    from webwire.safety.recovery_guard import RecoveryGuardUnavailable
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        _seed_effect(dispatcher, "fx-pub", "actor|like|post|pub|", [EffectState.EFFECT_UNKNOWN])
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+        proposal = (
+            await _wire(
+                path,
+                instance,
+                "reconciliation_prepare",
+                {
+                    "reconciliation_session_id": wire_id,
+                    "effect_id": "fx-pub",
+                    "verdict": "CONFIRMED_EFFECT",
+                    "evidence": _M6_EVIDENCE,
+                    "evidence_summary": "verified",
+                },
+            )
+        )["data"]["proposal"]
+        await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+
+        # Inject a fail-closed guard publication on the REAL coordinator.
+        guard = dispatcher._m6_reconciliation._guard
+        original_refresh = guard.refresh
+
+        def _closed_refresh() -> Any:
+            raise RecoveryGuardUnavailable("injected publication failure")
+
+        guard.refresh = _closed_refresh  # type: ignore[method-assign]
+        try:
+            failed = await _wire(
+                path,
+                instance,
+                "reconciliation_resolve",
+                {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+            )
+        finally:
+            guard.refresh = original_refresh  # type: ignore[method-assign]
+
+        assert failed["ok"] is False
+        assert failed["error"]["code"] == "reconciliation_publication_failed", failed
+        safety = failed["safety"]
+        assert safety["fact_durable"] is True
+        assert safety["guard_publication"] == "failed_closed"
+        assert safety["record"]["effect_id"] == "fx-pub"
+
+        # The durable record — not the transport response — is the truth a
+        # retry observes: the proposal is now resolved.
+        retry = await _wire(
+            path,
+            instance,
+            "reconciliation_resolve",
+            {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+        )
+        assert retry["ok"] is False
+        assert retry["error"]["code"] == "reconciliation"  # proposal_resolved (operator error)
+        assert "proposal_resolved" in retry["error"]["message"]
+    finally:
+        await dispatcher.stop()
+
+
+async def test_F78_real_pagination_over_multiple_effects(tmp_path: Path) -> None:
+    """F-78 against the REAL coordinator: three unresolved effects page
+    through the bounded list contract (limit + keyset after_effect_id)."""
+    from webwire.safety.effect_ledger import EffectState
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        for suffix in ("a", "b", "c"):
+            _seed_effect(
+                dispatcher,
+                f"fx-p-{suffix}",
+                f"actor|like|post|p{suffix}|",
+                [EffectState.EFFECT_UNKNOWN],
+            )
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+
+        page1 = await _wire(
+            path,
+            instance,
+            "reconciliation_list",
+            {"reconciliation_session_id": wire_id, "limit": 2},
+        )
+        ids1 = [t["effect_id"] for t in page1["data"]["targets"]]
+        assert len(ids1) == 2
+        assert page1["data"]["total"] == 3
+        assert page1["data"]["has_more"] is True
+
+        page2 = await _wire(
+            path,
+            instance,
+            "reconciliation_list",
+            {"reconciliation_session_id": wire_id, "limit": 2, "after_effect_id": ids1[-1]},
+        )
+        ids2 = [t["effect_id"] for t in page2["data"]["targets"]]
+        assert len(ids2) == 1
+        assert page2["data"]["has_more"] is False
+        assert set(ids1) | set(ids2) == {f"fx-p-{s}" for s in "abc"}
     finally:
         await dispatcher.stop()

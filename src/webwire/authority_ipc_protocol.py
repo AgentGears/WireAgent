@@ -7,14 +7,16 @@ One strict, non-executable protocol over bounded UTF-8 JSON (frozen
   no unbounded read, queue, or allocation anywhere in the IPC path);
 - the handshake model (``AuthorityHello``): exact protocol version,
   diagnostic runtime version, EXACT runtime_build_id, the owner's
-  authority_instance_id, canonical absolute domain, the five supported
-  operations, and lifecycle state;
+  authority_instance_id, canonical absolute domain, the frozen advertised
+  operation set, and lifecycle state;
 - deterministic runtime build identity (artifact/source hashing — package
   version is NOT a build identity; an unavailable/ambiguous exact
   identity means production IPC does not enter READY);
-- strict post-schema request validation and normalization for exactly the
-  five Layer-4 operations, deliberately NARROWER than the permissive
-  aliases local capabilities accept;
+- strict post-schema request validation and normalization for the frozen
+  advertised operations (Layer-4 pure reads/health; Layer-5 whoami, the
+  six non-file writes, and the reconciliation operator surface),
+  deliberately NARROWER than the permissive aliases local capabilities
+  accept — media/multi-image/download/compose stay unadvertised (M7-T66);
 - canonical request identity: sorted-key deterministic serialization of
   protocol_version + operation + normalized payload — request_id,
   runtime_build_id, and authority_instance_id are excluded by §10.5.
@@ -73,6 +75,7 @@ IPC_SUPPORTED_OPERATIONS = frozenset(
         "bookmark_post",
         "like_post",
         "reconciliation_open",
+        "reconciliation_close",
         "reconciliation_list",
         "reconciliation_show",
         "reconciliation_prepare",
@@ -293,8 +296,14 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
     "reconciliation_open": {
         "operator_id": (str, True, None),
     },
+    "reconciliation_close": {
+        "reconciliation_session_id": (str, True, None),
+    },
     "reconciliation_list": {
         "reconciliation_session_id": (str, True, None),
+        # F-78: keyset pagination — one bounded page per request.
+        "after_effect_id": (str, False, None),
+        "limit": (int, False, None),
     },
     "reconciliation_show": {
         "reconciliation_session_id": (str, True, None),
@@ -349,6 +358,7 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "bookmark_post": {},
     "like_post": {},
     "reconciliation_open": {},
+    "reconciliation_close": {},
     "reconciliation_list": {},
     "reconciliation_show": {},
     "reconciliation_prepare": {},

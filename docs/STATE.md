@@ -461,6 +461,34 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — M7 Layer 4 MERGED (PR #27, squash `8092e6c`).** The
+  merge-gate pass at exact head `a64e8a4` returned MERGE-READY with no
+  new blocking or high-severity findings; F-61 through F-71 closed at
+  the Layer-4 implementation boundary. The merged chain: qualified
+  owner lock → STARTING authority session → hydrated M5/M6/browser
+  root → secure platform endpoint → parked listener → READY → accept
+  enabled → bounded framing → exact protocol/build compatibility →
+  five-operation allowlist (health, read, read_profile, read_thread,
+  read_search) → strict schema + canonical request identity →
+  stale-instance admission → bounded owner work → Dispatcher; and
+  shutdown: READY → DRAINING → close IPC admission/connections/endpoint
+  → admitted owner work drains → revoke ephemeral authority → retire
+  browser/root → TERMINAL → owner lock release LAST. Real transports
+  on both platforms: Unix-domain sockets with 0600 + Linux SO_PEERCRED
+  same-uid enforcement, and Windows named pipes with a current-user
+  DACL, PIPE_REJECT_REMOTE_CLIENTS, next-instance accept, and
+  CancelIoEx drain release. Production IPC is enabled through
+  build_production_runtime() (enable_ipc=True) while raw Dispatcher
+  construction stays opt-in. Six review rounds, twelve findings
+  (F-60..F-71 with sub-items), all resolved before merge. Merge-head
+  evidence (CI #615, all four jobs green): Linux 3.11 1275 passed +
+  13 skipped, Ruff clean, mypy 100 source files clean; Windows Server
+  2025 3.11 durability 170 + 4, Layer-4 IPC 46, rule store 57; Windows
+  3.12 the same 46 Layer-4 tests; Linux 3.12 green. Deferred by design:
+  retained request table (Layer 5), artifact/media semantics (Layer 6),
+  genuine foreign-user/platform qualification + non-Linux POSIX
+  credential primitives (Layer 7), exhaustive T59 Windows Server 2025
+  remote-reachability qualification (Layer 8).
 - **2026-10-06 — PR #27 sixth repair round: F-69 accept-gate, F-70
   SO_PEERCRED, F-62 seam removal, F-71 doc truth, F-61 production
   enable.** F-69 (blocker, fixed): the frozen startup order is now
@@ -785,11 +813,15 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: layers 1-3 on main. NEXT BUILD (M7 Layer 4): local IPC
-  transport + handshake + bounded pure read/health surface (health,
-  read, read_profile, read_thread, read_search only; whoami, writes,
-  media, download_image withheld to Layers 5-6). Second adapter remains
-  deferred until the M7 boundary is stable.
+  M7 STATUS: layers 1-4 on main (Layer 4 squash-merged 2026-10-06,
+  8092e6c, after six review rounds and a merge-gate pass — all findings
+  F-60..F-71 closed at the Layer-4 implementation boundary; T59
+  exhaustive Windows-platform qualification and non-Linux POSIX peer
+  credentials remain Layers 7-8 by design). NEXT BUILD (M7 Layer 5):
+  owner-routed whoami, non-file writes, confirmation/reconciliation
+  routing, and the bounded retained request table. Layer 6
+  artifact/media semantics are NOT pulled forward. Second adapter
+  remains deferred until the M7 boundary is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

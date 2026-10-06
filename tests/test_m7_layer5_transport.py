@@ -28,6 +28,8 @@ from webwire.envelope import ok_result
 from webwire.safety.confirmation_state import ConfirmationState
 from webwire.safety.models import RiskTier
 
+_TIER = RiskTier.PUBLIC_CONTENT_IRREVERSIBLE  # post_text's tier
+
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets are POSIX-only")
 
 BUILD_ID = compute_runtime_build_id()
@@ -58,10 +60,10 @@ def _confirmation_owner(tmp_path: Path, *, confirmation: ConfirmationState, log:
         log.append(dict(input))
         token_str = input.get("confirmation_token")
         if token_str is None:
-            token = confirmation.issue(intent_hash=INTENT, risk_tier=RiskTier.HIGH, capability_name=CAP)
+            token = confirmation.issue(intent_hash=INTENT, risk_tier=_TIER, capability_name=CAP)
             return ok_result(data={"preview": "Will post", "confirmation_token": token.token})
         _token, reason = confirmation.validate_and_consume(
-            token_str, intent_hash=INTENT, risk_tier=RiskTier.HIGH, capability_name=CAP
+            token_str, intent_hash=INTENT, risk_tier=_TIER, capability_name=CAP
         )
         if reason is not None:
             return ok_result(data={"confirmation_rejected": reason})
@@ -255,7 +257,7 @@ async def test_stale_owner_instance_token_cannot_reach_execution(tmp_path: Path)
         stale_client.close()
         # No consume happened: the token is still pending authority.
         _token, reason = confirmation.validate_and_consume(
-            old_token, intent_hash=INTENT, risk_tier=RiskTier.HIGH, capability_name=CAP
+            old_token, intent_hash=INTENT, risk_tier=_TIER, capability_name=CAP
         )
         assert reason is None, "the stale replay must not consume the token"
     finally:

@@ -461,6 +461,45 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — M7 Layer 5 round one (branch m7-layer5-ipc-writes, from
+  exact main d0b0b92): whoami + non-file writes + the retained request
+  table, tests-first.** The advertised IPC surface grows from five pure
+  reads to twelve: the authority-establishing `whoami` read (M7-RV10
+  qualification — routed through the same exact-build/admission/stale
+  gates as every operation) and the six non-file-backed writes
+  (post_text, reply_post, quote_post, delete_post, bookmark_post,
+  like_post) with strict per-op schemas, at-least-one target
+  disjunctions, and the optional opaque `confirmation_token` field; the
+  existing owner-private ConfirmationState remains the token authority —
+  the pipeline only routes (frozen §13). Media/multi-image/download/
+  compose remain UNADVERTISED (M7-T66, Layer-6 forbidden scope; raw
+  client paths die as unknown schema fields before compose). The
+  retained request table (frozen §10.5, new
+  authority_ipc_request_table.py): key = request_id, comparison value =
+  the canonical normalized identity (still excluding request_id/build/
+  instance — the Layer-4 rule); new id executes once; same id + same
+  in-flight request JOINS the same owner work (await on the shared
+  future); same id + same completed request returns the RETAINED frame
+  byte-for-byte with no second invocation; same id + different canonical
+  request = request_id_reused protocol violation with no execution.
+  In-flight entries are pinned/non-evictable — saturation backpressures
+  new admission (table_full, M7-T57); completed entries are bounded LRU
+  (eviction makes no exactly-once claim, M7-T25); the table is
+  process-local — a successor owner starts empty (M7-T26). A stale-owner
+  fast-path pre-check now rejects dead-instance clients BEFORE any table
+  consultation, so an old token can never learn or reach anything under
+  the current owner (§13/M7-T30); the atomic admit still guards the
+  race. Reconciliation routing (§14.1, M7-T39): an external recovery
+  process under a live owner fails authority_busy before constructing
+  any M6 coordinator — routing through the owner is the only write
+  path; owner-absent standalone recovery remains the Layer-3 temporary
+  owner, unchanged. Layer-4 allowlist tests updated for the T61-flip.
+  New tests: 11 table units, 18 pipeline (schemas/surface/table/fencing/
+  stale-token), 5 real-socket confirmation+join (T27/T28/T29/T30/T43
+  with a REAL ConfirmationState behind the real transport, POSIX CI),
+  2 reconciliation-routing. Gate ALL GREEN: 1309 passed + 27
+  platform-skipped (Windows), ruff clean, mypy clean on 101 files.
+
 - **2026-10-06 — M7 Layer 4 MERGED (PR #27, squash `8092e6c`).** The
   merge-gate pass at exact head `a64e8a4` returned MERGE-READY with no
   new blocking or high-severity findings; F-61 through F-71 closed at

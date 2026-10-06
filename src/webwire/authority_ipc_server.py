@@ -26,6 +26,7 @@ Layer-4 constraints implemented here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ from webwire.authority_ipc_protocol import (
     compute_runtime_build_id,
     validate_and_normalize_request,
 )
+from webwire.authority_ipc_request_table import RetainedRequestTable
 from webwire.authority_session import (
     AuthorityAdmissionClosedError,
     AuthoritySession,
@@ -108,6 +110,10 @@ class AuthorityIPCServer:
         # semaphore, fed by IPC_SERVER_MAX_CONCURRENT via the Dispatcher.)
         self._kill_probe = kill_probe
         self._recovery_probe = recovery_probe
+        # M7 Layer 5 — the retained request table (frozen §10.5): the
+        # process-local dedupe state for THIS owner instance. It dies with
+        # the owner; a successor starts empty (M7-T26).
+        self._table = RetainedRequestTable()
 
     @property
     def active_requests(self) -> int:
@@ -315,6 +321,88 @@ class AuthorityIPCServer:
                 IPCRequestOutcome.error("missing_instance", "authority_instance_id is required"),
                 is_response=True,
             )
+        # M7 Layer 5 fast-path: a client addressing a DEAD owner instance
+        # is rejected as stale BEFORE any table state is consulted — an
+        # old token (or reused id) never learns or reaches anything under
+        # the current owner. The atomic admit below re-checks the race.
+        if expected_instance != self._session.authority_instance_id:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "stale_authority_instance",
+                    "the owner instance this request addressed is no longer the active owner",
+                ),
+                is_response=True,
+            )
+        # M7 Layer 5 — the retained request table (frozen §10.5). The KEY
+        # is request_id; the comparison VALUE is the canonical normalized
+        # identity (which excludes request_id/runtime_build_id/
+        # authority_instance_id — the Layer-4 rule retained by design).
+        table_decision = self._table.classify(request_id, _identity)
+        if table_decision.kind == "violation":
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "request_id_reused",
+                    "this request_id was already used for a DIFFERENT canonical "
+                    "request; a reused id must carry the identical request "
+                    "(protocol violation, no execution)",
+                ),
+                is_response=True,
+            )
+        if table_decision.kind == "retained":
+            # M7-T23: the same completed request returns the RETAINED
+            # frame — byte-for-byte, with no second Dispatcher invocation.
+            assert table_decision.response is not None
+            return table_decision.response
+        if table_decision.kind == "full":
+            # M7-T57: in-flight entries are pinned and non-evictable, so
+            # saturation backpressures NEW admission instead of evicting
+            # live owner work.
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "table_full",
+                    "the retained request table is fully occupied by in-flight "
+                    "owner work; retry after live requests complete",
+                ),
+                is_response=True,
+            )
+        if table_decision.kind == "join":
+            # M7-T22/T43: the duplicate joins the SAME owner-side work.
+            assert table_decision.future is not None
+            try:
+                return await asyncio.shield(table_decision.future)
+            except Exception as exc:  # noqa: BLE001 - the joiner reports, never executes
+                return encode_json_frame(
+                    IPCRequestOutcome.error(
+                        "internal",
+                        f"the joined owner-side request failed: {exc!r}",
+                    ),
+                    is_response=True,
+                )
+        # kind == "new": run the admitted pipeline. EVERY terminal frame
+        # completes the entry (a capability error envelope is a terminal
+        # outcome — the retry observes the same frame, never a re-run);
+        # an infrastructure exception abandons it so joiners wake and a
+        # retry classifies as NEW again.
+        try:
+            response_frame = await self._admitted_request_pipeline(
+                expected_instance=expected_instance,
+                operation=operation,
+                normalized=normalized,
+            )
+        except BaseException as exc:
+            self._table.abandon(request_id, exc)
+            raise
+        self._table.complete(request_id, response_frame)
+        return response_frame
+
+    async def _admitted_request_pipeline(
+        self,
+        *,
+        expected_instance: str,
+        operation: str,
+        normalized: dict[str, Any],
+    ) -> bytes:
+        """The drain/admission/Dispatcher tail for a NEW retained request."""
         if self._draining:
             return encode_json_frame(
                 IPCRequestOutcome.error("draining", IPC_DRAINING_MESSAGE),

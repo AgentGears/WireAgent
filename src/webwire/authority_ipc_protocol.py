@@ -52,7 +52,28 @@ __all__ = [
 # -- frozen constants (centralized; no scattered magic numbers) --------------
 
 IPC_PROTOCOL_VERSION = 1
-IPC_SUPPORTED_OPERATIONS = frozenset({"health", "read", "read_profile", "read_thread", "read_search"})
+# Layer 4: bounded pure reads/health. Layer 5 (frozen §10.3 delta +
+# M7-RV10): the authority-establishing whoami read and the six
+# NON-FILE-BACKED writes. Media-backed writes, artifact referents, and
+# download_image remain UNADVERTISED until the Layer-6 media-ingress
+# qualification (M7-T66) — requesting them dies at this allowlist,
+# before the Dispatcher is reachable.
+IPC_SUPPORTED_OPERATIONS = frozenset(
+    {
+        "health",
+        "read",
+        "read_profile",
+        "read_thread",
+        "read_search",
+        "whoami",
+        "post_text",
+        "reply_post",
+        "quote_post",
+        "delete_post",
+        "bookmark_post",
+        "like_post",
+    }
+)
 IPC_MAX_FRAME_BYTES = 1 << 20  # 1 MiB — a frame header + payload ceiling
 IPC_MAX_REQUEST_BYTES = 64 * 1024  # 64 KiB — a single request payload
 IPC_MAX_RESPONSE_BYTES = 1 << 20  # 1 MiB — a single response payload
@@ -219,7 +240,61 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "tab": (str, False, IPC_SEARCH_TABS),
         "limit": (int, False, None),
     },
+    # Layer 5: the authority-establishing read carries NO parameters.
+    "whoami": {},
+    # Layer 5 non-file writes. The optional ``confirmation_token`` is the
+    # OPAQUE owner-minted material from the preview response — the owner's
+    # ConfirmationState remains the authority; the schema only routes.
+    # Target fields are validated per-field here and as an at-least-one
+    # disjunction by _WRITE_TARGET_RULES below (a write with no target is
+    # malformed before any capability compose).
+    "post_text": {
+        "text": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "reply_post": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "quote_post": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "delete_post": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "bookmark_post": {
+        "post_id": (str, False, None),
+        "post_url": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "like_post": {
+        "post_id": (str, False, None),
+        "post_url": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
 }
+
+# Writes whose target is an at-least-one disjunction (no bare "no target"
+# write ever reaches capability compose).
+_WRITE_TARGET_RULES: dict[str, tuple[str, ...]] = {
+    "reply_post": ("post_url", "target_post_id"),
+    "quote_post": ("post_url", "target_post_id"),
+    "delete_post": ("post_url", "target_post_id"),
+    "bookmark_post": ("post_id", "post_url"),
+    "like_post": ("post_id", "post_url"),
+}
+
+# The confirmation token is opaque HIGH-ENTROPY owner-minted material
+# (secrets.token_urlsafe(16) = 22 chars; hex forms are longer). Anything
+# shorter is not a token the owner could have issued.
+_MIN_CONFIRMATION_TOKEN_CHARS = 16
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
     "health": {},
@@ -227,6 +302,15 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "read_profile": {"tab": "posts", "limit": 20, "include_retweets": True},
     "read_thread": {"limit": 20},
     "read_search": {"tab": "top", "limit": 20},
+    # Layer 5: whoami and the writes carry NO defaulted fields — exactly
+    # what the client sent, schema-validated, nothing invented.
+    "whoami": {},
+    "post_text": {},
+    "reply_post": {},
+    "quote_post": {},
+    "delete_post": {},
+    "bookmark_post": {},
+    "like_post": {},
 }
 
 
@@ -244,7 +328,14 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
     frozen defaults applied (§ item 5: health {}, read {post_url},
     read_profile {handle, tab='posts', limit=20, include_retweets=True},
     read_thread {post_url, limit=20}, read_search {query, tab='top',
-    limit=20})."""
+    limit=20}).
+
+    Layer 5 additions: whoami carries NO parameters; the six non-file
+    writes validate their strict field sets plus an at-least-one target
+    disjunction, and the optional ``confirmation_token`` must be opaque
+    high-entropy material. Raw client filesystem paths are not in any
+    Layer-5 schema — they die as unknown fields before capability
+    compose."""
     if operation not in IPC_SUPPORTED_OPERATIONS:
         raise IPCSchemaError(
             f"unknown IPC operation {operation!r}; supported: {sorted(IPC_SUPPORTED_OPERATIONS)}"
@@ -278,11 +369,23 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
             if not isinstance(value, str):
                 raise IPCSchemaError(f"{operation}.{name} must be a string")
             _check_string(f"{operation}.{name}", value)
+            if name == "confirmation_token" and len(value) < _MIN_CONFIRMATION_TOKEN_CHARS:
+                raise IPCSchemaError(
+                    f"{operation}.{name} must be opaque high-entropy material "
+                    f"(at least {_MIN_CONFIRMATION_TOKEN_CHARS} characters, as issued by the owner)"
+                )
             if enum is not None and value not in enum:
                 raise IPCSchemaError(f"{operation}.{name} must be one of {sorted(enum)}")
         else:  # pragma: no cover — schema definition error
             raise IPCSchemaError(f"internal schema error for {name}")
         normalized[name] = value
+    # Layer 5: a write with NO target is malformed — the disjunction must
+    # be satisfied by at least one present, non-empty target field.
+    target_rule = _WRITE_TARGET_RULES.get(operation)
+    if target_rule is not None and not any(normalized.get(name) for name in target_rule):
+        raise IPCSchemaError(
+            f"{operation} requires at least one of {list(target_rule)} as the target"
+        )
     return normalized
 
 

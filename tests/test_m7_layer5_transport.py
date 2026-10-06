@@ -80,6 +80,18 @@ def _confirmation_owner(tmp_path: Path, *, confirmation: ConfirmationState, log:
     return session, ipc, transport, loop, str(transport.endpoint_path or "")
 
 
+def _wire_request(path: str, instance_id: str, operation: str, payload: dict) -> dict:
+    """One request on ONE fresh connection (the frozen wire law: connect →
+    hello → one framed request → response → close). The confirmation flow
+    links requests by TOKEN, never by connection lifetime."""
+    client = IPCClient(path, expected_build_id=BUILD_ID)
+    client.connect()
+    try:
+        return client.request(_envelope(operation, payload, instance_id=instance_id))
+    finally:
+        client.close()
+
+
 def _teardown(transport, loop) -> None:
     transport.stop()
     loop.call_soon_threadsafe(loop.stop)
@@ -106,40 +118,27 @@ async def test_two_clients_share_one_owner_confirmation_state(tmp_path: Path) ->
     log: list = []
     session, ipc, transport, loop, path = _confirmation_owner(tmp_path, confirmation=confirmation, log=log)
     try:
-        a = IPCClient(path, expected_build_id=BUILD_ID)
-        b = IPCClient(path, expected_build_id=BUILD_ID)
-        hello_a = a.connect()
-        hello_b = b.connect()
+        instance = session.authority_instance_id
+        hello_a = IPCClient(path, expected_build_id=BUILD_ID).connect()
+        hello_b = IPCClient(path, expected_build_id=BUILD_ID).connect()
         assert hello_a.authority_instance_id == hello_b.authority_instance_id
 
-        preview_a = a.request(
-            _envelope("post_text", {"text": "from A"}, instance_id=session.authority_instance_id)
-        )
-        preview_b = b.request(
-            _envelope("post_text", {"text": "from B"}, instance_id=session.authority_instance_id)
-        )
+        # Each request rides its OWN connection (one request per
+        # connection); the two clients share the owner's token state.
+        preview_a = _wire_request(path, instance, "post_text", {"text": "from A"})
+        preview_b = _wire_request(path, instance, "post_text", {"text": "from B"})
         token_a = preview_a["data"]["confirmation_token"]
         token_b = preview_b["data"]["confirmation_token"]
         assert token_a and token_b and token_a != token_b
 
-        executed_a = a.request(
-            _envelope(
-                "post_text",
-                {"text": "from A", "confirmation_token": token_a},
-                instance_id=session.authority_instance_id,
-            )
+        executed_a = _wire_request(
+            path, instance, "post_text", {"text": "from A", "confirmation_token": token_a}
         )
-        executed_b = b.request(
-            _envelope(
-                "post_text",
-                {"text": "from B", "confirmation_token": token_b},
-                instance_id=session.authority_instance_id,
-            )
+        executed_b = _wire_request(
+            path, instance, "post_text", {"text": "from B", "confirmation_token": token_b}
         )
         assert executed_a["data"]["executed"] is True
         assert executed_b["data"]["executed"] is True
-        a.close()
-        b.close()
     finally:
         _teardown(transport, loop)
 
@@ -198,31 +197,18 @@ async def test_reconciliation_epoch_advances_stales_all_client_tokens(tmp_path: 
     log: list = []
     session, ipc, transport, loop, path = _confirmation_owner(tmp_path, confirmation=confirmation, log=log)
     try:
-        a = IPCClient(path, expected_build_id=BUILD_ID)
-        b = IPCClient(path, expected_build_id=BUILD_ID)
-        a.connect()
-        b.connect()
-        token_a = a.request(
-            _envelope("post_text", {"text": "A"}, instance_id=session.authority_instance_id)
-        )["data"]["confirmation_token"]
-        token_b = b.request(
-            _envelope("post_text", {"text": "B"}, instance_id=session.authority_instance_id)
-        )["data"]["confirmation_token"]
+        instance = session.authority_instance_id
+        token_a = _wire_request(path, instance, "post_text", {"text": "A"})["data"]["confirmation_token"]
+        token_b = _wire_request(path, instance, "post_text", {"text": "B"})["data"]["confirmation_token"]
 
         # The owner-side reconciliation event advances the shared epoch.
         confirmation.advance_epoch()
 
-        for client, token in ((a, token_a), (b, token_b)):
-            response = client.request(
-                _envelope(
-                    "post_text",
-                    {"text": "A" if client is a else "B", "confirmation_token": token},
-                    instance_id=session.authority_instance_id,
-                )
+        for text, token in (("A", token_a), ("B", token_b)):
+            response = _wire_request(
+                path, instance, "post_text", {"text": text, "confirmation_token": token}
             )
             assert response["data"].get("confirmation_rejected") == "stale_confirmation_epoch"
-        a.close()
-        b.close()
     finally:
         _teardown(transport, loop)
 

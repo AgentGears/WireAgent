@@ -15,6 +15,8 @@ import asyncio
 import secrets
 import socket
 import struct
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,13 +24,18 @@ import pytest
 
 from webwire.authority_ipc_framing import HEADER_SIZE, encode_json_frame
 from webwire.authority_ipc_protocol import (
+    IPC_MAX_RESPONSE_BYTES,
     IPC_PROTOCOL_VERSION,
+    IPC_SUPPORTED_OPERATIONS,
+    AuthorityHello,
     compute_runtime_build_id,
 )
 from webwire.authority_ipc_server import AuthorityIPCServer
 from webwire.authority_ipc_transport import IPCClient, IPCTransportServer
 from webwire.authority_session import AuthoritySession
+from webwire.config import WebWireConfig
 from webwire.envelope import ok_result
+from webwire.safety.kill_switch import KillSwitch
 
 # POSIX-only: AF_UNIX sockets. Windows named-pipe transport qualification
 # is Layer 8; the security pipeline is qualified independently on both
@@ -55,6 +62,9 @@ def _server_with_transport(
     invoke_result: Any = None,
     invoke_log: list | None = None,
     slow_release: asyncio.Event | None = None,
+    max_concurrent: int = 4,
+    kill_probe: Any = None,
+    recovery_probe: Any = None,
 ):
     session = _session_ready()
     loop = asyncio.new_event_loop()
@@ -81,8 +91,15 @@ def _server_with_transport(
         authority_domain=authority_domain,
         invoke=invoke,
         runtime_build_id=BUILD_ID,
+        kill_probe=kill_probe,
+        recovery_probe=recovery_probe,
     )
-    transport = IPCTransportServer(ipc_server=ipc, authority_domain=authority_domain, loop=loop)
+    transport = IPCTransportServer(
+        ipc_server=ipc,
+        authority_domain=authority_domain,
+        loop=loop,
+        max_concurrent=max_concurrent,
+    )
     transport.start()
     path = transport.endpoint_path or ""
     return session, ipc, transport, loop, path
@@ -287,8 +304,6 @@ async def test_real_disconnect_does_not_cancel_admitted_work(tmp_path: Path) -> 
 
 def _wait_event(event: asyncio.Event) -> None:
     """Block until the event is set (called from executor thread)."""
-    import time
-
     deadline = time.monotonic() + 10
     while not event.is_set() and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -317,5 +332,255 @@ async def test_disconnect_before_request_no_admission(tmp_path: Path) -> None:
         time.sleep(0.2)  # let the handler see the close  # noqa: ASYNC251
         assert session.active_work == 0
         assert log == [], "no Dispatcher invocation"
+    finally:
+        _teardown(transport, loop)
+
+
+# ---------------------------------------------------------------------------
+# F-62: saturation — bounded handler slots refuse, not queue
+# ---------------------------------------------------------------------------
+
+
+async def test_saturation_third_connection_refused_without_hello(tmp_path: Path) -> None:
+    """Capacity 2: two admitted requests hold both handler slots; a THIRD
+    connection is refused at accept time — closed without ever receiving a
+    hello. No unlimited waiters, no queue growth. After release, the two
+    held requests complete normally."""
+    release = asyncio.Event()
+    session, ipc, transport, loop, path = _server_with_transport(
+        tmp_path, slow_release=release, max_concurrent=2
+    )
+    results: list[Any] = []
+
+    def _held_request() -> None:
+        client = IPCClient(path, expected_build_id=BUILD_ID)
+        client.connect()
+        response = client.request(
+            _envelope("read", {"post_url": "u"}, instance_id=session.authority_instance_id)
+        )
+        results.append(response)
+        client.close()
+
+    first = threading.Thread(target=_held_request)
+    second = threading.Thread(target=_held_request)
+    first.start()
+    second.start()
+    try:
+        # Wait until BOTH requests are admitted (each admission implies its
+        # handler slot is held for the whole connection). The admission
+        # counter is mutated on the owner loop's thread — poll it.
+        deadline = time.monotonic() + 5
+        while ipc.active_requests < 2 and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.02)
+        assert ipc.active_requests == 2, "both held requests must be admitted"
+
+        # The third connection: refused WITHOUT a hello (closed at accept).
+        with pytest.raises(ConnectionError):
+            IPCClient(path, expected_build_id=BUILD_ID).connect()
+
+        # Release: the two held requests complete.
+        loop.call_soon_threadsafe(release.set)
+        first.join(timeout=10)
+        second.join(timeout=10)
+        assert len(results) == 2
+        assert all(r["ok"] is True for r in results)
+    finally:
+        _teardown(transport, loop)
+
+
+# ---------------------------------------------------------------------------
+# F-65: the abnormal §10.3 wire states are PRODUCIBLE from live signals
+# ---------------------------------------------------------------------------
+
+
+async def test_wire_state_killed_via_real_kill_switch(tmp_path: Path) -> None:
+    """A tripped KillSwitch (the SAME object the enforcement path consults)
+    makes the hello carry state=killed on the wire."""
+    kill = KillSwitch(WebWireConfig(state_dir=tmp_path / "kill-domain"))
+    session, ipc, transport, loop, path = _server_with_transport(
+        tmp_path, kill_probe=kill.tripped
+    )
+    try:
+        kill.trip()
+        client = IPCClient(path, expected_build_id=BUILD_ID)
+        hello = client.connect()
+        assert hello.lifecycle_state == "killed"
+        client.close()
+        kill.reset()
+    finally:
+        _teardown(transport, loop)
+
+
+async def test_wire_state_recovery_unavailable_via_probe(tmp_path: Path) -> None:
+    """A recovery probe reporting unavailable makes the hello carry
+    state=recovery_unavailable on the wire (the guard's status().available
+    degrades to False when composite recovery truth cannot be held)."""
+    session, ipc, transport, loop, path = _server_with_transport(
+        tmp_path, recovery_probe=lambda: True
+    )
+    try:
+        client = IPCClient(path, expected_build_id=BUILD_ID)
+        hello = client.connect()
+        assert hello.lifecycle_state == "recovery_unavailable"
+        client.close()
+    finally:
+        _teardown(transport, loop)
+
+
+# ---------------------------------------------------------------------------
+# F-67: malicious-server regressions — the CLIENT refuses oversized frames
+# before body allocation (bounded receive on the client side)
+# ---------------------------------------------------------------------------
+
+
+def _fake_hello_frame() -> bytes:
+    hello = AuthorityHello(
+        protocol_version=IPC_PROTOCOL_VERSION,
+        runtime_version="3.11.0",
+        runtime_build_id=BUILD_ID,
+        authority_instance_id="a" * 64,
+        authority_domain="/fake",
+        supported_operations=IPC_SUPPORTED_OPERATIONS,
+        lifecycle_state="ready",
+    )
+    return encode_json_frame(hello.to_dict(), is_response=True)
+
+
+def _serve_one_connection(server_sock: socket.socket, frames: list[bytes]) -> None:
+    """Accept one client, send the prepared frames, hold the connection."""
+    server_sock.settimeout(10)
+    conn, _ = server_sock.accept()
+    try:
+        for frame in frames:
+            conn.sendall(frame)
+        conn.settimeout(10)
+        try:
+            conn.recv(1)  # hold open until the client closes
+        except OSError:
+            pass
+    finally:
+        conn.close()
+
+
+async def test_client_refuses_oversized_hello_before_body_read(tmp_path: Path) -> None:
+    """A malicious server announcing an over-ceiling hello length: the
+    client refuses from the HEADER, before allocating/reading the body."""
+    evil = struct.pack(">Q", IPC_MAX_RESPONSE_BYTES + 1)
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    fake_path = str(tmp_path / "evil.sock")
+    server_sock.bind(fake_path)
+    server_sock.listen(1)
+    try:
+        thread = threading.Thread(target=_serve_one_connection, args=(server_sock, [evil]))
+        thread.start()
+
+        client = IPCClient(fake_path, expected_build_id=BUILD_ID)
+        with pytest.raises(ValueError, match="exceeds the .*-byte ceiling"):
+            client.connect()
+        assert client._sock is None, "the client must close after refusing"
+        thread.join(timeout=10)
+    finally:
+        server_sock.close()
+
+
+async def test_client_refuses_oversized_response_before_body_read(tmp_path: Path) -> None:
+    """A malicious server: valid hello, then an over-ceiling RESPONSE
+    announcement. The client's request() refuses from the header."""
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    fake_path = str(tmp_path / "evil2.sock")
+    server_sock.bind(fake_path)
+    server_sock.listen(1)
+
+    def _hello_then_evil() -> None:
+        server_sock.settimeout(10)
+        conn, _ = server_sock.accept()
+        try:
+            conn.sendall(_fake_hello_frame())
+            # Swallow the client's request frame (bounded).
+            hdr = b""
+            while len(hdr) < HEADER_SIZE:
+                chunk = conn.recv(HEADER_SIZE - len(hdr))
+                if not chunk:
+                    return
+                hdr += chunk
+            (length,) = struct.unpack(">Q", hdr)
+            body = b""
+            while len(body) < length:
+                chunk = conn.recv(length - len(body))
+                if not chunk:
+                    return
+                body += chunk
+            # Announce an over-ceiling response.
+            conn.sendall(struct.pack(">Q", IPC_MAX_RESPONSE_BYTES + 1))
+            conn.settimeout(10)
+            try:
+                conn.recv(1)
+            except OSError:
+                pass
+        finally:
+            conn.close()
+
+    try:
+        thread = threading.Thread(target=_hello_then_evil)
+        thread.start()
+
+        client = IPCClient(fake_path, expected_build_id=BUILD_ID)
+        client.connect()
+        envelope = _envelope("read", {"post_url": "u"}, instance_id="a" * 64)
+        with pytest.raises(ValueError, match="exceeds the .*-byte ceiling"):
+            client.request(envelope)
+        client.close()
+        thread.join(timeout=10)
+    finally:
+        server_sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Idle-client shutdown: drain closes the stalled handler, the rendezvous
+# disappears, and a successor owner can bind the same path
+# ---------------------------------------------------------------------------
+
+
+async def test_idle_client_shutdown_successor_binds(tmp_path: Path) -> None:
+    """The reviewer-specified shutdown sequence with an IDLE client: the
+    client connects, reads the hello, then stalls before sending any
+    frame. Drain (transport.stop) closes the stalled connection — the
+    handler exits — the rendezvous pathname is ABSENT, and a SUCCESSOR
+    endpoint can bind the same path immediately."""
+    session, ipc, transport, loop, path = _server_with_transport(tmp_path)
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        # Read the hello, then stall (send nothing).
+        hdr = b""
+        while len(hdr) < HEADER_SIZE:
+            hdr += sock.recv(HEADER_SIZE - len(hdr))
+        (hello_len,) = struct.unpack(">Q", hdr)
+        body = b""
+        while len(body) < hello_len:
+            body += sock.recv(hello_len - len(body))
+
+        # Drain: close connections first, then the endpoint (unlinks).
+        transport.stop()
+
+        # The idle client sees EOF — its handler exited.
+        sock.settimeout(5)
+        assert sock.recv(1) == b"", "the stalled handler must be closed at drain"
+        sock.close()
+
+        # The rendezvous pathname is absent.
+        import os
+
+        assert not os.path.exists(path), "endpoint pathname must be gone after stop"  # noqa: ASYNC240
+
+        # A successor owner binds the same path without interference.
+        from webwire.authority_ipc_endpoint import create_endpoint
+
+        successor = create_endpoint(tmp_path)
+        successor.bind()
+        try:
+            assert successor.path == path
+        finally:
+            successor.close()
     finally:
         _teardown(transport, loop)

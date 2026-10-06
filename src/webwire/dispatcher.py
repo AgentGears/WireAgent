@@ -319,6 +319,11 @@ class Dispatcher:
                             session=session,
                             authority_domain=self._config.state_dir,
                             invoke=self._invoke_admitted,
+                            # F-65: live producers for the abnormal §10.3
+                            # wire states — the SAME objects the enforcement
+                            # path consults, never a second source of truth.
+                            kill_probe=self._kill.tripped,
+                            recovery_probe=self._recovery_unavailable,
                         )
                         self._ipc_transport = IPCTransportServer(
                             ipc_server=self._ipc_server,
@@ -920,6 +925,20 @@ class Dispatcher:
     @property
     def kill_switch(self) -> KillSwitch:
         return self._kill
+
+    def _recovery_unavailable(self) -> bool:
+        """F-65 wire-state probe: composite recovery truth is not currently
+        available. Diagnostic only — mutation enforcement fails closed in the
+        guard itself (require_clear), independently of this probe. Before the
+        guard exists (pre-start) there is no live owner to diagnose, so the
+        probe reports available."""
+        guard = getattr(self, "_m5_recovery", None)
+        if guard is None:
+            return False
+        try:
+            return not guard.status().available
+        except Exception:  # noqa: BLE001 - the pipeline treats a raising probe as not signalled
+            return False
 
     @property
     def session_manager(self) -> SessionManager:

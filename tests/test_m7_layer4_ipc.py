@@ -513,3 +513,89 @@ def test_hello_carries_exact_build_and_current_owner() -> None:
     restored = AuthorityHello.from_dict(wire)
     assert restored.runtime_build_id == BUILD_ID
     assert restored.authority_instance_id == session.authority_instance_id
+
+
+# ---------------------------------------------------------------------------
+# F-65: the abnormal §10.3 wire states are PRODUCIBLE from live signals
+# (platform-portable: no socket, direct pipeline qualification)
+# ---------------------------------------------------------------------------
+
+
+def _server_with_probes(
+    session: AuthoritySession,
+    *,
+    kill_probe: Any = None,
+    recovery_probe: Any = None,
+) -> AuthorityIPCServer:
+    async def invoke(name: str, input: dict) -> Any:
+        return ok_result(data={"ok": True})
+
+    return AuthorityIPCServer(
+        session=session,
+        authority_domain=Path("ipc-test"),
+        invoke=invoke,
+        runtime_build_id=BUILD_ID,
+        kill_probe=kill_probe,
+        recovery_probe=recovery_probe,
+    )
+
+
+def test_wire_state_killed_from_live_kill_switch(tmp_path: Path) -> None:
+    """A tripped KillSwitch — the SAME object the enforcement path
+    consults — makes the hello carry state=killed on the wire."""
+    from webwire.config import WebWireConfig
+    from webwire.safety.kill_switch import KillSwitch
+
+    kill = KillSwitch(WebWireConfig(state_dir=tmp_path))
+    session = _session_ready()
+    server = _server_with_probes(session, kill_probe=kill.tripped)
+    try:
+        assert server._hello().lifecycle_state == "ready"
+        kill.trip()
+        assert server._hello().lifecycle_state == "killed"
+    finally:
+        kill.reset()
+
+
+def test_wire_state_recovery_unavailable_from_probe() -> None:
+    """A recovery probe reporting unavailable (the RecoveryGuard's
+    status().available degraded to False) makes the hello carry
+    state=recovery_unavailable on the wire."""
+    session = _session_ready()
+    server = _server_with_probes(session, recovery_probe=lambda: True)
+    assert server._hello().lifecycle_state == "recovery_unavailable"
+
+
+def test_wire_state_priority_killed_outranks_recovery_and_lifecycle() -> None:
+    """Safety signals outrank lifecycle diagnostics: with BOTH the kill
+    switch tripped and recovery unavailable, the wire says killed."""
+    session = _session_ready()
+    server = _server_with_probes(
+        session,
+        kill_probe=lambda: True,
+        recovery_probe=lambda: True,
+    )
+    assert server._hello().lifecycle_state == "killed"
+
+
+def test_wire_state_recovery_outranks_ready_lifecycle() -> None:
+    """With recovery unavailable on a READY session, the wire explains
+    the degraded condition instead of claiming plain readiness."""
+    session = _session_ready()
+    server = _server_with_probes(session, recovery_probe=lambda: True)
+    assert session.state.value == "ready"
+    assert server._hello().lifecycle_state == "recovery_unavailable"
+
+
+def test_wire_state_raising_probe_degrades_to_lifecycle_answer() -> None:
+    """A probe that raises must not break the handshake: the diagnostic
+    degrades to the lifecycle answer. Enforcement is unaffected — the
+    kill switch and the recovery guard still fail closed in their own
+    paths, independently of this diagnostic field."""
+    session = _session_ready()
+
+    def _boom() -> bool:
+        raise RuntimeError("probe backend vanished")
+
+    server = _server_with_probes(session, kill_probe=_boom, recovery_probe=_boom)
+    assert server._hello().lifecycle_state == "ready"

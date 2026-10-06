@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 import struct
 import threading
 from pathlib import Path
 from typing import Any, Optional
 
-from webwire.authority_ipc_endpoint import IPCEndpoint, create_endpoint
+from webwire.authority_ipc_endpoint import IPCEndpoint, connect_local_stream, create_endpoint
 from webwire.authority_ipc_framing import (
     HEADER_SIZE,
     FrameHeader,
@@ -241,16 +240,14 @@ class IPCClient:
     def __init__(self, endpoint_path: str, *, expected_build_id: str) -> None:
         self._path = endpoint_path
         self._expected_build = expected_build_id
-        self._sock: Optional[Any] = None
+        self._sock: Optional[Any] = None  # socket or _WindowsPipeConnection
         self._hello: Optional[AuthorityHello] = None
 
     def connect(self) -> AuthorityHello:
-        """Connect, read hello with BOUNDED framing, verify exact
-        protocol + build."""
-        if not hasattr(socket, "AF_UNIX"):
-            raise RuntimeError("AF_UNIX sockets are POSIX-only")
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(self._path)
+        """Connect via the PLATFORM connector (POSIX domain socket or
+        Windows named pipe), read hello with BOUNDED framing, verify
+        exact protocol + build."""
+        sock = connect_local_stream(self._path)
         self._sock = sock
         # F-67: bounded receive with the strict decoder — the response
         # ceiling bounds the hello (a hello IS a response-shaped frame).

@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from webwire.authority_ipc_framing import (
     FrameHeader,
@@ -90,6 +90,8 @@ class AuthorityIPCServer:
         invoke: Any,  # async callable(name, input) -> ActionResult
         runtime_build_id: Optional[str] = None,
         max_concurrent: int = IPC_SERVER_MAX_CONCURRENT,
+        kill_probe: Optional[Callable[[], bool]] = None,
+        recovery_probe: Optional[Callable[[], bool]] = None,
     ) -> None:
         if runtime_build_id is None:
             runtime_build_id = compute_runtime_build_id()
@@ -100,6 +102,12 @@ class AuthorityIPCServer:
         self._max_concurrent = max_concurrent  # F-62: consumed by the transport
         self._active_requests = 0
         self._draining = False
+        # F-65: live producers for the two abnormal §10.3 wire states. The
+        # Dispatcher wires kill_probe to KillSwitch.tripped and recovery_probe
+        # to "not RecoveryGuard.status().available" — the same signals the
+        # enforcement path already consults, never a second source of truth.
+        self._kill_probe = kill_probe
+        self._recovery_probe = recovery_probe
 
     @property
     def active_requests(self) -> int:
@@ -136,7 +144,27 @@ class AuthorityIPCServer:
         return frozenset({"ready", "draining", "killed", "recovery_unavailable"})
 
     def _wire_state(self) -> str:
-        """Map the internal session state to the frozen wire vocabulary."""
+        """Map live owner signals to the frozen wire vocabulary.
+
+        Priority: killed > recovery_unavailable > ready > draining. The
+        safety signals outrank the lifecycle ones — a client connecting
+        during the drain race window still deserves to learn that the
+        kill switch is tripped or that composite recovery truth is
+        unavailable. A probe that raises is treated as "not signalled"
+        (fail-open on the DIAGNOSTIC only; the enforcement paths behind
+        these signals stay fail-closed independently)."""
+        if self._kill_probe is not None:
+            try:
+                if self._kill_probe():
+                    return "killed"
+            except Exception:  # noqa: BLE001 - diagnostic probe must not break hello
+                logger.exception("kill_probe raised; treating as not signalled")
+        if self._recovery_probe is not None:
+            try:
+                if self._recovery_probe():
+                    return "recovery_unavailable"
+            except Exception:  # noqa: BLE001 - diagnostic probe must not break hello
+                logger.exception("recovery_probe raised; treating as not signalled")
         internal = self._session.state.value
         if internal == "ready":
             return "ready"

@@ -187,12 +187,15 @@ def _fit_optional_budget(safety: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in safety.items() if key not in optional_keys}
 
 
-def _failure_frame(code: str, message: str, safety: dict[str, Any]) -> bytes:
-    """F-77: encode a failure envelope through a DETERMINISTIC DEGRADATION
-    LADDER — the budgeted projection, then without the optional diagnostic
-    blocks entirely, then the minimal mandatory envelope. Mandatory safety
-    facts always reach the client; optional diagnostics are dropped
-    first, and a failed failure-frame NEVER becomes a generic internal."""
+def _failure_frame(code: str, message: str, safety: dict[str, Any], result: Any = None) -> bytes:
+    """F-77/F-80: encode a failure envelope through a DETERMINISTIC
+    DEGRADATION LADDER whose floor is SIZE-INDEPENDENT — the diagnostic
+    message itself is bounded at every rung, and the absolute floor uses
+    a fixed synthetic message plus the independently extracted mandatory
+    safety facts. Mandatory facts always reach the client; a failed
+    failure-frame NEVER becomes a generic internal."""
+    bounded_code = code[:64]
+    bounded_message = (message or "")[:_FAILURE_MESSAGE_MAX_CHARS]
     budgeted = _fit_optional_budget(safety)
     candidates = [budgeted]
     without_optionals = {
@@ -203,13 +206,26 @@ def _failure_frame(code: str, message: str, safety: dict[str, Any]) -> bytes:
     candidates.append(_MANDATORY_ONLY_MERGE(budgeted))
     for candidate in candidates:
         try:
-            return encode_json_frame(IPCRequestOutcome.failure(code, message, candidate), is_response=True)
+            return encode_json_frame(
+                IPCRequestOutcome.failure(bounded_code, bounded_message, candidate),
+                is_response=True,
+            )
         except IPCProtocolError:
             continue
-    # The mandatory envelope is booleans plus ≤64-char strings; this
-    # encode cannot realistically fail, but the law is absolute — never
-    # let a failed failure-frame become a generic internal.
-    return encode_json_frame(IPCRequestOutcome.failure(code, message, {}), is_response=True)
+    # F-80 absolute floor: fixed synthetic message + the INDEPENDENTLY
+    # extracted hard-capped mandatory facts (from the result itself, not
+    # the projected dict). This rung cannot exceed any wire ceiling.
+    return encode_json_frame(
+        IPCRequestOutcome.failure(
+            bounded_code,
+            "capability failed; optional diagnostics omitted",
+            _mandatory_safety(result) if result is not None else {},
+        ),
+        is_response=True,
+    )
+
+
+_FAILURE_MESSAGE_MAX_CHARS = 2048
 
 
 def _MANDATORY_ONLY_MERGE(safety: dict[str, Any]) -> dict[str, Any]:
@@ -708,11 +724,14 @@ class AuthorityIPCServer:
             # F-72: a FAILED outcome carries its bounded safety projection —
             # public_side_effect / reconciliation_required / m5_effect_state
             # and friends must survive the boundary so a client can tell an
-            # uncertain external mutation from a clean denial.
+            # uncertain external mutation from a clean denial. F-80: the
+            # result is passed through so the ladder's floor can extract
+            # the mandatory facts independently of any oversized message.
             return _failure_frame(
                 "capability",
                 error_msg or "capability failed",
                 _safety_projection(result),
+                result=result,
             )
         try:
             return encode_json_frame(IPCRequestOutcome.ok(data), is_response=True)
@@ -772,15 +791,34 @@ class AuthorityIPCServer:
                 # F-78: reclaimable logical sessions — an explicit close
                 # frees the registry slot (and discards any uncommitted
                 # proposal/authority state) before owner drain/restart.
+                # F-79: a session holding a COMMITTED-BUT-UNCONSUMED
+                # authority (an M6 persistence continuation in progress)
+                # must NOT be closable — this wire session holds the only
+                # client-reachable reference to the exact committed
+                # authority; destroying it would strand the continuation
+                # (committed_resolution_in_progress) for this owner's
+                # whole lifetime. The client must first re-drive the exact
+                # committed proposal to known durability.
                 close_id = payload.get("reconciliation_session_id")
-                closed = (
-                    self._reconciliation_sessions.pop(close_id, None) if isinstance(close_id, str) else None
+                closable = (
+                    self._reconciliation_sessions.get(close_id) if isinstance(close_id, str) else None
                 )
-                if closed is None:
+                if closable is None:
                     return _error(
                         "reconciliation_session_unknown",
                         "unknown, drained, or restarted reconciliation session",
                     )
+                for authority in closable.authorities.values():
+                    if getattr(authority, "committed", False) and not getattr(authority, "consumed", True):
+                        return _error(
+                            "reconciliation_continuation_required",
+                            "this session holds a COMMITTED-but-unconsumed "
+                            "reconciliation authority whose exact continuation is "
+                            "still required — re-drive the same proposal (with a "
+                            "FRESH request_id) to known durability before closing",
+                        )
+                assert isinstance(close_id, str)  # guarded by the lookup above
+                self._reconciliation_sessions.pop(close_id, None)
                 return _ok({"closed": True})
 
             session_id = payload.get("reconciliation_session_id")
@@ -795,21 +833,24 @@ class AuthorityIPCServer:
             op = current.operator_session
 
             if operation == "reconciliation_list":
-                # F-78: a bounded list contract — keyset pagination by
-                # effect_id with an explicit limit; never an unbounded page.
-                targets = op.list_targets()
+                # F-81: the bounded query lives BELOW the materialization
+                # seam — the owner-side operator API constructs at most
+                # `limit` targets; the wire layer never materializes or
+                # sorts the full unresolved set. `total` is the TRUE total
+                # unresolved count (a count, not a list); `remaining` is
+                # the candidate count after the cursor.
                 after = payload.get("after_effect_id")
                 limit = payload.get("limit", IPC_RECONCILIATION_LIST_DEFAULT_LIMIT)
-                if after:
-                    targets = tuple(target for target in targets if target.effect_id > after)
-                ordered = sorted(targets, key=lambda target: target.effect_id)
-                page = ordered[:limit]
+                page, total, remaining, has_more = op.list_targets_page(
+                    limit=limit, after_effect_id=after if after else None
+                )
                 return _ok(
                     {
                         "targets": [_serialize_target(t) for t in page],
-                        "total": len(targets),
+                        "total": total,
+                        "remaining": remaining,
                         "limit": limit,
-                        "has_more": len(ordered) > len(page),
+                        "has_more": has_more,
                     }
                 )
 
@@ -890,7 +931,9 @@ class AuthorityIPCServer:
                     "ambiguous_durability": exc.ambiguous,
                     "continuation_required": (
                         "continue the SAME proposal/authority — do not re-confirm "
-                        "or re-prepare a new proposal for this fact"
+                        "or re-prepare a new proposal for this fact; re-drive the "
+                        "resolve with a FRESH request_id (the failed request's "
+                        "retained frame cannot perform the continuation)"
                     ),
                 },
             )

@@ -811,3 +811,246 @@ async def test_F78_real_pagination_over_multiple_effects(tmp_path: Path) -> None
         assert set(ids1) | set(ids2) == {f"fx-p-{s}" for s in "abc"}
     finally:
         await dispatcher.stop()
+
+
+# ---------------------------------------------------------------------------
+# Fourth-review regressions over the real stack: F-79 committed-continuation
+# close protection; F-81 true-total pagination through the bounded query
+# ---------------------------------------------------------------------------
+
+
+async def test_F79_close_refused_until_committed_continuation_redriven(tmp_path: Path) -> None:
+    """F-79: after an ambiguous persistence failure the wire session holds
+    the ONLY client-reachable reference to the exact committed authority.
+    close is REFUSED (reconciliation_continuation_required); the session
+    survives; a retry of the FAILED request_id returns the retained
+    failure (it cannot perform the continuation); a FRESH request_id
+    re-drives the SAME proposal and succeeds; only then does close
+    succeed."""
+    from webwire.safety.effect_ledger import EffectState
+    from webwire.safety.reconciliation_ledger import ReconciliationLedgerAmbiguousError
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        _seed_effect(dispatcher, "fx-f79", "actor|like|post|f79|", [EffectState.EFFECT_UNKNOWN])
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+        proposal = (
+            await _wire(
+                path,
+                instance,
+                "reconciliation_prepare",
+                {
+                    "reconciliation_session_id": wire_id,
+                    "effect_id": "fx-f79",
+                    "verdict": "CONFIRMED_EFFECT",
+                    "evidence": _M6_EVIDENCE,
+                    "evidence_summary": "verified",
+                },
+            )
+        )["data"]["proposal"]
+        await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+
+        # Inject the ambiguous persistence failure for ONE resolve.
+        ledger = dispatcher._m6_reconciliation._reconciliation_ledger
+        original_append = ledger.append_durable
+
+        def _ambiguous_append(record: Any) -> None:
+            raise ReconciliationLedgerAmbiguousError("injected ambiguous durability")
+
+        ledger.append_durable = _ambiguous_append  # type: ignore[method-assign]
+        try:
+            failed = await _wire(
+                path,
+                instance,
+                "reconciliation_resolve",
+                {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+            )
+        finally:
+            ledger.append_durable = original_append  # type: ignore[method-assign]
+        assert failed["error"]["code"] == "reconciliation_persistence_failed"
+        assert "FRESH request_id" in failed["safety"]["continuation_required"]
+
+        # The wire session now holds a committed-but-unconsumed authority:
+        # close is REFUSED and the session survives.
+        refused = await _wire(path, instance, "reconciliation_close", {"reconciliation_session_id": wire_id})
+        assert refused["ok"] is False
+        assert refused["error"]["code"] == "reconciliation_continuation_required"
+        still = await _wire(
+            path, instance, "reconciliation_list", {"reconciliation_session_id": wire_id, "limit": 1}
+        )
+        assert still["ok"] is True, "the session must survive the refused close"
+
+        # A NEW open is NOT a workaround for the continuation either — but
+        # more importantly the SAME session's exact authority re-drives:
+        # a retry with the FAILED request_id returns the retained failure
+        # (cannot continue), so a fresh id is required. Re-drive now.
+        resolved = await _wire(
+            path,
+            instance,
+            "reconciliation_resolve",
+            {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+        )
+        assert resolved["ok"] is True, resolved
+        assert resolved["data"]["resolution"]["confirmation_epoch"] >= 1
+
+        # Continuation complete: close now succeeds.
+        closed = await _wire(path, instance, "reconciliation_close", {"reconciliation_session_id": wire_id})
+        assert closed["ok"] is True and closed["data"]["closed"] is True
+    finally:
+        await dispatcher.stop()
+
+
+async def test_F79_same_request_id_retry_returns_retained_persistence_failure(tmp_path: Path) -> None:
+    """The §10.5 corollary the F-75 response now states: retrying the
+    FAILED resolve with the SAME request_id returns the retained failure
+    frame byte-identically — it cannot perform the continuation; only a
+    FRESH request_id executes the re-drive."""
+    import json as _json
+    import secrets as _secrets
+
+    from webwire.authority_ipc_framing import encode_json_frame as _enc
+    from webwire.authority_ipc_framing import parse_frame_header as _parse
+    from webwire.safety.effect_ledger import EffectState
+    from webwire.safety.reconciliation_ledger import ReconciliationLedgerAmbiguousError
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        _seed_effect(dispatcher, "fx-f79b", "actor|like|post|f79b|", [EffectState.EFFECT_UNKNOWN])
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+        proposal = (
+            await _wire(
+                path,
+                instance,
+                "reconciliation_prepare",
+                {
+                    "reconciliation_session_id": wire_id,
+                    "effect_id": "fx-f79b",
+                    "verdict": "CONFIRMED_EFFECT",
+                    "evidence": _M6_EVIDENCE,
+                    "evidence_summary": "verified",
+                },
+            )
+        )["data"]["proposal"]
+        await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+
+        def _resolve_frame(rid: str) -> bytes:
+            return _enc(
+                {
+                    "protocol_version": 1,
+                    "operation": "reconciliation_resolve",
+                    "payload": {
+                        "reconciliation_session_id": wire_id,
+                        "proposal_id": proposal["proposal_id"],
+                    },
+                    "request_id": rid,
+                    "authority_instance_id": instance,
+                    "runtime_build_id": dispatcher._ipc_server._runtime_build_id,
+                }
+            )
+
+        async def _drive(frame: bytes) -> dict:
+            header, consumed = _parse(frame)
+            return _json.loads((await dispatcher._ipc_server.process_request(header, frame[consumed:]))[8:])
+
+        # 1. The resolve FAILS under an injected ambiguous append.
+        ledger = dispatcher._m6_reconciliation._reconciliation_ledger
+        original_append = ledger.append_durable
+
+        def _ambiguous_append(record: Any) -> None:
+            raise ReconciliationLedgerAmbiguousError("injected ambiguous durability")
+
+        rid = _secrets.token_hex(16)
+        frame = _resolve_frame(rid)
+        ledger.append_durable = _ambiguous_append  # type: ignore[method-assign]
+        try:
+            failed = await _drive(frame)
+        finally:
+            ledger.append_durable = original_append  # type: ignore[method-assign]
+        assert failed["error"]["code"] == "reconciliation_persistence_failed"
+
+        # 2. SAME request_id: the retained failure frame, byte-identical —
+        #    no continuation.
+        assert await _drive(frame) == failed
+
+        # 3. FRESH request_id: the exact committed authority re-drives and
+        #    resolves terminally.
+        resolved = await _drive(_resolve_frame(_secrets.token_hex(16)))
+        assert resolved["ok"] is True, resolved
+    finally:
+        await dispatcher.stop()
+
+
+async def test_F81_true_total_and_remaining_pagination(tmp_path: Path) -> None:
+    """F-81 via the real bounded query: `total` is the TRUE total
+    unresolved count (cursor-independent); `remaining` is after-cursor."""
+    from webwire.safety.effect_ledger import EffectState
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        for suffix in ("a", "b", "c"):
+            _seed_effect(
+                dispatcher,
+                f"fx-q-{suffix}",
+                f"actor|like|post|q{suffix}|",
+                [EffectState.EFFECT_UNKNOWN],
+            )
+        path = str(dispatcher._ipc_transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+        wire_id = (await _wire(path, instance, "reconciliation_open", {"operator_id": "op"}))["data"][
+            "reconciliation_session_id"
+        ]
+
+        page1 = await _wire(
+            path,
+            instance,
+            "reconciliation_list",
+            {"reconciliation_session_id": wire_id, "limit": 2},
+        )
+        ids1 = [t["effect_id"] for t in page1["data"]["targets"]]
+        assert len(ids1) == 2
+        assert page1["data"]["total"] == 3
+        assert page1["data"]["remaining"] == 3
+        assert page1["data"]["has_more"] is True
+
+        page2 = await _wire(
+            path,
+            instance,
+            "reconciliation_list",
+            {"reconciliation_session_id": wire_id, "limit": 2, "after_effect_id": ids1[-1]},
+        )
+        ids2 = [t["effect_id"] for t in page2["data"]["targets"]]
+        assert len(ids2) == 1
+        assert page2["data"]["total"] == 3, "the TRUE total is cursor-independent"
+        assert page2["data"]["remaining"] == 1
+        assert page2["data"]["has_more"] is False
+        assert set(ids1) | set(ids2) == {f"fx-q-{s}" for s in "abc"}
+    finally:
+        await dispatcher.stop()

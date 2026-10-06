@@ -268,6 +268,19 @@ class _FakeOperatorSession:
         self.calls.append(("show", effect_id))
         return self.list_targets()[0]
 
+    def list_targets_page(self, *, limit: int, after_effect_id=None) -> Any:
+        targets = self.list_targets()
+        ids = sorted(t.effect_id for t in targets)
+        eligible = [i for i in ids if after_effect_id is None or i > after_effect_id]
+        page_ids = eligible[:limit]
+        by_id = {t.effect_id: t for t in targets}
+        return (
+            [by_id[i] for i in page_ids],
+            len(ids),
+            len(eligible),
+            len(eligible) > len(page_ids),
+        )
+
     def prepare_resolution(self, *, effect_id: str, verdict: Any, evidence: dict, evidence_summary: str) -> Any:
         self.calls.append(("prepare", effect_id))
         operator_id = self.operator_id
@@ -699,7 +712,8 @@ async def test_reconciliation_list_is_paginated() -> None:
     )
     assert page1["ok"] is True
     assert [t["effect_id"] for t in page1["data"]["targets"]] == ["fx-1-a", "fx-1-b"]
-    assert page1["data"]["total"] == 3
+    assert page1["data"]["total"] == 3  # TRUE total unresolved, not after-cursor
+    assert page1["data"]["remaining"] == 3
     assert page1["data"]["limit"] == 2
     assert page1["data"]["has_more"] is True
 
@@ -710,4 +724,62 @@ async def test_reconciliation_list_is_paginated() -> None:
         {"reconciliation_session_id": wire_id, "limit": 2, "after_effect_id": "fx-1-b"},
     )
     assert [t["effect_id"] for t in page2["data"]["targets"]] == ["fx-1-c"]
+    assert page2["data"]["total"] == 3  # true total is cursor-independent
+    assert page2["data"]["remaining"] == 1
     assert page2["data"]["has_more"] is False
+
+# ---------------------------------------------------------------------------
+# F-80: the safety envelope is size-independent — even a >1 MiB message
+# ---------------------------------------------------------------------------
+
+
+async def test_giant_error_message_still_delivers_mandatory_safety() -> None:
+    """F-80: a capability error message LARGER than the response ceiling
+    cannot push every degradation rung over the limit — the message is
+    bounded at each rung and the absolute floor (synthetic message +
+    independently extracted mandatory facts) always encodes. The response
+    decodes normally, carries the code and mandatory safety facts, is
+    never a generic internal, and the same request_id returns the
+    retained identical frame."""
+    session = _session_ready()
+    calls: list = []
+
+    def _giant_failure() -> Any:
+        result = action_result(
+            ok=False,
+            error=ActionError(
+                category=ErrorCategory.UNKNOWN,
+                message="x" * (2 * 1024 * 1024),  # 2 MiB — over every ceiling
+                recoverable=False,
+            ),
+        )
+        result.data = {
+            "public_side_effect": True,
+            "reconciliation_required": True,
+            "m5_effect_state": "effect_unknown",
+            "semantic_key": "actor|post|none|giant",
+        }
+        return result
+
+    async def invoke(name: str, payload: dict) -> Any:
+        calls.append(name)
+        return _giant_failure()
+
+    server = _server(session, invoke)
+    rid = secrets.token_hex(16)
+    frame = _frame("post_text", {"text": "boom"}, instance_id=session.authority_instance_id, request_id=rid)
+
+    response = await _respond(server, frame)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "capability"
+    assert len(response["error"]["message"]) <= 2048, "the wire message is bounded"
+    safety = response["safety"]
+    assert safety["public_side_effect"] is True
+    assert safety["reconciliation_required"] is True
+    assert safety["m5_effect_state"] == "effect_unknown"
+    assert safety["semantic_key"] == "actor|post|none|giant"
+
+    # The retained retry is identical — no re-execution.
+    second = await _respond(server, frame)
+    assert second == response
+    assert len(calls) == 1

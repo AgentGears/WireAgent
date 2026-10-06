@@ -134,6 +134,16 @@ class ReconciliationOperatorSession:
         """Read-only equivalent of ``webwire recovery list``."""
         return self._coordinator.list_targets()
 
+    def list_targets_page(
+        self,
+        *,
+        limit: int,
+        after_effect_id: Optional[str] = None,
+    ) -> tuple[list[ReconciliationTarget], int, int, bool]:
+        """M7 Layer 5 (F-81): bounded read-only enumeration — at most
+        ``limit`` targets are constructed; see the coordinator."""
+        return self._coordinator.list_targets_page(limit=limit, after_effect_id=after_effect_id)
+
     def show_target(self, effect_id: str) -> ReconciliationTarget:
         """Read-only equivalent of ``webwire recovery show <effect_id>``."""
         return self._coordinator.describe_target(effect_id)

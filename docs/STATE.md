@@ -461,6 +461,40 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — M7 Layer 5 fourth repair round (PR #28, F-79/F-80/F-81):
+  committed-continuation close protection, size-independent safety
+  floor, execution-bounded reconciliation pagination.** F-79 (blocker,
+  fixed): reconciliation_close REFUSES to close a logical session
+  holding any committed-but-unconsumed ReconciliationAuthority
+  (stable code reconciliation_continuation_required) — that wire session
+  is the only client-reachable reference to the exact committed fact,
+  and destroying it would strand the M6 continuation
+  (committed_resolution_in_progress) for the owner's whole lifetime.
+  The F-75 persistence response now explicitly requires a FRESH
+  request_id for the re-drive (the failed request's retained §10.5
+  frame cannot perform the continuation). Real-coordinator regressions:
+  ambiguous persistence failure → close REFUSED, session survives →
+  same-id retry returns the retained failure byte-identically → fresh
+  id re-drives the exact committed authority → resolves → close only
+  then succeeds. F-80 (blocker, fixed): the failure ladder bounds the
+  DIAGNOSTIC MESSAGE at every rung (2048 chars) and its absolute floor
+  is size-independent — a fixed synthetic message plus the
+  INDEPENDENTLY extracted hard-capped mandatory facts (_mandatory_safety
+  is now actually used, taking the result itself, not the projected
+  dict). A >1 MiB error message with uncertain-effect facts still
+  delivers code+mandatory safety, never internal, and the same
+  request_id returns the retained identical frame. F-81 (high, fixed):
+  the bounded query moved BELOW the materialization seam — the
+  coordinator grows list_targets_page(limit, after_effect_id)
+  constructing at most `limit` ReconciliationTargets (cursor and
+  ordering over ids; only the page's projections are wrapped), exposed
+  through the operator delegate and the owner-admitted wrapper; the
+  wire layer no longer materializes or sorts the full unresolved set.
+  `total` is now the TRUE total unresolved count (cursor-independent)
+  and `remaining` is the after-cursor candidate count. Real-stack
+  pagination regression updated accordingly. 4 new tests. Gate ALL
+  GREEN locally; ruff + mypy clean on 101 files.
+
 - **2026-10-06 — M7 Layer 5 third repair round (PR #28, F-75/F-76/F-77/F-78):
   exceptional M6 wire states, faithful display, guaranteed safety
   envelope, bounded reconciliation resources.** F-75 (blocker, fixed):

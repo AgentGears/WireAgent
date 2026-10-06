@@ -304,6 +304,43 @@ class ReconciliationCoordinator:
             if item.unresolved
         )
 
+    def list_targets_page(
+        self,
+        *,
+        limit: int,
+        after_effect_id: Optional[str] = None,
+    ) -> tuple[list[ReconciliationTarget], int, int, bool]:
+        """M7 Layer 5 (F-81): BOUNDED operator enumeration.
+
+        Unlike ``list_targets`` — which materializes every unresolved
+        target for the local CLI — this pages by effect_id and constructs
+        AT MOST ``limit`` ReconciliationTarget objects: the cursor and
+        ordering work over ids, and only the returned page's projections
+        are wrapped. Returns ``(page, total_unresolved, remaining_after_cursor,
+        has_more)`` where ``total_unresolved`` is the TRUE total across
+        all unresolved targets (a count, never a materialized list)."""
+        if limit < 1:
+            raise ReconciliationDenied("invalid_limit")
+        projection = self._guard.projector.project()
+        unresolved_ids = [item.effect_id for item in projection if item.unresolved]
+        total = len(unresolved_ids)
+        eligible = sorted(
+            effect_id for effect_id in unresolved_ids if after_effect_id is None or effect_id > after_effect_id
+        )
+        page_ids = eligible[:limit]
+        wanted = set(page_ids)
+        by_id = {item.effect_id: item for item in projection if item.effect_id in wanted}
+        page = [
+            ReconciliationTarget(
+                effect_id=effect_id,
+                first_record=by_id[effect_id].first_record,
+                last_record=by_id[effect_id].last_record,
+                projection=by_id[effect_id],
+            )
+            for effect_id in page_ids
+        ]
+        return page, total, len(eligible), len(eligible) > len(page_ids)
+
     def _describe_target_locked(self, effect_id: str) -> ReconciliationTarget:
         """Describe a target while publication/protocol/lifecycle fences are held."""
         if self._gateway.live_attempt_owns_effect(effect_id):

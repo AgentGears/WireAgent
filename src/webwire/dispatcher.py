@@ -147,6 +147,7 @@ class Dispatcher:
         # M7 Layer 4: the IPC server binds after the browser/root and
         # before READY; closes before TERMINAL in the shutdown law.
         self._ipc_server: Optional[Any] = None
+        self._ipc_transport: Optional[Any] = None
         self._enable_ipc = enable_ipc
         # The lifecycle fence between start() and stop(). Asyncio (not
         # threading): a threading lock acquired by a waiting coroutine would
@@ -299,22 +300,33 @@ class Dispatcher:
                 raise
             if result.ok:
                 if self._enable_ipc:
-                    # M7 Layer 4: bind the secured IPC endpoint AFTER the
-                    # browser/root and BEFORE READY — no READY window with
-                    # the production endpoint missing. Bind/security failure
-                    # is a startup failure following the fail-closed law.
-                    # Opt-in: the security pipeline is fully tested via
-                    # AuthorityIPCServer independently; endpoint transport
-                    # activation is a deployment configuration.
+                    # M7 Layer 4 (F-68): the frozen startup order is
+                    #   bind endpoint → READY → start accepting
+                    # The transport binds BEFORE session.activate() and
+                    # starts accepting AFTER it — a STARTING owner never
+                    # serves hellos. Bind/security failure is a startup
+                    # failure following the fail-closed law.
                     try:
-                        from webwire.authority_ipc_server import AuthorityIPCServer
+                        from webwire.authority_ipc_server import (
+                            IPC_SERVER_MAX_CONCURRENT,
+                            AuthorityIPCServer,
+                        )
+                        from webwire.authority_ipc_transport import (
+                            IPCTransportServer,
+                        )
 
                         self._ipc_server = AuthorityIPCServer(
                             session=session,
                             authority_domain=self._config.state_dir,
                             invoke=self._invoke_admitted,
                         )
-                        self._ipc_server.start()
+                        self._ipc_transport = IPCTransportServer(
+                            ipc_server=self._ipc_server,
+                            authority_domain=self._config.state_dir,
+                            loop=asyncio.get_event_loop(),
+                            max_concurrent=IPC_SERVER_MAX_CONCURRENT,  # F-62: one source
+                        )
+                        self._ipc_transport.bind()  # endpoint exists, not yet accepting
                     except BaseException as exc:
                         logger.exception("IPC endpoint bind failed")
                         await self._teardown_failed_start(session)
@@ -328,6 +340,10 @@ class Dispatcher:
                             failure_category=FailureCategory.SECURITY,
                         )
                 session.activate()
+                # F-68: start accepting only AFTER READY — a STARTING
+                # owner never serves hellos to clients.
+                if self._enable_ipc and self._ipc_transport is not None:
+                    self._ipc_transport.start_accepting()
                 try:
                     # `is not None`, not `or {}`: an empty-but-present data
                     # dict must be enriched IN PLACE, not replaced.
@@ -372,13 +388,15 @@ class Dispatcher:
         # F-52: proven quiescent + revoked — mark the failed session
         # TERMINAL before closing the owner handle, so the Dispatcher never
         # reports a live session it no longer owns.
-        # M7 Layer 4: close the IPC endpoint if a bind happened or was
-        # partially attempted — no endpoint outlives the owner session.
-        if self._ipc_server is not None:
+        # M7 Layer 4: close the IPC transport + endpoint if a bind happened
+        # or was partially attempted — no endpoint outlives the owner session.
+        if self._ipc_transport is not None:
             try:
-                self._ipc_server.stop()
+                self._ipc_transport.stop()
             except Exception:  # noqa: BLE001 — cleanup during teardown
-                logger.warning("IPC endpoint cleanup during failed start")
+                logger.warning("IPC transport cleanup during failed start")
+            self._ipc_transport = None
+        if self._ipc_server is not None:
             self._ipc_server = None
         session.abort_from_starting()
         self._release_authority()
@@ -553,6 +571,9 @@ class Dispatcher:
             # already-open connections cannot submit fresh work.
             if self._ipc_server is not None:
                 self._ipc_server.begin_drain()
+            if self._ipc_transport is not None:
+                self._ipc_transport.stop()  # closes connections + endpoint + unlinks
+                self._ipc_transport = None
             # 2. Drain all admitted owner work. The invocation lock waits
             #    for in-flight invokes (and blocks new ones); the session
             #    drain waits for admitted reconciliation operations.
@@ -603,11 +624,9 @@ class Dispatcher:
                         "ownership is retained fail-closed",
                         failure_category=FailureCategory.SECURITY,
                     )
-                # 4b. M7 Layer 4: close/unlink the IPC endpoint BEFORE
-                # TERMINAL — the endpoint never outlives the owner session.
-                if self._ipc_server is not None:
-                    self._ipc_server.stop()
-                    self._ipc_server = None
+                # 4b. M7 Layer 4: the transport was already stopped at
+                # step 1 (DRAINING); the endpoint never outlives the owner.
+                self._ipc_server = None
                 # 5. Terminal, then 6. release LAST. A release failure
                 # (F-58) is fail-stop: the owner handle is RETAINED (the
                 # release-retry path above handles a later stop) and the

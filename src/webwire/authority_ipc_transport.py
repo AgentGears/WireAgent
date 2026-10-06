@@ -111,15 +111,31 @@ class IPCTransportServer:
     def endpoint_path(self) -> Optional[str]:
         return self._endpoint.path if self._endpoint else None
 
-    def start(self) -> None:
-        """Create+bind the QUALIFIED endpoint (umask, stale cleanup,
-        0600) and start the bounded accept loop."""
+    def bind(self) -> None:
+        """F-68: Create+bind the QUALIFIED endpoint WITHOUT accepting.
+
+        The frozen §8.1 startup order is: create endpoint → READY →
+        begin accepting client work. This method performs only the
+        first step; the Dispatcher calls it BEFORE session.activate(),
+        then calls start_accepting() AFTER READY. A STARTING owner
+        never serves hellos."""
         self._endpoint = create_endpoint(self._authority_domain)
         self._endpoint.bind()  # F-66: the qualified endpoint owns all security
+
+    def start_accepting(self) -> None:
+        """F-68: Begin the bounded accept loop (AFTER READY)."""
+        if self._endpoint is None:
+            raise RuntimeError("bind() must be called before start_accepting()")
         self._running = True
         thread = threading.Thread(target=self._accept_loop, daemon=True, name="webwire-ipc-listener")
         thread.start()
         self._listener_thread = thread
+
+    def start(self) -> None:
+        """Convenience: bind + start_accepting (for tests that don't
+        need the two-phase lifecycle). Production uses the split."""
+        self.bind()
+        self.start_accepting()
 
     _listener_thread: Optional[threading.Thread] = None
 

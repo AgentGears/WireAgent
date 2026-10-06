@@ -26,13 +26,11 @@ Layer-4 constraints implemented here:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from webwire.authority_ipc_endpoint import IPCEndpoint, create_endpoint
 from webwire.authority_ipc_framing import (
     FrameHeader,
     encode_json_frame,
@@ -99,43 +97,20 @@ class AuthorityIPCServer:
         self._authority_domain = authority_domain
         self._invoke = invoke
         self._runtime_build_id = runtime_build_id
-        self._max_concurrent = max_concurrent
+        self._max_concurrent = max_concurrent  # F-62: consumed by the transport
         self._active_requests = 0
         self._draining = False
-        self._endpoint: Optional[IPCEndpoint] = None
-        self._listener_task: Optional[asyncio.Task] = None
-
-    @property
-    def endpoint_path(self) -> Optional[str]:
-        return self._endpoint.path if self._endpoint else None
 
     @property
     def active_requests(self) -> int:
         return self._active_requests
 
-    # -- lifecycle (called from Dispatcher.start/stop) ----------------------
-
-    def start(self) -> None:
-        """Bind the secured IPC endpoint (before READY). Raises on any
-        bind/security failure — the Dispatcher treats that as a startup
-        failure and follows the fail-closed teardown law."""
-        self._endpoint = create_endpoint(self._authority_domain)
-        self._endpoint.bind()
-        self._draining = False
+    # -- lifecycle (drain flag only; the TRANSPORT owns the endpoint) -----
 
     def begin_drain(self) -> None:
         """Stop accepting new IPC work (called at DRAINING). Already-open
         connections cannot submit fresh work after this point."""
         self._draining = True
-
-    def stop(self) -> None:
-        """Close/unlink the endpoint (called BEFORE terminalize/release)."""
-        self._draining = True
-        if self._endpoint is not None:
-            try:
-                self._endpoint.close()
-            finally:
-                self._endpoint = None
 
     # -- request processing (the security pipeline) -------------------------
 
@@ -196,8 +171,14 @@ class AuthorityIPCServer:
             return encode_json_frame(IPCRequestOutcome.error("protocol", str(exc)), is_response=True)
 
         # Handshake/compatibility fields on the request envelope.
+        # F-63: int-but-not-bool — Python's == lets True==1 and 1.0==1
+        # through a plain != comparison; the exact gate must reject both.
         protocol_version = request.get("protocol_version")
-        if protocol_version != IPC_PROTOCOL_VERSION:
+        if (
+            isinstance(protocol_version, bool)
+            or not isinstance(protocol_version, int)
+            or protocol_version != IPC_PROTOCOL_VERSION
+        ):
             return encode_json_frame(
                 IPCRequestOutcome.error(
                     "protocol_mismatch",

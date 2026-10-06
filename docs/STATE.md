@@ -487,6 +487,27 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #27 fourth repair round: F-68 lifecycle split +
+  Dispatcher wiring + protocol fixes.** F-68 (blocker, fixed):
+  IPCTransportServer is split into bind() (creates+binds the qualified
+  endpoint WITHOUT accepting) and start_accepting() (begins the bounded
+  accept loop). The Dispatcher now constructs BOTH AuthorityIPCServer
+  (the security pipeline) AND IPCTransportServer (the operational
+  transport), calling transport.bind() BEFORE session.activate() and
+  transport.start_accepting() AFTER it — the frozen §8.1 order: create
+  endpoint → READY → begin accepting client work. A STARTING owner
+  never serves hellos. AuthorityIPCServer is now a pure pipeline (its
+  start/stop/endpoint lifecycle methods removed — the transport owns the
+  endpoint). Shutdown: transport.stop() at DRAINING (closes connections
+  + endpoint + unlinks) before terminalize/release. F-63 (partial fix):
+  protocol_version now rejects bool (True≠1 gate) and float (1.0≠1) —
+  the exact int check runs before the equality comparison. F-62:
+  max_concurrent is single-sourced — the Dispatcher constructs the
+  transport with IPC_SERVER_MAX_CONCURRENT (from the pipeline module's
+  constant); AuthorityIPCServer._max_concurrent is consumed by the
+  transport, not independently enforced. The old AuthorityIPCServer
+  constructor parameter is retained for API compatibility but the
+  transport's max_concurrent is the ONE capacity authority.
 - **2026-10-02 — PR #27 third repair round: F-66/F-67 + F-63/F-65
   completion.** F-66 (blocker, fixed): the POSIX transport NO LONGER
   binds its own socket — IPCTransportServer now creates and consumes the

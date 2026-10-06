@@ -487,6 +487,34 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #27 third repair round: F-66/F-67 + F-63/F-65
+  completion.** F-66 (blocker, fixed): the POSIX transport NO LONGER
+  binds its own socket — IPCTransportServer now creates and consumes the
+  QUALIFIED IPCEndpoint (create_endpoint → bind, which owns
+  umask-before-bind, stale-path cleanup under ownership, 0600
+  permissions, and unlink-on-close). There is ONE rendezvous and ONE
+  lifecycle owner. F-67 (blocker, fixed): the IPCClient now uses ONE
+  bounded receive primitive (_bounded_receive: read 8-byte header →
+  reject lengths over the ceiling BEFORE body allocation → read exactly
+  the announced body → decode with the strict JSON decoder). Both the
+  hello receive (connect) and the response receive (request) enforce
+  IPC_MAX_RESPONSE_BYTES; no unbounded allocation happens before the
+  owner's identity is verified. F-63 (completed): envelope validation
+  is now EXACT EQUALITY with the six frozen keys — both unknown AND
+  missing fields reject (a health request without `payload` now fails
+  schema, not silently defaulting to {}). F-65 (completed): the hello
+  wire state uses the FROZEN §10.3 vocabulary
+  (ready/draining/killed/recovery_unavailable) — NOT the internal
+  AuthoritySession lifecycle; the server maps internal→wire states
+  (ready→ready; starting/draining/terminal→draining for wire purposes);
+  from_dict validates against the §10.3 set; the unreachable duplicate
+  check beneath the state validation was the exact leftover the reviewer
+  flagged — removed. F-62 (partial→improved): the transport semaphore
+  now takes max_concurrent from the constructor parameter (no longer
+  hardcoded 4); connection tracking added (stop() closes all tracked
+  connections, then the endpoint — idle handlers exit, admitted work
+  still governed by session drain). Saturation regression test still
+  TBD.
 - **2026-10-02 — PR #27 second repair round: F-60 POSIX transport +
   F-63/F-65 completion.** The operational POSIX transport (F-60) is now
   REAL: a bounded thread-based accept loop over Unix-domain sockets

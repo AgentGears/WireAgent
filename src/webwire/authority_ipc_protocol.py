@@ -174,12 +174,12 @@ class AuthorityHello:
         for field in ("runtime_version", "runtime_build_id", "authority_instance_id", "authority_domain"):
             if not isinstance(raw[field], str) or not raw[field]:
                 raise IPCProtocolError(f"hello {field} must be a non-empty string")
-        # F-65: state must be from the frozen lifecycle vocabulary.
-        _VALID_STATES = frozenset({"starting", "ready", "draining", "terminal"})
-        if raw["state"] not in _VALID_STATES:
-            raise IPCProtocolError(f"hello state {raw['state']!r} must be one of {sorted(_VALID_STATES)}")
-            if not isinstance(raw[field], str) or not raw[field]:
-                raise IPCProtocolError(f"hello {field} must be a non-empty string")
+        # F-65: state must be from the FROZEN §10.3 WIRE vocabulary
+        # (ready/draining/killed/recovery_unavailable) — NOT the internal
+        # session lifecycle states.
+        _VALID_WIRE_STATES = frozenset({"ready", "draining", "killed", "recovery_unavailable"})
+        if raw["state"] not in _VALID_WIRE_STATES:
+            raise IPCProtocolError(f"hello state {raw['state']!r} must be one of {sorted(_VALID_WIRE_STATES)}")
         ops = raw["supported_ipc_operations"]
         if not isinstance(ops, list) or not all(isinstance(o, str) for o in ops):
             raise IPCProtocolError("supported_ipc_operations must be a list of strings")

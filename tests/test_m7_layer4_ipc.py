@@ -383,7 +383,10 @@ async def test_missing_instance_id_rejected() -> None:
     frame = _request("read", {"post_url": "u"})  # no instance_id
     header, consumed = parse_frame_header(frame)
     response = json.loads((await server.process_request(header, frame[consumed:]))[8:])
-    assert response["error"]["code"] == "missing_instance"
+    # F-63: exact envelope equality catches the MISSING key here (before
+    # the dedicated instance check would fire).
+    assert response["error"]["code"] == "schema"
+    assert "missing" in response["error"]["message"]
     assert log == []
 
 

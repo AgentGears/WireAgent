@@ -147,8 +147,27 @@ class AuthorityIPCServer:
             authority_instance_id=self._session.authority_instance_id,
             authority_domain=str(self._authority_domain),
             supported_operations=IPC_SUPPORTED_OPERATIONS,
-            lifecycle_state=self._session.state.value,
+            # F-65: the WIRE state is the frozen §10.3 diagnostic vocabulary
+            # (ready/draining/killed/recovery_unavailable), NOT the internal
+            # AuthoritySession lifecycle. A STARTING owner never serves
+            # hellos (the endpoint binds during STARTING but the accept
+            # loop starts at READY); terminal maps to draining for wire
+            # purposes (a terminal owner accepts nothing).
+            lifecycle_state=self._wire_state(),
         )
+
+    @staticmethod
+    def _WIRE_STATES() -> frozenset[str]:
+        return frozenset({"ready", "draining", "killed", "recovery_unavailable"})
+
+    def _wire_state(self) -> str:
+        """Map the internal session state to the frozen wire vocabulary."""
+        internal = self._session.state.value
+        if internal == "ready":
+            return "ready"
+        # draining / starting / terminal all mean "not accepting" on the
+        # wire; the §10.3 vocabulary has no "starting" or "terminal".
+        return "draining"
 
     async def process_request(self, raw_header: FrameHeader, raw_payload: bytes) -> bytes:
         """The full security pipeline for one framed request.
@@ -251,8 +270,8 @@ class AuthorityIPCServer:
                 is_response=True,
             )
 
-        # F-63: the ENTIRE envelope is strict — exactly the six frozen
-        # keys; unknown envelope fields reject before admission.
+        # F-63: the ENTIRE envelope is strict — EXACT EQUALITY with the
+        # six frozen keys (both unknown AND missing fields reject).
         _ENVELOPE_KEYS = frozenset(
             {
                 "protocol_version",
@@ -263,12 +282,19 @@ class AuthorityIPCServer:
                 "payload",
             }
         )
-        _envelope_unknown = set(request.keys()) - _ENVELOPE_KEYS
-        if _envelope_unknown:
+        _envelope_actual = set(request.keys())
+        _envelope_unknown = _envelope_actual - _ENVELOPE_KEYS
+        _envelope_missing = _ENVELOPE_KEYS - _envelope_actual
+        if _envelope_unknown or _envelope_missing:
+            _detail = []
+            if _envelope_unknown:
+                _detail.append(f"unknown: {sorted(_envelope_unknown)}")
+            if _envelope_missing:
+                _detail.append(f"missing: {sorted(_envelope_missing)}")
             return encode_json_frame(
                 IPCRequestOutcome.error(
                     "schema",
-                    f"unknown envelope fields: {sorted(_envelope_unknown)}",
+                    "envelope must have exactly the six frozen keys; " + "; ".join(_detail),
                 ),
                 is_response=True,
             )

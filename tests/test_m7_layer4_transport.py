@@ -75,15 +75,16 @@ def _server_with_transport(
             await slow_release.wait()
         return invoke_result or ok_result(data={"ok": True})
 
+    authority_domain = tmp_path  # F-66: the qualified endpoint derives from this
     ipc = AuthorityIPCServer(
         session=session,
-        authority_domain=Path("transport-test"),
+        authority_domain=authority_domain,
         invoke=invoke,
         runtime_build_id=BUILD_ID,
     )
-    path = _sock_path(tmp_path)
-    transport = IPCTransportServer(ipc_server=ipc, endpoint_path=path, loop=loop)
+    transport = IPCTransportServer(ipc_server=ipc, authority_domain=authority_domain, loop=loop)
     transport.start()
+    path = transport.endpoint_path or ""
     return session, ipc, transport, loop, path
 
 

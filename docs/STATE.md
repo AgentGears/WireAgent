@@ -461,6 +461,89 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — PR #27 sixth repair round: F-69 accept-gate, F-70
+  SO_PEERCRED, F-62 seam removal, F-71 doc truth, F-61 production
+  enable.** F-69 (blocker, fixed): the frozen startup order is now
+  bind endpoint → prepare PARKED listener thread → READY → release the
+  accept gate. IPCTransportServer.start_accepting() creates the listener
+  thread while the session is still STARTING — the thread parks on a
+  threading.Event (the READY gate) and only enters accept() after
+  release_accept_gate(), a non-failing Event.set() called after
+  session.activate(). A Thread.start() failure therefore raises inside
+  the guarded startup block where the normal fail-closed STARTING
+  cleanup applies (revoke → browser quiesce → endpoint close/unlink →
+  TERMINAL → ownership release) — a READY owner can no longer be
+  stranded with a bound endpoint and no accept loop. Regression:
+  injected listener-thread failure proves never-READY (revoke is
+  impossible from READY per the F-59 state gate), browser/root quiesced,
+  transport cleared, successor lock acquires. F-70 (high, fixed):
+  PosixDomainSocketEndpoint.accept() now enforces the frozen §10.1
+  peer-identity requirement on Linux via SO_PEERCRED — the
+  kernel-reported peer uid must equal the owner's effective uid; a
+  foreign uid is closed BEFORE the hello and returns None, which the
+  accept loop skips WITHOUT consuming a handler slot (rejection is not
+  a listener failure; the listener survives). macOS/BSD primitives
+  remain Layer 7. Regression: foreign-uid client rejected without a
+  hello, then a same-uid client served a full roundtrip by the SAME
+  listener. F-62 (cleanup): the dead AuthorityIPCServer
+  max_concurrent constructor parameter/field is REMOVED — capacity
+  lives in exactly one place, the transport semaphore fed by
+  IPC_SERVER_MAX_CONCURRENT (now also the transport's default).
+  F-71 (docs): the Windows endpoint/test documentation now describes
+  the shipped classic DACL assembly (SetEntriesInAclW +
+  InitializeSecurityDescriptor + SetSecurityDescriptorDacl), not the
+  abandoned BuildSecurityDescriptorW route (whose empirical record
+  stays in scripts/diag_pipe_dacl.py); STATE and the PR body updated
+  to this head. F-61 (closed): build_production_runtime() constructs
+  its dispatcher with enable_ipc=True — production IPC is ON through
+  the real factory while the Dispatcher default stays False (tests and
+  offline recovery do not silently gain an endpoint). Factory-injected
+  test doubles carry the kwarg; a regression asserts the production
+  call passes True.
+- **2026-10-06 — PR #27 fifth repair round: Windows named-pipe transport
+  operational (F-64), wire-state producers (F-65), saturation and
+  malicious-server and shutdown regressions (F-62/F-67).** F-64: the
+  Windows endpoint is a real, locally-qualified transport. All Win32
+  declarations carry argtypes/restype (the original OpenProcessToken
+  failure was 32-bit-truncated handles from undeclared prototypes).
+  DACL assembly is the classic SetEntriesInAclW +
+  InitializeSecurityDescriptor + SetSecurityDescriptorDacl path — the
+  documented 9-arg BuildSecurityDescriptorW was implemented and tested
+  first and empirically writes invalid out-parameters through ctypes on
+  this platform (returns ERROR_SUCCESS; IsValidSecurityDescriptor
+  False; downstream CreateNamedPipeW fails 998; sentinel-probe evidence
+  in scripts/diag_pipe_dacl.py). Three further ABI traps isolated and
+  fixed: GRANT_ACCESS is 1 (ACCESS_MODE starts at NOT_USED_ACCESS=0);
+  the x64 absolute SECURITY_DESCRIPTOR is 40 bytes (the 20-byte legacy
+  minimum heap-corrupts — 64-byte own buffer); the creator's next pipe
+  instance needs FILE_ALL_ACCESS in the single user-only ACE (a minimal
+  mask is access-denied), while FILE_FLAG_FIRST_PIPE_INSTANCE is
+  bind-only (it refuses even same-process second instances). A
+  socket-compatible _WindowsPipeConnection (ReadFile/WriteFile;
+  CancelIoEx release at drain), accept-loop next-instance creation,
+  and a platform-neutral local client (connect_local_stream) make the
+  transport platform-agnostic; IPCClient uses it. F-65: the abnormal
+  §10.3 wire states are producible from live signals — kill_probe and
+  recovery_probe callables with priority killed > recovery_unavailable
+  > ready > draining; the Dispatcher wires KillSwitch.tripped and the
+  RecoveryGuard status (the same objects the enforcement path
+  consults); a raising probe degrades to the lifecycle answer
+  (diagnostic only; enforcement fails closed independently). F-62
+  saturation regression: capacity 2, two admitted requests hold both
+  handler slots, a third connection is refused WITHOUT a hello, held
+  work completes after release. F-67 client-side regressions: a
+  malicious server announcing an over-ceiling hello or response length
+  is refused from the header, before body allocation. Idle-client
+  shutdown regression — which caught a real cross-platform defect:
+  POSIX close() does NOT unblock a recv() held by another thread, and
+  the blocked reader keeps the open file description alive so the peer
+  never sees EOF; fixed with shutdown(SHUT_RDWR) before close() at
+  drain for tracked connections AND the listener socket (Windows was
+  already correct via CancelIoEx). The CI windows job now runs the
+  Layer-4 transport + pipeline suites (46 tests) alongside the
+  durability job. Evidence at head 1920523: Linux 3.11 1271 passed +
+  13 skipped, ruff clean, mypy 100 files clean, Windows Server 2025
+  3.11/3.12 durability 170+4 / Layer-4 46 / rule store 57.
 - **2026-10-01 — M8 layer 2 review fixes (PR #22): F-09..F-15 resolved.**
   The maintainer-first pass at exact head 81ced8c found three blockers, two
   contract gaps, and an evidence gap; every finding verified against the code
@@ -487,6 +570,195 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #27 fourth repair round: F-68 lifecycle split +
+  Dispatcher wiring + protocol fixes.** F-68 (blocker, fixed):
+  IPCTransportServer is split into bind() (creates+binds the qualified
+  endpoint WITHOUT accepting) and start_accepting() (begins the bounded
+  accept loop). The Dispatcher now constructs BOTH AuthorityIPCServer
+  (the security pipeline) AND IPCTransportServer (the operational
+  transport), calling transport.bind() BEFORE session.activate() and
+  transport.start_accepting() AFTER it — the frozen §8.1 order: create
+  endpoint → READY → begin accepting client work. A STARTING owner
+  never serves hellos. AuthorityIPCServer is now a pure pipeline (its
+  start/stop/endpoint lifecycle methods removed — the transport owns the
+  endpoint). Shutdown: transport.stop() at DRAINING (closes connections
+  + endpoint + unlinks) before terminalize/release. F-63 (partial fix):
+  protocol_version now rejects bool (True≠1 gate) and float (1.0≠1) —
+  the exact int check runs before the equality comparison. F-62:
+  max_concurrent is single-sourced — the Dispatcher constructs the
+  transport with IPC_SERVER_MAX_CONCURRENT (from the pipeline module's
+  constant); AuthorityIPCServer._max_concurrent is consumed by the
+  transport, not independently enforced. (Correction, sixth round: the
+  server-side constructor seam this description left behind was a
+  safety-looking no-op — nothing consumed the field. The sixth repair
+  round REMOVED it; the transport semaphore alone is the capacity
+  authority.)
+- **2026-10-02 — PR #27 third repair round: F-66/F-67 + F-63/F-65
+  completion.** F-66 (blocker, fixed): the POSIX transport NO LONGER
+  binds its own socket — IPCTransportServer now creates and consumes the
+  QUALIFIED IPCEndpoint (create_endpoint → bind, which owns
+  umask-before-bind, stale-path cleanup under ownership, 0600
+  permissions, and unlink-on-close). There is ONE rendezvous and ONE
+  lifecycle owner. F-67 (blocker, fixed): the IPCClient now uses ONE
+  bounded receive primitive (_bounded_receive: read 8-byte header →
+  reject lengths over the ceiling BEFORE body allocation → read exactly
+  the announced body → decode with the strict JSON decoder). Both the
+  hello receive (connect) and the response receive (request) enforce
+  IPC_MAX_RESPONSE_BYTES; no unbounded allocation happens before the
+  owner's identity is verified. F-63 (completed): envelope validation
+  is now EXACT EQUALITY with the six frozen keys — both unknown AND
+  missing fields reject (a health request without `payload` now fails
+  schema, not silently defaulting to {}). F-65 (completed): the hello
+  wire state uses the FROZEN §10.3 vocabulary
+  (ready/draining/killed/recovery_unavailable) — NOT the internal
+  AuthoritySession lifecycle; the server maps internal→wire states
+  (ready→ready; starting/draining/terminal→draining for wire purposes);
+  from_dict validates against the §10.3 set; the unreachable duplicate
+  check beneath the state validation was the exact leftover the reviewer
+  flagged — removed. F-62 (partial→improved): the transport semaphore
+  now takes max_concurrent from the constructor parameter (no longer
+  hardcoded 4); connection tracking added (stop() closes all tracked
+  connections, then the endpoint — idle handlers exit, admitted work
+  still governed by session drain). Saturation regression test still
+  TBD.
+- **2026-10-02 — PR #27 second repair round: F-60 POSIX transport +
+  F-63/F-65 completion.** The operational POSIX transport (F-60) is now
+  REAL: a bounded thread-based accept loop over Unix-domain sockets
+  (authority_ipc_transport.py), one request per connection (connect →
+  hello → one framed request → one framed response → close), with
+  connection-handler slots bounded BEFORE task creation (a non-blocking
+  semaphore acquire in the accept loop — saturation refuses the
+  connection immediately, no unlimited waiter population). The
+  AuthorityIPCClient reads and validates AuthorityHello (exact protocol
+  + exact build), refuses before sending on mismatch, and sends/receives
+  real frames over the socket. Transport tests exercise REAL connections
+  (POSIX-gated on Linux CI): roundtrip (client → hello → read →
+  response), stale instance through the real socket, build-mismatch
+  client refusal, oversized-frame refusal from the header (server closes
+  without reading the body), the reviewer's exact disconnect sequence
+  (client sends a valid read → owner admits and blocks → client socket
+  FORCIBLY closed → owner invocation continues → admission returns to
+  0), and disconnect-before-request (no admission, no Dispatcher).
+  F-63 completed: request_id now requires a HIGH-ENTROPY hex identifier
+  (≥32 hex chars, i.e. ≥128 bits; "aaaaaaaa" rejects); the ENTIRE
+  request envelope is strict — exactly the six frozen keys
+  (protocol_version, runtime_build_id, authority_instance_id,
+  request_id, operation, payload); unknown envelope fields reject before
+  admission. F-65 completed: runtime_version is REQUIRED in
+  AuthorityHello.from_dict (not optional); protocol_version rejects bool
+  (True is not a valid version); the state field validates against the
+  frozen lifecycle vocabulary {starting, ready, draining, terminal}.
+  The 6 transport tests are POSIX-gated (AF_UNIX sockets; Windows
+  named-pipe transport is Layer 8). Suite 1251 + 15 skipped on Windows
+  (count from the run). Linux CI will run the transport tests.
+- **2026-10-02 — PR #27 review pass: F-60..F-65 — partial repair
+  (protocol/bounds/envelope strictness; transport deferred).** The review
+  found six findings, all valid. This round closes the protocol-level
+  items; the transport and production-mandatory items remain explicitly
+  open. FIXED in this round: F-62 (partial): the 64KiB REQUEST ceiling
+  is now enforced from the ANNOUNCED FRAME HEADER before any JSON
+  decoding or allocation — the 1MiB frame ceiling alone previously
+  allowed oversized request payloads through to the decoder. F-63:
+  runtime_build_id is now REQUIRED in every request envelope (omission
+  returns missing_build_id — the exact-build gate cannot be bypassed by
+  leaving the field out); request_id is required and shape-validated
+  (8–128 characters) as a bounded routing identity — NOT the Layer-5
+  retained request table, which stays in its frozen layer. F-65
+  (complete): allow_nan=False on all outbound JSON (NaN/Infinity can no
+  longer escape the encoder even though the decoder already rejected
+  them); AuthorityHello wire field names normalized to the frozen §10
+  shape (supported_ipc_operations, state — not the Python attribute
+  names); from_dict now strictly validates types and rejects unknown
+  fields; the stale error code is stale_authority_instance (the frozen
+  name); IPC_READ_TABS reduced to exactly the capability's supported
+  enum {posts, replies, media} — the invalid "likes" value removed
+  (the schema must never be a superset of what the capability accepts).
+  F-64 (partial): Windows pipe mode constants corrected (PIPE_TYPE_BYTE
+  and PIPE_READMODE_BYTE are both 0x0, not 0x1|0x2 — the previous
+  values were MESSAGE mode which is invalid with a byte-type pipe) and
+  PIPE_REJECT_REMOTE_CLIENTS (0x8) added to the pipe creation flags
+  (kernel-level remote-client rejection independent of the DACL).
+  REMAINING OPEN (the transport gap): F-60 (BLOCKER — no functioning
+  IPC transport): the accept loop, connection handler, frame I/O over
+  real sockets/pipes, hello transmission, and client implementation do
+  not exist; process_request is only exercised by direct function
+  calls. F-61 (BLOCKER — production-mandatory IPC): enable_ipc stays
+  False until the transport lands (the correct order per the review:
+  transport first, then production-mandatory). F-62 (partial —
+  max_concurrent): the semaphore/bounded-accept enforcement is not yet
+  implemented. F-64 (partial — Windows DACL): the
+  BuildSecurityDescriptorW parameter count/layout and the OpenProcessToken
+  failure remain unfixable without careful Win32 ABI work; the pipe
+  constants and PIPE_REJECT_REMOTE_CLIENTS are corrected but the DACL
+  construction path still fails. The review's external findings were
+  independently reconciled: its request-table finding was partially
+  accepted (request-ID presence/validation is Layer 4; retained
+  same-ID join/cache/dedupe semantics remain Layer 5 per frozen §24.1).
+  Suite 1251 (count from the run — unchanged net; the fixes tightened
+  existing tests rather than adding count).
+- **2026-10-02 — M7 LAYER 4 BUILT (PR pending): local IPC transport,
+  handshake, bounded pure read/health surface.** Built per the frozen
+  eight-item Layer-4 contract from exact main acb8d2e, tests first (the
+  layer-4 suite failed to collect until the protocol/framing modules
+  existed). Four new modules: (1) authority_ipc_protocol.py — the frozen
+  constants (centralized frame/request/response/string/limit ceilings),
+  deterministic runtime build identity (sorted source-tree hashing —
+  package version is NOT a build identity; an unavailable/ambiguous
+  identity raises IPCBuildIdentityError = production IPC does not enter
+  READY), the AuthorityHello handshake model (exact protocol version,
+  exact runtime_build_id, authority_instance_id, canonical absolute
+  domain, the five supported operations, lifecycle state), strict
+  post-schema validation + normalization for exactly health/read/
+  read_profile/read_thread/read_search (deliberately narrower than local
+  aliases — url/q rejected; defaults tab=posts/limit=20/include_retweets
+  =true; limits 1–100; enums enforced; non-finite numbers, oversized
+  strings, unknown fields rejected), and canonical request identity
+  (sorted-key deterministic serialization of protocol_version+operation+
+  normalized_payload, excluding request_id/runtime_build_id/
+  authority_instance_id per §10.5 — key-order independent).
+  (2) authority_ipc_framing.py — bounded length-prefixed UTF-8 JSON
+  framing (8-byte big-endian header; no pickle/marshal/object
+  deserialization; rejects malformed UTF-8, malformed JSON, non-object
+  envelopes, truncated headers, over-limit lengths, trailing bytes,
+  non-finite constants, duplicate keys). (3) authority_ipc_endpoint.py —
+  the platform-local endpoint abstraction: POSIX Unix-domain socket
+  under the canonical domain with owner-restricted 0o600 permissions and
+  stale-path cleanup ONLY after ownership; Windows named pipe with a
+  DACL granting access only to the current user's SID (remote clients
+  rejected by the DACL + local namespace scope). Full platform
+  qualification is Layers 7–8; the security properties are implemented.
+  (4) authority_ipc_server.py — the security pipeline: frame decode →
+  handshake compatibility (exact protocol + exact build) → operation
+  allowlist (whoami/writes/media/download die HERE) → strict schema
+  validation → canonical identity → stale-instance admission via
+  AuthoritySession.admit(expected_instance_id=...) → ONLY THEN
+  Dispatcher.invoke under the session admission, which spans the complete
+  invocation so shutdown drains these reads before release. Client
+  disconnect does NOT cancel the admitted owner task (the conservative
+  disconnect law). Bounded by IPC_SERVER_MAX_CONCURRENT. Dispatcher
+  lifecycle wiring: the IPC server binds AFTER the browser/root and
+  BEFORE READY (no READY window without the endpoint; bind failure =
+  startup failure following the fail-closed law); shutdown: DRAINING
+  atomically closes new IPC admission → close/unlink endpoint BEFORE
+  TERMINAL → release owner lock LAST. IPC binding is opt-in (deployment
+  configuration; the security pipeline is fully tested independently
+  via AuthorityIPCServer). 34 new tests covering: build identity
+  (deterministic, source-sensitive, unavailable-tree-refused); framing
+  (roundtrip, invalid UTF-8, malformed JSON, non-object, oversized,
+  truncated, non-finite, duplicate keys); schema (all five ops, defaults,
+  enums, aliases rejected, limits, oversized strings, unknown ops);
+  canonical identity (key-order independence, different payload = 
+  different identity, request_id excluded); the server pipeline
+  (protocol mismatch/build mismatch/stale instance/forbidden operations/
+  schema violation/malformed frames — ALL before Dispatcher; valid
+  request reaching Dispatcher under admission; missing instance;
+  draining rejection; admission spanning complete invocation; client
+  disconnect not cancelling admitted work); and the handshake
+  (AuthorityHello round-trip with exact build and current owner). One
+  disclosed self-bug: session.activate() was initially trapped inside
+  the enable_ipc conditional, terminalizing every non-IPC start —
+  caught by existing Layer-2 tests going red, fixed immediately.
+  Suite 1251 (count from the run).
 - **2026-10-02 — PR #26 MERGED (b695ad3): M7 LAYER 3 COMPLETE — owner
   instance identity, stale-session denial, lifecycle-atomic revocation,
   crash takeover with no stealing.** Cleared through three review rounds

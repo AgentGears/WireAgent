@@ -577,8 +577,8 @@ async def test_F54_production_factory_pins_one_domain_across_cwd_change(
 
         runtime = await build_production_runtime(
             cfg,
-            dispatcher_factory=lambda c, *, session_manager: _RecordingDispatcher(
-                c, session_manager=session_manager
+            dispatcher_factory=lambda c, *, session_manager, enable_ipc: _RecordingDispatcher(
+                c, session_manager=session_manager, enable_ipc=enable_ipc
             ),
         )
         # CWD changes AFTER construction: the recorded domains must already
@@ -606,9 +606,10 @@ async def test_F54_production_factory_pins_one_domain_across_cwd_change(
 class _RecordingDispatcherBase:
     """A recording stand-in for the production wiring test."""
 
-    def __init__(self, config, *, session_manager) -> None:
+    def __init__(self, config, *, session_manager, enable_ipc: bool = False) -> None:
         self._config = config
         self._session = session_manager
+        self.enable_ipc = enable_ipc  # F-61: the production factory passes True
         self.stopped = False
 
     async def start(self):
@@ -712,8 +713,8 @@ async def test_F54_real_factory_warns_with_relative_and_absolute_domain(tmp_path
 
         runtime = await build_production_runtime(
             cfg,
-            dispatcher_factory=lambda c, *, session_manager: _FactoryRecorder(
-                c, session_manager=session_manager
+            dispatcher_factory=lambda c, *, session_manager, enable_ipc: _FactoryRecorder(
+                c, session_manager=session_manager, enable_ipc=enable_ipc
             ),
         )
         assert runtime is not None

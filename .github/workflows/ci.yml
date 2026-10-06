@@ -65,6 +65,12 @@ jobs:
           tests/test_m7_authority_owner_lock_setup_failures.py
           tests/test_m7_authority_owner_lock_callback_failures.py
           tests/test_m7_authority_owner_lock_failstop_processes.py
+      - name: Windows named-pipe IPC qualification (F-64)
+        # The Layer-4 transport's Windows half: real named pipes, the
+        # current-user DACL, the accept loop's next-instance behavior,
+        # and the shutdown/successor lifecycle. The AF_UNIX half runs in
+        # the Linux full-suite job above.
+        run: python -m pytest -q tests/test_m7_layer4_transport_windows.py tests/test_m7_layer4_ipc.py
       - name: Windows rule-store qualification (F-32)
         # The rule store's interprocess fence has a platform-specific lock
         # branch (msvcrt.locking here, flock on Linux); the full suite only

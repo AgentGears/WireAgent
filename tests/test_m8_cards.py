@@ -895,7 +895,7 @@ async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
     cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
     made: list = []
 
-    def dispatcher_factory(config, *, session_manager):
+    def dispatcher_factory(config, *, session_manager, enable_ipc=False):
         d = _RecordingDispatcher(session=session_manager)
         made.append(d)
         return d
@@ -906,13 +906,13 @@ async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
     assert made[0].session.resolved_handle == "@owner"
     assert made[0].stopped is False, "the caller owns stop()"
 
-    def bad_factory(config, *, session_manager):
+    def bad_factory(config, *, session_manager, enable_ipc=False):
         return _RecordingDispatcher(whoami_ok=False, session=session_manager)
 
     with pytest.raises(RuntimeError, match="no verified actor"):
         await build_production_runtime(cfg, dispatcher_factory=bad_factory, session_factory=_FakeSession)
 
-    def handleless_factory(config, *, session_manager):
+    def handleless_factory(config, *, session_manager, enable_ipc=False):
         return _RecordingDispatcher(whoami_handle="", session=session_manager)
 
     with pytest.raises(RuntimeError, match="resolved actor"):
@@ -921,7 +921,7 @@ async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
     # F-51: a whitespace-only response handle is TRUTHY response data but
     # set_resolved_handle refuses it — the factory must verify the actor
     # state the write path trusts, and that state is unset here.
-    def blank_handle_factory(config, *, session_manager):
+    def blank_handle_factory(config, *, session_manager, enable_ipc=False):
         return _RecordingDispatcher(whoami_handle="   ", session=session_manager)
 
     with pytest.raises(RuntimeError, match="resolved actor"):
@@ -931,7 +931,7 @@ async def test_F41_production_runtime_wiring(tmp_path: Path) -> None:
 
     start_failed = _RecordingDispatcher(start_ok=False)
 
-    def start_fail_factory(config, *, session_manager):
+    def start_fail_factory(config, *, session_manager, enable_ipc=False):
         return start_failed
 
     with pytest.raises(RuntimeError, match="start failed"):

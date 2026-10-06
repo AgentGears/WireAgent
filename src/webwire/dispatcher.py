@@ -93,6 +93,8 @@ class Dispatcher:
         self,
         config: Optional[WebWireConfig] = None,
         session_manager: Optional[SessionManager] = None,
+        *,
+        enable_ipc: bool = False,  # F-61 closed: the production factory passes True explicitly
     ) -> None:
         # M7-RV11 / F-46: resolve state_dir ONCE, before ANY authority-root
         # construction. Every derived path — journal, effect ledger, rules
@@ -142,6 +144,11 @@ class Dispatcher:
         # new Dispatcher for a new owner session.
         self._owner_lock: Optional[Any] = None
         self._authority_session: Optional[Any] = None
+        # M7 Layer 4: the IPC server binds after the browser/root and
+        # before READY; closes before TERMINAL in the shutdown law.
+        self._ipc_server: Optional[Any] = None
+        self._ipc_transport: Optional[Any] = None
+        self._enable_ipc = enable_ipc
         # The lifecycle fence between start() and stop(). Asyncio (not
         # threading): a threading lock acquired by a waiting coroutine would
         # block the event loop thread itself; this lock is only ever taken
@@ -292,7 +299,64 @@ class Dispatcher:
                 await self._teardown_failed_start(session)
                 raise
             if result.ok:
+                if self._enable_ipc:
+                    # M7 Layer 4 (F-68/F-69): the frozen startup order is
+                    #   bind endpoint → prepare PARKED listener → READY → release the accept gate
+                    # The transport binds and creates its listener thread
+                    # while the session is still STARTING, so a bind OR
+                    # thread-creation failure takes the normal fail-closed
+                    # startup cleanup (never a READY window). The parked
+                    # thread only enters accept() after
+                    # release_accept_gate() — a non-failing Event.set —
+                    # so a STARTING owner never serves hellos and a READY
+                    # owner always has a live acceptor.
+                    try:
+                        from webwire.authority_ipc_server import (
+                            IPC_SERVER_MAX_CONCURRENT,
+                            AuthorityIPCServer,
+                        )
+                        from webwire.authority_ipc_transport import (
+                            IPCTransportServer,
+                        )
+
+                        self._ipc_server = AuthorityIPCServer(
+                            session=session,
+                            authority_domain=self._config.state_dir,
+                            invoke=self._invoke_admitted,
+                            # F-65: live producers for the abnormal §10.3
+                            # wire states — the SAME objects the enforcement
+                            # path consults, never a second source of truth.
+                            kill_probe=self._kill.tripped,
+                            recovery_probe=self._recovery_unavailable,
+                        )
+                        self._ipc_transport = IPCTransportServer(
+                            ipc_server=self._ipc_server,
+                            authority_domain=self._config.state_dir,
+                            loop=asyncio.get_event_loop(),
+                            max_concurrent=IPC_SERVER_MAX_CONCURRENT,  # F-62: one source
+                        )
+                        self._ipc_transport.bind()  # endpoint exists, not yet accepting
+                        # F-69: listener thread creation happens INSIDE the
+                        # guarded block — Thread.start() failure here is a
+                        # STARTING cleanup, not a stranded READY owner.
+                        self._ipc_transport.start_accepting()
+                    except BaseException as exc:
+                        logger.exception("IPC startup failed (endpoint bind or listener preparation)")
+                        await self._teardown_failed_start(session)
+                        from super_browser.results.types import FailureCategory
+
+                        from webwire.envelope import hard_failure
+
+                        return hard_failure(
+                            f"IPC startup failed ({exc!r}); startup refused "
+                            "(no READY window without the bound endpoint and a live acceptor)",
+                            failure_category=FailureCategory.SECURITY,
+                        )
                 session.activate()
+                # F-68/F-69: only the non-failing gate release happens
+                # after READY — Event.set() cannot strand a READY owner.
+                if self._enable_ipc and self._ipc_transport is not None:
+                    self._ipc_transport.release_accept_gate()
                 try:
                     # `is not None`, not `or {}`: an empty-but-present data
                     # dict must be enriched IN PLACE, not replaced.
@@ -303,6 +367,10 @@ class Dispatcher:
                 return result
             await self._teardown_failed_start(session)
             return result
+
+    async def _invoke_admitted(self, name: str, input: dict[str, Any]) -> Any:
+        """The IPC server's bounded execution seam into the Dispatcher."""
+        return await self._invoke_inner(name, input)
 
     async def _teardown_failed_start(self, session: Any) -> None:
         """F-44: a failed/cancelled start releases ownership only after the
@@ -333,6 +401,16 @@ class Dispatcher:
         # F-52: proven quiescent + revoked — mark the failed session
         # TERMINAL before closing the owner handle, so the Dispatcher never
         # reports a live session it no longer owns.
+        # M7 Layer 4: close the IPC transport + endpoint if a bind happened
+        # or was partially attempted — no endpoint outlives the owner session.
+        if self._ipc_transport is not None:
+            try:
+                self._ipc_transport.stop()
+            except Exception:  # noqa: BLE001 — cleanup during teardown
+                logger.warning("IPC transport cleanup during failed start")
+            self._ipc_transport = None
+        if self._ipc_server is not None:
+            self._ipc_server = None
         session.abort_from_starting()
         self._release_authority()
 
@@ -501,6 +579,14 @@ class Dispatcher:
             # is already closed; continue the shutdown law.
             if session.state.value == "ready":
                 session.begin_drain()
+            # M7 Layer 4: stop accepting new IPC work at DRAINING, and
+            # close/unlink the endpoint BEFORE retire/terminalize —
+            # already-open connections cannot submit fresh work.
+            if self._ipc_server is not None:
+                self._ipc_server.begin_drain()
+            if self._ipc_transport is not None:
+                self._ipc_transport.stop()  # closes connections + endpoint + unlinks
+                self._ipc_transport = None
             # 2. Drain all admitted owner work. The invocation lock waits
             #    for in-flight invokes (and blocks new ones); the session
             #    drain waits for admitted reconciliation operations.
@@ -551,6 +637,9 @@ class Dispatcher:
                         "ownership is retained fail-closed",
                         failure_category=FailureCategory.SECURITY,
                     )
+                # 4b. M7 Layer 4: the transport was already stopped at
+                # step 1 (DRAINING); the endpoint never outlives the owner.
+                self._ipc_server = None
                 # 5. Terminal, then 6. release LAST. A release failure
                 # (F-58) is fail-stop: the owner handle is RETAINED (the
                 # release-retry path above handles a later stop) and the
@@ -844,6 +933,20 @@ class Dispatcher:
     @property
     def kill_switch(self) -> KillSwitch:
         return self._kill
+
+    def _recovery_unavailable(self) -> bool:
+        """F-65 wire-state probe: composite recovery truth is not currently
+        available. Diagnostic only — mutation enforcement fails closed in the
+        guard itself (require_clear), independently of this probe. Before the
+        guard exists (pre-start) there is no live owner to diagnose, so the
+        probe reports available."""
+        guard = getattr(self, "_m5_recovery", None)
+        if guard is None:
+            return False
+        try:
+            return not guard.status().available
+        except Exception:  # noqa: BLE001 - the pipeline treats a raising probe as not signalled
+            return False
 
     @property
     def session_manager(self) -> SessionManager:

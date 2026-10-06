@@ -152,10 +152,16 @@ class IPCTransportServer:
             # 2. Read exactly one request frame (8-byte header + body).
             header_bytes = _read_exact(conn, HEADER_SIZE)
             (length,) = struct.unpack(">Q", header_bytes)
-            from webwire.authority_ipc_protocol import IPC_MAX_FRAME_BYTES
+            from webwire.authority_ipc_protocol import IPC_MAX_FRAME_BYTES, IPC_MAX_REQUEST_BYTES
 
-            if length > IPC_MAX_FRAME_BYTES:
-                # Refuse oversized frames without reading the body.
+            # F-62: refuse BOTH over-limit frames and over-limit REQUESTS
+            # from the announced header — BEFORE reading the body or any
+            # JSON allocation. The transport is the last boundary before
+            # bytes hit the pipeline.
+            if length > IPC_MAX_FRAME_BYTES or length > IPC_MAX_REQUEST_BYTES:
+                # Close without reading the body (the process_request
+                # 64KiB check would also catch it, but only after the
+                # body bytes were already read from the socket).
                 return
             body = _read_exact(conn, length)
 

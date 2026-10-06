@@ -15,6 +15,7 @@ endpoint lifecycle ordering.
 from __future__ import annotations
 
 import json
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -264,7 +265,7 @@ def _request(
         "operation": operation,
         "payload": payload,
     }
-    body["request_id"] = "req-test-0001"  # F-63: required routing identity
+    body["request_id"] = secrets.token_hex(16)  # F-63: 128-bit hex routing identity
     if instance_id is not None:
         body["authority_instance_id"] = instance_id
     if build_id is not None:

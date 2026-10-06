@@ -487,6 +487,36 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #27 second repair round: F-60 POSIX transport +
+  F-63/F-65 completion.** The operational POSIX transport (F-60) is now
+  REAL: a bounded thread-based accept loop over Unix-domain sockets
+  (authority_ipc_transport.py), one request per connection (connect →
+  hello → one framed request → one framed response → close), with
+  connection-handler slots bounded BEFORE task creation (a non-blocking
+  semaphore acquire in the accept loop — saturation refuses the
+  connection immediately, no unlimited waiter population). The
+  AuthorityIPCClient reads and validates AuthorityHello (exact protocol
+  + exact build), refuses before sending on mismatch, and sends/receives
+  real frames over the socket. Transport tests exercise REAL connections
+  (POSIX-gated on Linux CI): roundtrip (client → hello → read →
+  response), stale instance through the real socket, build-mismatch
+  client refusal, oversized-frame refusal from the header (server closes
+  without reading the body), the reviewer's exact disconnect sequence
+  (client sends a valid read → owner admits and blocks → client socket
+  FORCIBLY closed → owner invocation continues → admission returns to
+  0), and disconnect-before-request (no admission, no Dispatcher).
+  F-63 completed: request_id now requires a HIGH-ENTROPY hex identifier
+  (≥32 hex chars, i.e. ≥128 bits; "aaaaaaaa" rejects); the ENTIRE
+  request envelope is strict — exactly the six frozen keys
+  (protocol_version, runtime_build_id, authority_instance_id,
+  request_id, operation, payload); unknown envelope fields reject before
+  admission. F-65 completed: runtime_version is REQUIRED in
+  AuthorityHello.from_dict (not optional); protocol_version rejects bool
+  (True is not a valid version); the state field validates against the
+  frozen lifecycle vocabulary {starting, ready, draining, terminal}.
+  The 6 transport tests are POSIX-gated (AF_UNIX sockets; Windows
+  named-pipe transport is Layer 8). Suite 1251 + 15 skipped on Windows
+  (count from the run). Linux CI will run the transport tests.
 - **2026-10-02 — PR #27 review pass: F-60..F-65 — partial repair
   (protocol/bounds/envelope strictness; transport deferred).** The review
   found six findings, all valid. This round closes the protocol-level

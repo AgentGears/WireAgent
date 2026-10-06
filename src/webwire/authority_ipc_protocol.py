@@ -148,8 +148,12 @@ class AuthorityHello:
     def from_dict(cls, raw: Any) -> "AuthorityHello":
         if not isinstance(raw, dict):
             raise IPCProtocolError("hello must be a JSON object")
+        # F-65: runtime_version is REQUIRED (diagnostic-only but still
+        # part of the frozen AuthorityHello shape — a missing field is a
+        # malformed handshake, not a tolerable omission).
         required = {
             "protocol_version",
+            "runtime_version",
             "runtime_build_id",
             "authority_instance_id",
             "authority_domain",
@@ -159,14 +163,21 @@ class AuthorityHello:
         missing = required - set(raw.keys())
         if missing:
             raise IPCProtocolError(f"hello missing fields: {sorted(missing)}")
-        # F-65: strict validation — unknown fields and wrong types reject.
-        allowed = required | {"runtime_version"}
-        unknown = set(raw.keys()) - allowed
+        # F-65: strict validation — unknown fields reject (no optional extras).
+        unknown = set(raw.keys()) - required
         if unknown:
             raise IPCProtocolError(f"hello has unknown fields: {sorted(unknown)}")
-        if not isinstance(raw["protocol_version"], int):
+        # F-65: bool is a subclass of int — reject protocol_version=True.
+        pv = raw["protocol_version"]
+        if isinstance(pv, bool) or not isinstance(pv, int):
             raise IPCProtocolError("hello protocol_version must be an integer")
-        for field in ("runtime_build_id", "authority_instance_id", "authority_domain", "state"):
+        for field in ("runtime_version", "runtime_build_id", "authority_instance_id", "authority_domain"):
+            if not isinstance(raw[field], str) or not raw[field]:
+                raise IPCProtocolError(f"hello {field} must be a non-empty string")
+        # F-65: state must be from the frozen lifecycle vocabulary.
+        _VALID_STATES = frozenset({"starting", "ready", "draining", "terminal"})
+        if raw["state"] not in _VALID_STATES:
+            raise IPCProtocolError(f"hello state {raw['state']!r} must be one of {sorted(_VALID_STATES)}")
             if not isinstance(raw[field], str) or not raw[field]:
                 raise IPCProtocolError(f"hello {field} must be a non-empty string")
         ops = raw["supported_ipc_operations"]

@@ -230,14 +230,45 @@ class AuthorityIPCServer:
         # trace, never authority (request_id carries no special power).
         _identity = canonical_request_identity(operation, normalized)
 
-        # F-63: request_id is required and shape-validated (a bounded
-        # routing identity — NOT the Layer-5 retained request table).
+        # F-63: request_id is required as a HIGH-ENTROPY identifier (at
+        # least 128 random bits, hex-encoded: 32 hex chars from
+        # secrets.token_hex(16)) — not an arbitrary 8-character string.
+        # Routing identity only; NOT the Layer-5 retained request table.
         request_id = request.get("request_id")
-        if not isinstance(request_id, str) or not (8 <= len(request_id) <= 128):
+        if (
+            not isinstance(request_id, str)
+            or len(request_id) < 32
+            or len(request_id) > 128
+            or not all(c in "0123456789abcdef" for c in request_id)
+        ):
             return encode_json_frame(
                 IPCRequestOutcome.error(
                     "schema",
-                    "request_id must be a string of 8–128 characters",
+                    "request_id must be a hex string of at least 32 "
+                    "characters (128+ bits of entropy, e.g. "
+                    "secrets.token_hex(16))",
+                ),
+                is_response=True,
+            )
+
+        # F-63: the ENTIRE envelope is strict — exactly the six frozen
+        # keys; unknown envelope fields reject before admission.
+        _ENVELOPE_KEYS = frozenset(
+            {
+                "protocol_version",
+                "runtime_build_id",
+                "authority_instance_id",
+                "request_id",
+                "operation",
+                "payload",
+            }
+        )
+        _envelope_unknown = set(request.keys()) - _ENVELOPE_KEYS
+        if _envelope_unknown:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "schema",
+                    f"unknown envelope fields: {sorted(_envelope_unknown)}",
                 ),
                 is_response=True,
             )

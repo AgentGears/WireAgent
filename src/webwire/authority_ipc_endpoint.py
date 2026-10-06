@@ -59,8 +59,16 @@ def _win32() -> Any:
     return vars(ctypes).get("windll")
 
 
+def _get_last_win32_error() -> int:
+    """ctypes.get_last_error resolved at runtime — typeshed declares it
+    Windows-only, so a direct reference breaks Linux mypy (same F-25
+    portability lesson). Returns 0 off-Windows; no POSIX path reads it."""
+    getter = vars(ctypes).get("get_last_error")
+    return int(getter()) if getter is not None else 0
+
+
 # F-64: all Win32 DLLs used for handle-bearing calls are loaded with
-# use_last_error=True so ``ctypes.get_last_error()`` reads a per-thread
+# use_last_error=True so ``_get_last_win32_error()`` reads a per-thread
 # snapshot that no intermediate Python-level call can clobber. The
 # previous failure (OpenProcessToken returning garbage) came from calling
 # these APIs WITHOUT argtypes: ctypes passes Python ints as 32-bit C
@@ -228,7 +236,7 @@ class _WindowsPipeConnection:
             None,
         )
         if not handle or handle == _INVALID_HANDLE:
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             raise ConnectionError(f"ConnectFileW to {pipe_name} failed: error {err}")
         return cls(handle)
 
@@ -241,7 +249,7 @@ class _WindowsPipeConnection:
         read = ctypes.c_uint32(0)
         ok = k32.ReadFile(self._handle, buf, bufsize, ctypes.byref(read), None)
         if not ok:
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             if err in (_ERROR_BROKEN_PIPE, _ERROR_NO_DATA, _ERROR_OPERATION_ABORTED):
                 raise ConnectionError(f"pipe closed by peer (error {err})")
             raise OSError(f"ReadFile failed: error {err}")
@@ -252,7 +260,7 @@ class _WindowsPipeConnection:
         written = ctypes.c_uint32(0)
         ok = k32.WriteFile(self._handle, data, len(data), ctypes.byref(written), None)
         if not ok:
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             if err in (_ERROR_BROKEN_PIPE, _ERROR_NO_DATA, _ERROR_OPERATION_ABORTED):
                 raise ConnectionError(f"pipe closed by peer (error {err})")
             raise OSError(f"WriteFile failed: error {err}")
@@ -428,7 +436,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
             ctypes.byref(self._sa) if self._sa is not None else None,
         )
         if not handle or handle == _INVALID_HANDLE:
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             raise RuntimeError(f"CreateNamedPipeW failed for {self._pipe_name}: error {err}")
         return handle
 
@@ -446,7 +454,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         token = ctypes.c_void_p()
         TOKEN_QUERY = 0x0008
         if not adv.OpenProcessToken(k32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             raise RuntimeError(f"OpenProcessToken failed: error {err}")
         try:
             # TokenUser == 1: the TOKEN_USER struct { SID_AND_ATTRIBUTES }.
@@ -454,7 +462,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
             adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
             buf = ctypes.create_string_buffer(max(needed.value, 64))
             if not adv.GetTokenInformation(token, 1, buf, needed.value, ctypes.byref(needed)):
-                err = ctypes.get_last_error()
+                err = _get_last_win32_error()
                 raise RuntimeError(f"GetTokenInformation failed: error {err}")
 
             class SID_AND_ATTRIBUTES(ctypes.Structure):
@@ -517,10 +525,10 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         sd_buffer = ctypes.create_string_buffer(64)
         SECURITY_DESCRIPTOR_REVISION = 1
         if not adv.InitializeSecurityDescriptor(sd_buffer, SECURITY_DESCRIPTOR_REVISION):
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             raise RuntimeError(f"InitializeSecurityDescriptor failed: error {err}")
         if not adv.SetSecurityDescriptorDacl(sd_buffer, True, acl, False):
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             raise RuntimeError(f"SetSecurityDescriptorDacl failed: error {err}")
 
         class SECURITY_ATTRIBUTES(ctypes.Structure):
@@ -547,7 +555,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         listen_handle = self._handle
         connected = k32.ConnectNamedPipe(listen_handle, None)
         if not connected:
-            err = ctypes.get_last_error()
+            err = _get_last_win32_error()
             if err != _ERROR_PIPE_CONNECTED:  # already-connected is fine
                 raise RuntimeError(f"ConnectNamedPipe failed: error {err}")
         try:

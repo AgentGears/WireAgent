@@ -461,6 +461,49 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — M7 Layer 5 second repair round (PR #28, F-72/F-73/F-74):
+  mutation safety state, task-owning retention, reconciliation over
+  owner IPC.** F-72 (blocker, fixed): FAILED ActionResults no longer
+  collapse into a bare capability error — the wire failure envelope now
+  carries a bounded, JSON-safe SAFETY PROJECTION (allowlisted outcome
+  scalars with hoisting from the kernel's nested payload, a narrowed
+  policy verdict, the final trace stages plus the intent dedupe key, and
+  a bounded copy of the capability data; non-finite floats drop,
+  strings/containers truncate, raw authority objects never cross).
+  public_side_effect / reconciliation_required / m5_effect_state survive
+  the boundary; a clean denial is distinguishable from an uncertain
+  external mutation; the retained retry returns the identical frame.
+  F-74 (blocker, fixed): the retained table now owns the EXECUTION TASK
+  (pin_task — the strong owner-side §10.5 reference), the caller awaits a
+  shield, and a handler wait expiry answers request_in_progress with
+  explicit response-uncertainty semantics — never a fabricated terminal
+  failure for a live mutation (the coroutine is not cancelled). The
+  injectable-short-timeout regression proves the reviewer sequence:
+  blocked mutation → wait expires → exactly-one execution, live pinned
+  task → same-id retry joins → release → retained terminal response →
+  admission returns to zero. F-73 (blocker, fixed): reconciliation now
+  ROUTES through owner IPC (§14.3) — six advertised operations
+  (reconciliation_open/list/show/prepare/confirm/resolve) over a
+  bounded (4), instance-bound, process-local registry of logical
+  operator sessions built on the Dispatcher's owner-admitted
+  OwnedReconciliationOperatorSession; drain revokes every session; the
+  minted ReconciliationAuthority stays owner-private (clients confirm by
+  exact frozen text and address proposals by id); schemas are strict
+  (verdict enum, evidence object bound, at-least-one rules). T41 proven
+  through a REAL Dispatcher over the real transport: two clients' write
+  tokens go stale_confirmation_epoch after an owner-side wire
+  reconciliation resolves terminally — one shared owner root. Plus the
+  TRUE integration regression: real client socket → pipeline → REAL
+  Dispatcher → REAL WriteKernel (real token mint/consume) → REAL M5
+  post_text executor (DOM port stubbed) → capture failure → the wire
+  frame preserves reconciliation_required + effect_unknown + the
+  semantic key, and the durable ledger carries EFFECT_UNKNOWN.
+  Docstrings updated to the real surface (no more "exactly five
+  operations"). 15 new repair tests (12 portable + 3 transport, the
+  latter platform-neutral — they run on Windows named pipes AND Linux
+  sockets). Gate ALL GREEN: 1324 passed + 27 platform-skipped, ruff
+  clean, mypy clean on 101 files.
+
 - **2026-10-06 — M7 Layer 5 round one (branch m7-layer5-ipc-writes, from
   exact main d0b0b92): whoami + non-file writes + the retained request
   table, tests-first.** The advertised IPC surface grows from five pure

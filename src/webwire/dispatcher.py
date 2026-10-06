@@ -328,6 +328,10 @@ class Dispatcher:
                             # path consults, never a second source of truth.
                             kill_probe=self._kill.tripped,
                             recovery_probe=self._recovery_unavailable,
+                            # F-73 (§14.3): reconciliation routes through
+                            # THIS owner — the provider mints owner-admitted
+                            # operator sessions from the same M6 root.
+                            reconciliation_provider=self.create_reconciliation_operator_session,
                         )
                         self._ipc_transport = IPCTransportServer(
                             ipc_server=self._ipc_server,

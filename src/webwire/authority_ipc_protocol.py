@@ -72,6 +72,12 @@ IPC_SUPPORTED_OPERATIONS = frozenset(
         "delete_post",
         "bookmark_post",
         "like_post",
+        "reconciliation_open",
+        "reconciliation_list",
+        "reconciliation_show",
+        "reconciliation_prepare",
+        "reconciliation_confirm",
+        "reconciliation_resolve",
     }
 )
 IPC_MAX_FRAME_BYTES = 1 << 20  # 1 MiB — a frame header + payload ceiling
@@ -82,6 +88,8 @@ IPC_MAX_LIMIT = 100  # read limits cannot exceed this
 
 IPC_READ_TABS = frozenset({"posts", "replies", "media"})  # exactly the capability's enum (F-65: no superset)
 IPC_SEARCH_TABS = frozenset({"top", "latest", "people"})
+# F-73: the only terminal M6 verdicts (ReconciliationVerdict's exact values).
+IPC_RECONCILIATION_VERDICTS = frozenset({"CONFIRMED_EFFECT", "CONFIRMED_NO_EFFECT"})
 
 
 class IPCProtocolError(ValueError):
@@ -279,6 +287,35 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "post_url": (str, False, None),
         "confirmation_token": (str, False, None),
     },
+    # F-73 (§14.3): the reconciliation operator wire surface. Opaque
+    # logical sessions; exact same-session text confirmation; the
+    # ReconciliationAuthority never crosses the wire.
+    "reconciliation_open": {
+        "operator_id": (str, True, None),
+    },
+    "reconciliation_list": {
+        "reconciliation_session_id": (str, True, None),
+    },
+    "reconciliation_show": {
+        "reconciliation_session_id": (str, True, None),
+        "effect_id": (str, True, None),
+    },
+    "reconciliation_prepare": {
+        "reconciliation_session_id": (str, True, None),
+        "effect_id": (str, True, None),
+        "verdict": (str, True, IPC_RECONCILIATION_VERDICTS),
+        "evidence": (dict, True, None),
+        "evidence_summary": (str, True, None),
+    },
+    "reconciliation_confirm": {
+        "reconciliation_session_id": (str, True, None),
+        "proposal_id": (str, True, None),
+        "confirmation_text": (str, True, None),
+    },
+    "reconciliation_resolve": {
+        "reconciliation_session_id": (str, True, None),
+        "proposal_id": (str, True, None),
+    },
 }
 
 # Writes whose target is an at-least-one disjunction (no bare "no target"
@@ -311,6 +348,12 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "delete_post": {},
     "bookmark_post": {},
     "like_post": {},
+    "reconciliation_open": {},
+    "reconciliation_list": {},
+    "reconciliation_show": {},
+    "reconciliation_prepare": {},
+    "reconciliation_confirm": {},
+    "reconciliation_resolve": {},
 }
 
 
@@ -365,6 +408,20 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
         elif expected_type is bool:
             if not isinstance(value, bool):
                 raise IPCSchemaError(f"{operation}.{name} must be a boolean")
+        elif expected_type is dict:
+            # F-73: the operator's evidence object. Strict JSON decoding
+            # already produced plain data; enforce object shape and a
+            # bounded serialized size (it is hashed and retained by M6).
+            if not isinstance(value, dict):
+                raise IPCSchemaError(f"{operation}.{name} must be a JSON object")
+            try:
+                encoded = json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise IPCSchemaError(f"{operation}.{name} must be finite JSON data") from exc
+            if len(encoded) > IPC_MAX_STRING_BYTES:
+                raise IPCSchemaError(
+                    f"{operation}.{name} exceeds the {IPC_MAX_STRING_BYTES}-byte bound"
+                )
         elif expected_type is str:
             if not isinstance(value, str):
                 raise IPCSchemaError(f"{operation}.{name} must be a string")

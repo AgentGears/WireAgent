@@ -63,6 +63,11 @@ class TableDecision:
 class _Inflight:
     canonical: str
     future: "asyncio.Future[bytes]"
+    # F-74 (§10.5): the STRONG owner-side reference to the executing task.
+    # The table — not the RPC wait — owns admitted work; the task is never
+    # cancelled by caller disappearance and the pin keeps it referenced
+    # until its safe local terminal boundary.
+    task: Optional["asyncio.Task[bytes]"] = None
 
 
 class RetainedRequestTable:
@@ -123,6 +128,14 @@ class RetainedRequestTable:
         return TableDecision(kind=_KIND_NEW, future=future)
 
     # -- executor terminal transitions (owner-loop thread only) ------------
+
+    def pin_task(self, request_id: str, task: "asyncio.Task[bytes]") -> None:
+        """F-74: attach the executing task to its in-flight entry — the
+        table holds the strong owner-side reference for the work's whole
+        lifetime (caller disconnect/timeout never orphans it)."""
+        entry = self._inflight.get(request_id)
+        if entry is not None:
+            entry.task = task
 
     def complete(self, request_id: str, response: bytes) -> None:
         """The admitted request reached its terminal response frame (a

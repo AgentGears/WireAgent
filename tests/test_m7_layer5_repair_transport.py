@@ -1,0 +1,443 @@
+"""M7 Layer 5 first-review repairs over the REAL transport — F-74 timeout
+law, F-73/T41 reconciliation through a REAL Dispatcher, and the true
+IPC → Dispatcher → WriteKernel/M5 integration regression.
+
+Platform-neutral: the transport and IPCClient run on POSIX domain sockets
+and Windows named pipes alike, so this suite executes in the Windows gate
+AND on Linux CI.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import secrets
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from super_browser.results import ActionResult
+
+from webwire.authority_ipc_protocol import IPC_PROTOCOL_VERSION, compute_runtime_build_id
+from webwire.authority_ipc_server import AuthorityIPCServer
+from webwire.authority_ipc_transport import IPCClient, IPCTransportServer
+from webwire.authority_session import AuthoritySession
+from webwire.config import WebWireConfig
+from webwire.envelope import ok_result
+
+BUILD_ID = compute_runtime_build_id()
+
+
+def _wire_request(path: str, instance: str, operation: str, payload: dict) -> dict:
+    client = IPCClient(path, expected_build_id=BUILD_ID)
+    client.connect()
+    try:
+        return client.request(
+            {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "operation": operation,
+                "payload": payload,
+                "request_id": secrets.token_hex(16),
+                "authority_instance_id": instance,
+                "runtime_build_id": BUILD_ID,
+            }
+        )
+    finally:
+        client.close()
+
+
+def _wire_request_id(path: str, instance: str, operation: str, payload: dict, request_id: str) -> dict:
+    client = IPCClient(path, expected_build_id=BUILD_ID)
+    client.connect()
+    try:
+        return client.request(
+            {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "operation": operation,
+                "payload": payload,
+                "request_id": request_id,
+                "authority_instance_id": instance,
+                "runtime_build_id": BUILD_ID,
+            }
+        )
+    finally:
+        client.close()
+
+
+async def _wire(path: str, instance: str, operation: str, payload: dict) -> dict:
+    """Blocking wire call offloaded off the owner's event loop — calling
+    IPCClient.request on the loop thread would deadlock the very handler
+    the request is waiting for."""
+    return await asyncio.to_thread(_wire_request, path, instance, operation, payload)
+
+
+# ---------------------------------------------------------------------------
+# F-74: transport wait expiry is response uncertainty, never mutation failure
+# ---------------------------------------------------------------------------
+
+
+async def test_timeout_is_request_in_progress_work_survives_and_joins(tmp_path: Path) -> None:
+    """The reviewer-specified sequence with an INJECTABLE short wait:
+    a mutating request is admitted and blocked; the handler's wait expires
+    (response = request_in_progress, NOT a terminal failure); execution is
+    still exactly once; the table still owns the live task; a retry with
+    the SAME request_id joins it; release → retained terminal response;
+    admission returns to zero."""
+    session = AuthoritySession(authority_domain=Path("f74"))
+    session.register_revoker(lambda: None)
+    session.activate()
+    loop = asyncio.new_event_loop()
+
+    def _run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    threading.Thread(target=_run_loop, daemon=True).start()
+
+    release = asyncio.Event()
+    executions: list[dict] = []
+
+    async def invoke(name: str, payload: dict) -> Any:
+        executions.append(dict(payload))
+        await release.wait()
+        return ok_result(data={"posted": True})
+
+    ipc = AuthorityIPCServer(
+        session=session, authority_domain=tmp_path, invoke=invoke, runtime_build_id=BUILD_ID
+    )
+    transport = IPCTransportServer(
+        ipc_server=ipc, authority_domain=tmp_path, loop=loop, request_timeout_s=1.0
+    )
+    transport.start()
+    path = str(transport.endpoint_path or "")
+    instance = session.authority_instance_id
+    rid = secrets.token_hex(16)
+
+    try:
+        # The blocked mutation; the handler wait expires at 1s.
+        timed_out = _wire_request_id(
+            path, instance, "post_text", {"text": "uncertain"}, rid
+        )
+        assert timed_out["ok"] is False
+        assert timed_out["error"]["code"] == "request_in_progress", timed_out
+        assert "UNCERTAIN" in timed_out["error"]["message"]
+
+        # The admitted work survived: exactly one execution, still pinned.
+        assert len(executions) == 1
+        entry = ipc._table._inflight.get(rid)
+        assert entry is not None and entry.task is not None and not entry.task.done()
+
+        # The SAME request_id joins the live work and observes the terminal
+        # outcome after release.
+        result_box: list[dict] = []
+
+        def _joiner() -> None:
+            result_box.append(_wire_request_id(path, instance, "post_text", {"text": "uncertain"}, rid))
+
+        joiner = threading.Thread(target=_joiner)
+        joiner.start()
+        await asyncio.sleep(0.3)
+        loop.call_soon_threadsafe(release.set)
+        joiner.join(timeout=15)
+
+        assert result_box and result_box[0]["ok"] is True
+        assert result_box[0]["data"]["posted"] is True
+        assert len(executions) == 1, "joined, never re-executed"
+
+        # The completed frame is retained byte-for-byte for later retries.
+        again = _wire_request_id(path, instance, "post_text", {"text": "uncertain"}, rid)
+        assert again == result_box[0]
+
+        # Admission fully drained.
+        deadline = time.monotonic() + 5
+        while session.active_work and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.05)
+        assert session.active_work == 0
+    finally:
+        transport.stop()
+        loop.call_soon_threadsafe(loop.stop)
+        time.sleep(0.2)  # noqa: ASYNC251
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Real-Dispatcher fixtures (F-73/T41 + the integration regression)
+# ---------------------------------------------------------------------------
+
+
+class _StubSB:
+    _page = None
+    _controller = None
+
+
+async def _started_ipc_dispatcher(tmp_path: Path, *, stack_installer=None):
+    from webwire.dispatcher import Dispatcher
+    from webwire.session import SessionManager
+
+    class _RecordingSessionManager(SessionManager):
+        def __init__(self, config) -> None:
+            super().__init__(config)
+            self._sb = _StubSB()  # type: ignore[assignment]
+            self._started = True
+            self._resolved_handle = "@owner"
+
+        async def start(self) -> Any:
+            return ok_result(data={})
+
+        async def stop(self) -> Any:
+            return ok_result(data={})
+
+    cfg = WebWireConfig(state_dir=tmp_path, kill_env_var=None)
+    sm = _RecordingSessionManager(cfg)
+    dispatcher = Dispatcher(cfg, session_manager=sm, enable_ipc=True)  # type: ignore[arg-type]
+    if stack_installer is not None:
+        dispatcher._install_m5_live_stack = stack_installer  # type: ignore[method-assign]
+    else:
+        from types import SimpleNamespace
+
+        dispatcher._install_m5_live_stack = (  # type: ignore[method-assign]
+            lambda sb: setattr(dispatcher, "_m5_stack", SimpleNamespace(read_broker=object()))
+        )
+    started = await dispatcher.start()
+    assert started.ok, getattr(started.error, "message", started)
+    return dispatcher
+
+
+async def test_T41_reconciliation_over_ipc_advances_shared_epoch(tmp_path: Path) -> None:
+    """F-73/T41 through a REAL Dispatcher: clients A and B hold write
+    confirmation tokens; owner-side reconciliation over IPC (open →
+    prepare → confirm → resolve) advances the CANONICAL ConfirmationState
+    epoch; both tokens go stale — proof that Layer-5 reconciliation and
+    write confirmation share one owner root."""
+    from webwire.safety.effect_ledger import EffectLedgerRecord, EffectState
+    from webwire.safety.models import RiskTier
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        raw = EffectLedgerRecord(
+            effect_id="fx-wire-t41",
+            semantic_key="actor|like|post|wire-t41|",
+            state=EffectState.EFFECT_UNKNOWN,
+            action_type="like",
+            intent_hash="intent-wire",
+            policy_binding="policy-wire",
+            actor_id="actor",
+            target_type="post",
+            target_id="wire-t41",
+            timestamp="2026-10-06T00:00:00+00:00",
+        )
+        dispatcher._m5_ledger.append_durable(raw)
+        dispatcher._m5_recovery.hydrate()
+
+        confirmation_state = dispatcher._write_kernel.confirmation_state
+        token_a = confirmation_state.issue(
+            intent_hash="ia", risk_tier=RiskTier.PRIVATE_REVERSIBLE, capability_name="bookmark_post"
+        )
+        token_b = confirmation_state.issue(
+            intent_hash="ib", risk_tier=RiskTier.PRIVATE_REVERSIBLE, capability_name="bookmark_post"
+        )
+
+        transport = dispatcher._ipc_transport
+        path = str(transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        opened = await _wire(path, instance, "reconciliation_open", {"operator_id": "local-admin"})
+        assert opened["ok"] is True, opened
+        wire_id = opened["data"]["reconciliation_session_id"]
+
+        listed = await _wire(path, instance, "reconciliation_list", {"reconciliation_session_id": wire_id})
+        assert listed["ok"] is True, listed
+        assert any(t["effect_id"] == "fx-wire-t41" for t in listed["data"]["targets"])
+
+        prepared = await _wire(
+            path,
+            instance,
+            "reconciliation_prepare",
+            {
+                "reconciliation_session_id": wire_id,
+                "effect_id": "fx-wire-t41",
+                "verdict": "CONFIRMED_EFFECT",
+                "evidence": {
+                    "basis": "operator-review",
+                    "observed_at": "2026-10-06T00:00:00+00:00",
+                    "observations": [{"kind": "operator", "value": "verified"}],
+                },
+                "evidence_summary": "Operator verified the terminal effect evidence.",
+            },
+        )
+        assert prepared["ok"] is True, prepared
+        proposal = prepared["data"]["proposal"]
+        assert proposal["effect_id"] == "fx-wire-t41"
+
+        confirmed = await _wire(
+            path,
+            instance,
+            "reconciliation_confirm",
+            {
+                "reconciliation_session_id": wire_id,
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_text": proposal["confirmation_text"],
+            },
+        )
+        assert confirmed["ok"] is True, confirmed
+
+        resolved = await _wire(
+            path,
+            instance,
+            "reconciliation_resolve",
+            {"reconciliation_session_id": wire_id, "proposal_id": proposal["proposal_id"]},
+        )
+        assert resolved["ok"] is True, resolved
+        assert resolved["data"]["resolution"]["confirmation_epoch"] >= 1
+
+        # THE T41 invariant: both clients' tokens are stale under the SAME
+        # canonical ConfirmationState the owner's writes use.
+        for token, intent in ((token_a, "ia"), (token_b, "ib")):
+            _t, reason = confirmation_state.validate_and_consume(
+                token.token,
+                intent_hash=intent,
+                risk_tier=RiskTier.PRIVATE_REVERSIBLE,
+                capability_name="bookmark_post",
+            )
+            assert reason == "stale_confirmation_epoch"
+
+        # And the unresolved effect is now clear for mutation.
+        assert dispatcher._m5_recovery.require_clear(raw.semantic_key, refresh=False) is None
+    finally:
+        await dispatcher.stop()
+
+
+# ---------------------------------------------------------------------------
+# The true IPC → Dispatcher → WriteKernel/M5 integration regression
+# ---------------------------------------------------------------------------
+
+
+class _PortBroker:
+    """The browser DOM port for post_text (mirrors the M5 executor test
+    double): capture FAILS after submit, so the REAL M5 executor records
+    EFFECT_UNKNOWN with reconciliation required."""
+
+    def __init__(self) -> None:
+        self.composer_text = ""
+        self.submit_calls = 0
+
+    async def fill_composer(self, text: str) -> ActionResult:
+        self.composer_text = text
+        return ok_result(data={"filled": True})
+
+    async def read_composer_text(self) -> ActionResult:
+        return ok_result(data={"composer_text": self.composer_text})
+
+    async def verify_attachment_ready(self) -> ActionResult:
+        return ok_result(data={"ready": True})
+
+    async def count_attachments(self) -> ActionResult:
+        return ok_result(data={"count": 0})
+
+    async def attach_media(self, image_path: str) -> ActionResult:
+        raise AssertionError("plain post must not attach media")
+
+    async def close_composer(self) -> ActionResult:
+        self.composer_text = ""
+        return ok_result(data={"cleanup": "closed"})
+
+    async def click_submit(  # noqa: E501
+        self, *, _commit_gate, _precommit_check, _expected_text, _expected_attachments
+    ) -> ActionResult:
+        self.submit_calls += 1
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
+        return ok_result(data={"clicked": True})
+
+
+class _FailingEvidence:
+    """Baseline OK; new-post capture FAILS → effect_unknown."""
+
+    async def capture_pre_submit_ids(self) -> ActionResult:
+        return ok_result(data={"status_ids": ["10", "11"]})
+
+    async def capture_new_post(self, pre_submit_ids: set[str], *, exclude_ids=None) -> ActionResult:
+        from super_browser.results.types import FailureCategory
+
+        from webwire.envelope import soft_failure
+
+        return soft_failure("capture failed", failure_category=FailureCategory.UNKNOWN)
+
+    async def verify_post_text(self, post_url: str, normalized_text: str) -> ActionResult:
+        return ok_result(data={"text_matches": True})
+
+
+async def test_ipc_to_writekernel_uncertain_effect_end_to_end(tmp_path: Path) -> None:
+    """The TRUE integration path: a real client socket → the owner's IPC
+    pipeline → the REAL Dispatcher → the REAL WriteKernel (preview issues
+    a REAL token; confirm consumes it atomically) → the REAL M5 post_text
+    executor over a stub DOM port whose capture fails → the wire failure
+    frame PRESERVES the uncertain-effect safety state (F-72 end to end).
+    """
+    from types import SimpleNamespace
+
+    from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+    from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+    from webwire.safety.m5_post_text_executor import M5PostTextExecutor
+    from webwire.safety.scoped_authority import ScopedAuthorityBroker
+
+    port = _PortBroker()
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        # Replace the stub stack with the REAL write path over the
+        # dispatcher's OWN gateway (the write path consults _m5_stack per
+        # invocation; the fresh dispatcher has no cached adapters).
+        scoped = ScopedAuthorityBroker(
+            port,
+            dispatcher._m5_gateway,
+            policies=DEFAULT_EFFECT_POLICIES,
+        )
+        runtime = M5ExecutionRuntime(
+            scoped_authority=scoped,
+            commit_gateway=dispatcher._m5_gateway,
+            policies=DEFAULT_EFFECT_POLICIES,
+        )
+        executor = M5PostTextExecutor(runtime=runtime, evidence_reader=_FailingEvidence())
+        dispatcher._m5_stack = SimpleNamespace(read_broker=object(), post_text_executor=executor)
+        transport = dispatcher._ipc_transport
+        path = str(transport.endpoint_path or "")
+        instance = dispatcher._authority_session.authority_instance_id
+
+        # Phase 1 (preview): the REAL WriteKernel mints a REAL token.
+        preview = await _wire(path, instance, "post_text", {"text": "live integration post"})
+        assert preview["ok"] is True, preview
+        kernel_data = preview["data"]["data"]
+        token = kernel_data["confirmation_token"]
+        assert token and kernel_data["preview"]
+        assert dispatcher._write_kernel.confirmation_state._diagnostic_pending_tokens()
+
+        # Phase 2 (confirm): real consumption → real executor → capture
+        # failure → EFFECT_UNKNOWN, preserved on the wire (F-72).
+        outcome = await _wire(
+            path, instance, "post_text", {"text": "live integration post", "confirmation_token": token}
+        )
+        assert outcome["ok"] is False, outcome
+        safety = outcome["safety"]
+        assert safety["reconciliation_required"] is True
+        assert safety["m5_effect_state"] == "effect_unknown"
+        assert safety["semantic_key"] is not None
+        assert port.submit_calls == 1
+
+        # The token was consumed exactly once (single-use authority).
+        pending = dispatcher._write_kernel.confirmation_state._diagnostic_pending_tokens()
+        assert pending[token].consumed is True
+
+        # The durable M5 ledger carries the unresolved effect the wire
+        # just reported — the client's reconciliation decision has real
+        # backing.
+        from webwire.safety.effect_ledger import EffectState
+
+        states = [record.state for record in dispatcher._m5_ledger.read_records()]
+        assert EffectState.EFFECT_UNKNOWN in states
+    finally:
+        await dispatcher.stop()

@@ -487,6 +487,51 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   inspect.getsource remains. F-15: the execute_with_approver seam exposed on
   ALL six migrated adapters (post-text, reply, quote, media, delete adapters
   now delegate with a per-call approver). Suite 1062 (count from the run).
+- **2026-10-02 — PR #27 review pass: F-60..F-65 — partial repair
+  (protocol/bounds/envelope strictness; transport deferred).** The review
+  found six findings, all valid. This round closes the protocol-level
+  items; the transport and production-mandatory items remain explicitly
+  open. FIXED in this round: F-62 (partial): the 64KiB REQUEST ceiling
+  is now enforced from the ANNOUNCED FRAME HEADER before any JSON
+  decoding or allocation — the 1MiB frame ceiling alone previously
+  allowed oversized request payloads through to the decoder. F-63:
+  runtime_build_id is now REQUIRED in every request envelope (omission
+  returns missing_build_id — the exact-build gate cannot be bypassed by
+  leaving the field out); request_id is required and shape-validated
+  (8–128 characters) as a bounded routing identity — NOT the Layer-5
+  retained request table, which stays in its frozen layer. F-65
+  (complete): allow_nan=False on all outbound JSON (NaN/Infinity can no
+  longer escape the encoder even though the decoder already rejected
+  them); AuthorityHello wire field names normalized to the frozen §10
+  shape (supported_ipc_operations, state — not the Python attribute
+  names); from_dict now strictly validates types and rejects unknown
+  fields; the stale error code is stale_authority_instance (the frozen
+  name); IPC_READ_TABS reduced to exactly the capability's supported
+  enum {posts, replies, media} — the invalid "likes" value removed
+  (the schema must never be a superset of what the capability accepts).
+  F-64 (partial): Windows pipe mode constants corrected (PIPE_TYPE_BYTE
+  and PIPE_READMODE_BYTE are both 0x0, not 0x1|0x2 — the previous
+  values were MESSAGE mode which is invalid with a byte-type pipe) and
+  PIPE_REJECT_REMOTE_CLIENTS (0x8) added to the pipe creation flags
+  (kernel-level remote-client rejection independent of the DACL).
+  REMAINING OPEN (the transport gap): F-60 (BLOCKER — no functioning
+  IPC transport): the accept loop, connection handler, frame I/O over
+  real sockets/pipes, hello transmission, and client implementation do
+  not exist; process_request is only exercised by direct function
+  calls. F-61 (BLOCKER — production-mandatory IPC): enable_ipc stays
+  False until the transport lands (the correct order per the review:
+  transport first, then production-mandatory). F-62 (partial —
+  max_concurrent): the semaphore/bounded-accept enforcement is not yet
+  implemented. F-64 (partial — Windows DACL): the
+  BuildSecurityDescriptorW parameter count/layout and the OpenProcessToken
+  failure remain unfixable without careful Win32 ABI work; the pipe
+  constants and PIPE_REJECT_REMOTE_CLIENTS are corrected but the DACL
+  construction path still fails. The review's external findings were
+  independently reconciled: its request-table finding was partially
+  accepted (request-ID presence/validation is Layer 4; retained
+  same-ID join/cache/dedupe semantics remain Layer 5 per frozen §24.1).
+  Suite 1251 (count from the run — unchanged net; the fixes tightened
+  existing tests rather than adding count).
 - **2026-10-02 — M7 LAYER 4 BUILT (PR pending): local IPC transport,
   handshake, bounded pure read/health surface.** Built per the frozen
   eight-item Layer-4 contract from exact main acb8d2e, tests first (the

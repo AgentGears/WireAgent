@@ -94,7 +94,7 @@ class Dispatcher:
         config: Optional[WebWireConfig] = None,
         session_manager: Optional[SessionManager] = None,
         *,
-        enable_ipc: bool = False,
+        enable_ipc: bool = False,  # F-61: becomes True when F-60 transport lands
     ) -> None:
         # M7-RV11 / F-46: resolve state_dir ONCE, before ANY authority-root
         # construction. Every derived path — journal, effect ledger, rules

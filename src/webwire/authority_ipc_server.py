@@ -157,7 +157,20 @@ class AuthorityIPCServer:
         after: frame decode → handshake fields → operation allowlist →
         schema validation → stale-instance admission."""
         from webwire.authority_ipc_framing import decode_json_frame
+        from webwire.authority_ipc_protocol import IPC_MAX_REQUEST_BYTES
 
+        # F-62: the 64KiB REQUEST ceiling is enforced from the announced
+        # header BEFORE any JSON decoding or allocation — the 1MiB frame
+        # ceiling alone would allow oversized request payloads.
+        if raw_header.length > IPC_MAX_REQUEST_BYTES:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "request_oversized",
+                    f"announced request length {raw_header.length} exceeds the "
+                    f"{IPC_MAX_REQUEST_BYTES}-byte request ceiling",
+                ),
+                is_response=True,
+            )
         try:
             request = decode_json_frame(raw_header, raw_payload)
         except IPCProtocolError as exc:
@@ -173,8 +186,18 @@ class AuthorityIPCServer:
                 ),
                 is_response=True,
             )
+        # F-63: runtime_build_id is REQUIRED — omitting it must not bypass
+        # the exact-build gate.
         client_build_id = request.get("runtime_build_id")
-        if client_build_id is not None and client_build_id != self._runtime_build_id:
+        if not isinstance(client_build_id, str) or not client_build_id:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "missing_build_id",
+                    "runtime_build_id is required (exact-build compatibility cannot be bypassed by omission)",
+                ),
+                is_response=True,
+            )
+        if client_build_id != self._runtime_build_id:
             return encode_json_frame(
                 IPCRequestOutcome.error(
                     "build_mismatch",
@@ -207,6 +230,18 @@ class AuthorityIPCServer:
         # trace, never authority (request_id carries no special power).
         _identity = canonical_request_identity(operation, normalized)
 
+        # F-63: request_id is required and shape-validated (a bounded
+        # routing identity — NOT the Layer-5 retained request table).
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str) or not (8 <= len(request_id) <= 128):
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "schema",
+                    "request_id must be a string of 8–128 characters",
+                ),
+                is_response=True,
+            )
+
         # Stale-instance admission: the Layer-3 primitive, not a pre-check.
         expected_instance = request.get("authority_instance_id")
         if not isinstance(expected_instance, str) or not expected_instance:
@@ -234,7 +269,7 @@ class AuthorityIPCServer:
         except AuthorityStaleInstanceError:
             return encode_json_frame(
                 IPCRequestOutcome.error(
-                    "stale_instance",
+                    "stale_authority_instance",
                     "the owner instance this request addressed is no longer the active owner",
                 ),
                 is_response=True,

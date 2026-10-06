@@ -264,6 +264,7 @@ def _request(
         "operation": operation,
         "payload": payload,
     }
+    body["request_id"] = "req-test-0001"  # F-63: required routing identity
     if instance_id is not None:
         body["authority_instance_id"] = instance_id
     if build_id is not None:
@@ -328,7 +329,7 @@ async def test_stale_instance_cannot_reach_dispatcher() -> None:
     frame = _request("read", {"post_url": "u"}, instance_id=stale)
     header, consumed = parse_frame_header(frame)
     response = json.loads((await server.process_request(header, frame[consumed:]))[8:])
-    assert response["error"]["code"] == "stale_instance"
+    assert response["error"]["code"] == "stale_authority_instance"
     assert log == [], "stale instance: no Dispatcher work"
     assert session.active_work == 0
 
@@ -501,7 +502,10 @@ def test_hello_carries_exact_build_and_current_owner() -> None:
     assert hello.authority_instance_id == session.authority_instance_id
     assert hello.supported_operations == IPC_SUPPORTED_OPERATIONS
     assert hello.lifecycle_state == "ready"
-    # Round-trip
-    restored = AuthorityHello.from_dict(hello.to_dict())
+    # Round-trip via the FROZEN wire names
+    wire = hello.to_dict()
+    assert "supported_ipc_operations" in wire  # F-65: frozen name
+    assert "state" in wire  # F-65: frozen name
+    restored = AuthorityHello.from_dict(wire)
     assert restored.runtime_build_id == BUILD_ID
     assert restored.authority_instance_id == session.authority_instance_id

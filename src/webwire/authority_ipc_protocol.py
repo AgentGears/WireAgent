@@ -59,7 +59,7 @@ IPC_MAX_RESPONSE_BYTES = 1 << 20  # 1 MiB — a single response payload
 IPC_MAX_STRING_BYTES = 2048  # any single string field
 IPC_MAX_LIMIT = 100  # read limits cannot exceed this
 
-IPC_READ_TABS = frozenset({"posts", "replies", "media", "likes"})
+IPC_READ_TABS = frozenset({"posts", "replies", "media"})  # exactly the capability's enum (F-65: no superset)
 IPC_SEARCH_TABS = frozenset({"top", "latest", "people"})
 
 
@@ -118,7 +118,11 @@ def compute_runtime_build_id(src_root: Optional[Path] = None) -> str:
 class AuthorityHello:
     """The owner's handshake: exact-build, exact-protocol, current-owner
     diagnostics. Every field is owner-supplied truth; the client verifies
-    rather than trusting caller-supplied environment strings."""
+    rather than trusting caller-supplied environment strings.
+
+    Wire field names follow the frozen §10 shape exactly (F-65):
+    ``supported_ipc_operations`` and ``state`` — not the Python attribute
+    names, which stay descriptive internally."""
 
     protocol_version: int
     runtime_version: str  # diagnostic only (sys.version)
@@ -135,8 +139,9 @@ class AuthorityHello:
             "runtime_build_id": self.runtime_build_id,
             "authority_instance_id": self.authority_instance_id,
             "authority_domain": self.authority_domain,
-            "supported_operations": sorted(self.supported_operations),
-            "lifecycle_state": self.lifecycle_state,
+            # F-65: the frozen wire names, not the Python attribute names
+            "supported_ipc_operations": sorted(self.supported_operations),
+            "state": self.lifecycle_state,
         }
 
     @classmethod
@@ -148,15 +153,25 @@ class AuthorityHello:
             "runtime_build_id",
             "authority_instance_id",
             "authority_domain",
-            "supported_operations",
-            "lifecycle_state",
+            "supported_ipc_operations",
+            "state",
         }
         missing = required - set(raw.keys())
         if missing:
             raise IPCProtocolError(f"hello missing fields: {sorted(missing)}")
-        ops = raw["supported_operations"]
+        # F-65: strict validation — unknown fields and wrong types reject.
+        allowed = required | {"runtime_version"}
+        unknown = set(raw.keys()) - allowed
+        if unknown:
+            raise IPCProtocolError(f"hello has unknown fields: {sorted(unknown)}")
+        if not isinstance(raw["protocol_version"], int):
+            raise IPCProtocolError("hello protocol_version must be an integer")
+        for field in ("runtime_build_id", "authority_instance_id", "authority_domain", "state"):
+            if not isinstance(raw[field], str) or not raw[field]:
+                raise IPCProtocolError(f"hello {field} must be a non-empty string")
+        ops = raw["supported_ipc_operations"]
         if not isinstance(ops, list) or not all(isinstance(o, str) for o in ops):
-            raise IPCProtocolError("supported_operations must be a list of strings")
+            raise IPCProtocolError("supported_ipc_operations must be a list of strings")
         return cls(
             protocol_version=raw["protocol_version"],
             runtime_version=str(raw.get("runtime_version", "")),
@@ -164,7 +179,7 @@ class AuthorityHello:
             authority_instance_id=raw["authority_instance_id"],
             authority_domain=raw["authority_domain"],
             supported_operations=frozenset(ops),
-            lifecycle_state=raw["lifecycle_state"],
+            lifecycle_state=raw["state"],  # F-65: the frozen wire name
         )
 
 

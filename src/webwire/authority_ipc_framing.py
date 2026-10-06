@@ -70,7 +70,13 @@ def encode_json_frame(obj: Any, *, is_response: bool = False) -> bytes:
     oversized objects reject before any bytes hit the wire."""
     ceiling = IPC_MAX_RESPONSE_BYTES if is_response else IPC_MAX_REQUEST_BYTES
     try:
-        raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        raw = json.dumps(
+            obj,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,  # F-65: outbound NaN/Infinity is protocol-violating
+        ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise IPCProtocolError(f"object is not strict-JSON encodable: {exc}") from exc
     if len(raw) > ceiling:

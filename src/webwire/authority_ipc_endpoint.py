@@ -253,18 +253,17 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
 
     def _create_pipe(self, sa: Any) -> int:
         """Call CreateNamedPipeW with the DACL-backed security attributes."""
-        import ctypes
-
         kernel32 = _win32().kernel32
         PIPE_ACCESS_DUPLEX = 0x3
         FILE_FLAG_FIRST_PIPE_INSTANCE = 0x80000
-        PIPE_TYPE_BYTE = 0x1
-        PIPE_READMODE_BYTE = 0x2
+        PIPE_TYPE_BYTE = 0x0  # F-64: byte mode is 0x0 (0x1 is message type)
+        PIPE_READMODE_BYTE = 0x0  # F-64: byte readmode is 0x0 (0x2 is message)
         PIPE_WAIT = 0x0
+        PIPE_REJECT_REMOTE_CLIENTS = 0x8  # F-64: kernel-level remote rejection
         return kernel32.CreateNamedPipeW(
             self._pipe_name,
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,  # single instance
             65536,  # out buffer
             65536,  # in buffer

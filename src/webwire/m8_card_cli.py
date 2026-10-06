@@ -93,7 +93,12 @@ async def build_production_runtime(
     # input + resolved absolute domain) on this real path.
     config = canonical_config(config)
     session = make_session(config)
-    dispatcher = make_dispatcher(config, session_manager=session)
+    # F-61: production IPC is ON — the Layer-4 transport (bounded local
+    # endpoint, exact-build handshake, seven-gate pipeline) is the
+    # production inter-client surface. The kwarg stays explicit so default
+    # Dispatcher construction (tests, offline recovery) does not silently
+    # gain an endpoint.
+    dispatcher = make_dispatcher(config, session_manager=session, enable_ipc=True)
     try:
         started = await dispatcher.start()
         if not started.ok:

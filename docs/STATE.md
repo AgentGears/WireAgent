@@ -461,6 +461,89 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-06 — PR #27 sixth repair round: F-69 accept-gate, F-70
+  SO_PEERCRED, F-62 seam removal, F-71 doc truth, F-61 production
+  enable.** F-69 (blocker, fixed): the frozen startup order is now
+  bind endpoint → prepare PARKED listener thread → READY → release the
+  accept gate. IPCTransportServer.start_accepting() creates the listener
+  thread while the session is still STARTING — the thread parks on a
+  threading.Event (the READY gate) and only enters accept() after
+  release_accept_gate(), a non-failing Event.set() called after
+  session.activate(). A Thread.start() failure therefore raises inside
+  the guarded startup block where the normal fail-closed STARTING
+  cleanup applies (revoke → browser quiesce → endpoint close/unlink →
+  TERMINAL → ownership release) — a READY owner can no longer be
+  stranded with a bound endpoint and no accept loop. Regression:
+  injected listener-thread failure proves never-READY (revoke is
+  impossible from READY per the F-59 state gate), browser/root quiesced,
+  transport cleared, successor lock acquires. F-70 (high, fixed):
+  PosixDomainSocketEndpoint.accept() now enforces the frozen §10.1
+  peer-identity requirement on Linux via SO_PEERCRED — the
+  kernel-reported peer uid must equal the owner's effective uid; a
+  foreign uid is closed BEFORE the hello and returns None, which the
+  accept loop skips WITHOUT consuming a handler slot (rejection is not
+  a listener failure; the listener survives). macOS/BSD primitives
+  remain Layer 7. Regression: foreign-uid client rejected without a
+  hello, then a same-uid client served a full roundtrip by the SAME
+  listener. F-62 (cleanup): the dead AuthorityIPCServer
+  max_concurrent constructor parameter/field is REMOVED — capacity
+  lives in exactly one place, the transport semaphore fed by
+  IPC_SERVER_MAX_CONCURRENT (now also the transport's default).
+  F-71 (docs): the Windows endpoint/test documentation now describes
+  the shipped classic DACL assembly (SetEntriesInAclW +
+  InitializeSecurityDescriptor + SetSecurityDescriptorDacl), not the
+  abandoned BuildSecurityDescriptorW route (whose empirical record
+  stays in scripts/diag_pipe_dacl.py); STATE and the PR body updated
+  to this head. F-61 (closed): build_production_runtime() constructs
+  its dispatcher with enable_ipc=True — production IPC is ON through
+  the real factory while the Dispatcher default stays False (tests and
+  offline recovery do not silently gain an endpoint). Factory-injected
+  test doubles carry the kwarg; a regression asserts the production
+  call passes True.
+- **2026-10-06 — PR #27 fifth repair round: Windows named-pipe transport
+  operational (F-64), wire-state producers (F-65), saturation and
+  malicious-server and shutdown regressions (F-62/F-67).** F-64: the
+  Windows endpoint is a real, locally-qualified transport. All Win32
+  declarations carry argtypes/restype (the original OpenProcessToken
+  failure was 32-bit-truncated handles from undeclared prototypes).
+  DACL assembly is the classic SetEntriesInAclW +
+  InitializeSecurityDescriptor + SetSecurityDescriptorDacl path — the
+  documented 9-arg BuildSecurityDescriptorW was implemented and tested
+  first and empirically writes invalid out-parameters through ctypes on
+  this platform (returns ERROR_SUCCESS; IsValidSecurityDescriptor
+  False; downstream CreateNamedPipeW fails 998; sentinel-probe evidence
+  in scripts/diag_pipe_dacl.py). Three further ABI traps isolated and
+  fixed: GRANT_ACCESS is 1 (ACCESS_MODE starts at NOT_USED_ACCESS=0);
+  the x64 absolute SECURITY_DESCRIPTOR is 40 bytes (the 20-byte legacy
+  minimum heap-corrupts — 64-byte own buffer); the creator's next pipe
+  instance needs FILE_ALL_ACCESS in the single user-only ACE (a minimal
+  mask is access-denied), while FILE_FLAG_FIRST_PIPE_INSTANCE is
+  bind-only (it refuses even same-process second instances). A
+  socket-compatible _WindowsPipeConnection (ReadFile/WriteFile;
+  CancelIoEx release at drain), accept-loop next-instance creation,
+  and a platform-neutral local client (connect_local_stream) make the
+  transport platform-agnostic; IPCClient uses it. F-65: the abnormal
+  §10.3 wire states are producible from live signals — kill_probe and
+  recovery_probe callables with priority killed > recovery_unavailable
+  > ready > draining; the Dispatcher wires KillSwitch.tripped and the
+  RecoveryGuard status (the same objects the enforcement path
+  consults); a raising probe degrades to the lifecycle answer
+  (diagnostic only; enforcement fails closed independently). F-62
+  saturation regression: capacity 2, two admitted requests hold both
+  handler slots, a third connection is refused WITHOUT a hello, held
+  work completes after release. F-67 client-side regressions: a
+  malicious server announcing an over-ceiling hello or response length
+  is refused from the header, before body allocation. Idle-client
+  shutdown regression — which caught a real cross-platform defect:
+  POSIX close() does NOT unblock a recv() held by another thread, and
+  the blocked reader keeps the open file description alive so the peer
+  never sees EOF; fixed with shutdown(SHUT_RDWR) before close() at
+  drain for tracked connections AND the listener socket (Windows was
+  already correct via CancelIoEx). The CI windows job now runs the
+  Layer-4 transport + pipeline suites (46 tests) alongside the
+  durability job. Evidence at head 1920523: Linux 3.11 1271 passed +
+  13 skipped, ruff clean, mypy 100 files clean, Windows Server 2025
+  3.11/3.12 durability 170+4 / Layer-4 46 / rule store 57.
 - **2026-10-01 — M8 layer 2 review fixes (PR #22): F-09..F-15 resolved.**
   The maintainer-first pass at exact head 81ced8c found three blockers, two
   contract gaps, and an evidence gap; every finding verified against the code
@@ -505,9 +588,11 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   max_concurrent is single-sourced — the Dispatcher constructs the
   transport with IPC_SERVER_MAX_CONCURRENT (from the pipeline module's
   constant); AuthorityIPCServer._max_concurrent is consumed by the
-  transport, not independently enforced. The old AuthorityIPCServer
-  constructor parameter is retained for API compatibility but the
-  transport's max_concurrent is the ONE capacity authority.
+  transport, not independently enforced. (Correction, sixth round: the
+  server-side constructor seam this description left behind was a
+  safety-looking no-op — nothing consumed the field. The sixth repair
+  round REMOVED it; the transport semaphore alone is the capacity
+  authority.)
 - **2026-10-02 — PR #27 third repair round: F-66/F-67 + F-63/F-65
   completion.** F-66 (blocker, fixed): the POSIX transport NO LONGER
   binds its own socket — IPCTransportServer now creates and consumes the

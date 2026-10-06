@@ -536,6 +536,45 @@ async def test_client_refuses_oversized_response_before_body_read(tmp_path: Path
 
 
 # ---------------------------------------------------------------------------
+# F-70: SO_PEERCRED peer-identity enforcement (Linux)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="SO_PEERCRED is Linux")
+async def test_foreign_peer_uid_rejected_before_hello_listener_survives(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A connection whose kernel-reported uid is not the owner's effective
+    uid is closed BEFORE the hello — and the listener SURVIVES the
+    rejection (a rejected peer is not a listener failure); a same-uid
+    client immediately after gets full service."""
+    import webwire.authority_ipc_endpoint as endpoint_module
+
+    session, ipc, transport, loop, path = _server_with_transport(tmp_path)
+    try:
+        real = endpoint_module._expected_peer_uid()
+        assert real is not None
+
+        # Phase 1: expect a foreign uid → the peer is rejected pre-hello.
+        monkeypatch.setattr(endpoint_module, "_expected_peer_uid", lambda: real + 1)
+        with pytest.raises(ConnectionError):
+            IPCClient(path, expected_build_id=BUILD_ID).connect()
+
+        # Phase 2: same-uid → the SAME listener serves a full roundtrip.
+        monkeypatch.setattr(endpoint_module, "_expected_peer_uid", lambda: real)
+        client = IPCClient(path, expected_build_id=BUILD_ID)
+        hello = client.connect()
+        assert hello.lifecycle_state == "ready"
+        response = client.request(
+            _envelope("read", {"post_url": "u"}, instance_id=session.authority_instance_id)
+        )
+        assert response["ok"] is True
+        client.close()
+    finally:
+        _teardown(transport, loop)
+
+
+# ---------------------------------------------------------------------------
 # Idle-client shutdown: drain closes the stalled handler, the rendezvous
 # disappears, and a successor owner can bind the same path
 # ---------------------------------------------------------------------------

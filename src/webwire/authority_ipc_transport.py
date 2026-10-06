@@ -35,7 +35,7 @@ from webwire.authority_ipc_protocol import (
     IPC_PROTOCOL_VERSION,
     AuthorityHello,
 )
-from webwire.authority_ipc_server import AuthorityIPCServer
+from webwire.authority_ipc_server import IPC_SERVER_MAX_CONCURRENT, AuthorityIPCServer
 
 logger = logging.getLogger(__name__)
 
@@ -94,53 +94,79 @@ class IPCTransportServer:
         ipc_server: AuthorityIPCServer,
         authority_domain: Path,
         loop: asyncio.AbstractEventLoop,
-        max_concurrent: int = 4,
+        max_concurrent: int = IPC_SERVER_MAX_CONCURRENT,  # F-62: THE capacity source
     ) -> None:
         self._ipc = ipc_server
         self._authority_domain = authority_domain
         self._loop = loop
-        self._max_concurrent = max_concurrent
-        self._handler_slots = threading.Semaphore(max_concurrent)  # F-62: from param
+        self._handler_slots = threading.Semaphore(max_concurrent)  # F-62: the single capacity enforcement
         self._endpoint: Optional[IPCEndpoint] = None
         self._running = False
         self._connections: set[Any] = set()  # F-60: tracked for shutdown
         self._connections_lock = threading.Lock()
+        # F-69: the READY gate. The listener THREAD is created while the
+        # session is still STARTING (so thread-creation failure takes the
+        # normal startup-cleanup path), but it parks here and only enters
+        # the accept loop after the session activates. threading.Event.set
+        # cannot fail, so the READY -> accepting transition itself is
+        # non-failing by construction.
+        self._accept_gate = threading.Event()
+        self._listener_thread: Optional[threading.Thread] = None
 
     @property
     def endpoint_path(self) -> Optional[str]:
-        return self._endpoint.path if self._endpoint else None
+        return self._endpoint.path if self._endpoint is not None else None
 
     def bind(self) -> None:
         """F-68: Create+bind the QUALIFIED endpoint WITHOUT accepting.
 
         The frozen §8.1 startup order is: create endpoint → READY →
-        begin accepting client work. This method performs only the
-        first step; the Dispatcher calls it BEFORE session.activate(),
-        then calls start_accepting() AFTER READY. A STARTING owner
-        never serves hellos."""
+        begin accepting client work. This method performs only the first
+        step; the Dispatcher calls it BEFORE session.activate(), then
+        prepares the gated listener, activates, and releases the gate.
+        A STARTING owner never serves hellos."""
         self._endpoint = create_endpoint(self._authority_domain)
         self._endpoint.bind()  # F-66: the qualified endpoint owns all security
 
     def start_accepting(self) -> None:
-        """F-68: Begin the bounded accept loop (AFTER READY)."""
+        """F-69: Create the listener thread NOW — while the session is
+        still STARTING. The thread parks on the READY gate (see
+        ``_listener_main``); a Thread.start() failure therefore raises
+        HERE, inside the guarded startup block, where the normal
+        fail-closed STARTING cleanup applies. No accept() happens until
+        ``release_accept_gate()`` after READY."""
         if self._endpoint is None:
             raise RuntimeError("bind() must be called before start_accepting()")
         self._running = True
-        thread = threading.Thread(target=self._accept_loop, daemon=True, name="webwire-ipc-listener")
-        thread.start()
+        thread = threading.Thread(target=self._listener_main, daemon=True, name="webwire-ipc-listener")
+        thread.start()  # F-69: creation failure = STARTING cleanup, never a READY window without an acceptor
         self._listener_thread = thread
 
+    def release_accept_gate(self) -> None:
+        """F-69: Open the READY gate (called only AFTER session.activate()).
+        ``threading.Event.set()`` is a non-failing process-local state
+        transition — the last step of the frozen startup order cannot
+        strand a READY owner without an accept loop."""
+        self._accept_gate.set()
+
+    def _listener_main(self) -> None:
+        self._accept_gate.wait()  # parked from STARTING until READY (or stop)
+        self._accept_loop()
+
     def start(self) -> None:
-        """Convenience: bind + start_accepting (for tests that don't
-        need the two-phase lifecycle). Production uses the split."""
+        """Convenience: bind + gated listener + immediate gate release
+        (for tests that don't need the two-phase lifecycle). Production
+        uses the split."""
         self.bind()
         self.start_accepting()
-
-    _listener_thread: Optional[threading.Thread] = None
+        self.release_accept_gate()
 
     def stop(self) -> None:
         """Close tracked connections, then the endpoint (which unlinks)."""
         self._running = False
+        # Wake a listener still parked on the READY gate (shutdown before
+        # READY): the loop condition sees _running False and exits.
+        self._accept_gate.set()
         # Close the endpoint first (stops accepting).
         if self._endpoint is not None:
             try:
@@ -176,6 +202,11 @@ class IPCTransportServer:
                 if self._running:
                     logger.warning("IPC accept loop: accept failed", exc_info=True)
                 break
+            # F-70: None = the endpoint rejected the peer (e.g. SO_PEERCRED
+            # uid mismatch) and already closed it — skip WITHOUT consuming
+            # a handler slot; the listener keeps serving.
+            if conn is None:
+                continue
             # F-62: acquire a handler slot BEFORE spawning; saturation
             # refuses the connection immediately (no unlimited waiters).
             if not self._handler_slots.acquire(blocking=False):

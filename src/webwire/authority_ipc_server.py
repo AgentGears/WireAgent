@@ -89,7 +89,6 @@ class AuthorityIPCServer:
         authority_domain: Path,
         invoke: Any,  # async callable(name, input) -> ActionResult
         runtime_build_id: Optional[str] = None,
-        max_concurrent: int = IPC_SERVER_MAX_CONCURRENT,
         kill_probe: Optional[Callable[[], bool]] = None,
         recovery_probe: Optional[Callable[[], bool]] = None,
     ) -> None:
@@ -99,13 +98,14 @@ class AuthorityIPCServer:
         self._authority_domain = authority_domain
         self._invoke = invoke
         self._runtime_build_id = runtime_build_id
-        self._max_concurrent = max_concurrent  # F-62: consumed by the transport
         self._active_requests = 0
         self._draining = False
         # F-65: live producers for the two abnormal §10.3 wire states. The
         # Dispatcher wires kill_probe to KillSwitch.tripped and recovery_probe
         # to "not RecoveryGuard.status().available" — the same signals the
         # enforcement path already consults, never a second source of truth.
+        # (F-62: connection capacity lives in ONE place — the transport's
+        # semaphore, fed by IPC_SERVER_MAX_CONCURRENT via the Dispatcher.)
         self._kill_probe = kill_probe
         self._recovery_probe = recovery_probe
 

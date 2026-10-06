@@ -20,6 +20,7 @@ import ctypes  # noqa: F401 — used by _win32() via vars(ctypes)
 import hashlib
 import os
 import socket
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -30,6 +31,23 @@ __all__ = [
     "WindowsNamedPipeEndpoint",
     "create_endpoint",
 ]
+
+# F-70 (frozen §10.1): peer-identity checking where the platform reliably
+# exposes it. Linux SO_PEERCRED is kernel-provided and unforgeable by the
+# connecting process. Resolved at runtime: macOS/BSD lack it (their
+# LOCAL_PEERCRED-family primitives are Layer 7 qualification), and
+# typeshed treats the socket constant as platform-variable.
+_SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
+
+
+def _expected_peer_uid() -> Optional[int]:
+    """The uid every accepted peer must carry (the owner's effective uid).
+
+    os.geteuid is POSIX-only in typeshed, so it resolves at runtime; off
+    POSIX this returns None and the check is skipped (the endpoint is
+    never constructed there)."""
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter is not None else None
 
 
 class IPCEndpoint:
@@ -349,6 +367,24 @@ class PosixDomainSocketEndpoint(IPCEndpoint):
     def accept(self) -> Any:
         assert self._socket is not None
         conn, _ = self._socket.accept()
+        # F-70 (frozen §10.1): peer-identity check where the platform
+        # reliably exposes it. The 0600 mode already constrains access;
+        # SO_PEERCRED closes the contract on Linux by requiring the peer's
+        # kernel-reported uid to equal the owner's effective uid. A foreign
+        # uid is closed BEFORE the hello and returns None — the listener
+        # itself keeps serving (rejection is not a listener failure).
+        if _SO_PEERCRED is not None:
+            # The buflen form returns the raw struct ucred bytes
+            # {pid, uid, gid} — three ints, kernel-provided.
+            creds = conn.getsockopt(socket.SOL_SOCKET, _SO_PEERCRED, struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", creds)
+            expected = _expected_peer_uid()
+            if expected is not None and uid != expected:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return None  # rejected before hello
         return conn
 
     def close(self) -> None:
@@ -441,9 +477,9 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         return handle
 
     def _build_current_user_security_attributes(self) -> Any:
-        """SECURITY_ATTRIBUTES whose self-relative descriptor (built by
-        the 9-arg BuildSecurityDescriptorW ABI) grants pipe access ONLY
-        to the current user's SID."""
+        """SECURITY_ATTRIBUTES whose absolute descriptor (SetEntriesInAclW
+        ACL + InitializeSecurityDescriptor/SetSecurityDescriptorDacl)
+        grants pipe access ONLY to the current user's SID."""
         import ctypes.wintypes as wt
 
         adv = _win_advapi32()

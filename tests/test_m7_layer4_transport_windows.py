@@ -1,7 +1,8 @@
 """M7 Layer 4 Windows named-pipe transport tests (F-64).
 
-Real named-pipe qualification on Windows: the DACL construction (the
-9-arg BuildSecurityDescriptorW ABI), the accept loop's next-instance
+Real named-pipe qualification on Windows: the current-user DACL (the
+classic SetEntriesInAclW + InitializeSecurityDescriptor +
+SetSecurityDescriptorDacl assembly), the accept loop's next-instance
 behavior, the local pipe client, real frame I/O over ReadFile/WriteFile,
 and the shutdown/successor lifecycle. These run ONLY on win32; the
 POSIX equivalents live in tests/test_m7_layer4_transport.py.
@@ -93,8 +94,9 @@ def _teardown(transport, loop) -> None:
 
 
 def test_windows_endpoint_binds_with_current_user_dacl(tmp_path: Path) -> None:
-    """The DACL construction (token → SID → 9-arg BuildSecurityDescriptorW
-    → SECURITY_ATTRIBUTES → CreateNamedPipeW) completes without error —
+    """The DACL construction (token → SID → SetEntriesInAclW →
+    InitializeSecurityDescriptor + SetSecurityDescriptorDacl →
+    SECURITY_ATTRIBUTES → CreateNamedPipeW) completes without error —
     the exact path that failed before the argtypes repair."""
     from webwire.authority_ipc_endpoint import WindowsNamedPipeEndpoint
 

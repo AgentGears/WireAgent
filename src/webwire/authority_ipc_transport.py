@@ -147,9 +147,17 @@ class IPCTransportServer:
                 self._endpoint.close()  # F-66: unlinks the rendezvous
             finally:
                 self._endpoint = None
-        # Close all tracked live connections (idle handlers exit).
+        # Release every live connection. POSIX close() alone does NOT
+        # unblock a recv() held by another thread — and the blocked
+        # reader keeps the open file description (and the peer's side of
+        # the connection) alive. shutdown() forces EOF both ways first;
+        # the Windows pipe connection implements it as CancelIoEx.
         with self._connections_lock:
             for conn in list(self._connections):
+                try:
+                    conn.shutdown(2)  # 2 == socket.SHUT_RDWR
+                except (AttributeError, OSError, ValueError):
+                    pass
                 try:
                     conn.close()
                 except OSError:

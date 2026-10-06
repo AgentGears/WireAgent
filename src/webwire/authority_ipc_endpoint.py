@@ -258,6 +258,14 @@ class _WindowsPipeConnection:
             raise OSError(f"WriteFile failed: error {err}")
         return written.value
 
+    def shutdown(self, how: int = 2) -> None:
+        """Socket-compatible force-EOF: releases any in-process reader
+        blocked in recv (CancelIoEx) without destroying the handle. The
+        ``how`` argument mirrors socket.shutdown's SHUT_RDWR protocol and
+        is ignored — a pipe is always shut down both ways."""
+        if self._handle is not None:
+            _win_kernel32().CancelIoEx(self._handle, None)
+
     def close(self) -> None:
         # CancelIoEx first: a handler thread blocked in ReadFile on this
         # handle is released with ERROR_OPERATION_ABORTED before the
@@ -337,6 +345,14 @@ class PosixDomainSocketEndpoint(IPCEndpoint):
 
     def close(self) -> None:
         if self._socket is not None:
+            # shutdown() before close(): a close() alone does not release
+            # an accept() blocked in another thread (the blocked call
+            # holds the open file description). shutdown makes the pending
+            # accept raise, so the listener thread observes stop cleanly.
+            try:
+                self._socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._socket.close()
             finally:

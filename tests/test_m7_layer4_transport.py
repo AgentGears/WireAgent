@@ -59,6 +59,15 @@ def _server_with_transport(
     session = _session_ready()
     loop = asyncio.new_event_loop()
 
+    import threading
+
+    def _run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=_run_loop, daemon=True)
+    loop_thread.start()
+
     async def invoke(name: str, input: dict) -> Any:
         if invoke_log is not None:
             invoke_log.append((name, dict(input)))
@@ -99,6 +108,10 @@ def _envelope(
 
 def _teardown(transport, loop) -> None:
     transport.stop()
+    loop.call_soon_threadsafe(loop.stop)
+    import time
+
+    time.sleep(0.2)
     loop.close()
 
 

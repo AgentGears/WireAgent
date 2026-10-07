@@ -324,6 +324,9 @@ class Dispatcher:
                             staging_root=self._config.state_dir / "media-staging",
                             artifact_root=self._config.state_dir / "media-artifacts",
                             authority_instance_id=session.authority_instance_id,
+                            # F-82: both roots are proven real directories
+                            # beneath the CANONICAL authority domain.
+                            authority_domain=self._config.state_dir,
                         )
                         from webwire.authority_ipc_transport import (
                             IPCTransportServer,
@@ -636,6 +639,13 @@ class Dispatcher:
                 # 3. Revoke ephemeral confirmation authority (F-47): every
                 #    pending phase-1 token dies with this owner session.
                 session.revoke_authority()
+                # Layer 6 (F-84): FINAL media retention — after the drain
+                # completed, every admitted mutation has unpinned its
+                # artifacts, so this pass reclaims what the pre-drain
+                # cleanup had to leave in place. Nothing orphaned survives
+                # the owner's controlled shutdown.
+                if self._media_registry is not None:
+                    self._media_registry.cleanup_unpinned()
                 # 4. Retire the operator/browser root.
                 self._m5_stack = None
                 self._m5_canary_adapters.clear()

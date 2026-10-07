@@ -155,7 +155,7 @@ async def test_media_ingest_failures_are_stable_wire_codes(tmp_path: Path) -> No
 
     missing = await _ask(server, session, "media_ingest", {"staged_name": "nope.png"})
     assert missing["ok"] is False
-    assert missing["error"]["code"] in ("media_validation_failed", "invalid_staged_name")
+    assert missing["error"]["code"] in ("not_regular_file", "media_validation_failed")
 
 
 async def test_media_ingest_without_registry_refused(tmp_path: Path) -> None:
@@ -319,3 +319,76 @@ async def test_admitted_media_work_pins_its_artifacts(tmp_path: Path) -> None:
     registry.cleanup_unpinned()
     with pytest.raises(Exception, match="unknown_artifact"):  # noqa: B017
         registry.resolve(minted.ref)
+
+
+# ---------------------------------------------------------------------------
+# F-84: media_release over the wire; F-85: alt-text withheld
+# ---------------------------------------------------------------------------
+
+
+async def test_media_release_over_the_wire(tmp_path: Path) -> None:
+    session = _session_ready()
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+    server = _server(session, tmp_path, registry=registry)
+
+    released = await _ask(
+        server, session, "media_release", {"artifact_ref": minted.ref}
+    )
+    assert released["ok"] is True and released["data"]["released"] is True
+
+    gone = await _ask(server, session, "post_photo", {"text": "x", "artifact_ref": minted.ref})
+    assert gone["error"]["code"] == "unknown_artifact"
+
+    unknown = await _ask(server, session, "media_release", {"artifact_ref": "f" * 32})
+    assert unknown["error"]["code"] == "unknown_artifact"
+
+
+async def test_pinned_artifact_refuses_wire_release(tmp_path: Path) -> None:
+    """An artifact pinned by live admitted work cannot be released from
+    the wire while the mutation executes."""
+    session = _session_ready()
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+    inside_invoke = asyncio.Event()
+    release = asyncio.Event()
+
+    async def invoke(name: str, payload: dict) -> Any:
+        inside_invoke.set()
+        await release.wait()
+        return ok_result(data={"posted": True})
+
+    server = _server(session, tmp_path, registry=registry, invoke=invoke)
+    task = asyncio.create_task(
+        _ask(server, session, "post_photo", {"text": "x", "artifact_ref": minted.ref})
+    )
+    await inside_invoke.wait()
+    try:
+        refused = await _ask(server, session, "media_release", {"artifact_ref": minted.ref})
+        assert refused["error"]["code"] == "artifact_pinned"
+    finally:
+        release.set()
+        assert (await task)["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "operation,payload",
+    [
+        ("post_photo", {"text": "x", "artifact_ref": "R", "alt_text": "a description"}),
+        (
+            "post_multi_image",
+            {"artifact_refs": ["A", "B"], "alt_texts": ["one", "two"]},
+        ),
+    ],
+)
+async def test_alt_text_fields_withheld_from_ipc(operation: str, payload: dict) -> None:
+    """F-85: alt-text is NOT an IPC field until real upload support
+    exists — the contract must not accept inputs the execution path
+    silently ignores."""
+    session = _session_ready()
+    server = _server(session, Path("layer6-alt-probe"), registry=None)
+    response = await _ask(server, session, operation, payload)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "schema"

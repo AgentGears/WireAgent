@@ -712,6 +712,8 @@ class AuthorityIPCServer:
                         return await self._reconciliation_route(operation, normalized)
                     if operation == "media_ingest":
                         return self._media_ingest_route(normalized)
+                    if operation == "media_release":
+                        return self._media_release_route(normalized)
                     if operation in IPC_MEDIA_OPERATIONS:
                         # Layer 6: resolve opaque refs to OWNER-side paths
                         # (all-or-nothing for ordered lists) and PIN the
@@ -804,6 +806,28 @@ class AuthorityIPCServer:
         return encode_json_frame(
             IPCRequestOutcome.ok({"artifact": artifact.to_wire_dict()}),
             is_response=True,
+        )
+
+    def _media_release_route(self, payload: dict[str, Any]) -> bytes:
+        """F-84: explicit reclamation. A PINNED artifact (live admitted
+        work) refuses release; an unpinned one is removed with its
+        unreferenced owner file; unknown refs stay unknown_artifact."""
+        if self._media_registry is None:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "media_unavailable",
+                    "this owner exposes no media ingress",
+                ),
+                is_response=True,
+            )
+        try:
+            self._media_registry.release(payload["artifact_ref"])
+        except MediaIngressError as exc:
+            return encode_json_frame(
+                IPCRequestOutcome.error(exc.code, str(exc)), is_response=True
+            )
+        return encode_json_frame(
+            IPCRequestOutcome.ok({"released": True}), is_response=True
         )
 
     def _resolve_media_refs(

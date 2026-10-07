@@ -368,3 +368,110 @@ async def test_registry_is_bounded(tmp_path: Path) -> None:
 
     with pytest.raises(MediaIngressError, match="registry_full"):
         small.ingest("c.png")
+
+# ---------------------------------------------------------------------------
+# First-review regressions: F-82 root confinement, F-83 bounded
+# acquisition, F-84 explicit release
+# ---------------------------------------------------------------------------
+
+
+async def test_root_symlink_rejected_at_construction(tmp_path: Path) -> None:
+    """F-82: a pre-existing symlinked media root is a confinement breach
+    (cleanup could unlink foreign files) — construction refuses it."""
+    domain = tmp_path / "domain"
+    domain.mkdir()
+    real_staging = domain / "real-staging"
+    real_staging.mkdir()
+    alias = domain / "media-staging"
+    try:
+        alias.symlink_to(real_staging, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation requires privileges on this platform")
+    with pytest.raises(MediaIngressError, match="root_symlink_rejected"):
+        _registry(tmp_path)
+
+
+async def test_root_outside_authority_domain_rejected(tmp_path: Path) -> None:
+    """F-82: roots must resolve BENEATH the canonical authority domain —
+    a staging root pointing elsewhere is refused at construction."""
+    domain = tmp_path / "domain"
+    domain.mkdir()
+    with pytest.raises(MediaIngressError, match="root_outside_authority_domain"):
+        MediaArtifactRegistry(
+            staging_root=tmp_path / "elsewhere" / "staging",
+            artifact_root=domain / "artifacts",
+            authority_instance_id=INSTANCE,
+            authority_domain=domain,
+        )
+
+
+async def test_alias_directory_component_rejected(tmp_path: Path) -> None:
+    """F-82: a staged name whose INTERMEDIATE component is a symlink
+    directory — even one resolving back INSIDE staging — fails before
+    the file is opened."""
+    registry = _registry(tmp_path)
+    staging = registry.staging_root
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "photo.png").write_bytes(_PNG_1X1)
+    try:
+        (staging / "alias").symlink_to(staging, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation requires privileges on this platform")
+    with pytest.raises(MediaIngressError, match="symlink_rejected"):
+        registry.ingest("alias/photo.png")
+
+
+async def test_oversized_staged_file_rejected_without_unbounded_read(tmp_path: Path) -> None:
+    """F-83: the acquisition is BOUNDED — a staged file over the
+    validator cap is refused by the streaming copy (never an unbounded
+    read), leaves no temporary residue, and no registry entry."""
+    from webwire.safety.attachment import _MAX_FILE_BYTES
+
+    registry = _registry(tmp_path)
+    big = b"x" * (_MAX_FILE_BYTES + _MAX_FILE_BYTES)
+    _stage(registry, "big.png", data=big)
+    with pytest.raises(MediaIngressError, match="media_validation_failed|file_too_large"):
+        registry.ingest("big.png")
+    assert registry.artifact_count == 0
+    # No temporary acquisition residue in the artifact root.
+    assert list(registry.artifact_root.glob("*.tmp")) == []
+
+
+async def test_staged_file_vanishing_at_open_is_a_stable_error(tmp_path: Path) -> None:
+    """F-83: deletion between resolution and open maps to a stable
+    acquisition code — never a raw OSError escaping to internal."""
+    registry = _registry(tmp_path)
+    staged = _stage(registry, "photo.png")
+    original_resolve = registry._resolve_staged_path
+
+    def _resolve_then_vanish(name: str) -> Path:
+        resolved = original_resolve(name)
+        staged.unlink()
+        return resolved
+
+    registry._resolve_staged_path = _resolve_then_vanish  # type: ignore[method-assign]
+    with pytest.raises(MediaIngressError, match="acquisition_failed"):
+        registry.ingest("photo.png")
+    assert list(registry.artifact_root.glob("*.tmp")) == []
+
+
+async def test_release_refuses_pinned_and_removes_unpinned(tmp_path: Path) -> None:
+    """F-84: media_release semantics at the registry — a pinned artifact
+    (live admitted work) is refused; an unpinned one is removed with its
+    unreferenced owner file; unknown refs stay unknown_artifact."""
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+
+    registry.pin(minted.ref, "live-work")
+    with pytest.raises(MediaIngressError, match="artifact_pinned"):
+        registry.release(minted.ref)
+
+    registry.unpin(minted.ref, "live-work")
+    registry.release(minted.ref)
+    with pytest.raises(MediaIngressError, match="unknown_artifact"):
+        registry.resolve(minted.ref)
+    assert not Path(minted.owner_path).exists(), "the owner file left with its entry"  # noqa: ASYNC240
+
+    with pytest.raises(MediaIngressError, match="unknown_artifact"):
+        registry.release(minted.ref)

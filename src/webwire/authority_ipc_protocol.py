@@ -75,6 +75,7 @@ IPC_SUPPORTED_OPERATIONS = frozenset(
         "bookmark_post",
         "like_post",
         "media_ingest",
+        "media_release",
         "post_photo",
         "reply_photo",
         "quote_photo",
@@ -308,10 +309,15 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
     "media_ingest": {
         "staged_name": (str, True, None),
     },
+    # F-84: explicit client-driven reclamation. Refuses pinned refs
+    # (live admitted work); a pending confirmation's ref stays valid
+    # until released or cleaned — never silently evicted.
+    "media_release": {
+        "artifact_ref": (str, True, None),
+    },
     "post_photo": {
         "text": (str, False, None),
         "artifact_ref": (str, True, None),
-        "alt_text": (str, False, None),
         "confirmation_token": (str, False, None),
     },
     "reply_photo": {
@@ -319,7 +325,6 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "target_post_id": (str, False, None),
         "text": (str, True, None),
         "artifact_ref": (str, True, None),
-        "alt_text": (str, False, None),
         "confirmation_token": (str, False, None),
     },
     "quote_photo": {
@@ -327,13 +332,11 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "target_post_id": (str, False, None),
         "text": (str, True, None),
         "artifact_ref": (str, True, None),
-        "alt_text": (str, False, None),
         "confirmation_token": (str, False, None),
     },
     "post_multi_image": {
         "text": (str, False, None),
         "artifact_refs": (list, True, None),
-        "alt_texts": (list, False, None),
         "confirmation_token": (str, False, None),
     },
     "reply_multi_image": {
@@ -341,7 +344,6 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "target_post_id": (str, False, None),
         "text": (str, True, None),
         "artifact_refs": (list, True, None),
-        "alt_texts": (list, False, None),
         "confirmation_token": (str, False, None),
     },
     "quote_multi_image": {
@@ -349,7 +351,6 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "target_post_id": (str, False, None),
         "text": (str, True, None),
         "artifact_refs": (list, True, None),
-        "alt_texts": (list, False, None),
         "confirmation_token": (str, False, None),
     },
     # F-73 (§14.3): the reconciliation operator wire surface. Opaque
@@ -424,6 +425,7 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "bookmark_post": {},
     "like_post": {},
     "media_ingest": {},
+    "media_release": {},
     "post_photo": {},
     "reply_photo": {},
     "quote_photo": {},
@@ -500,8 +502,6 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
                 raise IPCSchemaError(
                     f"{operation}.{name} must carry 1..{IPC_MAX_MEDIA_ITEMS} ordered items"
                 )
-            if name == "alt_texts" and len(value) > IPC_MAX_MEDIA_ITEMS:
-                raise IPCSchemaError(f"{operation}.{name} exceeds {IPC_MAX_MEDIA_ITEMS} items")
             for index, item in enumerate(value):
                 if not isinstance(item, str):
                     raise IPCSchemaError(f"{operation}.{name}[{index}] must be a string")

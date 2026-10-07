@@ -461,6 +461,55 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 6 second repair round (PR #29,
+  F-82/F-83/F-84/F-85/F-86): root confinement, bounded acquisition,
+  explicit release, honest alt-text scope, and the real media-stack
+  proof.** F-82 (blocker, fixed): the registry now takes the CANONICAL
+  AUTHORITY DOMAIN explicitly; both roots are proven REAL directories
+  beneath the resolved domain (symlink/reparse roots rejected at
+  construction — a symlinked artifact root could have let cleanup
+  unlink foreign files); every staged-name COMPONENT is walked for
+  symlinks before the file is opened (an aliasing directory resolving
+  back inside staging still fails). F-83 (blocker, fixed): acquisition
+  is BOUNDED and race-resistant — the staged file is streamed ONCE into
+  an owner-controlled temporary copy reading at most the validator cap
+  plus one byte (a post-open grow cannot force unbounded allocation);
+  the EXISTING validate_media_file pipeline runs on that immutable
+  copy; the digest is bound from it; and the content-addressed object
+  is published ATOMICALLY (os.replace). Filesystem/acquisition failures
+  map to stable codes (acquisition_failed / media_validation_failed) —
+  never raw OSError, never internal. F-84 (high, fixed): media_release
+  {artifact_ref} gives clients explicit reclamation (refuses pinned
+  refs with artifact_pinned; removes unpinned entries WITH their
+  unreferenced owner files); the Dispatcher runs a FINAL
+  cleanup_unpinned AFTER the drain completes and before revoke/terminal
+  — post-unpin artifacts no longer survive shutdown as orphans; no
+  silent LRU eviction (a pending confirmation's ref stays valid until
+  released or cleaned). F-85 (high, fixed): alt_text/alt_texts are
+  WITHDRAWN from the IPC schema — the real execution path does not
+  apply them, and the contract must not accept inputs it silently
+  ignores; they return only with real upload support. F-86 (blocker,
+  fixed): the T68/T70 acceptance proofs now run through the PRODUCTION
+  stack — a real client socket → the pipeline → the REAL Dispatcher →
+  the REAL WriteKernel (real token mint/consume) →
+  M5MediaCapabilityAdapter → M5ActorBoundMediaExecutor over a
+  controlled media port: phase-1 preview binds the content-addressed
+  digest; phase-2 confirmation attaches the EXACT owner bytes
+  (attach_calls == [the staged PNG]); the artifact stays pinned across
+  admitted execution WITH the client disconnected (retention during the
+  window cannot delete it; the pin drops at the terminal boundary); and
+  a corrupt ordered item N resolves NOTHING — zero attach calls, no
+  composer opened (T70). 10 new tests (6 ingress regressions + 3
+  wire/pipeline + 3 real-stack; 3 symlink probes skip where creation
+  needs privileges — Linux CI exercises them). DEBUG LESSONS: the
+  actor-bound media executor's content proof requires identity-bearing
+  evidence data (post_actor/direct_status_owned/post_url identity), the
+  media port must echo the FILLED composer text back, and cross-loop
+  coordination between the test loop and the dispatcher's transport
+  loop needs threading events with polling — asyncio events never wake
+  cross-loop waiters. Gate ALL GREEN: full suite + ruff + mypy clean on
+  102 files.
+
 - **2026-10-07 — M7 Layer 6 round one (branch m7-layer6-media-ingress,
   from exact main 4daa84c): the artifact referent model, tests-first.**
   The round's center of gravity is the REFERENT MODEL, not the six

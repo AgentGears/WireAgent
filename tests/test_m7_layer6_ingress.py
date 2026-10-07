@@ -388,7 +388,12 @@ async def test_root_symlink_rejected_at_construction(tmp_path: Path) -> None:
     except OSError:
         pytest.skip("symlink creation requires privileges on this platform")
     with pytest.raises(MediaIngressError, match="root_symlink_rejected"):
-        _registry(tmp_path)
+        MediaArtifactRegistry(
+            staging_root=alias,
+            artifact_root=domain / "artifacts",
+            authority_instance_id=INSTANCE,
+            authority_domain=domain,
+        )
 
 
 async def test_root_outside_authority_domain_rejected(tmp_path: Path) -> None:

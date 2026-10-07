@@ -47,6 +47,17 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+
+def _close_win_handle(handle: Any) -> None:
+    """Close a Win32 handle via runtime-resolved windll (ctypes.windll is
+    Windows-only in typeshed — the F-25 portability pattern)."""
+    import ctypes
+
+    windll = getattr(ctypes, "windll", None)
+    if windll is not None:
+        windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 MEDIA_MAX_STAGED_NAME_CHARS = 128
 MEDIA_DEFAULT_MAX_ARTIFACTS = 256
 _READ_CHUNK_BYTES = 1 << 16
@@ -305,7 +316,6 @@ class MediaArtifactRegistry:
         bridged into the bounded reader. The pathname is never reopened.
         Intermediate components stay path-checked; their substitution is
         caught by the final-path containment proof on this handle."""
-        import ctypes
 
         handle = self._win_create_validated(staged_name)
         try:
@@ -321,10 +331,10 @@ class MediaArtifactRegistry:
             msvcrt = __import__("importlib", fromlist=["import_module"]).import_module("msvcrt")
             fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         except MediaIngressError:
-            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+            _close_win_handle(handle)
             raise
         except OSError as exc:
-            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+            _close_win_handle(handle)
             raise MediaIngressError(
                 "acquisition_failed", f"the staged file could not be opened: {exc!r}"
             ) from exc

@@ -461,6 +461,71 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 7 round one (branch m7-layer7-posix-
+  qualification, from exact main 705ef6b): the multi-process
+  qualification harness first.** Per the frozen design ("Layers 7-8 are
+  qualification layers; production changes occur only when real
+  multi-process/platform evidence falsifies a frozen assumption"),
+  this round adds a real-process harness and qualification lanes, NOT
+  architecture. The harness (tests/_m7_layer7_harness.py +
+  _m7_layer7_worker.py): a controller spawning REAL worker processes —
+  real AuthorityOwnerLock, real AuthoritySession, real Dispatcher with
+  production IPC — observing only process/OS boundaries (exit codes,
+  worker JSON records, rendezvous/endpoint state, durable rows); gate
+  files are test orchestration only, never authority signals. Worker
+  scenarios: lock-hold/probe, owner-die (unclean os._exit),
+  owner-hung (controller must kill), full-owner (real Dispatcher+IPC;
+  clean stop or unclean death on a gate), full-owner-write, ipc-request
+  (hello-verified send; optional disconnect-after-send fault),
+  ipc-raw (hex frames / oversized announcements / EOF probes), and
+  fork-child (POSIX). Lanes qualified so far, ALL on genuine sibling
+  processes: (1) ownership — simultaneous acquisition yields exactly
+  one owner (loser = authority_busy exit), clean release permits
+  immediate succession, process death permits succession ONLY after
+  the OS kills the hung owner; (2) crash/takeover — a full production
+  owner dies uncleanly, a real successor process acquires, hydrates,
+  reaches READY with a NEW instance id and serving endpoint, while a
+  contender during the live owner fails authority_busy before
+  browser/IPC; corrupt durable history refuses successor startup fail
+  closed; (3) lifecycle — clean stop releases for a successor
+  full-owner; a client disconnect after a mutating send leaves the
+  owner alive and a later clean stop completes in order; (4) IPC
+  faults — duplicate request_id over two real connections returns the
+  byte-stable retained frame; capacity saturation over real
+  connections refuses the extra connection AT THE ENDPOINT and service
+  resumes after the stalls drain; announced-oversized frames are
+  refused (clean EOF on POSIX / peer-close on pipes) with the owner
+  still serving; owner death after an uncertain mutation: the
+  successor starts cleanly and the OLD envelope is rejected as
+  stale_authority_instance — RPC uncertainty never became mutation
+  truth; (6) media boundary — artifact refs die with the owner (a
+  successor's registry is empty; staged bytes re-ingest as a NEW ref —
+  no replay authority survives), unclean death mid-ingress leaves at
+  most inert .tmp residue (never a half-written content-addressed
+  object), and the post-drain retention pass reclaims unpinned
+  artifacts at clean shutdown. POSIX-only lane (Linux CI): empirical
+  socket mode 0600 in the authority domain; stale-path successor
+  rebinding; fork-child — the inherited descriptor does NOT keep the
+  domain locked after parent death while the child lives; and
+  /proc-based proof the production owner holds NO listening TCP
+  socket. ONE production delta, each evidence-driven and
+  mechanism-tiny: _WindowsPipeConnection.settimeout became a no-op
+  (socket-API compatibility — socket-shaped callers work unchanged on
+  both platforms; needed by the real-transport fault probes). The
+  inherited M5/M6 contracts carry via the full gate + CI unchanged
+  (lane 7 = the suites themselves). 15 cross-platform tests (Windows-
+  native locally) + 4 POSIX-only (CI Linux). Gate ALL GREEN: full
+  suite + ruff + mypy clean on 102 files. HARNESS LESSONS: a worker
+  must run gate waits OFF the event loop (blocking the loop deadlocks
+  every in-flight run_coroutine_threadsafe); the DOM port is stubbed
+  at Layer 7 so read-op assertions accept any well-formed frame (the
+  laws under test are retention/service, not the read result); the
+  fifth connection at capacity is refused at the ENDPOINT on Windows
+  (ConnectionError at connect) — that IS the saturation law observed
+  live; and a stub M5 read broker must be shaped (allowed_methods) or
+  even health raises.
+
+
 - **2026-10-07 — M7 Layer 6 MERGED (PR #29, squash `de3551d`).** The
   merge-gate pass at exact head `79a6658` returned MERGE-READY; F-82
   through F-91 all closed at the Layer-6 implementation boundary after

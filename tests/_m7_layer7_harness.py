@@ -1,0 +1,146 @@
+"""M7 Layer 7 — multi-process qualification harness (controller side).
+
+Spawns REAL worker processes (real AuthorityOwnerLock, real
+AuthoritySession, real Dispatcher/IPC where the scenario requires) and
+observes only process/OS boundaries: exit status, JSON records the
+worker writes, rendezvous/endpoint state on disk, and durable M5/M6
+rows. Synchronization gate files under a per-test scratch directory are
+TEST ORCHESTRATION, never authority signals.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+WORKER = Path(__file__).with_name("_m7_layer7_worker.py")
+
+# Stable exit codes the worker contract defines (distinct from signal
+# deaths, which the OS reports as negative returncodes on POSIX).
+EXIT_OK = 0
+EXIT_BUSY = 23
+EXIT_DIED_UNCLEAN = 9  # os._exit code the owner-die scenarios use
+
+
+class WorkerHandle:
+    """One running worker process plus its result plumbing."""
+
+    def __init__(self, process: subprocess.Popen[Any], result_path: Path) -> None:
+        self.process = process
+        self.result_path = result_path
+
+    @property
+    def returncode(self) -> Optional[int]:
+        return self.process.returncode
+
+    def wait(self, timeout: float = 30.0) -> int:
+        try:
+            return self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+            raise
+
+    def terminate(self) -> None:
+        """OS-level termination (SIGTERM/ TerminateProcess)."""
+        self.process.terminate()
+
+    def kill(self) -> None:
+        """Hard kill (SIGKILL/ TerminateProcess)."""
+        self.process.kill()
+
+    def poll(self) -> Optional[int]:
+        return self.process.poll()
+
+    def result(self, timeout: float = 15.0) -> dict[str, Any]:
+        """The worker's JSON record (written after its first stable
+        observation, before any gate waits)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.result_path.exists():
+                text = self.result_path.read_text(encoding="utf-8").strip()
+                if text:
+                    return json.loads(text)
+            if self.poll() is not None and not self.result_path.exists():
+                break
+            time.sleep(0.02)
+        raise TimeoutError(
+            f"worker result {self.result_path} never appeared "
+            f"(exit={self.poll()}, stdout tail follows)\n"
+            f"{getattr(self.process, 'stdout', None) and _tail(self.process)}"
+        )
+
+
+def _tail(process: subprocess.Popen[Any]) -> str:
+    return ""
+
+
+def start_worker(
+    scratch: Path,
+    scenario: str,
+    *args: str,
+) -> WorkerHandle:
+    """Launch one worker scenario. Result files and gates live under
+    ``scratch``; each call mints a unique result name."""
+    scratch.mkdir(parents=True, exist_ok=True)
+    tag = f"{scenario}-{time.monotonic_ns()}"
+    result_path = scratch / f"{tag}.json"
+    argv = [sys.executable, str(WORKER), scenario, str(result_path), *map(str, args)]
+    process = subprocess.Popen(  # noqa: S603 - fixed interpreter + repo file
+        argv,
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return WorkerHandle(process, result_path)
+
+
+def gate(scratch: Path, name: str) -> Path:
+    """An orchestration gate file (created by the controller to release a
+    waiting worker; never read by production code)."""
+    return scratch / f"gate-{name}"
+
+
+def open_gate(scratch: Path, name: str) -> None:
+    gate(scratch, name).write_text("go", encoding="utf-8")
+
+
+def wait_exit(handle: WorkerHandle, timeout: float = 30.0) -> int:
+    return handle.wait(timeout=timeout)
+
+
+def wait_record(path: Path, timeout: float = 15.0) -> dict[str, Any]:
+    """Wait for a JSON file another process wrote (worker result or
+    client record)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return json.loads(text)
+        time.sleep(0.02)
+    raise TimeoutError(f"record {path} never appeared within {timeout}s")
+
+
+def stdout_records(handle: WorkerHandle, timeout: float = 20.0) -> list[dict[str, Any]]:
+    """Parse the worker's stdout as JSON lines (event stream)."""
+    try:
+        out, _err = handle.process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        handle.process.kill()
+        raise
+    records = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records

@@ -284,6 +284,12 @@ class _WindowsPipeConnection:
             raise OSError(f"WriteFile failed: error {err}")
         return written.value
 
+    def settimeout(self, value: object) -> None:
+        """Socket-API compatibility: synchronous pipe reads have no
+        per-socket timeout dial; present so socket-shaped callers work
+        unchanged on both platforms."""
+        return None
+
     def shutdown(self, how: int = 2) -> None:
         """Socket-compatible force-EOF: releases any in-process reader
         blocked in recv (CancelIoEx) without destroying the handle. The

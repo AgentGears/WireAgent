@@ -461,6 +461,22 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 5 final repair (PR #28, F-81 closed): the
+  reconciliation page query is ONE pass.** RecoveryProjector.project()
+  already returns the canonical M6 snapshot sorted by effect_id, so
+  list_targets_page() no longer builds an unresolved-id list, a
+  candidate list, a second sort, or a lookup dict — it scans the sorted
+  snapshot once, counts total/remaining as integers, and constructs AT
+  MOST `limit` ReconciliationTarget wrappers. The instrumented
+  regression drives a 500-item pre-sorted projection with limit=1 and
+  limit=3: exactly `limit` wrappers are constructed (counted via a
+  patched __new__), builtins.sorted is invoked ZERO times during the
+  paging call, and the functional total/remaining/has_more/cursor
+  semantics are asserted unchanged. The complete projector pass remains
+  O(N) — the existing M6 canonical durable-truth reconstruction, not
+  new Layer-5 pagination amplification. Gate ALL GREEN; ruff + mypy
+  clean on 101 files.
+
 - **2026-10-06 — M7 Layer 5 fourth repair round (PR #28, F-79/F-80/F-81):
   committed-continuation close protection, size-independent safety
   floor, execution-bounded reconciliation pagination.** F-79 (blocker,

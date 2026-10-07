@@ -1054,3 +1054,72 @@ async def test_F81_true_total_and_remaining_pagination(tmp_path: Path) -> None:
         assert set(ids1) | set(ids2) == {f"fx-q-{s}" for s in "abc"}
     finally:
         await dispatcher.stop()
+
+# ---------------------------------------------------------------------------
+# F-81 final: the paging single pass — instrumented bounded enumeration
+# ---------------------------------------------------------------------------
+
+
+async def test_F81_single_pass_no_resort_no_full_target_materialization(tmp_path: Path) -> None:
+    """F-81 (final): over a large ALREADY-SORTED projection, one page
+    request constructs AT MOST `limit` ReconciliationTarget wrappers and
+    never invokes sorted() — no unresolved-id list, no candidate list, no
+    re-sort, no lookup dict. Functional total/remaining/has_more checks
+    remain intact."""
+    from unittest.mock import patch as _patch
+
+    import webwire.safety.reconciliation_coordinator as coordinator_module
+
+    dispatcher = await _started_ipc_dispatcher(tmp_path)
+    try:
+        count = 500
+
+        class _FakeProjection:
+            def __init__(self, index: int) -> None:
+                self.effect_id = f"fx-{index:04d}"
+                self.unresolved = True
+                self.first_record = type("R", (), {"state": type("S", (), {"value": "EFFECT_UNKNOWN"})()})()
+                self.last_record = self.first_record
+
+        # A large canonical snapshot, pre-sorted exactly as the real
+        # projector guarantees — so no sort is owed to anyone.
+        sorted_projection = [_FakeProjection(i) for i in range(count)]
+        dispatcher._m6_reconciliation._guard.projector.project = (  # type: ignore[method-assign]
+            lambda: sorted_projection
+        )
+
+        constructed: list[int] = []
+
+        class _CountingTarget(coordinator_module.ReconciliationTarget):
+            def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+                constructed.append(1)
+                return super().__new__(cls)
+
+        with (
+            _patch.object(coordinator_module, "ReconciliationTarget", _CountingTarget),
+            _patch("builtins.sorted") as sorted_spy,
+        ):
+            page, total, remaining, has_more = dispatcher._m6_reconciliation.list_targets_page(
+                limit=1, after_effect_id="fx-0009"
+            )
+
+        assert total == count
+        assert remaining == count - 10
+        assert has_more is True
+        assert [t.effect_id for t in page] == ["fx-0010"], "the next page after the cursor"
+        assert len(constructed) == 1, "exactly limit wrappers constructed — never the full set"
+        assert sorted_spy.call_count == 0, "the single pass adds no sort over the sorted snapshot"
+
+        # A first page (no cursor) is equally bounded.
+        constructed.clear()
+        with (
+            _patch.object(coordinator_module, "ReconciliationTarget", _CountingTarget),
+            _patch("builtins.sorted") as sorted_spy,
+        ):
+            first_page, total, remaining, has_more = dispatcher._m6_reconciliation.list_targets_page(limit=3)
+        assert [t.effect_id for t in first_page] == ["fx-0000", "fx-0001", "fx-0002"]
+        assert (total, remaining, has_more) == (count, count, True)
+        assert len(constructed) == 3
+        assert sorted_spy.call_count == 0
+    finally:
+        await dispatcher.stop()

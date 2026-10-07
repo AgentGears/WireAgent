@@ -461,6 +461,176 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 6 fourth repair round (PR #29, F-90/F-91):
+  one authoritative Windows handle; already-absent release.** F-90
+  (blocker, fixed): the Windows confined open no longer probes one
+  handle and reads through a different pathname-opened one. ONE handle
+  is both the confinement decision and the acquisition source:
+  CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT (no-follow — a
+  reparse/symlink final component yields a handle to the LINK itself),
+  the handle's OWN attributes inspected with fail-closed semantics
+  (reparse → symlink_rejected; directory → not_regular_file; open/
+  inspection failure → acquisition_failed — "unable to prove" is never
+  safe), GetFinalPathNameByHandleW proves the SAME handle's final
+  resolved path beneath the staging root (also the containment proof for
+  path-checked intermediate components), and msvcrt.open_osfhandle
+  bridges THIS handle into the bounded reader — the pathname is never
+  reopened. The old probe helper is gone. POSIX hardening included: the
+  staging-root descriptor itself now opens with O_NOFOLLOW |
+  O_DIRECTORY so the root path cannot become the one component outside
+  the no-follow chain. Regressions (Windows-native, executing on this
+  gate): poisoning os.open proves a normal ingest never reopens by
+  pathname; the probe-failure injection fails closed with no fallthrough;
+  the reviewer-specified substitution race (regular file validated, then
+  the pathname replaced with a symlink to an outside DIFFERENT image)
+  acquires the VALIDATED handle's bytes (the staged PNG digest), never
+  the substituted pathname. F-91 (high, fixed): media_release treats an
+  ALREADY-ABSENT content-addressed file as complete reclamation — the
+  reference is removed (released=true semantics), the bounded slot is
+  reclaimed, and the ref reads unknown_artifact afterwards; a
+  permission/IO unlink failure on an EXISTING file still refuses
+  truthfully (artifact_release_failed, reference retained). No
+  permanently unreleasable live references. 5 new tests. Gate ALL
+  GREEN: full suite + ruff + mypy clean on 102 files.
+
+- **2026-10-07 — M7 Layer 6 third repair round (PR #29, F-87/F-88/F-89):
+  bounded/stable owner-copy revalidation, open-time confinement,
+  truthful release.** F-87 (blocker, fixed): resolve() no longer calls
+  read_bytes() — _bounded_digest streams at most the validator cap plus
+  one byte and converts every failure to a stable code: artifact_deleted
+  (vanished), artifact_unreadable (open/read OSError),
+  artifact_oversize, digest_mismatch. An oversize or corrupt owner copy
+  immediately before an irreversible media mutation is refused bounded
+  and stable — never an unbounded allocation, never a generic internal.
+  Wire regression: deleted and oversize owner copies reach the client as
+  their stable codes with the Dispatcher never reached. F-88 (high,
+  fixed): the final open IS the confinement decision. POSIX: a dir_fd
+  walk from the staging root opens every staged-name component with
+  O_NOFOLLOW — a component swapped for a symlink between check and open
+  fails the OPEN itself (ELOOP → symlink_rejected); the _openat seam
+  exists for race injection. Windows: the final component is probed
+  with FILE_FLAG_OPEN_REPARSE_POINT (opening the LINK itself when the
+  component is a reparse point) and the handle's own attributes are
+  inspected — a reparse alias is refused at the handle level;
+  intermediate components use the portable best-effort checks (full
+  platform qualification stays Layers 7/8). Acquisition now reads from
+  the HELD descriptor — no re-resolved path between confinement and
+  bytes. Regressions: a final-component symlink to an outside valid
+  image is refused at open with no ref minted; the injected check-to-
+  open race (regular file passing all checks, substituted at the _openat
+  seam) is refused (POSIX; Linux CI). F-89 (high, fixed): media_release
+  is TRUTHFUL — the owner file is deleted FIRST and the registry entry
+  removed only on success; deletion failure raises
+  artifact_release_failed with BOTH the reference and the file remaining
+  (never "released: true" while media stays on disk); a shared
+  content-addressed file with another live entry releases the reference
+  alone (complete reclamation). cleanup_unpinned is documented
+  BEST-EFFORT retention: unlink failures are logged as residue, and the
+  docstring no longer claims guaranteed artifact removal — guaranteed
+  reclamation is the explicit media_release contract, which fails
+  honestly. Protocol module header updated to the real advertised
+  surface (Layer-6 media ops via opaque refs; download_image/compose
+  still unadvertised). 6 new tests (2 symlink/race probes run on Linux
+  CI). Gate ALL GREEN: full suite + ruff + mypy clean on 102 files.
+
+- **2026-10-07 — M7 Layer 6 second repair round (PR #29,
+  F-82/F-83/F-84/F-85/F-86): root confinement, bounded acquisition,
+  explicit release, honest alt-text scope, and the real media-stack
+  proof.** F-82 (blocker, fixed): the registry now takes the CANONICAL
+  AUTHORITY DOMAIN explicitly; both roots are proven REAL directories
+  beneath the resolved domain (symlink/reparse roots rejected at
+  construction — a symlinked artifact root could have let cleanup
+  unlink foreign files); every staged-name COMPONENT is walked for
+  symlinks before the file is opened (an aliasing directory resolving
+  back inside staging still fails). F-83 (blocker, fixed): acquisition
+  is BOUNDED and race-resistant — the staged file is streamed ONCE into
+  an owner-controlled temporary copy reading at most the validator cap
+  plus one byte (a post-open grow cannot force unbounded allocation);
+  the EXISTING validate_media_file pipeline runs on that immutable
+  copy; the digest is bound from it; and the content-addressed object
+  is published ATOMICALLY (os.replace). Filesystem/acquisition failures
+  map to stable codes (acquisition_failed / media_validation_failed) —
+  never raw OSError, never internal. F-84 (high, fixed): media_release
+  {artifact_ref} gives clients explicit reclamation (refuses pinned
+  refs with artifact_pinned; removes unpinned entries WITH their
+  unreferenced owner files); the Dispatcher runs a FINAL
+  cleanup_unpinned AFTER the drain completes and before revoke/terminal
+  — post-unpin artifacts no longer survive shutdown as orphans; no
+  silent LRU eviction (a pending confirmation's ref stays valid until
+  released or cleaned). F-85 (high, fixed): alt_text/alt_texts are
+  WITHDRAWN from the IPC schema — the real execution path does not
+  apply them, and the contract must not accept inputs it silently
+  ignores; they return only with real upload support. F-86 (blocker,
+  fixed): the T68/T70 acceptance proofs now run through the PRODUCTION
+  stack — a real client socket → the pipeline → the REAL Dispatcher →
+  the REAL WriteKernel (real token mint/consume) →
+  M5MediaCapabilityAdapter → M5ActorBoundMediaExecutor over a
+  controlled media port: phase-1 preview binds the content-addressed
+  digest; phase-2 confirmation attaches the EXACT owner bytes
+  (attach_calls == [the staged PNG]); the artifact stays pinned across
+  admitted execution WITH the client disconnected (retention during the
+  window cannot delete it; the pin drops at the terminal boundary); and
+  a corrupt ordered item N resolves NOTHING — zero attach calls, no
+  composer opened (T70). 10 new tests (6 ingress regressions + 3
+  wire/pipeline + 3 real-stack; 3 symlink probes skip where creation
+  needs privileges — Linux CI exercises them). DEBUG LESSONS: the
+  actor-bound media executor's content proof requires identity-bearing
+  evidence data (post_actor/direct_status_owned/post_url identity), the
+  media port must echo the FILLED composer text back, and cross-loop
+  coordination between the test loop and the dispatcher's transport
+  loop needs threading events with polling — asyncio events never wake
+  cross-loop waiters. Gate ALL GREEN: full suite + ruff + mypy clean on
+  102 files.
+
+- **2026-10-07 — M7 Layer 6 round one (branch m7-layer6-media-ingress,
+  from exact main 4daa84c): the artifact referent model, tests-first.**
+  The round's center of gravity is the REFERENT MODEL, not the six
+  capability names. New authority_media_ingress.py: the
+  MediaArtifactRegistry owns two locations under the canonical authority
+  domain — the staging root (clients place bytes; the owner resolves
+  names strictly inside it: no absolute paths, no traversal, no
+  backslashes, no symlinks — a client filesystem string can never become
+  mutation authority through IPC) and the content-addressed artifact
+  store (<sha256>.bin — the owner copy is built from the exact bytes the
+  owner read and hashed, immune to staged-file mutation afterwards;
+  resolve() re-verifies the owner copy digest before every use:
+  substitution/corruption defense; expected_digest binds the preview's
+  artifact into the confirmed mutation). Ingress gates on the EXISTING
+  validation pipeline (validate_media_file: upload roots, regular-file/
+  no-symlink, magic-byte MIME, size, dimensions, SHA-256, EXIF) BEFORE
+  any preview/token authority. The minted artifact_ref is OPAKE,
+  instance-scoped, and ephemeral — a successor owner's registry never
+  knows it; never M5/M6 authority; never a durable replay credential.
+  Ordered resolve_ordered() is ALL-OR-NOTHING (a bad item N resolves
+  nothing). pin/unpin carry admitted-mutation retention: cleanup can
+  never delete live media; unpinned artifacts are reclaimed at drain.
+  The registry is bounded (max 256; overflow = registry_full). Wire
+  surface: media_ingest {staged_name} returns preview-grade metadata +
+  the opaque ref; the SIX media writes (post_photo, reply_photo,
+  quote_photo, post_multi_image, reply_multi_image, quote_multi_image)
+  join the advertised surface taking artifact_ref / ordered artifact_refs
+  (1..4) — raw image_path(s) die as unknown schema fields; the pipeline
+  resolves refs to OWNER-side paths (all-or-nothing) and substitutes
+  them into the capability input, so the existing media capabilities and
+  M5 adapters run unchanged with their immutable digest/manifest binding
+  and all-before-any-upload preflight intact; admitted media work pins
+  its artifacts for the invoke's duration; ingress/resolution failures
+  are stable wire codes (invalid_staged_name, symlink_rejected,
+  staged_outside_root, media_validation_failed, digest_mismatch,
+  unknown_artifact, registry_full, media_unavailable) — never internal.
+  download_image remains UNADVERTISED (the local-output contract is its
+  own future decision); compose_post stays off the surface. The
+  Dispatcher constructs the registry at IPC startup (instance-scoped)
+  and runs unpinned retention at drain. Legacy T66 assertions in the
+  Layer-4/5 suites updated for the flip. Tests: 16 ingress + 18 pipeline
+  + 3 real-transport (37 new + 1 platform-skipped symlink probe that
+  Linux CI exercises). Gate ALL GREEN: full suite + ruff + mypy clean on
+  102 files. EXPLICITLY FLAGGED for review: the real-executor media
+  integration (socket → Dispatcher → WriteKernel → M5 media executor
+  with a stub media port) is NOT yet in this round — the wire chain is
+  qualified at the pipeline-invoke level, mirroring how Layer-5 round
+  one flagged §14.3 before round two integrated it.
+
 - **2026-10-07 — M7 Layer 5 MERGED (PR #28, squash `13a471c`).** The
   merge-gate pass at exact head `4ec46ae` returned MERGE-READY; F-72
   through F-81 all closed at the Layer-5 implementation boundary after

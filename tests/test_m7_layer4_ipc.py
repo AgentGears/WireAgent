@@ -202,7 +202,7 @@ def test_unknown_operation_rejected() -> None:
     # Layer 5 (M7-RV10/T61-flip): whoami and the six non-file writes are
     # now advertised; what stays unknown is everything outside the frozen
     # surface — media, local-output, and non-capability names.
-    for op in ("download_image", "create_rule", "post_photo"):
+    for op in ("download_image", "create_rule", "compose_post"):
         with pytest.raises(IPCSchemaError, match="unknown IPC operation"):
             validate_and_normalize_request(op, {})
 
@@ -347,13 +347,9 @@ async def test_forbidden_operations_rejected_before_dispatcher() -> None:
     session = _session_ready()
     log: list = []
     server = _server(session, invoke_log=log)
+    # Layer 6 moved the six media writes into the advertised surface via
+    # the qualified artifact-ingress contract; these stay outside it.
     for op in (
-        "post_photo",
-        "reply_photo",
-        "quote_photo",
-        "post_multi_image",
-        "reply_multi_image",
-        "quote_multi_image",
         "download_image",
         "compose_post",
         "create_reconciliation_operator_session",

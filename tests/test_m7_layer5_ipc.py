@@ -35,14 +35,11 @@ LAYER5_READS = frozenset({"whoami"})
 LAYER5_WRITES = frozenset(
     {"post_text", "reply_post", "quote_post", "delete_post", "bookmark_post", "like_post"}
 )
+# Layer 6 flipped the six media writes into the advertised surface (with
+# the qualified artifact-ingress contract in the same round). What stays
+# forbidden is the local-output capability and the card-preview op.
 LAYER6_FORBIDDEN = frozenset(
     {
-        "post_photo",
-        "reply_photo",
-        "quote_photo",
-        "post_multi_image",
-        "reply_multi_image",
-        "quote_multi_image",
         "download_image",
         "compose_post",
     }
@@ -105,11 +102,11 @@ def test_layer5_operations_are_advertised() -> None:
 
 
 def test_layer6_media_scope_remains_unadvertised() -> None:
-    """M7-T66: photo/multi-image/media writes, artifacts, and the local
-    output capability are NOT advertised before the Layer-6 media-ingress
-    qualification — requesting them dies at the allowlist, before the
-    Dispatcher is reachable (no owner path resolution, preview, token,
-    or effect authority)."""
+    """The Layer-6 residual boundary: the local-output capability and the
+    card-preview op remain UNADVERTISED — requesting them dies at the
+    allowlist, before the Dispatcher is reachable. (The six media WRITES
+    joined the surface in Layer 6 via the qualified artifact-ingress
+    contract; see the Layer-6 suites.)"""
     assert not (LAYER6_FORBIDDEN & IPC_SUPPORTED_OPERATIONS)
     session = _session_ready()
     log: list = []
@@ -118,8 +115,8 @@ def test_layer6_media_scope_remains_unadvertised() -> None:
     async def _check() -> dict[str, Any]:
         header, payload = parse_and_split(
             _frame(
-                "post_photo",
-                {"text": "x", "image_path": "C:/raw/client/path.png"},
+                "download_image",
+                {"post_url": "https://x.com/a/1"},
                 instance_id=session.authority_instance_id,
             )
         )

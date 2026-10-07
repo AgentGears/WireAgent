@@ -49,6 +49,7 @@ from webwire.authority_ipc_protocol import (
     validate_and_normalize_request,
 )
 from webwire.authority_ipc_request_table import RetainedRequestTable
+from webwire.authority_media_ingress import MediaArtifactRegistry, MediaIngressError
 from webwire.authority_session import (
     AuthorityAdmissionClosedError,
     AuthoritySession,
@@ -353,6 +354,7 @@ class AuthorityIPCServer:
         kill_probe: Optional[Callable[[], bool]] = None,
         recovery_probe: Optional[Callable[[], bool]] = None,
         reconciliation_provider: Optional[Callable[[str], Any]] = None,
+        media_registry: Optional[MediaArtifactRegistry] = None,
     ) -> None:
         if runtime_build_id is None:
             runtime_build_id = compute_runtime_build_id()
@@ -381,6 +383,11 @@ class AuthorityIPCServer:
         # logical session and any uncommitted operator authority.
         self._reconciliation_provider = reconciliation_provider
         self._reconciliation_sessions: dict[str, _ReconciliationWireSession] = {}
+        # Layer 6: the owner-side artifact registry. The six media write
+        # operations resolve opaque instance-scoped artifact_refs through
+        # it into OWNER-side content-addressed paths before the Dispatcher
+        # is reachable; a raw client path never resolves anywhere.
+        self._media_registry = media_registry
 
     @property
     def active_requests(self) -> int:
@@ -663,6 +670,7 @@ class AuthorityIPCServer:
                     expected_instance=expected_instance,
                     operation=operation,
                     normalized=normalized,
+                    request_id=request_id_str,
                 )
             except BaseException as exc:
                 self._table.abandon(request_id_str, exc)
@@ -680,6 +688,7 @@ class AuthorityIPCServer:
         expected_instance: str,
         operation: str,
         normalized: dict[str, Any],
+        request_id: str,
     ) -> bytes:
         """The drain/admission/Dispatcher tail for a NEW retained request."""
         if self._draining:
@@ -701,7 +710,36 @@ class AuthorityIPCServer:
                     # capability invocation.
                     if operation in IPC_RECONCILIATION_OPERATIONS:
                         return await self._reconciliation_route(operation, normalized)
-                    result = await self._invoke(operation, normalized)
+                    if operation == "media_ingest":
+                        return self._media_ingest_route(normalized)
+                    if operation == "media_release":
+                        return self._media_release_route(normalized)
+                    if operation in IPC_MEDIA_OPERATIONS:
+                        # Layer 6: resolve opaque refs to OWNER-side paths
+                        # (all-or-nothing for ordered lists) and PIN the
+                        # artifacts for the duration of the admitted work —
+                        # retention/cleanup can never delete live media.
+                        # Resolution failures are STABLE wire states (the
+                        # ingress error taxonomy), never escaped exceptions.
+                        try:
+                            media = self._resolve_media_refs(normalized)
+                        except MediaIngressError as exc:
+                            return encode_json_frame(
+                                IPCRequestOutcome.error(exc.code, str(exc)),
+                                is_response=True,
+                            )
+                        registry = self._media_registry
+                        assert registry is not None  # _resolve_media_refs raised otherwise
+                        normalized = self._translate_media_payload(normalized, media)
+                        for artifact in media:
+                            registry.pin(artifact.ref, request_id)
+                        try:
+                            result = await self._invoke(operation, normalized)
+                        finally:
+                            for artifact in media:
+                                registry.unpin(artifact.ref, request_id)
+                    else:
+                        result = await self._invoke(operation, normalized)
                 finally:
                     self._active_requests -= 1
         except AuthorityStaleInstanceError:
@@ -743,6 +781,87 @@ class AuthorityIPCServer:
                 ),
                 is_response=True,
             )
+
+    # -- Layer 6: media ingress + artifact-ref translation --------------------
+
+    def _media_ingest_route(self, payload: dict[str, Any]) -> bytes:
+        """media_ingest: owner-side validation of one staged artifact and
+        the minted OPAQUE ref. Runs inside owner admission; any failure
+        is a stable wire code (the ingress error taxonomy) with NO token
+        or preview authority minted."""
+        if self._media_registry is None:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "media_unavailable",
+                    "this owner exposes no media ingress",
+                ),
+                is_response=True,
+            )
+        try:
+            artifact = self._media_registry.ingest(payload["staged_name"])
+        except MediaIngressError as exc:
+            return encode_json_frame(
+                IPCRequestOutcome.error(exc.code, str(exc)), is_response=True
+            )
+        return encode_json_frame(
+            IPCRequestOutcome.ok({"artifact": artifact.to_wire_dict()}),
+            is_response=True,
+        )
+
+    def _media_release_route(self, payload: dict[str, Any]) -> bytes:
+        """F-84: explicit reclamation. A PINNED artifact (live admitted
+        work) refuses release; an unpinned one is removed with its
+        unreferenced owner file; unknown refs stay unknown_artifact."""
+        if self._media_registry is None:
+            return encode_json_frame(
+                IPCRequestOutcome.error(
+                    "media_unavailable",
+                    "this owner exposes no media ingress",
+                ),
+                is_response=True,
+            )
+        try:
+            self._media_registry.release(payload["artifact_ref"])
+        except MediaIngressError as exc:
+            return encode_json_frame(
+                IPCRequestOutcome.error(exc.code, str(exc)), is_response=True
+            )
+        return encode_json_frame(
+            IPCRequestOutcome.ok({"released": True}), is_response=True
+        )
+
+    def _resolve_media_refs(
+        self, payload: dict[str, Any]
+    ) -> list[Any]:
+        """Resolve the payload's artifact reference(s) to owner-side
+        artifacts — ordered ALL-OR-NOTHING for multi-image work: a bad
+        item resolves NOTHING and the request dies before the Dispatcher
+        is reachable."""
+        if self._media_registry is None:
+            raise MediaIngressError(
+                "media_unavailable", "this owner exposes no media ingress"
+            )
+        if "artifact_refs" in payload:
+            return self._media_registry.resolve_ordered(payload["artifact_refs"])
+        return [self._media_registry.resolve(payload["artifact_ref"])]
+
+    @staticmethod
+    def _translate_media_payload(
+        payload: dict[str, Any], media: list[Any]
+    ) -> dict[str, Any]:
+        """Substitute the OWNER-side content-addressed paths into the
+        capability input (image_path / image_paths) — the existing media
+        capabilities and M5 adapters then run unchanged, re-hashing the
+        owner files (which match the bound digests by construction)."""
+        was_multi = "artifact_refs" in payload
+        translated = dict(payload)
+        translated.pop("artifact_ref", None)
+        translated.pop("artifact_refs", None)
+        if was_multi:
+            translated["image_paths"] = [artifact.owner_path for artifact in media]
+        else:
+            translated["image_path"] = media[0].owner_path
+        return translated
 
     # -- F-73: the reconciliation operator wire route (§14.3) --------------
 
@@ -969,6 +1088,20 @@ class AuthorityIPCServer:
 # The reconciliation operations (F-78 adds the reclaiming close). They
 # are routed INSIDE the same admission/stale/table gates as capabilities;
 # the owner-side registry holds the logical sessions.
+# Layer 6: the six media-backed writes. Their wire payloads carry OPAQUE
+# artifact_refs; the pipeline resolves them to owner-side paths before the
+# Dispatcher sees anything.
+IPC_MEDIA_OPERATIONS = frozenset(
+    {
+        "post_photo",
+        "reply_photo",
+        "quote_photo",
+        "post_multi_image",
+        "reply_multi_image",
+        "quote_multi_image",
+    }
+)
+
 IPC_RECONCILIATION_OPERATIONS = frozenset(
     {
         "reconciliation_open",

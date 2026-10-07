@@ -14,9 +14,11 @@ One strict, non-executable protocol over bounded UTF-8 JSON (frozen
   identity means production IPC does not enter READY);
 - strict post-schema request validation and normalization for the frozen
   advertised operations (Layer-4 pure reads/health; Layer-5 whoami, the
-  six non-file writes, and the reconciliation operator surface),
+  six non-file writes, and the reconciliation operator surface; Layer-6
+  media ingress/release and the six artifact-ref media writes),
   deliberately NARROWER than the permissive aliases local capabilities
-  accept — media/multi-image/download/compose stay unadvertised (M7-T66);
+  accept — download_image (its own local-output contract) and
+  compose_post stay unadvertised;
 - canonical request identity: sorted-key deterministic serialization of
   protocol_version + operation + normalized payload — request_id,
   runtime_build_id, and authority_instance_id are excluded by §10.5.
@@ -56,10 +58,12 @@ __all__ = [
 IPC_PROTOCOL_VERSION = 1
 # Layer 4: bounded pure reads/health. Layer 5 (frozen §10.3 delta +
 # M7-RV10): the authority-establishing whoami read and the six
-# NON-FILE-BACKED writes. Media-backed writes, artifact referents, and
-# download_image remain UNADVERTISED until the Layer-6 media-ingress
-# qualification (M7-T66) — requesting them dies at this allowlist,
-# before the Dispatcher is reachable.
+# NON-FILE-BACKED writes plus the reconciliation operator surface.
+# Layer 6: media_ingest/media_release and the six media-backed writes —
+# advertised ONLY through opaque instance-scoped artifact_refs minted by
+# the owner-side ingress contract (raw image_path strings die at the
+# schema). download_image stays UNADVERTISED until its own local-output
+# contract exists; compose_post is not an IPC surface.
 IPC_SUPPORTED_OPERATIONS = frozenset(
     {
         "health",
@@ -74,6 +78,14 @@ IPC_SUPPORTED_OPERATIONS = frozenset(
         "delete_post",
         "bookmark_post",
         "like_post",
+        "media_ingest",
+        "media_release",
+        "post_photo",
+        "reply_photo",
+        "quote_photo",
+        "post_multi_image",
+        "reply_multi_image",
+        "quote_multi_image",
         "reconciliation_open",
         "reconciliation_close",
         "reconciliation_list",
@@ -93,6 +105,8 @@ IPC_READ_TABS = frozenset({"posts", "replies", "media"})  # exactly the capabili
 IPC_SEARCH_TABS = frozenset({"top", "latest", "people"})
 # F-73: the only terminal M6 verdicts (ReconciliationVerdict's exact values).
 IPC_RECONCILIATION_VERDICTS = frozenset({"CONFIRMED_EFFECT", "CONFIRMED_NO_EFFECT"})
+# Layer 6: the ordered multi-image bound (the existing upload surface's cap).
+IPC_MAX_MEDIA_ITEMS = 4
 
 
 class IPCProtocolError(ValueError):
@@ -290,6 +304,59 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "post_url": (str, False, None),
         "confirmation_token": (str, False, None),
     },
+    # M7 Layer 6: media ingress + the six media-backed writes. The wire
+    # takes OPAQUE instance-scoped artifact_refs (minted by media_ingest
+    # from the owner-controlled staging root) — NEVER raw image_path /
+    # image_paths strings, which the schema rejects as unknown fields
+    # before any capability compose (a client filesystem string can never
+    # become mutation authority through IPC).
+    "media_ingest": {
+        "staged_name": (str, True, None),
+    },
+    # F-84: explicit client-driven reclamation. Refuses pinned refs
+    # (live admitted work); a pending confirmation's ref stays valid
+    # until released or cleaned — never silently evicted.
+    "media_release": {
+        "artifact_ref": (str, True, None),
+    },
+    "post_photo": {
+        "text": (str, False, None),
+        "artifact_ref": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "reply_photo": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_ref": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "quote_photo": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_ref": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "post_multi_image": {
+        "text": (str, False, None),
+        "artifact_refs": (list, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "reply_multi_image": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_refs": (list, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "quote_multi_image": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_refs": (list, True, None),
+        "confirmation_token": (str, False, None),
+    },
     # F-73 (§14.3): the reconciliation operator wire surface. Opaque
     # logical sessions; exact same-session text confirmation; the
     # ReconciliationAuthority never crosses the wire.
@@ -335,6 +402,10 @@ _WRITE_TARGET_RULES: dict[str, tuple[str, ...]] = {
     "delete_post": ("post_url", "target_post_id"),
     "bookmark_post": ("post_id", "post_url"),
     "like_post": ("post_id", "post_url"),
+    "reply_photo": ("post_url", "target_post_id"),
+    "quote_photo": ("post_url", "target_post_id"),
+    "reply_multi_image": ("post_url", "target_post_id"),
+    "quote_multi_image": ("post_url", "target_post_id"),
 }
 
 # The confirmation token is opaque HIGH-ENTROPY owner-minted material
@@ -357,6 +428,14 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "delete_post": {},
     "bookmark_post": {},
     "like_post": {},
+    "media_ingest": {},
+    "media_release": {},
+    "post_photo": {},
+    "reply_photo": {},
+    "quote_photo": {},
+    "post_multi_image": {},
+    "reply_multi_image": {},
+    "quote_multi_image": {},
     "reconciliation_open": {},
     "reconciliation_close": {},
     "reconciliation_list": {},
@@ -418,6 +497,19 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
         elif expected_type is bool:
             if not isinstance(value, bool):
                 raise IPCSchemaError(f"{operation}.{name} must be a boolean")
+        elif expected_type is list:
+            # Layer 6: ordered artifact/alt-text lists. Bounded count;
+            # every item is a bounded non-empty string.
+            if not isinstance(value, list):
+                raise IPCSchemaError(f"{operation}.{name} must be a JSON array")
+            if name == "artifact_refs" and not (1 <= len(value) <= IPC_MAX_MEDIA_ITEMS):
+                raise IPCSchemaError(
+                    f"{operation}.{name} must carry 1..{IPC_MAX_MEDIA_ITEMS} ordered items"
+                )
+            for index, item in enumerate(value):
+                if not isinstance(item, str):
+                    raise IPCSchemaError(f"{operation}.{name}[{index}] must be a string")
+                _check_string(f"{operation}.{name}[{index}]", item)
         elif expected_type is dict:
             # F-73: the operator's evidence object. Strict JSON decoding
             # already produced plain data; enforce object shape and a

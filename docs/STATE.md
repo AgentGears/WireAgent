@@ -461,6 +461,31 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 5 MERGED (PR #28, squash `13a471c`).** The
+  merge-gate pass at exact head `4ec46ae` returned MERGE-READY; F-72
+  through F-81 all closed at the Layer-5 implementation boundary after
+  five review rounds, and the Layer-5 request/reconciliation model is
+  now frozen. The merged owner boundary: client → exact
+  handshake/build/instance → strict operation schema → canonical
+  request identity → retained request table → owner admission →
+  whoami OR non-file M5 write OR owner-side M6 reconciliation →
+  bounded truthful result. Mutation uncertainty stays grounded in
+  durable M5/M6 truth rather than the RPC response; reconciliation
+  authority stays owner-private; committed continuations survive
+  transport failure and cannot be discarded by session close; same-ID
+  retry is transport dedupe while a fresh request ID re-drives a
+  committed M6 continuation; the failure floor is size-independent
+  (mandatory safety facts always delivered); reconciliation paging is
+  one pass over the already-sorted canonical projection. Advertised
+  surface: five pure reads/health + whoami + six non-file writes + the
+  seven reconciliation operator operations. Layer 6 media/artifact
+  scope never leaked forward. Merge-head evidence (CI #624, all four
+  jobs green): Linux 3.11 1353 passed + 13 skipped, Ruff clean, mypy
+  clean on 101 source files; Windows Server 2025 3.11 durability
+  170 + 4, named-pipe IPC 46, rule store 57; 3.12 mirrors green.
+  Deferred by design: artifact/media ingress + download_image output
+  contract (Layer 6), genuine foreign-user/platform qualification
+  (Layers 7-8), second adapter.
 - **2026-10-07 — M7 Layer 5 final repair (PR #28, F-81 closed): the
   reconciliation page query is ONE pass.** RecoveryProjector.project()
   already returns the canonical M6 snapshot sorted by effect_id, so
@@ -988,15 +1013,15 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: layers 1-4 on main (Layer 4 squash-merged 2026-10-06,
-  8092e6c, after six review rounds and a merge-gate pass — all findings
-  F-60..F-71 closed at the Layer-4 implementation boundary; T59
-  exhaustive Windows-platform qualification and non-Linux POSIX peer
-  credentials remain Layers 7-8 by design). NEXT BUILD (M7 Layer 5):
-  owner-routed whoami, non-file writes, confirmation/reconciliation
-  routing, and the bounded retained request table. Layer 6
-  artifact/media semantics are NOT pulled forward. Second adapter
-  remains deferred until the M7 boundary is stable.
+  M7 STATUS: layers 1-5 on main (Layer 5 squash-merged 2026-10-07,
+  13a471c, after five review rounds and a merge-gate pass — all findings
+  F-72..F-81 closed at the Layer-5 implementation boundary; the
+  Layer-5 request/reconciliation model is now FROZEN; POSIX/Windows
+  exhaustive platform qualification remains Layers 7-8 by design).
+  NEXT BUILD (M7 Layer 6): owner-side artifact/media ingress and
+  local-output semantics (download_image output contract only if
+  exposed). Second adapter remains deferred until the M7 boundary is
+  stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

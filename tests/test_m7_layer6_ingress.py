@@ -480,3 +480,189 @@ async def test_release_refuses_pinned_and_removes_unpinned(tmp_path: Path) -> No
 
     with pytest.raises(MediaIngressError, match="unknown_artifact"):
         registry.release(minted.ref)
+
+# ---------------------------------------------------------------------------
+# Third-review regressions: F-87 bounded/stable owner-copy revalidation,
+# F-88 open-time confinement, F-89 truthful release
+# ---------------------------------------------------------------------------
+
+
+async def test_F87_oversize_owner_copy_rejected_without_unbounded_read(tmp_path: Path) -> None:
+    """An owner copy replaced by an oversize file is refused by the
+    BOUNDED streaming digest — a stable media error, never an unbounded
+    allocation, and never a generic internal."""
+    from webwire.safety.attachment import _MAX_FILE_BYTES
+
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+    Path(minted.owner_path).write_bytes(b"x" * (_MAX_FILE_BYTES + _MAX_FILE_BYTES))  # noqa: ASYNC240
+
+    with pytest.raises(MediaIngressError, match="artifact_oversize"):
+        registry.resolve(minted.ref)
+    assert registry.artifact_count == 1, "no silent eviction"
+
+
+async def test_F87_owner_copy_deleted_is_a_stable_error(tmp_path: Path) -> None:
+    """A vanished owner copy maps to artifact_deleted — never a raw
+    FileNotFoundError escaping to internal."""
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+    Path(minted.owner_path).unlink()  # noqa: ASYNC240
+    with pytest.raises(MediaIngressError, match="artifact_deleted"):
+        registry.resolve(minted.ref)
+
+
+async def test_F87_stable_errors_reach_the_wire_before_invoke(tmp_path: Path) -> None:
+    """Through the pipeline: an oversize or deleted owner copy refuses
+    the media write with a STABLE code and the Dispatcher is never
+    reached (no execution against bad bytes)."""
+    import json
+    import secrets
+
+    from webwire.authority_ipc_framing import encode_json_frame, parse_frame_header
+    from webwire.authority_ipc_protocol import IPC_PROTOCOL_VERSION, compute_runtime_build_id
+    from webwire.authority_ipc_server import AuthorityIPCServer
+    from webwire.authority_session import AuthoritySession
+    from webwire.envelope import ok_result
+
+    session = AuthoritySession(authority_domain=Path("layer6-f87"))
+    session.register_revoker(lambda: None)
+    session.activate()
+    registry = _registry(tmp_path, instance=session.authority_instance_id)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+
+    async def _invoke(name: str, payload: dict) -> object:
+        return ok_result(data={})
+
+    server = AuthorityIPCServer(
+        session=session,
+        authority_domain=Path("layer6-f87"),
+        invoke=_invoke,
+        runtime_build_id=compute_runtime_build_id(),
+        media_registry=registry,
+    )
+
+    async def _ask(operation: str, payload: dict) -> dict:
+        frame = encode_json_frame(
+            {
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "operation": operation,
+                "payload": payload,
+                "request_id": secrets.token_hex(16),
+                "authority_instance_id": session.authority_instance_id,
+                "runtime_build_id": compute_runtime_build_id(),
+            }
+        )
+        header, consumed = parse_frame_header(frame)
+        return json.loads((await server.process_request(header, frame[consumed:]))[8:])
+
+    Path(minted.owner_path).unlink()  # noqa: ASYNC240
+    deleted = await _ask("post_photo", {"text": "x", "artifact_ref": minted.ref})
+    assert deleted["ok"] is False
+    assert deleted["error"]["code"] == "artifact_deleted"
+
+    _stage(registry, "again.png")
+    second = registry.ingest("again.png")
+    from webwire.safety.attachment import _MAX_FILE_BYTES
+
+    Path(second.owner_path).write_bytes(b"x" * (_MAX_FILE_BYTES + 1024))  # noqa: ASYNC240
+    oversize = await _ask("post_photo", {"text": "x", "artifact_ref": second.ref})
+    assert oversize["error"]["code"] == "artifact_oversize"
+
+
+async def test_F88_final_component_symlink_refused_at_open(tmp_path: Path) -> None:
+    """The final staged component swapped for a symlink (to an OUTSIDE
+    file with valid image bytes) is refused BY THE OPEN ITSELF — the
+    no-follow walk/reparse probe is the confinement decision, and no
+    artifact_ref is minted from foreign bytes."""
+    registry = _registry(tmp_path)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_PNG_1X1)
+    staging = registry.staging_root
+    staging.mkdir(parents=True, exist_ok=True)
+    target = staging / "photo.png"
+    target.write_bytes(_PNG_1X1)
+    try:
+        target.unlink()
+        target.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation requires privileges on this platform")
+    with pytest.raises(MediaIngressError, match="symlink_rejected"):
+        registry.ingest("photo.png")
+    assert registry.artifact_count == 0
+
+
+async def test_F88_injected_check_to_open_race_refused(tmp_path: Path) -> None:
+    """The reviewer-specified injected race: a REGULAR staged file passes
+    every check, then is substituted with a symlink before the open.
+    The no-follow openat refuses it — no artifact_ref is minted. (The
+    _openat seam exists precisely for this injection; POSIX-only because
+    O_NOFOLLOW is the mechanism under test.)"""
+    import os as _os
+
+    if not hasattr(_os, "O_NOFOLLOW"):
+        pytest.skip("O_NOFOLLOW confinement is the POSIX mechanism")
+
+    registry = _registry(tmp_path)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_PNG_1X1)
+    staging = registry.staging_root
+    staging.mkdir(parents=True, exist_ok=True)
+    staged = staging / "photo.png"
+    staged.write_bytes(_PNG_1X1)
+
+    raced = {"armed": False}
+
+    class _RacingRegistry(MediaArtifactRegistry):
+        def _openat(self, dir_fd: int, name: str, flags: int) -> int:
+            if name == "photo.png" and not raced["armed"]:
+                # Substitute a symlink at exactly the check-to-open seam.
+                raced["armed"] = True
+                staged.unlink()
+                staged.symlink_to(outside)
+            return super()._openat(dir_fd, name, flags)
+
+    racing = _RacingRegistry(
+        staging_root=registry.staging_root,
+        artifact_root=registry.artifact_root,
+        authority_instance_id=INSTANCE,
+    )
+    with pytest.raises(MediaIngressError, match="symlink_rejected"):
+        racing.ingest("photo.png")
+    assert racing.artifact_count == 0
+
+
+async def test_F89_release_reports_deletion_failure_truthfully(tmp_path: Path, monkeypatch) -> None:
+    """F-89: when the storage unlink fails, media_release does NOT claim
+    success — the reference AND the file both remain, and the client
+    sees artifact_release_failed; a subsequent successful release
+    completes honestly."""
+    import webwire.authority_media_ingress as ingress_module
+
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+
+    def _failing_unlink(*args: object, **kwargs: object) -> None:
+        raise OSError("injected storage failure")
+
+    monkeypatch.setattr(ingress_module.os, "unlink", _failing_unlink)
+    # Path.unlink delegates to os.unlink at call time in this context;
+    # if the platform caches differently, patch Path.unlink too.
+    import pathlib
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _failing_unlink)
+    with pytest.raises(MediaIngressError, match="artifact_release_failed"):
+        registry.release(minted.ref)
+    # Truthful state: BOTH the reference and the file remain.
+    assert registry.resolve(minted.ref).sha256 == minted.sha256
+    assert Path(minted.owner_path).exists()  # noqa: ASYNC240
+
+    monkeypatch.undo()
+    registry.release(minted.ref)
+    assert not Path(minted.owner_path).exists()  # noqa: ASYNC240
+    with pytest.raises(MediaIngressError, match="unknown_artifact"):
+        registry.resolve(minted.ref)

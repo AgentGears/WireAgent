@@ -24,7 +24,9 @@ unpins them.
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import logging
 import os
 import secrets
 import threading
@@ -42,6 +44,8 @@ __all__ = [
     "MEDIA_MAX_STAGED_NAME_CHARS",
     "MEDIA_DEFAULT_MAX_ARTIFACTS",
 ]
+
+logger = logging.getLogger(__name__)
 
 MEDIA_MAX_STAGED_NAME_CHARS = 128
 MEDIA_DEFAULT_MAX_ARTIFACTS = 256
@@ -214,17 +218,168 @@ class MediaArtifactRegistry:
             )
         return resolved
 
-    def _acquire_bounded_copy(self, source: Path) -> Path:
-        """F-83: BOUNDED, race-resistant acquisition. The staged file is
-        streamed ONCE into an owner-controlled temporary file inside the
-        artifact root, reading at most the validator's cap plus one byte
-        — a post-open grow cannot force an unbounded allocation, and a
-        mid-read deletion/swap affects only the read, never the system.
-        The temporary copy is the immutable object everything later
-        validates, hashes, and publishes."""
+    def _openat(self, dir_fd: int, name: str, flags: int) -> int:
+        """F-88 seam: open one path component relative to a directory
+        descriptor. Tests wrap this to inject the check-to-open race; the
+        production behavior is the no-follow openat itself."""
+        return os.open(name, flags, dir_fd=dir_fd)
+
+    def _open_staged_confined(self, staged_name: str) -> int:
+        """F-88: the final open IS part of the confinement decision.
+
+        POSIX: a dir_fd walk from the staging root opens every component
+        with O_NOFOLLOW — a component swapped for a symlink/reparse
+        alias between check and open fails the OPEN itself (ELOOP), so
+        the bytes acquired can only be bytes inside the staging tree.
+
+        Windows: the final component is probed with
+        FILE_FLAG_OPEN_REPARSE_POINT (opening the LINK itself when the
+        component is a reparse point) and the handle's own attributes are
+        inspected — a reparse/symlink alias is refused at the handle
+        level; intermediate components are checked as best the portable
+        surface allows (full platform qualification is Layers 7/8).
+        Returns a file descriptor for the confined regular file."""
+        import stat as _stat
+
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            try:
+                dir_fd = os.open(self._staging_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            except OSError as exc:
+                raise MediaIngressError(
+                    "acquisition_failed", f"the staging root could not be opened: {exc!r}"
+                ) from exc
+            try:
+                parts = staged_name.split("/")
+                for index, part in enumerate(parts):
+                    last = index == len(parts) - 1
+                    flags = os.O_RDONLY | nofollow | (0 if last else getattr(os, "O_DIRECTORY", 0))
+                    fd = self._openat(dir_fd, part, flags)
+                    os.close(dir_fd)
+                    dir_fd = fd
+                info = os.fstat(dir_fd)
+                if not _stat.S_ISREG(info.st_mode):
+                    os.close(dir_fd)
+                    raise MediaIngressError(
+                        "not_regular_file", f"staged name is not a regular file: {staged_name}"
+                    )
+                return dir_fd
+            except MediaIngressError:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+                raise
+            except OSError as exc:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+                if exc.errno in (errno.ELOOP, errno.EMLINK):
+                    raise MediaIngressError(
+                        "symlink_rejected",
+                        f"symlinks are not allowed: {staged_name} (refused at open)",
+                    ) from exc
+                if isinstance(exc, FileNotFoundError):
+                    raise MediaIngressError(
+                        "not_regular_file", f"staged name is not a regular file: {staged_name}"
+                    ) from exc
+                raise MediaIngressError(
+                    "acquisition_failed", f"the staged file could not be opened: {exc!r}"
+                ) from exc
+        target = self._staging_root / staged_name
+        handle = self._win_open_reparse_probe(str(target))
+        if handle is not None:
+            self._win_close_handle(handle)
+            raise MediaIngressError(
+                "symlink_rejected",
+                f"symlinks/reparse points are not allowed: {staged_name} (refused at open)",
+            )
+        try:
+            fd = os.open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except OSError as exc:
+            raise MediaIngressError(
+                "acquisition_failed", f"the staged file could not be opened: {exc!r}"
+            ) from exc
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise MediaIngressError(
+                "not_regular_file", f"staged name is not a regular file: {staged_name}"
+            )
+        return fd
+
+    @staticmethod
+    def _win_open_reparse_probe(path: str) -> Any:
+        """Open with FILE_FLAG_OPEN_REPARSE_POINT and inspect the handle's
+        OWN attributes: returns the handle when the path IS a reparse
+        point (the link itself, not its target), else None."""
+        import ctypes
+        import ctypes.wintypes as wt
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:  # pragma: no cover - non-Windows
+            return None
+        kernel32 = windll.kernel32
+        FILE_FLAG_OPEN_REPARSE_POINT = 0x200000
+        FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+        GENERIC_READ = 0x80000000
+        OPEN_EXISTING = 3
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            path,
+            GENERIC_READ,
+            0,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        if not handle or handle == -1:
+            return None
+
+        class _BHFI(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wt.DWORD),
+                ("ftCreationTime", wt.FILETIME),
+                ("ftLastAccessTime", wt.FILETIME),
+                ("ftLastWriteTime", wt.FILETIME),
+                ("dwVolumeSerialNumber", wt.DWORD),
+                ("nFileSizeHigh", wt.DWORD),
+                ("nFileSizeLow", wt.DWORD),
+                ("nNumberOfLinks", wt.DWORD),
+                ("nFileIndexHigh", wt.DWORD),
+                ("nFileIndexLow", wt.DWORD),
+            ]
+
+        info = _BHFI()
+        if not kernel32.GetFileInformationByHandle(ctypes.c_void_p(handle), ctypes.byref(info)):
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return None
+        if info.dwFileAttributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+            return handle
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return None
+
+    @staticmethod
+    def _win_close_handle(handle: Any) -> None:
+        import ctypes
+
+        windll = getattr(ctypes, "windll", None)
+        if windll is not None:
+            windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+    def _acquire_bounded_copy(self, source_fd: int) -> Path:
+        """F-83/F-88: BOUNDED, race-resistant acquisition FROM the
+        confined descriptor. The staged file is streamed ONCE into an
+        owner-controlled temporary file inside the artifact root, reading
+        at most the validator's cap plus one byte — a post-open grow
+        cannot force an unbounded allocation, and a mid-read deletion or
+        swap affects only the read, never the system. The temporary copy
+        is the immutable object everything later validates, hashes, and
+        publishes."""
         temp_path = self._artifact_root / f".ingest-{secrets.token_hex(8)}.tmp"
         try:
-            with open(source, "rb") as src, open(temp_path, "wb") as dst:
+            with os.fdopen(source_fd, "rb") as src, open(temp_path, "wb") as dst:
                 total = 0
                 while True:
                     chunk = src.read(_READ_CHUNK_BYTES)
@@ -252,7 +407,7 @@ class MediaArtifactRegistry:
         opaque ref. Any failure leaves NO new registry entry and NO
         published artifact."""
         self._check_staged_name(staged_name)
-        resolved = self._resolve_staged_path(staged_name)
+        self._resolve_staged_path(staged_name)  # F-82 name/root/alias gates
         with self._lock:
             if len(self._entries) >= self._max_artifacts:
                 raise MediaIngressError(
@@ -260,7 +415,10 @@ class MediaArtifactRegistry:
                     f"the artifact registry holds its maximum of {self._max_artifacts} "
                     "artifacts; release unreferenced artifacts or run cleanup",
                 )
-            temp_path = self._acquire_bounded_copy(resolved)
+            # F-88: the open is part of the confinement decision — the
+            # held descriptor (not a re-resolved path) feeds acquisition.
+            confined_fd = self._open_staged_confined(staged_name)
+            temp_path = self._acquire_bounded_copy(confined_fd)
             try:
                 # The EXISTING validation pipeline (upload roots, MIME,
                 # size, dimensions, SHA-256, EXIF) runs on the immutable
@@ -302,6 +460,39 @@ class MediaArtifactRegistry:
 
     # -- resolution ---------------------------------------------------------
 
+    @staticmethod
+    def _bounded_digest(owner_path: Path) -> str:
+        """F-87: BOUNDED, STABLE owner-copy revalidation. Streams at most
+        the validator cap plus one byte — an oversize/corrupt copy is
+        rejected without an unbounded allocation — and converts every
+        open/read failure to a stable ingress code (a vanished or
+        unreadable owner copy is ``artifact_deleted``/``artifact_unreadable``,
+        never a raw OSError escaping to a generic internal)."""
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with open(owner_path, "rb") as f:
+                while True:
+                    chunk = f.read(_READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_FILE_BYTES:
+                        raise MediaIngressError(
+                            "artifact_oversize",
+                            "the owner-side artifact copy exceeds the bounded size",
+                        )
+                    digest.update(chunk)
+        except FileNotFoundError as exc:
+            raise MediaIngressError(
+                "artifact_deleted", "the owner-side artifact copy no longer exists"
+            ) from exc
+        except OSError as exc:
+            raise MediaIngressError(
+                "artifact_unreadable", f"the owner-side artifact copy could not be read: {exc!r}"
+            ) from exc
+        return digest.hexdigest()
+
     def resolve(
         self,
         ref_token: Any,
@@ -319,12 +510,7 @@ class MediaArtifactRegistry:
                     "unknown, expired, or restarted artifact reference",
                 )
             artifact = entry.artifact
-            owner_path = Path(artifact.owner_path)
-            if not owner_path.exists():
-                raise MediaIngressError(
-                    "artifact_deleted", "the owner-side artifact copy no longer exists"
-                )
-            current = hashlib.sha256(owner_path.read_bytes()).hexdigest()
+            current = self._bounded_digest(Path(artifact.owner_path))
             if current != artifact.sha256:
                 raise MediaIngressError(
                     "digest_mismatch",
@@ -346,10 +532,15 @@ class MediaArtifactRegistry:
     # -- release, pinning, retention -----------------------------------------
 
     def release(self, ref_token: str) -> None:
-        """F-84: explicit client-driven reclamation. A PINNED artifact
-        (live admitted mutation work) cannot be released; a pending
-        confirmation token's ref stays valid until released or cleaned
-        — never silently evicted."""
+        """F-84/F-89: explicit client-driven reclamation with TRUTHFUL
+        deletion semantics. A PINNED artifact (live admitted mutation
+        work) cannot be released; a pending confirmation token's ref
+        stays valid until released or cleaned — never silently evicted.
+        The owner file is deleted FIRST and the registry entry is removed
+        only on success: if deletion fails the release raises
+        ``artifact_release_failed`` and BOTH the reference and the file
+        remain — the client is never told "released" while media stays
+        on disk."""
         with self._lock:
             entry = self._entries.get(ref_token)
             if entry is None:
@@ -362,8 +553,24 @@ class MediaArtifactRegistry:
                     "artifact_pinned",
                     "the artifact is pinned by live admitted work and cannot be released",
                 )
+            if any(
+                other.artifact.sha256 == entry.artifact.sha256
+                for token, other in self._entries.items()
+                if token != ref_token
+            ):
+                # Another live entry shares the content-addressed file:
+                # removing this reference is complete reclamation.
+                del self._entries[ref_token]
+                return
+            target = Path(entry.artifact.owner_path)
+            try:
+                target.unlink()
+            except OSError as exc:
+                raise MediaIngressError(
+                    "artifact_release_failed",
+                    f"the artifact reference could not be deleted from storage: {exc!r}",
+                ) from exc
             del self._entries[ref_token]
-            self._delete_unreferenced_file(entry.artifact.sha256)
 
     def pin(self, ref_token: str, pin_id: str) -> None:
         """Pin an artifact for the duration of admitted mutation work —
@@ -380,21 +587,16 @@ class MediaArtifactRegistry:
             if entry is not None:
                 entry.pins.discard(pin_id)
 
-    def _delete_unreferenced_file(self, sha256: str) -> None:
-        """Delete a content-addressed file no surviving entry uses."""
-        if any(entry.artifact.sha256 == sha256 for entry in self._entries.values()):
-            return
-        target = self._artifact_root / f"{sha256}.bin"
-        try:
-            target.unlink(missing_ok=True)
-        except OSError:
-            pass
-
     def cleanup_unpinned(self) -> int:
-        """Retention: remove unpinned registry entries and delete owner
-        copies no surviving entry uses. Returns the number of entries
-        removed. Pinned artifacts always survive."""
+        """BEST-EFFORT retention (F-89 truth): remove unpinned registry
+        entries and delete owner copies no surviving entry uses. Returns
+        the number of entries removed; pinned artifacts always survive.
+        File deletion here is DIAGNOSTIC-BEST-EFFORT — an unlink failure
+        is logged (residue may remain after shutdown) and is NOT a
+        guaranteed-removal claim. Guaranteed storage reclamation is the
+        explicit media_release contract, which fails honestly instead."""
         removed = 0
+        residue = 0
         with self._lock:
             survivors: dict[str, _Entry] = {}
             for token, entry in self._entries.items():
@@ -409,5 +611,11 @@ class MediaArtifactRegistry:
                     try:
                         path.unlink()
                     except OSError:
-                        pass
+                        residue += 1
+        if residue:
+            logger.warning(
+                "media retention left %d artifact file(s) on disk (best-effort cleanup; "
+                "unlinks failed)",
+                residue,
+            )
         return removed

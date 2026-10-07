@@ -14,9 +14,11 @@ One strict, non-executable protocol over bounded UTF-8 JSON (frozen
   identity means production IPC does not enter READY);
 - strict post-schema request validation and normalization for the frozen
   advertised operations (Layer-4 pure reads/health; Layer-5 whoami, the
-  six non-file writes, and the reconciliation operator surface),
+  six non-file writes, and the reconciliation operator surface; Layer-6
+  media ingress/release and the six artifact-ref media writes),
   deliberately NARROWER than the permissive aliases local capabilities
-  accept — media/multi-image/download/compose stay unadvertised (M7-T66);
+  accept — download_image (its own local-output contract) and
+  compose_post stay unadvertised;
 - canonical request identity: sorted-key deterministic serialization of
   protocol_version + operation + normalized payload — request_id,
   runtime_build_id, and authority_instance_id are excluded by §10.5.
@@ -56,10 +58,12 @@ __all__ = [
 IPC_PROTOCOL_VERSION = 1
 # Layer 4: bounded pure reads/health. Layer 5 (frozen §10.3 delta +
 # M7-RV10): the authority-establishing whoami read and the six
-# NON-FILE-BACKED writes. Media-backed writes, artifact referents, and
-# download_image remain UNADVERTISED until the Layer-6 media-ingress
-# qualification (M7-T66) — requesting them dies at this allowlist,
-# before the Dispatcher is reachable.
+# NON-FILE-BACKED writes plus the reconciliation operator surface.
+# Layer 6: media_ingest/media_release and the six media-backed writes —
+# advertised ONLY through opaque instance-scoped artifact_refs minted by
+# the owner-side ingress contract (raw image_path strings die at the
+# schema). download_image stays UNADVERTISED until its own local-output
+# contract exists; compose_post is not an IPC surface.
 IPC_SUPPORTED_OPERATIONS = frozenset(
     {
         "health",

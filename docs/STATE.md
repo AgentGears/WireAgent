@@ -461,6 +461,46 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 6 third repair round (PR #29, F-87/F-88/F-89):
+  bounded/stable owner-copy revalidation, open-time confinement,
+  truthful release.** F-87 (blocker, fixed): resolve() no longer calls
+  read_bytes() — _bounded_digest streams at most the validator cap plus
+  one byte and converts every failure to a stable code: artifact_deleted
+  (vanished), artifact_unreadable (open/read OSError),
+  artifact_oversize, digest_mismatch. An oversize or corrupt owner copy
+  immediately before an irreversible media mutation is refused bounded
+  and stable — never an unbounded allocation, never a generic internal.
+  Wire regression: deleted and oversize owner copies reach the client as
+  their stable codes with the Dispatcher never reached. F-88 (high,
+  fixed): the final open IS the confinement decision. POSIX: a dir_fd
+  walk from the staging root opens every staged-name component with
+  O_NOFOLLOW — a component swapped for a symlink between check and open
+  fails the OPEN itself (ELOOP → symlink_rejected); the _openat seam
+  exists for race injection. Windows: the final component is probed
+  with FILE_FLAG_OPEN_REPARSE_POINT (opening the LINK itself when the
+  component is a reparse point) and the handle's own attributes are
+  inspected — a reparse alias is refused at the handle level;
+  intermediate components use the portable best-effort checks (full
+  platform qualification stays Layers 7/8). Acquisition now reads from
+  the HELD descriptor — no re-resolved path between confinement and
+  bytes. Regressions: a final-component symlink to an outside valid
+  image is refused at open with no ref minted; the injected check-to-
+  open race (regular file passing all checks, substituted at the _openat
+  seam) is refused (POSIX; Linux CI). F-89 (high, fixed): media_release
+  is TRUTHFUL — the owner file is deleted FIRST and the registry entry
+  removed only on success; deletion failure raises
+  artifact_release_failed with BOTH the reference and the file remaining
+  (never "released: true" while media stays on disk); a shared
+  content-addressed file with another live entry releases the reference
+  alone (complete reclamation). cleanup_unpinned is documented
+  BEST-EFFORT retention: unlink failures are logged as residue, and the
+  docstring no longer claims guaranteed artifact removal — guaranteed
+  reclamation is the explicit media_release contract, which fails
+  honestly. Protocol module header updated to the real advertised
+  surface (Layer-6 media ops via opaque refs; download_image/compose
+  still unadvertised). 6 new tests (2 symlink/race probes run on Linux
+  CI). Gate ALL GREEN: full suite + ruff + mypy clean on 102 files.
+
 - **2026-10-07 — M7 Layer 6 second repair round (PR #29,
   F-82/F-83/F-84/F-85/F-86): root confinement, bounded acquisition,
   explicit release, honest alt-text scope, and the real media-stack

@@ -461,6 +461,181 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 5 final repair (PR #28, F-81 closed): the
+  reconciliation page query is ONE pass.** RecoveryProjector.project()
+  already returns the canonical M6 snapshot sorted by effect_id, so
+  list_targets_page() no longer builds an unresolved-id list, a
+  candidate list, a second sort, or a lookup dict — it scans the sorted
+  snapshot once, counts total/remaining as integers, and constructs AT
+  MOST `limit` ReconciliationTarget wrappers. The instrumented
+  regression drives a 500-item pre-sorted projection with limit=1 and
+  limit=3: exactly `limit` wrappers are constructed (counted via a
+  patched __new__), builtins.sorted is invoked ZERO times during the
+  paging call, and the functional total/remaining/has_more/cursor
+  semantics are asserted unchanged. The complete projector pass remains
+  O(N) — the existing M6 canonical durable-truth reconstruction, not
+  new Layer-5 pagination amplification. Gate ALL GREEN; ruff + mypy
+  clean on 101 files.
+
+- **2026-10-06 — M7 Layer 5 fourth repair round (PR #28, F-79/F-80/F-81):
+  committed-continuation close protection, size-independent safety
+  floor, execution-bounded reconciliation pagination.** F-79 (blocker,
+  fixed): reconciliation_close REFUSES to close a logical session
+  holding any committed-but-unconsumed ReconciliationAuthority
+  (stable code reconciliation_continuation_required) — that wire session
+  is the only client-reachable reference to the exact committed fact,
+  and destroying it would strand the M6 continuation
+  (committed_resolution_in_progress) for the owner's whole lifetime.
+  The F-75 persistence response now explicitly requires a FRESH
+  request_id for the re-drive (the failed request's retained §10.5
+  frame cannot perform the continuation). Real-coordinator regressions:
+  ambiguous persistence failure → close REFUSED, session survives →
+  same-id retry returns the retained failure byte-identically → fresh
+  id re-drives the exact committed authority → resolves → close only
+  then succeeds. F-80 (blocker, fixed): the failure ladder bounds the
+  DIAGNOSTIC MESSAGE at every rung (2048 chars) and its absolute floor
+  is size-independent — a fixed synthetic message plus the
+  INDEPENDENTLY extracted hard-capped mandatory facts (_mandatory_safety
+  is now actually used, taking the result itself, not the projected
+  dict). A >1 MiB error message with uncertain-effect facts still
+  delivers code+mandatory safety, never internal, and the same
+  request_id returns the retained identical frame. F-81 (high, fixed):
+  the bounded query moved BELOW the materialization seam — the
+  coordinator grows list_targets_page(limit, after_effect_id)
+  constructing at most `limit` ReconciliationTargets (cursor and
+  ordering over ids; only the page's projections are wrapped), exposed
+  through the operator delegate and the owner-admitted wrapper; the
+  wire layer no longer materializes or sorts the full unresolved set.
+  `total` is now the TRUE total unresolved count (cursor-independent)
+  and `remaining` is the after-cursor candidate count. Real-stack
+  pagination regression updated accordingly. 4 new tests. Gate ALL
+  GREEN locally; ruff + mypy clean on 101 files.
+
+- **2026-10-06 — M7 Layer 5 third repair round (PR #28, F-75/F-76/F-77/F-78):
+  exceptional M6 wire states, faithful display, guaranteed safety
+  envelope, bounded reconciliation resources.** F-75 (blocker, fixed):
+  the reconciliation route catches the M6 exceptional outcomes and
+  projects them into STABLE wire states — ReconciliationDenied →
+  reconciliation_denied (authority_expired →
+  reconciliation_authority_expired requiring a FRESH confirmation; the
+  same proposal re-confirms and resolves after expiry);
+  ReconciliationPersistenceError → reconciliation_persistence_failed
+  with the frozen record identity, the ambiguous_durability flag, and
+  the same-proposal/authority continuation requirement;
+  ReconciliationPublicationError → reconciliation_publication_failed
+  with fact_durable + guard failed_closed (and the retry genuinely
+  observes proposal_resolved — the successor state the first response
+  announced); the coordinator base → reconciliation_failed. All three
+  are injected-fault regressions against the REAL coordinator over the
+  real transport (short-TTL authority; ambiguous ledger append;
+  fail-closed guard refresh). F-76 (blocker, fixed): the operator
+  display is faithful to M6 truth — targets and proposals carry the
+  FULL lineage (semantic_key, action_type, intent_hash, policy_binding,
+  actor_id, target_type, target_id) with EXPLICIT first/current states
+  and timestamps; state is the CURRENT (last durable) record. The real
+  two-record RESERVED → EFFECT_UNKNOWN regression proves the operator
+  sees EFFECT_UNKNOWN, not the stale reserved. F-77 (blocker, fixed):
+  optional failure diagnostics consume a FIXED 64 KiB total byte budget
+  and drop deterministically (data → trace_stages → policy) before any
+  encode; the failure branch encodes through a degradation ladder whose
+  floor is a minimal mandatory envelope — the three mandatory facts
+  (public_side_effect, reconciliation_required, m5_effect_state) plus
+  the semantic key ALWAYS reach the client, never a generic internal.
+  Unsupported projected types redact to a stable <redacted:TypeName>
+  marker, not repr. Oversized uncertain-effect regression included.
+  F-78 (high, fixed): reconciliation_close reclaims registry slots;
+  per-session proposal state capped at 32 (reconciliation_proposal_
+  limit); reconciliation_list is a bounded keyset-paginated contract
+  (limit + after_effect_id, total/has_more); resolution status reports
+  a 16-key capped prefix plus the true count. Real pagination
+  regression over three seeded effects. Module headers updated to the
+  real advertised surface; the PR body's stale §14.3 deferral note
+  corrected. 10 new tests (5 portable + 5 real-stack transport). Gate
+  ALL GREEN: 1334 passed + 27 platform-skipped, ruff clean, mypy clean
+  on 101 files.
+
+- **2026-10-06 — M7 Layer 5 second repair round (PR #28, F-72/F-73/F-74):
+  mutation safety state, task-owning retention, reconciliation over
+  owner IPC.** F-72 (blocker, fixed): FAILED ActionResults no longer
+  collapse into a bare capability error — the wire failure envelope now
+  carries a bounded, JSON-safe SAFETY PROJECTION (allowlisted outcome
+  scalars with hoisting from the kernel's nested payload, a narrowed
+  policy verdict, the final trace stages plus the intent dedupe key, and
+  a bounded copy of the capability data; non-finite floats drop,
+  strings/containers truncate, raw authority objects never cross).
+  public_side_effect / reconciliation_required / m5_effect_state survive
+  the boundary; a clean denial is distinguishable from an uncertain
+  external mutation; the retained retry returns the identical frame.
+  F-74 (blocker, fixed): the retained table now owns the EXECUTION TASK
+  (pin_task — the strong owner-side §10.5 reference), the caller awaits a
+  shield, and a handler wait expiry answers request_in_progress with
+  explicit response-uncertainty semantics — never a fabricated terminal
+  failure for a live mutation (the coroutine is not cancelled). The
+  injectable-short-timeout regression proves the reviewer sequence:
+  blocked mutation → wait expires → exactly-one execution, live pinned
+  task → same-id retry joins → release → retained terminal response →
+  admission returns to zero. F-73 (blocker, fixed): reconciliation now
+  ROUTES through owner IPC (§14.3) — six advertised operations
+  (reconciliation_open/list/show/prepare/confirm/resolve) over a
+  bounded (4), instance-bound, process-local registry of logical
+  operator sessions built on the Dispatcher's owner-admitted
+  OwnedReconciliationOperatorSession; drain revokes every session; the
+  minted ReconciliationAuthority stays owner-private (clients confirm by
+  exact frozen text and address proposals by id); schemas are strict
+  (verdict enum, evidence object bound, at-least-one rules). T41 proven
+  through a REAL Dispatcher over the real transport: two clients' write
+  tokens go stale_confirmation_epoch after an owner-side wire
+  reconciliation resolves terminally — one shared owner root. Plus the
+  TRUE integration regression: real client socket → pipeline → REAL
+  Dispatcher → REAL WriteKernel (real token mint/consume) → REAL M5
+  post_text executor (DOM port stubbed) → capture failure → the wire
+  frame preserves reconciliation_required + effect_unknown + the
+  semantic key, and the durable ledger carries EFFECT_UNKNOWN.
+  Docstrings updated to the real surface (no more "exactly five
+  operations"). 15 new repair tests (12 portable + 3 transport, the
+  latter platform-neutral — they run on Windows named pipes AND Linux
+  sockets). Gate ALL GREEN: 1324 passed + 27 platform-skipped, ruff
+  clean, mypy clean on 101 files.
+
+- **2026-10-06 — M7 Layer 5 round one (branch m7-layer5-ipc-writes, from
+  exact main d0b0b92): whoami + non-file writes + the retained request
+  table, tests-first.** The advertised IPC surface grows from five pure
+  reads to twelve: the authority-establishing `whoami` read (M7-RV10
+  qualification — routed through the same exact-build/admission/stale
+  gates as every operation) and the six non-file-backed writes
+  (post_text, reply_post, quote_post, delete_post, bookmark_post,
+  like_post) with strict per-op schemas, at-least-one target
+  disjunctions, and the optional opaque `confirmation_token` field; the
+  existing owner-private ConfirmationState remains the token authority —
+  the pipeline only routes (frozen §13). Media/multi-image/download/
+  compose remain UNADVERTISED (M7-T66, Layer-6 forbidden scope; raw
+  client paths die as unknown schema fields before compose). The
+  retained request table (frozen §10.5, new
+  authority_ipc_request_table.py): key = request_id, comparison value =
+  the canonical normalized identity (still excluding request_id/build/
+  instance — the Layer-4 rule); new id executes once; same id + same
+  in-flight request JOINS the same owner work (await on the shared
+  future); same id + same completed request returns the RETAINED frame
+  byte-for-byte with no second invocation; same id + different canonical
+  request = request_id_reused protocol violation with no execution.
+  In-flight entries are pinned/non-evictable — saturation backpressures
+  new admission (table_full, M7-T57); completed entries are bounded LRU
+  (eviction makes no exactly-once claim, M7-T25); the table is
+  process-local — a successor owner starts empty (M7-T26). A stale-owner
+  fast-path pre-check now rejects dead-instance clients BEFORE any table
+  consultation, so an old token can never learn or reach anything under
+  the current owner (§13/M7-T30); the atomic admit still guards the
+  race. Reconciliation routing (§14.1, M7-T39): an external recovery
+  process under a live owner fails authority_busy before constructing
+  any M6 coordinator — routing through the owner is the only write
+  path; owner-absent standalone recovery remains the Layer-3 temporary
+  owner, unchanged. Layer-4 allowlist tests updated for the T61-flip.
+  New tests: 11 table units, 18 pipeline (schemas/surface/table/fencing/
+  stale-token), 5 real-socket confirmation+join (T27/T28/T29/T30/T43
+  with a REAL ConfirmationState behind the real transport, POSIX CI),
+  2 reconciliation-routing. Gate ALL GREEN: 1309 passed + 27
+  platform-skipped (Windows), ruff clean, mypy clean on 101 files.
+
 - **2026-10-06 — M7 Layer 4 MERGED (PR #27, squash `8092e6c`).** The
   merge-gate pass at exact head `a64e8a4` returned MERGE-READY with no
   new blocking or high-severity findings; F-61 through F-71 closed at

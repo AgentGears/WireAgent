@@ -7,14 +7,16 @@ One strict, non-executable protocol over bounded UTF-8 JSON (frozen
   no unbounded read, queue, or allocation anywhere in the IPC path);
 - the handshake model (``AuthorityHello``): exact protocol version,
   diagnostic runtime version, EXACT runtime_build_id, the owner's
-  authority_instance_id, canonical absolute domain, the five supported
-  operations, and lifecycle state;
+  authority_instance_id, canonical absolute domain, the frozen advertised
+  operation set, and lifecycle state;
 - deterministic runtime build identity (artifact/source hashing — package
   version is NOT a build identity; an unavailable/ambiguous exact
   identity means production IPC does not enter READY);
-- strict post-schema request validation and normalization for exactly the
-  five Layer-4 operations, deliberately NARROWER than the permissive
-  aliases local capabilities accept;
+- strict post-schema request validation and normalization for the frozen
+  advertised operations (Layer-4 pure reads/health; Layer-5 whoami, the
+  six non-file writes, and the reconciliation operator surface),
+  deliberately NARROWER than the permissive aliases local capabilities
+  accept — media/multi-image/download/compose stay unadvertised (M7-T66);
 - canonical request identity: sorted-key deterministic serialization of
   protocol_version + operation + normalized payload — request_id,
   runtime_build_id, and authority_instance_id are excluded by §10.5.
@@ -52,7 +54,35 @@ __all__ = [
 # -- frozen constants (centralized; no scattered magic numbers) --------------
 
 IPC_PROTOCOL_VERSION = 1
-IPC_SUPPORTED_OPERATIONS = frozenset({"health", "read", "read_profile", "read_thread", "read_search"})
+# Layer 4: bounded pure reads/health. Layer 5 (frozen §10.3 delta +
+# M7-RV10): the authority-establishing whoami read and the six
+# NON-FILE-BACKED writes. Media-backed writes, artifact referents, and
+# download_image remain UNADVERTISED until the Layer-6 media-ingress
+# qualification (M7-T66) — requesting them dies at this allowlist,
+# before the Dispatcher is reachable.
+IPC_SUPPORTED_OPERATIONS = frozenset(
+    {
+        "health",
+        "read",
+        "read_profile",
+        "read_thread",
+        "read_search",
+        "whoami",
+        "post_text",
+        "reply_post",
+        "quote_post",
+        "delete_post",
+        "bookmark_post",
+        "like_post",
+        "reconciliation_open",
+        "reconciliation_close",
+        "reconciliation_list",
+        "reconciliation_show",
+        "reconciliation_prepare",
+        "reconciliation_confirm",
+        "reconciliation_resolve",
+    }
+)
 IPC_MAX_FRAME_BYTES = 1 << 20  # 1 MiB — a frame header + payload ceiling
 IPC_MAX_REQUEST_BYTES = 64 * 1024  # 64 KiB — a single request payload
 IPC_MAX_RESPONSE_BYTES = 1 << 20  # 1 MiB — a single response payload
@@ -61,6 +91,8 @@ IPC_MAX_LIMIT = 100  # read limits cannot exceed this
 
 IPC_READ_TABS = frozenset({"posts", "replies", "media"})  # exactly the capability's enum (F-65: no superset)
 IPC_SEARCH_TABS = frozenset({"top", "latest", "people"})
+# F-73: the only terminal M6 verdicts (ReconciliationVerdict's exact values).
+IPC_RECONCILIATION_VERDICTS = frozenset({"CONFIRMED_EFFECT", "CONFIRMED_NO_EFFECT"})
 
 
 class IPCProtocolError(ValueError):
@@ -219,7 +251,96 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "tab": (str, False, IPC_SEARCH_TABS),
         "limit": (int, False, None),
     },
+    # Layer 5: the authority-establishing read carries NO parameters.
+    "whoami": {},
+    # Layer 5 non-file writes. The optional ``confirmation_token`` is the
+    # OPAQUE owner-minted material from the preview response — the owner's
+    # ConfirmationState remains the authority; the schema only routes.
+    # Target fields are validated per-field here and as an at-least-one
+    # disjunction by _WRITE_TARGET_RULES below (a write with no target is
+    # malformed before any capability compose).
+    "post_text": {
+        "text": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "reply_post": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "quote_post": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "confirmation_token": (str, False, None),
+    },
+    "delete_post": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "bookmark_post": {
+        "post_id": (str, False, None),
+        "post_url": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "like_post": {
+        "post_id": (str, False, None),
+        "post_url": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    # F-73 (§14.3): the reconciliation operator wire surface. Opaque
+    # logical sessions; exact same-session text confirmation; the
+    # ReconciliationAuthority never crosses the wire.
+    "reconciliation_open": {
+        "operator_id": (str, True, None),
+    },
+    "reconciliation_close": {
+        "reconciliation_session_id": (str, True, None),
+    },
+    "reconciliation_list": {
+        "reconciliation_session_id": (str, True, None),
+        # F-78: keyset pagination — one bounded page per request.
+        "after_effect_id": (str, False, None),
+        "limit": (int, False, None),
+    },
+    "reconciliation_show": {
+        "reconciliation_session_id": (str, True, None),
+        "effect_id": (str, True, None),
+    },
+    "reconciliation_prepare": {
+        "reconciliation_session_id": (str, True, None),
+        "effect_id": (str, True, None),
+        "verdict": (str, True, IPC_RECONCILIATION_VERDICTS),
+        "evidence": (dict, True, None),
+        "evidence_summary": (str, True, None),
+    },
+    "reconciliation_confirm": {
+        "reconciliation_session_id": (str, True, None),
+        "proposal_id": (str, True, None),
+        "confirmation_text": (str, True, None),
+    },
+    "reconciliation_resolve": {
+        "reconciliation_session_id": (str, True, None),
+        "proposal_id": (str, True, None),
+    },
 }
+
+# Writes whose target is an at-least-one disjunction (no bare "no target"
+# write ever reaches capability compose).
+_WRITE_TARGET_RULES: dict[str, tuple[str, ...]] = {
+    "reply_post": ("post_url", "target_post_id"),
+    "quote_post": ("post_url", "target_post_id"),
+    "delete_post": ("post_url", "target_post_id"),
+    "bookmark_post": ("post_id", "post_url"),
+    "like_post": ("post_id", "post_url"),
+}
+
+# The confirmation token is opaque HIGH-ENTROPY owner-minted material
+# (secrets.token_urlsafe(16) = 22 chars; hex forms are longer). Anything
+# shorter is not a token the owner could have issued.
+_MIN_CONFIRMATION_TOKEN_CHARS = 16
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
     "health": {},
@@ -227,6 +348,22 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "read_profile": {"tab": "posts", "limit": 20, "include_retweets": True},
     "read_thread": {"limit": 20},
     "read_search": {"tab": "top", "limit": 20},
+    # Layer 5: whoami and the writes carry NO defaulted fields — exactly
+    # what the client sent, schema-validated, nothing invented.
+    "whoami": {},
+    "post_text": {},
+    "reply_post": {},
+    "quote_post": {},
+    "delete_post": {},
+    "bookmark_post": {},
+    "like_post": {},
+    "reconciliation_open": {},
+    "reconciliation_close": {},
+    "reconciliation_list": {},
+    "reconciliation_show": {},
+    "reconciliation_prepare": {},
+    "reconciliation_confirm": {},
+    "reconciliation_resolve": {},
 }
 
 
@@ -244,7 +381,14 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
     frozen defaults applied (§ item 5: health {}, read {post_url},
     read_profile {handle, tab='posts', limit=20, include_retweets=True},
     read_thread {post_url, limit=20}, read_search {query, tab='top',
-    limit=20})."""
+    limit=20}).
+
+    Layer 5 additions: whoami carries NO parameters; the six non-file
+    writes validate their strict field sets plus an at-least-one target
+    disjunction, and the optional ``confirmation_token`` must be opaque
+    high-entropy material. Raw client filesystem paths are not in any
+    Layer-5 schema — they die as unknown fields before capability
+    compose."""
     if operation not in IPC_SUPPORTED_OPERATIONS:
         raise IPCSchemaError(
             f"unknown IPC operation {operation!r}; supported: {sorted(IPC_SUPPORTED_OPERATIONS)}"
@@ -274,15 +418,41 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
         elif expected_type is bool:
             if not isinstance(value, bool):
                 raise IPCSchemaError(f"{operation}.{name} must be a boolean")
+        elif expected_type is dict:
+            # F-73: the operator's evidence object. Strict JSON decoding
+            # already produced plain data; enforce object shape and a
+            # bounded serialized size (it is hashed and retained by M6).
+            if not isinstance(value, dict):
+                raise IPCSchemaError(f"{operation}.{name} must be a JSON object")
+            try:
+                encoded = json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise IPCSchemaError(f"{operation}.{name} must be finite JSON data") from exc
+            if len(encoded) > IPC_MAX_STRING_BYTES:
+                raise IPCSchemaError(
+                    f"{operation}.{name} exceeds the {IPC_MAX_STRING_BYTES}-byte bound"
+                )
         elif expected_type is str:
             if not isinstance(value, str):
                 raise IPCSchemaError(f"{operation}.{name} must be a string")
             _check_string(f"{operation}.{name}", value)
+            if name == "confirmation_token" and len(value) < _MIN_CONFIRMATION_TOKEN_CHARS:
+                raise IPCSchemaError(
+                    f"{operation}.{name} must be opaque high-entropy material "
+                    f"(at least {_MIN_CONFIRMATION_TOKEN_CHARS} characters, as issued by the owner)"
+                )
             if enum is not None and value not in enum:
                 raise IPCSchemaError(f"{operation}.{name} must be one of {sorted(enum)}")
         else:  # pragma: no cover — schema definition error
             raise IPCSchemaError(f"internal schema error for {name}")
         normalized[name] = value
+    # Layer 5: a write with NO target is malformed — the disjunction must
+    # be satisfied by at least one present, non-empty target field.
+    target_rule = _WRITE_TARGET_RULES.get(operation)
+    if target_rule is not None and not any(normalized.get(name) for name in target_rule):
+        raise IPCSchemaError(
+            f"{operation} requires at least one of {list(target_rule)} as the target"
+        )
     return normalized
 
 

@@ -18,6 +18,7 @@ import asyncio
 import logging
 import struct
 import threading
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Optional
 
@@ -95,11 +96,16 @@ class IPCTransportServer:
         authority_domain: Path,
         loop: asyncio.AbstractEventLoop,
         max_concurrent: int = IPC_SERVER_MAX_CONCURRENT,  # F-62: THE capacity source
+        request_timeout_s: float = 300.0,
     ) -> None:
         self._ipc = ipc_server
         self._authority_domain = authority_domain
         self._loop = loop
         self._handler_slots = threading.Semaphore(max_concurrent)  # F-62: the single capacity enforcement
+        # F-74: the handler's bounded wait for one response. Expiry is NOT
+        # mutation failure — the admitted owner task stays pinned in the
+        # retained table and the client is told exactly that.
+        self._request_timeout_s = request_timeout_s
         self._endpoint: Optional[IPCEndpoint] = None
         self._running = False
         self._connections: set[Any] = set()  # F-60: tracked for shutdown
@@ -242,7 +248,33 @@ class IPCTransportServer:
             header = FrameHeader(length=length)
             future = asyncio.run_coroutine_threadsafe(self._ipc.process_request(header, body), self._loop)
             try:
-                response_frame = future.result(timeout=300.0)
+                response_frame = future.result(timeout=self._request_timeout_s)
+            except FuturesTimeoutError:
+                # F-74 (§10.6): the handler's WAIT expired — the admitted
+                # owner work did not. The task stays pinned in the retained
+                # table; this response means response uncertainty, never
+                # mutation failure, and the client may retry the SAME
+                # request_id to join the live work. The coroutine is NOT
+                # cancelled.
+                logger.warning(
+                    "IPC handler wait expired after %.1fs; admitted work continues owner-side",
+                    self._request_timeout_s,
+                )
+                response_frame = encode_json_frame(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "request_in_progress",
+                            "message": (
+                                "the response wait expired while the admitted request "
+                                "was still executing owner-side; the outcome is "
+                                "UNCERTAIN — retry the same request_id to join the "
+                                "retained work (do not resend as a new request)"
+                            ),
+                        },
+                    },
+                    is_response=True,
+                )
             except Exception:
                 logger.exception("IPC pipeline error")
                 response_frame = encode_json_frame(

@@ -304,6 +304,46 @@ class ReconciliationCoordinator:
             if item.unresolved
         )
 
+    def list_targets_page(
+        self,
+        *,
+        limit: int,
+        after_effect_id: Optional[str] = None,
+    ) -> tuple[list[ReconciliationTarget], int, int, bool]:
+        """M7 Layer 5 (F-81): BOUNDED operator enumeration.
+
+        ``RecoveryProjector.project()`` is the canonical M6 snapshot and
+        ALREADY returns its projections sorted by effect_id — so paging
+        is ONE pass over that ordering: no unresolved-id list, no
+        candidate list, no second sort, no lookup dict. Only ``limit``
+        ReconciliationTarget wrappers are constructed, and the page holds
+        at most ``limit`` items regardless of how many unresolved effects
+        exist. Returns ``(page, total_unresolved, remaining_after_cursor,
+        has_more)`` — both counts are integers, never materialized
+        collections."""
+        if limit < 1:
+            raise ReconciliationDenied("invalid_limit")
+        total = 0
+        remaining = 0
+        page: list[ReconciliationTarget] = []
+        for item in self._guard.projector.project():
+            if not item.unresolved:
+                continue
+            total += 1
+            if after_effect_id is not None and item.effect_id <= after_effect_id:
+                continue
+            remaining += 1
+            if len(page) < limit:
+                page.append(
+                    ReconciliationTarget(
+                        effect_id=item.effect_id,
+                        first_record=item.first_record,
+                        last_record=item.last_record,
+                        projection=item,
+                    )
+                )
+        return page, total, remaining, remaining > len(page)
+
     def _describe_target_locked(self, effect_id: str) -> ReconciliationTarget:
         """Describe a target while publication/protocol/lifecycle fences are held."""
         if self._gateway.live_attempt_owns_effect(effect_id):

@@ -199,7 +199,10 @@ def test_oversized_string_rejected() -> None:
 
 
 def test_unknown_operation_rejected() -> None:
-    for op in ("whoami", "post_text", "like_post", "download_image", "create_rule"):
+    # Layer 5 (M7-RV10/T61-flip): whoami and the six non-file writes are
+    # now advertised; what stays unknown is everything outside the frozen
+    # surface — media, local-output, and non-capability names.
+    for op in ("download_image", "create_rule", "post_photo"):
         with pytest.raises(IPCSchemaError, match="unknown IPC operation"):
             validate_and_normalize_request(op, {})
 
@@ -336,22 +339,23 @@ async def test_stale_instance_cannot_reach_dispatcher() -> None:
 
 
 async def test_forbidden_operations_rejected_before_dispatcher() -> None:
-    """whoami, writes, media, download — everything outside the five
-    Layer-4 names — dies at the allowlist, never reaching the Dispatcher."""
+    """Media-backed writes, artifacts, and the local-output capability —
+    everything outside the frozen read/health/write surface — die at the
+    allowlist, never reaching the Dispatcher. (whoami and the non-file
+    writes joined the advertised surface in Layer 5 per M7-RV10; the
+    Layer-6 media scope is still forbidden, M7-T66.)"""
     session = _session_ready()
     log: list = []
     server = _server(session, invoke_log=log)
     for op in (
-        "whoami",
-        "post_text",
-        "like_post",
-        "bookmark_post",
-        "reply_post",
-        "quote_post",
-        "delete_post",
         "post_photo",
+        "reply_photo",
+        "quote_photo",
         "post_multi_image",
+        "reply_multi_image",
+        "quote_multi_image",
         "download_image",
+        "compose_post",
         "create_reconciliation_operator_session",
     ):
         frame = _request(op, {}, instance_id=session.authority_instance_id)

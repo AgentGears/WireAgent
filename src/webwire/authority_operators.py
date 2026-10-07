@@ -70,6 +70,11 @@ class OwnedReconciliationOperatorSession:
         with self._session.admit():
             return self._delegate.list_targets()
 
+    def list_targets_page(self, *, limit: int, after_effect_id: Optional[str] = None) -> Any:
+        """M7 Layer 5 (F-81): bounded owner-admitted enumeration."""
+        with self._session.admit():
+            return self._delegate.list_targets_page(limit=limit, after_effect_id=after_effect_id)
+
     def show_target(self, effect_id: str) -> Any:
         with self._session.admit():
             return self._delegate.show_target(effect_id)

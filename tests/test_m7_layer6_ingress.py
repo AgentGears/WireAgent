@@ -455,7 +455,11 @@ async def test_staged_file_vanishing_at_open_is_a_stable_error(tmp_path: Path) -
         return resolved
 
     registry._resolve_staged_path = _resolve_then_vanish  # type: ignore[method-assign]
-    with pytest.raises(MediaIngressError, match="acquisition_failed"):
+    # The confined open maps the vanished file to a stable code —
+    # not_regular_file on POSIX (the open sees ENOENT), acquisition_failed
+    # where the platform open reports otherwise. Both are stable; neither
+    # is a raw OSError.
+    with pytest.raises(MediaIngressError, match="acquisition_failed|not_regular_file"):
         registry.ingest("photo.png")
     assert list(registry.artifact_root.glob("*.tmp")) == []
 

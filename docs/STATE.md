@@ -461,6 +461,55 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 6 round one (branch m7-layer6-media-ingress,
+  from exact main 4daa84c): the artifact referent model, tests-first.**
+  The round's center of gravity is the REFERENT MODEL, not the six
+  capability names. New authority_media_ingress.py: the
+  MediaArtifactRegistry owns two locations under the canonical authority
+  domain — the staging root (clients place bytes; the owner resolves
+  names strictly inside it: no absolute paths, no traversal, no
+  backslashes, no symlinks — a client filesystem string can never become
+  mutation authority through IPC) and the content-addressed artifact
+  store (<sha256>.bin — the owner copy is built from the exact bytes the
+  owner read and hashed, immune to staged-file mutation afterwards;
+  resolve() re-verifies the owner copy digest before every use:
+  substitution/corruption defense; expected_digest binds the preview's
+  artifact into the confirmed mutation). Ingress gates on the EXISTING
+  validation pipeline (validate_media_file: upload roots, regular-file/
+  no-symlink, magic-byte MIME, size, dimensions, SHA-256, EXIF) BEFORE
+  any preview/token authority. The minted artifact_ref is OPAKE,
+  instance-scoped, and ephemeral — a successor owner's registry never
+  knows it; never M5/M6 authority; never a durable replay credential.
+  Ordered resolve_ordered() is ALL-OR-NOTHING (a bad item N resolves
+  nothing). pin/unpin carry admitted-mutation retention: cleanup can
+  never delete live media; unpinned artifacts are reclaimed at drain.
+  The registry is bounded (max 256; overflow = registry_full). Wire
+  surface: media_ingest {staged_name} returns preview-grade metadata +
+  the opaque ref; the SIX media writes (post_photo, reply_photo,
+  quote_photo, post_multi_image, reply_multi_image, quote_multi_image)
+  join the advertised surface taking artifact_ref / ordered artifact_refs
+  (1..4) — raw image_path(s) die as unknown schema fields; the pipeline
+  resolves refs to OWNER-side paths (all-or-nothing) and substitutes
+  them into the capability input, so the existing media capabilities and
+  M5 adapters run unchanged with their immutable digest/manifest binding
+  and all-before-any-upload preflight intact; admitted media work pins
+  its artifacts for the invoke's duration; ingress/resolution failures
+  are stable wire codes (invalid_staged_name, symlink_rejected,
+  staged_outside_root, media_validation_failed, digest_mismatch,
+  unknown_artifact, registry_full, media_unavailable) — never internal.
+  download_image remains UNADVERTISED (the local-output contract is its
+  own future decision); compose_post stays off the surface. The
+  Dispatcher constructs the registry at IPC startup (instance-scoped)
+  and runs unpinned retention at drain. Legacy T66 assertions in the
+  Layer-4/5 suites updated for the flip. Tests: 16 ingress + 18 pipeline
+  + 3 real-transport (37 new + 1 platform-skipped symlink probe that
+  Linux CI exercises). Gate ALL GREEN: full suite + ruff + mypy clean on
+  102 files. EXPLICITLY FLAGGED for review: the real-executor media
+  integration (socket → Dispatcher → WriteKernel → M5 media executor
+  with a stub media port) is NOT yet in this round — the wire chain is
+  qualified at the pipeline-invoke level, mirroring how Layer-5 round
+  one flagged §14.3 before round two integrated it.
+
 - **2026-10-07 — M7 Layer 5 MERGED (PR #28, squash `13a471c`).** The
   merge-gate pass at exact head `4ec46ae` returned MERGE-READY; F-72
   through F-81 all closed at the Layer-5 implementation boundary after

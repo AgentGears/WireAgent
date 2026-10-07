@@ -74,6 +74,13 @@ IPC_SUPPORTED_OPERATIONS = frozenset(
         "delete_post",
         "bookmark_post",
         "like_post",
+        "media_ingest",
+        "post_photo",
+        "reply_photo",
+        "quote_photo",
+        "post_multi_image",
+        "reply_multi_image",
+        "quote_multi_image",
         "reconciliation_open",
         "reconciliation_close",
         "reconciliation_list",
@@ -93,6 +100,8 @@ IPC_READ_TABS = frozenset({"posts", "replies", "media"})  # exactly the capabili
 IPC_SEARCH_TABS = frozenset({"top", "latest", "people"})
 # F-73: the only terminal M6 verdicts (ReconciliationVerdict's exact values).
 IPC_RECONCILIATION_VERDICTS = frozenset({"CONFIRMED_EFFECT", "CONFIRMED_NO_EFFECT"})
+# Layer 6: the ordered multi-image bound (the existing upload surface's cap).
+IPC_MAX_MEDIA_ITEMS = 4
 
 
 class IPCProtocolError(ValueError):
@@ -290,6 +299,59 @@ IPC_SCHEMA: dict[str, dict[str, tuple[type, bool, Any]]] = {
         "post_url": (str, False, None),
         "confirmation_token": (str, False, None),
     },
+    # M7 Layer 6: media ingress + the six media-backed writes. The wire
+    # takes OPAQUE instance-scoped artifact_refs (minted by media_ingest
+    # from the owner-controlled staging root) — NEVER raw image_path /
+    # image_paths strings, which the schema rejects as unknown fields
+    # before any capability compose (a client filesystem string can never
+    # become mutation authority through IPC).
+    "media_ingest": {
+        "staged_name": (str, True, None),
+    },
+    "post_photo": {
+        "text": (str, False, None),
+        "artifact_ref": (str, True, None),
+        "alt_text": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "reply_photo": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_ref": (str, True, None),
+        "alt_text": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "quote_photo": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_ref": (str, True, None),
+        "alt_text": (str, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "post_multi_image": {
+        "text": (str, False, None),
+        "artifact_refs": (list, True, None),
+        "alt_texts": (list, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "reply_multi_image": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_refs": (list, True, None),
+        "alt_texts": (list, False, None),
+        "confirmation_token": (str, False, None),
+    },
+    "quote_multi_image": {
+        "post_url": (str, False, None),
+        "target_post_id": (str, False, None),
+        "text": (str, True, None),
+        "artifact_refs": (list, True, None),
+        "alt_texts": (list, False, None),
+        "confirmation_token": (str, False, None),
+    },
     # F-73 (§14.3): the reconciliation operator wire surface. Opaque
     # logical sessions; exact same-session text confirmation; the
     # ReconciliationAuthority never crosses the wire.
@@ -335,6 +397,10 @@ _WRITE_TARGET_RULES: dict[str, tuple[str, ...]] = {
     "delete_post": ("post_url", "target_post_id"),
     "bookmark_post": ("post_id", "post_url"),
     "like_post": ("post_id", "post_url"),
+    "reply_photo": ("post_url", "target_post_id"),
+    "quote_photo": ("post_url", "target_post_id"),
+    "reply_multi_image": ("post_url", "target_post_id"),
+    "quote_multi_image": ("post_url", "target_post_id"),
 }
 
 # The confirmation token is opaque HIGH-ENTROPY owner-minted material
@@ -357,6 +423,13 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "delete_post": {},
     "bookmark_post": {},
     "like_post": {},
+    "media_ingest": {},
+    "post_photo": {},
+    "reply_photo": {},
+    "quote_photo": {},
+    "post_multi_image": {},
+    "reply_multi_image": {},
+    "quote_multi_image": {},
     "reconciliation_open": {},
     "reconciliation_close": {},
     "reconciliation_list": {},
@@ -418,6 +491,21 @@ def validate_and_normalize_request(operation: str, payload: Any) -> dict[str, An
         elif expected_type is bool:
             if not isinstance(value, bool):
                 raise IPCSchemaError(f"{operation}.{name} must be a boolean")
+        elif expected_type is list:
+            # Layer 6: ordered artifact/alt-text lists. Bounded count;
+            # every item is a bounded non-empty string.
+            if not isinstance(value, list):
+                raise IPCSchemaError(f"{operation}.{name} must be a JSON array")
+            if name == "artifact_refs" and not (1 <= len(value) <= IPC_MAX_MEDIA_ITEMS):
+                raise IPCSchemaError(
+                    f"{operation}.{name} must carry 1..{IPC_MAX_MEDIA_ITEMS} ordered items"
+                )
+            if name == "alt_texts" and len(value) > IPC_MAX_MEDIA_ITEMS:
+                raise IPCSchemaError(f"{operation}.{name} exceeds {IPC_MAX_MEDIA_ITEMS} items")
+            for index, item in enumerate(value):
+                if not isinstance(item, str):
+                    raise IPCSchemaError(f"{operation}.{name}[{index}] must be a string")
+                _check_string(f"{operation}.{name}[{index}]", item)
         elif expected_type is dict:
             # F-73: the operator's evidence object. Strict JSON decoding
             # already produced plain data; enforce object shape and a

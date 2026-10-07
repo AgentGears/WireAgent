@@ -148,6 +148,7 @@ class Dispatcher:
         # before READY; closes before TERMINAL in the shutdown law.
         self._ipc_server: Optional[Any] = None
         self._ipc_transport: Optional[Any] = None
+        self._media_registry: Optional[Any] = None  # Layer 6 artifact registry
         self._enable_ipc = enable_ipc
         # The lifecycle fence between start() and stop(). Asyncio (not
         # threading): a threading lock acquired by a waiting coroutine would
@@ -315,6 +316,15 @@ class Dispatcher:
                             IPC_SERVER_MAX_CONCURRENT,
                             AuthorityIPCServer,
                         )
+                        from webwire.authority_media_ingress import (
+                            MediaArtifactRegistry,
+                        )
+
+                        self._media_registry = MediaArtifactRegistry(
+                            staging_root=self._config.state_dir / "media-staging",
+                            artifact_root=self._config.state_dir / "media-artifacts",
+                            authority_instance_id=session.authority_instance_id,
+                        )
                         from webwire.authority_ipc_transport import (
                             IPCTransportServer,
                         )
@@ -332,6 +342,10 @@ class Dispatcher:
                             # THIS owner — the provider mints owner-admitted
                             # operator sessions from the same M6 root.
                             reconciliation_provider=self.create_reconciliation_operator_session,
+                            # Layer 6: the owner-side artifact registry —
+                            # staging + content-addressed store under the
+                            # canonical authority domain, instance-scoped.
+                            media_registry=self._media_registry,
                         )
                         self._ipc_transport = IPCTransportServer(
                             ipc_server=self._ipc_server,
@@ -588,6 +602,11 @@ class Dispatcher:
             # already-open connections cannot submit fresh work.
             if self._ipc_server is not None:
                 self._ipc_server.begin_drain()
+                # Layer 6 retention: unpinned artifacts are reclaimed at
+                # drain; pinned (live-mutation) artifacts survive until
+                # their safe terminal boundary unpins them.
+                if self._media_registry is not None:
+                    self._media_registry.cleanup_unpinned()
             if self._ipc_transport is not None:
                 self._ipc_transport.stop()  # closes connections + endpoint + unlinks
                 self._ipc_transport = None

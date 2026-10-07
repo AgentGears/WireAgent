@@ -461,6 +461,38 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 6 fourth repair round (PR #29, F-90/F-91):
+  one authoritative Windows handle; already-absent release.** F-90
+  (blocker, fixed): the Windows confined open no longer probes one
+  handle and reads through a different pathname-opened one. ONE handle
+  is both the confinement decision and the acquisition source:
+  CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT (no-follow — a
+  reparse/symlink final component yields a handle to the LINK itself),
+  the handle's OWN attributes inspected with fail-closed semantics
+  (reparse → symlink_rejected; directory → not_regular_file; open/
+  inspection failure → acquisition_failed — "unable to prove" is never
+  safe), GetFinalPathNameByHandleW proves the SAME handle's final
+  resolved path beneath the staging root (also the containment proof for
+  path-checked intermediate components), and msvcrt.open_osfhandle
+  bridges THIS handle into the bounded reader — the pathname is never
+  reopened. The old probe helper is gone. POSIX hardening included: the
+  staging-root descriptor itself now opens with O_NOFOLLOW |
+  O_DIRECTORY so the root path cannot become the one component outside
+  the no-follow chain. Regressions (Windows-native, executing on this
+  gate): poisoning os.open proves a normal ingest never reopens by
+  pathname; the probe-failure injection fails closed with no fallthrough;
+  the reviewer-specified substitution race (regular file validated, then
+  the pathname replaced with a symlink to an outside DIFFERENT image)
+  acquires the VALIDATED handle's bytes (the staged PNG digest), never
+  the substituted pathname. F-91 (high, fixed): media_release treats an
+  ALREADY-ABSENT content-addressed file as complete reclamation — the
+  reference is removed (released=true semantics), the bounded slot is
+  reclaimed, and the ref reads unknown_artifact afterwards; a
+  permission/IO unlink failure on an EXISTING file still refuses
+  truthfully (artifact_release_failed, reference retained). No
+  permanently unreleasable live references. 5 new tests. Gate ALL
+  GREEN: full suite + ruff + mypy clean on 102 files.
+
 - **2026-10-07 — M7 Layer 6 third repair round (PR #29, F-87/F-88/F-89):
   bounded/stable owner-copy revalidation, open-time confinement,
   truthful release.** F-87 (blocker, fixed): resolve() no longer calls

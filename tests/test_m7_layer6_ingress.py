@@ -24,6 +24,7 @@ authority and never a durable replay credential.
 
 from __future__ import annotations
 
+import sys as _sys
 from pathlib import Path
 
 import pytest
@@ -670,3 +671,123 @@ async def test_F89_release_reports_deletion_failure_truthfully(tmp_path: Path, m
     assert not Path(minted.owner_path).exists()  # noqa: ASYNC240
     with pytest.raises(MediaIngressError, match="unknown_artifact"):
         registry.resolve(minted.ref)
+
+# ---------------------------------------------------------------------------
+# Fourth-review regressions: F-90 (one authoritative Windows handle) and
+# F-91 (already-absent storage reclaims the reference)
+# ---------------------------------------------------------------------------
+
+_win_only = pytest.mark.skipif(_sys.platform != "win32", reason="the Windows one-handle path")
+
+
+@_win_only
+async def test_F90_acquisition_never_reopens_by_pathname(tmp_path: Path, monkeypatch) -> None:
+    """F-90's no-reopen law: with os.open(pathname) poisoned for the
+    module, a normal ingest still succeeds — the bounded reader is fed
+    from the ONE validated handle (msvcrt.open_osfhandle), never from a
+    second pathname open."""
+    import webwire.authority_media_ingress as ingress_module
+
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+
+    def _no_pathname_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError("acquisition reopened the staged path by pathname")
+
+    monkeypatch.setattr(ingress_module.os, "open", _no_pathname_open)
+    minted = registry.ingest("photo.png")
+    assert minted.mime == "image/png"
+    assert Path(minted.owner_path).read_bytes() == _PNG_1X1  # noqa: ASYNC240
+
+
+@_win_only
+async def test_F90_probe_failure_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """A reparse/identity probe that cannot establish safety is NOT
+    treated as safe: with the validated-open seam failing, ingest
+    refuses with a stable acquisition error and never falls through to
+    any pathname open."""
+    import webwire.authority_media_ingress as ingress_module
+
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+
+    def _unprovable(self: object, staged_name: str) -> object:
+        raise MediaIngressError(
+            "acquisition_failed", "identity could not be established (injected)"
+        )
+
+    monkeypatch.setattr(
+        ingress_module.MediaArtifactRegistry, "_win_create_validated", _unprovable
+    )
+    with pytest.raises(MediaIngressError, match="acquisition_failed"):
+        registry.ingest("photo.png")
+    assert registry.artifact_count == 0
+    assert list(registry.artifact_root.glob("*.tmp")) == []
+
+
+@_win_only
+async def test_F90_substituted_pathname_bytes_come_from_validated_handle(tmp_path: Path) -> None:
+    """The reviewer-specified injected Windows race: a REGULAR final
+    component passes validation, the PATHNAME is then substituted with a
+    symlink to an outside image — and the acquired bytes still come from
+    the validated handle (the staged PNG's digest), never from the
+    substituted pathname."""
+    registry = _registry(tmp_path)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_PNG_1X1 + bytes([9]))  # DIFFERENT content
+    staged = _stage(registry, "photo.png")
+
+    real_validated = registry._win_create_validated
+
+    def _validated_then_substitute(staged_name: str) -> object:
+        handle = real_validated(staged_name)
+        # Substitute the pathname at exactly the validation→acquisition
+        # seam; the already-validated handle must remain authoritative.
+        staged.unlink()
+        staged.symlink_to(outside)
+        return handle
+
+    registry._win_create_validated = _validated_then_substitute  # type: ignore[method-assign]
+    try:
+        minted = registry.ingest("photo.png")
+    except OSError:
+        pytest.skip("symlink creation requires privileges on this platform")
+    assert minted.byte_size == len(_PNG_1X1), "bytes came from the validated handle"
+    assert Path(minted.owner_path).read_bytes() == _PNG_1X1  # noqa: ASYNC240
+
+
+async def test_F91_release_of_absent_storage_reclaims_the_reference(tmp_path: Path) -> None:
+    """F-91: the content-addressed file already absent → media_release
+    SUCCEEDS, the bounded registry slot is reclaimed, and the ref reads
+    unknown_artifact afterwards — no permanently unreleasable entry."""
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+    assert registry.artifact_count == 1
+
+    Path(minted.owner_path).unlink()  # noqa: ASYNC240 — external removal
+    with pytest.raises(MediaIngressError, match="artifact_deleted"):
+        registry.resolve(minted.ref)
+
+    registry.release(minted.ref)  # storage already absent → success
+    assert registry.artifact_count == 0
+    with pytest.raises(MediaIngressError, match="unknown_artifact"):
+        registry.resolve(minted.ref)
+
+
+async def test_F91_io_failure_still_keeps_the_reference(tmp_path: Path, monkeypatch) -> None:
+    """The F-89 half stays truthful: a PERMISSION/IO unlink failure on a
+    file that EXISTS still refuses release and keeps the reference."""
+    import pathlib
+
+    registry = _registry(tmp_path)
+    _stage(registry, "photo.png")
+    minted = registry.ingest("photo.png")
+
+    def _io_failure(self: object, *args: object, **kwargs: object) -> None:
+        raise PermissionError("injected I/O failure")
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _io_failure)
+    with pytest.raises(MediaIngressError, match="artifact_release_failed"):
+        registry.release(minted.ref)
+    assert registry.artifact_count == 1

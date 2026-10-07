@@ -244,7 +244,12 @@ class MediaArtifactRegistry:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         if nofollow:
             try:
-                dir_fd = os.open(self._staging_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                # The staging root itself joins the no-follow chain: the
+                # root path cannot become the one component outside it.
+                dir_fd = os.open(
+                    self._staging_root,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow,
+                )
             except OSError as exc:
                 raise MediaIngressError(
                     "acquisition_failed", f"the staging root could not be opened: {exc!r}"
@@ -287,38 +292,55 @@ class MediaArtifactRegistry:
                 raise MediaIngressError(
                     "acquisition_failed", f"the staged file could not be opened: {exc!r}"
                 ) from exc
-        target = self._staging_root / staged_name
-        handle = self._win_open_reparse_probe(str(target))
-        if handle is not None:
-            self._win_close_handle(handle)
-            raise MediaIngressError(
-                "symlink_rejected",
-                f"symlinks/reparse points are not allowed: {staged_name} (refused at open)",
-            )
+        return self._win_open_final(staged_name)
+
+    def _win_open_final(self, staged_name: str) -> int:
+        """F-90: ONE Windows handle is both the confinement decision and
+        the acquisition source. The final component is opened with
+        FILE_FLAG_OPEN_REPARSE_POINT (no-follow: a reparse/symlink
+        component yields a handle to the LINK itself), the handle's own
+        attributes are inspected — fail CLOSED if identity cannot be
+        established — the handle's FINAL resolved path must be beneath
+        the staging root and a regular file, and THIS SAME handle is
+        bridged into the bounded reader. The pathname is never reopened.
+        Intermediate components stay path-checked; their substitution is
+        caught by the final-path containment proof on this handle."""
+        import ctypes
+
+        handle = self._win_create_validated(staged_name)
         try:
-            fd = os.open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            final = self._win_final_path(handle)
+            root = os.path.normcase(str(self._staging_root.resolve()))
+            if not os.path.normcase(final).startswith(root + os.sep) and os.path.normcase(
+                final
+            ) != root:
+                raise MediaIngressError(
+                    "staged_outside_root",
+                    f"staged name resolves outside the staging root: {staged_name}",
+                )
+            msvcrt = __import__("importlib", fromlist=["import_module"]).import_module("msvcrt")
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except MediaIngressError:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise
         except OSError as exc:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
             raise MediaIngressError(
                 "acquisition_failed", f"the staged file could not be opened: {exc!r}"
             ) from exc
-        if not _stat.S_ISREG(os.fstat(fd).st_mode):
-            os.close(fd)
-            raise MediaIngressError(
-                "not_regular_file", f"staged name is not a regular file: {staged_name}"
-            )
         return fd
 
-    @staticmethod
-    def _win_open_reparse_probe(path: str) -> Any:
-        """Open with FILE_FLAG_OPEN_REPARSE_POINT and inspect the handle's
-        OWN attributes: returns the handle when the path IS a reparse
-        point (the link itself, not its target), else None."""
+    def _win_create_validated(self, staged_name: str) -> Any:
+        """Open the final component no-follow and validate the HANDLE's
+        own attributes: reparse/symlink → symlink_rejected; directory →
+        not_regular_file; open/inspection failure → acquisition_failed
+        (fail CLOSED — 'unable to prove' is never treated as safe)."""
         import ctypes
         import ctypes.wintypes as wt
 
         windll = getattr(ctypes, "windll", None)
         if windll is None:  # pragma: no cover - non-Windows
-            return None
+            raise MediaIngressError("acquisition_failed", "the Windows open path is unavailable")
         kernel32 = windll.kernel32
         FILE_FLAG_OPEN_REPARSE_POINT = 0x200000
         FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -326,7 +348,7 @@ class MediaArtifactRegistry:
         OPEN_EXISTING = 3
         kernel32.CreateFileW.restype = ctypes.c_void_p
         handle = kernel32.CreateFileW(
-            path,
+            str(self._staging_root / staged_name),
             GENERIC_READ,
             0,
             None,
@@ -335,7 +357,10 @@ class MediaArtifactRegistry:
             None,
         )
         if not handle or handle == -1:
-            return None
+            raise MediaIngressError(
+                "acquisition_failed",
+                f"the staged file could not be opened (no-follow open refused): {staged_name}",
+            )
 
         class _BHFI(ctypes.Structure):
             _fields_ = [
@@ -354,19 +379,52 @@ class MediaArtifactRegistry:
         info = _BHFI()
         if not kernel32.GetFileInformationByHandle(ctypes.c_void_p(handle), ctypes.byref(info)):
             kernel32.CloseHandle(ctypes.c_void_p(handle))
-            return None
+            raise MediaIngressError(
+                "acquisition_failed",
+                f"the staged file's identity could not be established: {staged_name}",
+            )
         if info.dwFileAttributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
-            return handle
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
-        return None
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise MediaIngressError(
+                "symlink_rejected",
+                f"symlinks/reparse points are not allowed: {staged_name} (refused at open)",
+            )
+        if info.dwFileAttributes & 0x10:  # FILE_ATTRIBUTE_DIRECTORY
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise MediaIngressError(
+                "not_regular_file", f"staged name is not a regular file: {staged_name}"
+            )
+        return handle
 
     @staticmethod
-    def _win_close_handle(handle: Any) -> None:
+    def _win_final_path(handle: Any) -> str:
+        """GetFinalPathNameByHandleW on the SAME validated handle (the
+        containment proof for every intermediate component too)."""
         import ctypes
 
         windll = getattr(ctypes, "windll", None)
-        if windll is not None:
-            windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+        if windll is None:  # pragma: no cover - non-Windows
+            raise MediaIngressError("acquisition_failed", "the Windows path is unavailable")
+        kernel32 = windll.kernel32
+        kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+        kernel32.GetFinalPathNameByHandleW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel32.GetFinalPathNameByHandleW(
+            ctypes.c_void_p(handle), buffer, 32768, 0
+        )
+        if not length or length >= 32768:
+            raise MediaIngressError(
+                "acquisition_failed", "the staged file's final path could not be established"
+            )
+        final = buffer.value
+        if final.startswith("\\\\?\\"):
+            final = final[4:]
+        return final
 
     def _acquire_bounded_copy(self, source_fd: int) -> Path:
         """F-83/F-88: BOUNDED, race-resistant acquisition FROM the
@@ -565,6 +623,13 @@ class MediaArtifactRegistry:
             target = Path(entry.artifact.owner_path)
             try:
                 target.unlink()
+            except FileNotFoundError:
+                # F-91: the content-addressed file is ALREADY absent —
+                # reclamation is complete at the storage layer; keeping
+                # the entry would strand a permanently unreleasable
+                # reference (resolve() already reports artifact_deleted).
+                del self._entries[ref_token]
+                return
             except OSError as exc:
                 raise MediaIngressError(
                     "artifact_release_failed",

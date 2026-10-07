@@ -11,6 +11,8 @@ the POSIX-only scenarios live in the endpoint-security file.
 
 from __future__ import annotations
 
+import json
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -30,26 +32,53 @@ def _scratch(tmp_path: Path, name: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_simultaneous_sibling_acquisition_yields_exactly_one_owner(tmp_path: Path) -> None:
-    """T2/T32 at the process boundary: two sibling processes released
-    from a common start produce exactly ONE owner; the loser observes
-    authority_busy and exits with the busy code."""
-    scratch = _scratch(tmp_path, "race")
+def test_true_simultaneous_race_yields_exactly_one_owner(tmp_path: Path) -> None:
+    """T2 PROPER (F-92): two siblings both reach a COMMON pre-acquisition
+    barrier, then race acquire() from the same starting signal. Exactly
+    one wins and exactly one gets authority_busy."""
+    for round_index in range(3):
+        scratch = _scratch(tmp_path, f"race{round_index}")
+        state_dir = scratch / "state"
+        acquire_gate = harness.gate(scratch, "acquire")
+        release_gate = harness.gate(scratch, "release")
+
+        contenders = [
+            harness.start_worker(scratch, "lock-race", state_dir, acquire_gate, release_gate) for _ in range(2)
+        ]
+        for contender in contenders:
+            harness.wait_record(contender.result_path.with_suffix(".ready"))
+        harness.open_gate(scratch, "acquire")
+
+        records = [contender.result() for contender in contenders]
+        winners = [r for r in records if r["acquired"] is True]
+        losers = [r for r in records if r["busy"] is True]
+        assert len(winners) == 1, f"round {round_index}: {records}"
+        assert len(losers) == 1, f"round {round_index}: {records}"
+        # The loser exits immediately; the winner holds until released.
+        assert contenders[records.index(losers[0])].wait() == harness.EXIT_BUSY
+
+        harness.open_gate(scratch, "release")
+        assert contenders[records.index(winners[0])].wait() == harness.EXIT_OK
+
+
+def test_contender_against_established_owner_is_busy(tmp_path: Path) -> None:
+    """T5/T6-style non-steal evidence (the round-one serialized sequence,
+    honestly relabeled): contention against an ESTABLISHED owner."""
+    scratch = _scratch(tmp_path, "established")
     state_dir = scratch / "state"
     release = harness.gate(scratch, "release")
 
-    winner = harness.start_worker(scratch, "lock-hold", state_dir, release)
-    record = winner.result()
-    assert record["acquired"] is True
+    owner = harness.start_worker(scratch, "lock-hold", state_dir, release)
+    assert owner.result()["acquired"] is True
 
-    loser = harness.start_worker(scratch, "lock-probe", state_dir)
-    loser_record = loser.result()
-    assert loser_record["acquired"] is False
-    assert loser_record["busy"] is True
-    assert loser.wait() == harness.EXIT_BUSY
+    contender = harness.start_worker(scratch, "lock-probe", state_dir)
+    contender_record = contender.result()
+    assert contender_record["acquired"] is False
+    assert contender_record["busy"] is True
+    assert contender.wait() == harness.EXIT_BUSY
 
     harness.open_gate(scratch, "release")
-    assert winner.wait() == harness.EXIT_OK
+    assert owner.wait() == harness.EXIT_OK
 
 
 def test_clean_release_permits_immediate_succession(tmp_path: Path) -> None:
@@ -170,11 +199,10 @@ def test_unclean_death_with_stale_endpoint_does_not_block_successor(tmp_path: Pa
     assert successor.wait() == harness.EXIT_OK
 
 
-def test_corrupt_durable_history_refuses_startup_fail_closed(tmp_path: Path) -> None:
-    """T13/T14 at the process boundary: corrupt EffectLedger rows in the
-    domain mean a successor full-owner REFUSES to start (hydration fails
-    closed before browser/IPC READY)."""
-    scratch = _scratch(tmp_path, "corrupt")
+def test_corrupt_effect_ledger_refuses_startup_fail_closed(tmp_path: Path) -> None:
+    """T13 at the process boundary: corrupt EffectLedger rows refuse
+    successor startup (hydration fails closed before READY)."""
+    scratch = _scratch(tmp_path, "corrupt-effects")
     state_dir = scratch / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "effects.ndjson").write_text("{ this is not json\n", encoding="utf-8")
@@ -185,9 +213,104 @@ def test_corrupt_durable_history_refuses_startup_fail_closed(tmp_path: Path) -> 
     owner.wait(timeout=15)
 
 
+def test_corrupt_reconciliation_ledger_refuses_startup_fail_closed(tmp_path: Path) -> None:
+    """T14 at the process boundary: an ambiguous ReconciliationLedger
+    refuses successor startup the same fail-closed way."""
+    scratch = _scratch(tmp_path, "corrupt-recon")
+    state_dir = scratch / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "reconciliations.ndjson").write_text("{ this is not json\n", encoding="utf-8")
+
+    owner = harness.start_worker(scratch, "full-owner", state_dir, harness.gate(scratch, "done"), "clean")
+    record = owner.result()
+    assert record["started"] is False
+    owner.wait(timeout=15)
+
+
 # ---------------------------------------------------------------------------
 # Lane 3: lifecycle races under genuine process boundaries
 # ---------------------------------------------------------------------------
+
+
+def test_blocked_admitted_work_keeps_owner_alive_and_locked_through_stop(tmp_path: Path) -> None:
+    """T17/T18 at the REAL process boundary (F-93): an admitted request
+    blocks at a controlled post-admission barrier INSIDE owner work.
+    The controller then begins the owner's stop sequence: the owner
+    process MUST stay alive, a contender MUST still get authority_busy,
+    and only after the barrier releases — the admitted work reaching its
+    terminal boundary — does the clean stop complete and the successor
+    acquire."""
+    scratch = _scratch(tmp_path, "blockedadmit")
+    state_dir = scratch / "state"
+    stop_gate = harness.gate(scratch, "stop")
+    exec_gate = harness.gate(scratch, "exec")
+    events_path = scratch / "admissions.ndjson"
+
+    owner = harness.start_worker(
+        scratch, "full-owner-blocked", state_dir, stop_gate, exec_gate, events_path, "*"
+    )
+    record = owner.result()
+    assert record["started"] is True
+    endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+
+    # A real client previews (real token), then sends the CONFIRM over
+    # the wire; the owner admits it and blocks at the barrier.
+    rid = secrets.token_hex(16)
+    env = scratch / "payload.json"
+    env.write_text(json.dumps({"text": "blocked admitted work"}), encoding="utf-8")
+    previewer = harness.start_worker(
+        scratch,
+        "ipc-request",
+        Path(endpoint),
+        build,
+        instance,
+        "post_text",
+        env,
+        secrets.token_hex(16),
+        "normal",
+    )
+    token = previewer.result()["response"]["data"]["data"]["confirmation_token"]
+    confirm_env = scratch / "confirm.json"
+    confirm_env.write_text(
+        json.dumps({"text": "blocked admitted work", "confirmation_token": token}),
+        encoding="utf-8",
+    )
+    client = harness.start_worker(
+        scratch,
+        "ipc-request",
+        Path(endpoint),
+        build,
+        instance,
+        "post_text",
+        confirm_env,
+        rid,
+        "disconnect",
+    )
+    assert client.result()["sent"] is True
+    deadline = time.monotonic() + 10
+    while (
+        not events_path.exists() or not events_path.read_text(encoding="utf-8").strip()
+    ) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    admitted_line = events_path.read_text(encoding="utf-8").splitlines()[0]
+    assert json.loads(admitted_line)["admitted"] == "post_text", "the confirm was admitted BEFORE the barrier"
+
+    # Begin the stop sequence while the admitted work is blocked.
+    harness.open_gate(scratch, "stop")
+    harness.wait_record(owner.result_path.with_suffix(".stopping"))
+    assert owner.poll() is None, "the owner MUST stay alive draining admitted work"
+    contender = harness.start_worker(scratch, "lock-probe", state_dir)
+    assert contender.result()["busy"] is True, "ownership is retained during the drain"
+    assert contender.wait() == harness.EXIT_BUSY
+
+    # Release the barrier: the work terminalizes, the stop completes.
+    harness.open_gate(scratch, "exec")
+    assert owner.wait(timeout=30) == harness.EXIT_OK
+
+    successor = harness.start_worker(scratch, "full-owner", state_dir, harness.gate(scratch, "stop2"), "clean")
+    assert successor.result()["started"] is True
+    harness.open_gate(scratch, "stop2")
+    assert successor.wait() == harness.EXIT_OK
 
 
 def test_full_owner_clean_stop_releases_domain_for_successor(tmp_path: Path) -> None:

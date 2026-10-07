@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,10 @@ except ImportError:  # pragma: no cover - CI-only subprocess path
     sys.path.insert(0, str(Path(__file__).parent / "stubs"))
 
 from webwire.authority import AuthorityBusyError, AuthorityOwnerLock  # noqa: E402
+
+QUAL_TABLE_BOUND = 8
+
+QUAL_TABLE_BOUND = 8
 
 
 def _write(result_path: Path, payload: dict[str, Any]) -> None:
@@ -49,6 +54,30 @@ def _wait_gate(path: Path, timeout: float = 120.0) -> None:
 
 
 def lock_hold(result_path: Path, state_dir: Path, release_gate: Path) -> int:
+    lock = AuthorityOwnerLock(state_dir)
+    try:
+        lock.acquire()
+    except AuthorityBusyError:
+        _write(result_path, {"acquired": False, "busy": True})
+        return 23
+    _write(result_path, {"acquired": True, "busy": False})
+    _wait_gate(release_gate)
+    lock.release()
+    return 0
+
+
+def lock_race(
+    result_path: Path,
+    state_dir: Path,
+    acquire_gate: Path,
+    release_gate: Path,
+) -> int:
+    """TRUE simultaneous acquisition (F-92): signal ready, wait for the
+    COMMON acquire gate (both contenders barrier here), then race
+    acquire() against the sibling. Exactly one wins."""
+    ready = result_path.with_suffix(".ready")
+    _write(ready, {"ready": True})
+    _wait_gate(acquire_gate)
     lock = AuthorityOwnerLock(state_dir)
     try:
         lock.acquire()
@@ -141,8 +170,25 @@ def _build_dispatcher(state_dir: Path, block_submit_path: Path):
     dispatcher = Dispatcher(cfg, session_manager=sm, enable_ipc=True)  # type: ignore[arg-type]
     from types import SimpleNamespace
 
+    # The stub stack carries placeholder executors for EVERY migrated
+    # write family: write-kernel-level barriers fire BEFORE any executor
+    # method runs, so the placeholders are never called in the barrier
+    # scenarios — but the Dispatcher's adapter lookup requires the
+    # attributes to EXIST.
     dispatcher._install_m5_live_stack = (  # type: ignore[method-assign]
-        lambda sb: setattr(dispatcher, "_m5_stack", SimpleNamespace(read_broker=_StubSB()))
+        lambda sb: setattr(
+            dispatcher,
+            "_m5_stack",
+            SimpleNamespace(
+                read_broker=_StubSB(),
+                post_text_executor=object(),
+                reply_executor=object(),
+                quote_executor=object(),
+                delete_executor=object(),
+                effect_executor=object(),
+                media_executor=object(),
+            ),
+        )
     )
     return dispatcher
 
@@ -259,7 +305,7 @@ def ipc_request(
         from webwire.authority_ipc_framing import encode_json_frame
         from webwire.authority_ipc_transport import IPCClient
 
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))  # noqa: ASYNC240
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))  # noqa: ASYNC240  # noqa: ASYNC240
         envelope = {
             "protocol_version": 1,
             "operation": operation,
@@ -273,6 +319,7 @@ def ipc_request(
             client = IPCClient(str(endpoint), expected_build_id=build_id)
             try:
                 client.connect()
+                _write(result_path.with_suffix(".connected"), {"connected": True})
                 if disconnect_after_send:
                     client._sock.send(encode_json_frame(envelope))
                     client._sock.close()
@@ -320,7 +367,10 @@ def ipc_raw(
                     sock.send(encode_json_frame(step["envelope"]))
                     outcomes.append({"sent": True})
                 elif kind == "read-eof":
-                    sock.settimeout(step.get("timeout", 5))
+                    # No per-socket timeout (F-98: production exposes none on
+                    # pipes); the CONTROLLER bounds this probe — the expected
+                    # peer close arrives promptly, or the worker is killed and
+                    # the test fails.
                     try:
                         data = sock.recv(1)
                         outcomes.append({"recv": data.hex() if data else ""})
@@ -382,6 +432,507 @@ def fork_child(result_path: Path, state_dir: Path, release_gate: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Controlled execution barriers INSIDE admitted owner work (F-93/F-94/F-96)
+# ---------------------------------------------------------------------------
+
+
+def _wrap_write_kernel_with_barrier(
+    dispatcher, events_path: Path, exec_gate: Path, match: str, block_all: bool = False
+) -> None:
+    """Wrap the WRITE KERNEL's execute with a controlled execution
+    barrier INSIDE admitted owner work (F-93/F-94/F-96C). The barrier
+    sits inside ``_invoke_inner`` under the Dispatcher's invocation
+    lock — the point where the request is admitted, retained-table
+    pinned, and (for media) artifact-pinned. Blocking here while
+    ``Dispatcher.stop()`` begins is exactly the drain law under
+    qualification; a barrier placed BEFORE the invocation lock would
+    deadlock stop() against the released call re-entering the lock.
+    Test orchestration in THIS process only."""
+    import asyncio
+
+    kernel = dispatcher._write_kernel
+    original = kernel.execute
+
+    async def _barrier_execute(write_cap, broker, input, **kwargs):
+        # Default: only the CONFIRM (token-bearing) call blocks — the
+        # preview phase must complete so qualification clients can obtain
+        # real tokens. block_all (the tablesat scenario) blocks every
+        # call: each holds its retained-table entry while blocked INSIDE
+        # the invocation lock, which is exactly the drain-order shape
+        # stop() expects (an invoke-seam barrier OUTSIDE the lock
+        # deadlocks stop()'s lock-then-drain ordering).
+        carries_token = isinstance(input, dict) and input.get("confirmation_token")
+        should_block = block_all or carries_token
+        if should_block and (match == "*" or getattr(write_cap, "name", "") == match):
+            with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                fh.write(json.dumps({"admitted": getattr(write_cap, "name", "?")}) + "\n")
+            await asyncio.get_event_loop().run_in_executor(None, _wait_gate, exec_gate, 120.0)
+        return await original(write_cap, broker, input, **kwargs)
+
+    kernel.execute = _barrier_execute
+
+
+def full_owner_blocked(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    exec_gate: Path,
+    events_path: Path,
+    invoke_match: str,
+) -> int:
+    """A full production owner whose ADMITTED work blocks at a
+    controlled post-admission barrier (F-93/F-94). The stop sequence
+    begins while work is blocked: the owner must stay alive, keep the
+    domain locked, and only complete the clean stop after the barrier
+    releases and the admitted work terminalizes."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        _wrap_write_kernel_with_barrier(dispatcher, events_path, exec_gate, invoke_match)
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 120.0)
+        _write(result_path.with_suffix(".stopping"), {"stop_begun": True})
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+def full_owner_media_block(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    exec_gate: Path,
+    events_path: Path,
+) -> int:
+    """F-96C: a full owner with the media registry live; ADMITTED media
+    mutations block at the post-admission barrier WITH their artifacts
+    pinned (the IPC server pins around the wrapped invoke). Stop begins
+    while pinned: the artifact must survive until the work terminalizes,
+    then post-drain retention reclaims it."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        _wrap_write_kernel_with_barrier(dispatcher, events_path, exec_gate, "post_photo")
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 120.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+def ingest_crash(
+    result_path: Path,
+    state_dir: Path,
+    die_gate: Path,
+) -> int:
+    """F-96B: a full owner whose NEXT ingest acquires its bounded
+    temporary copy and then DIES at the pre-publish barrier — leaving
+    the .tmp residue and NO content-addressed object."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        registry = dispatcher._media_registry
+        original_acquire = registry._acquire_bounded_copy
+
+        def _acquire_then_die(source_fd: int) -> Path:
+            original_acquire(source_fd)  # the temp copy exists from here
+            _write(result_path.with_suffix(".temp"), {"temp_acquired": True})
+            _wait_gate(die_gate, timeout=60)
+            os._exit(9)
+
+        registry._acquire_bounded_copy = _acquire_then_die  # type: ignore[method-assign]
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, die_gate, 120.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Real-M5 controlled crash point (F-95): RESERVED durable, then death
+# ---------------------------------------------------------------------------
+
+
+class _BlockingPostPort:
+    """The real post-text DOM port with a controlled barrier INSIDE
+    click_submit — the point where the M5 attempt is already RESERVED
+    durably. Test orchestration in THIS process only."""
+
+    def __init__(self, die_gate: Path, blocked_marker: Path) -> None:
+        self.die_gate = die_gate
+        self.blocked_marker = blocked_marker
+        self.composer_text = ""
+
+    async def fill_composer(self, text: str) -> Any:
+        self.composer_text = text
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"filled": True})
+
+    async def read_composer_text(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"composer_text": self.composer_text})
+
+    async def verify_attachment_ready(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"ready": True})
+
+    async def count_attachments(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"count": 0})
+
+    async def close_composer(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"cleanup": "closed"})
+
+    async def attach_media(self, image_path: str) -> Any:
+        raise AssertionError("plain post must not attach media")
+
+    async def open_reply_on_target(self, post_url: str, target_post_id: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"opened": True})
+
+    async def open_quote_on_target(self, post_url: str, target_post_id: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"opened": True})
+
+    async def click_submit(
+        self, *, _commit_gate, _precommit_check, _expected_text, _expected_attachments
+    ) -> Any:
+        # The durable RESERVED row is written INSIDE the commit gate; the
+        # controlled crash point sits AFTER it returns clean — the attempt
+        # is reserved durably, the effect may or may not exist.
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
+        _write(self.blocked_marker, {"m5_submit_blocked": True, "expected": _expected_text})
+        _wait_gate(self.die_gate, timeout=60)
+        os._exit(9)  # die INSIDE the admitted mutation, RESERVED durable
+
+
+class _DieEvidence:
+    async def capture_pre_submit_ids(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"status_ids": ["10", "11"]})
+
+    async def capture_new_post(self, pre_submit_ids: set, *, exclude_ids=None) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"post_id": "99", "post_url": "https://x.com/owner/status/99"})
+
+    async def verify_post_text(self, post_url: str, normalized_text: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(
+            data={
+                "text_matches": True,
+                "direct_status_owned": True,
+                "post_actor": "owner",
+                "post_id": "99",
+                "post_url": "https://x.com/owner/status/99",
+            }
+        )
+
+
+def full_owner_m5_crash(
+    result_path: Path,
+    state_dir: Path,
+    die_gate: Path,
+    payload_path: Path,
+) -> int:
+    """F-95/T44 with the REAL M5 post-text executor: preview (real token)
+    -> confirm through the real pipeline -> the executor reaches
+    click_submit where the attempt is RESERVED durably -> the owner DIES
+    at the controlled point. The response never exists; durable M5
+    truth is whatever the ledger holds at death."""
+    import asyncio
+
+    async def _run() -> int:
+        from types import SimpleNamespace
+
+        from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+        from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
+        from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+        from webwire.safety.scoped_authority import ScopedAuthorityBroker
+
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        blocked_marker = result_path.with_suffix(".blocked")
+        port = _BlockingPostPort(die_gate, blocked_marker)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        scoped = ScopedAuthorityBroker(port, dispatcher._m5_gateway, policies=DEFAULT_EFFECT_POLICIES)
+        runtime = M5ExecutionRuntime(
+            scoped_authority=scoped,
+            commit_gateway=dispatcher._m5_gateway,
+            policies=DEFAULT_EFFECT_POLICIES,
+        )
+        dispatcher._m5_stack = SimpleNamespace(
+            read_broker=_StubSB(),
+            post_text_executor=M5ActorBoundPostTextExecutor(runtime=runtime, evidence_reader=_DieEvidence()),
+        )
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))  # noqa: ASYNC240
+        import secrets as _secrets
+
+        from webwire.authority_ipc_framing import encode_json_frame, parse_frame_header
+
+        def _envelope(operation: str, body: dict) -> dict:
+            return {
+                "protocol_version": 1,
+                "operation": operation,
+                "payload": body,
+                "request_id": _secrets.token_hex(16),
+                "authority_instance_id": dispatcher._authority_session.authority_instance_id,
+                "runtime_build_id": dispatcher._ipc_server._runtime_build_id,
+            }
+
+        async def _dispatch(operation: str, body: dict) -> dict:
+            frame = encode_json_frame(_envelope(operation, body))
+            header, consumed = parse_frame_header(frame)
+            response = await dispatcher._ipc_server.process_request(header, frame[consumed:])
+            return json.loads(response[8:])
+
+        preview = await _dispatch("post_text", payload)
+        token = preview["data"]["data"]["confirmation_token"]
+        _write(result_path.with_suffix(".preview"), {"token_minted": True})
+        confirm = await _dispatch("post_text", {**payload, "confirmation_token": token})
+        # Never returns: the executor dies inside click_submit.
+        _write(result_path.with_suffix(".confirm"), confirm)
+        return 0
+
+    return asyncio.run(_run())
+
+
+def full_owner_tablesat(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    exec_gate: Path,
+    events_path: Path,
+) -> int:
+    """F-94's T57 scenario: a full owner whose transport capacity is
+    raised ABOVE the retained-table bound for THIS qualification (the
+    production capacity=4 would turn table pressure into connection
+    backpressure — a different, separately-tested law). Every request
+    logs an ADMISSION event at the invoke seam (post table
+    registration) and blocks INSIDE the write kernel under the
+    invocation lock; the first enters the kernel, the rest queue on the
+    Dispatcher's single invocation lock — all admitted, all pinned."""
+    import asyncio
+
+    import webwire.authority_ipc_server as ipc_module
+
+    async def _run() -> int:
+        # Qualification-only constant overrides (test orchestration in
+        # THIS process; the Dispatcher reads both at start() time):
+        # transport capacity above the fill count, and the retained
+        # table bound lowered to 8. The LAW under qualification —
+        # bounded inflight, table_full backpressure, join-not-reexecute,
+        # release-then-terminalize — is independent of the constant's
+        # production value; the production value 64 would make each
+        # released invoke re-hydrate the full recovery projection and
+        # the drain would take minutes without adding evidence.
+        original_cap = ipc_module.IPC_SERVER_MAX_CONCURRENT
+        ipc_module.IPC_SERVER_MAX_CONCURRENT = 128
+        # RetainedRequestTable's bound is a DEF-TIME default parameter —
+        # patching the constant does nothing. Patch the NAME the server
+        # module resolves at construction time instead, forcing the
+        # smaller qualification bound.
+        original_table_cls = ipc_module.RetainedRequestTable
+
+        class _SmallRetainedTable(original_table_cls):  # type: ignore[misc, valid-type]
+            def __init__(self, **kwargs: Any) -> None:
+                kwargs["max_inflight"] = QUAL_TABLE_BOUND
+                super().__init__(**kwargs)
+
+        ipc_module.RetainedRequestTable = _SmallRetainedTable
+        try:
+            dispatcher = _build_dispatcher(state_dir, state_dir)
+            started = await dispatcher.start()
+        finally:
+            ipc_module.IPC_SERVER_MAX_CONCURRENT = original_cap
+            ipc_module.RetainedRequestTable = original_table_cls
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        # The barrier sits INSIDE the write kernel (under the invocation
+        # lock), blocking EVERY call: each admitted request holds its
+        # retained-table entry while blocked — table pressure — and the
+        # lock ordering matches stop()'s drain sequence. (An invoke-seam
+        # barrier OUTSIDE the lock deadlocks stop()'s lock-then-drain
+        # ordering; blocking only confirms would let previews complete
+        # and the table would never fill.)
+        _wrap_write_kernel_with_barrier(dispatcher, events_path, exec_gate, "*", block_all=True)
+        # EVIDENCE seam: log every request that reaches invoke (all
+        # admitted requests — the kernel serializes, so only the first
+        # enters the barrier; the rest queue on the invocation lock
+        # while holding their retained-table entries). Pass-through: no
+        # barrier here (an invoke-seam barrier outside the lock
+        # deadlocks stop()'s lock-then-drain ordering).
+        original_invoke = dispatcher._invoke_admitted
+
+        async def _logging_invoke(name: str, payload: dict) -> Any:
+            with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                fh.write(json.dumps({"invoke": name}) + "\n")
+            return await original_invoke(name, payload)
+
+        dispatcher._ipc_server._invoke = _logging_invoke
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        _write(result_path.with_suffix(".stopping"), {"stop_begun": True})
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+def ipc_flood(
+    result_path: Path,
+    endpoint: Path,
+    build_id: str,
+    instance_id: str,
+    operation: str,
+    payload_path: Path,
+    count: int,
+    duplicate_of_first: bool,
+) -> int:
+    """Send COUNT unique-request-id requests, ONE PER CONNECTION (the
+    wire law), disconnecting each immediately after send — from THIS one
+    process (spawning one client process per request is needlessly
+    slow). Optionally re-sends the FIRST request_id once more (the
+    duplicate-delivery probe)."""
+    import asyncio
+
+    async def _run() -> int:
+        from webwire.authority_ipc_framing import encode_json_frame
+        from webwire.authority_ipc_transport import IPCClient
+
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))  # noqa: ASYNC240
+        first_rid = secrets.token_hex(16)
+
+        def _do() -> dict[str, Any]:
+            sent = 0
+            errors: list[str] = []
+            for index in range(count):
+                rid = first_rid if index == 0 else secrets.token_hex(16)
+                client = IPCClient(str(endpoint), expected_build_id=build_id)
+                try:
+                    client.connect()
+                    client._sock.send(
+                        encode_json_frame(
+                            {
+                                "protocol_version": 1,
+                                "operation": operation,
+                                "payload": payload,
+                                "request_id": rid,
+                                "authority_instance_id": instance_id,
+                                "runtime_build_id": build_id,
+                            }
+                        )
+                    )
+                    client._sock.close()
+                    sent += 1
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(repr(exc))
+            if duplicate_of_first:
+                client = IPCClient(str(endpoint), expected_build_id=build_id)
+                try:
+                    client.connect()
+                    client._sock.send(
+                        encode_json_frame(
+                            {
+                                "protocol_version": 1,
+                                "operation": operation,
+                                "payload": payload,
+                                "request_id": first_rid,
+                                "authority_instance_id": instance_id,
+                                "runtime_build_id": build_id,
+                            }
+                        )
+                    )
+                    client._sock.close()
+                    sent += 1
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(repr(exc))
+            return {"sent": sent, "errors": errors, "first_request_id": first_rid}
+
+        decoded = await asyncio.to_thread(_do)
+        _write(result_path, decoded)
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -420,6 +971,22 @@ def main(argv: list[str]) -> int:
         return ipc_raw(result_path, Path(raw[0]), raw[1], raw[2])
     if scenario == "fork-child":
         return fork_child(result_path, Path(raw[0]), Path(raw[1]))
+    if scenario == "lock-race":
+        return lock_race(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
+    if scenario == "full-owner-blocked":
+        return full_owner_blocked(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]), raw[4])
+    if scenario == "full-owner-media-block":
+        return full_owner_media_block(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
+    if scenario == "ingest-crash":
+        return ingest_crash(result_path, Path(raw[0]), Path(raw[1]))
+    if scenario == "ipc-flood":
+        return ipc_flood(
+            result_path, Path(raw[0]), raw[1], raw[2], raw[3], Path(raw[4]), int(raw[5]), raw[6] == "dup"
+        )
+    if scenario == "full-owner-tablesat":
+        return full_owner_tablesat(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
+    if scenario == "full-owner-m5-crash":
+        return full_owner_m5_crash(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     print(f"unknown scenario {scenario}", file=sys.stderr)
     return 2
 

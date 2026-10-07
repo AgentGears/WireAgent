@@ -132,14 +132,10 @@ def test_no_tcp_listener_anywhere_in_the_owner(tmp_path: Path) -> None:
     assert record["started"] is True
     try:
         pid = owner.process.pid
-        tcp_listen = []
-        for line in Path(f"/proc/{pid}/net/tcp").read_text().splitlines()[1:]:
-            fields = line.split()
-            local_address, state_hex = fields[1], fields[3]
-            if int(state_hex, 16) == 0x0A:  # LISTEN
-                tcp_listen.append(local_address)
-        # /proc/net/tcp is system-wide; filter by sockets OWNED by this
-        # process via the socket inode mapping.
+        # F-97: BOTH the IPv4 and IPv6 tables — an owner with only an
+        # IPv6 listener must not pass an IPv4-only check. /proc/net/tcp*
+        # is system-wide; filter by sockets OWNED by this process via
+        # the fd-inode mapping.
         owned_inodes = set()
         for fd_link in Path(f"/proc/{pid}/fd").iterdir():
             try:
@@ -149,12 +145,12 @@ def test_no_tcp_listener_anywhere_in_the_owner(tmp_path: Path) -> None:
             text = str(target)
             if text.startswith("socket:["):
                 owned_inodes.add(text[8:-1])
-        tcp_lines = Path(f"/proc/{pid}/net/tcp").read_text().splitlines()[1:]
-        listening_owned = [
-            line.split()[1]
-            for line in tcp_lines
-            if int(line.split()[3], 16) == 0x0A and line.split()[9] in owned_inodes
-        ]
+        listening_owned = []
+        for table in (f"/proc/{pid}/net/tcp", f"/proc/{pid}/net/tcp6"):
+            for line in Path(table).read_text().splitlines()[1:]:
+                fields = line.split()
+                if int(fields[3], 16) == 0x0A and fields[9] in owned_inodes:
+                    listening_owned.append((table, fields[1]))
         assert listening_owned == [], f"the production owner holds listening TCP sockets: {listening_owned}"
     finally:
         harness.open_gate(scratch, "stop")

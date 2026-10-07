@@ -461,6 +461,69 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 7 second repair round (PR #30,
+  F-92..F-99): evidence fidelity — every test now exercises the law it
+  names.** Qualification-only round; the ONE round-one production delta
+  (the Windows settimeout no-op) is REVERTED (F-98: it advertised
+  timeout semantics while providing none; the EOF probe is now bounded
+  by the controller killing the worker). F-92: TRUE simultaneous T2 —
+  a lock-race worker signals READY, waits a COMMON acquire gate, and
+  races acquire() against its sibling; exactly one winner and exactly
+  one authority_busy per round, repeated 3x; the serialized
+  established-owner sequence is retained but honestly relabeled
+  T5/T6-style non-steal. F-93: T17/T18 at the real process boundary —
+  a controlled barrier INSIDE the write kernel (under the Dispatcher's
+  invocation lock) blocks an admitted CONFIRM; the stop sequence then
+  begins and the owner process MUST stay alive, a contender MUST get
+  authority_busy, and only after the barrier releases does the clean
+  stop complete and a successor acquire. F-94: REAL retained-table
+  saturation (T57) — a tablesat worker (transport capacity raised, the
+  table bound lowered to 8, both documented as qualification
+  orchestration independent of the law) admits 8 requests that block
+  in the kernel holding their table entries with clients DISCONNECTED;
+  the flood client (one process, one request per connection) provides
+  the fill; the 9th NEW request gets table_full (stable backpressure);
+  a same-id duplicate JOINS (invoke-event count unchanged); release
+  terminalizes all with a clean stop. The old connection-stall test is
+  retained and honestly relabeled TRANSPORT capacity backpressure.
+  F-95: REAL T44 — a full-owner-m5-crash worker installs the REAL
+  actor-bound post-text executor over a controlled DOM port whose
+  click_submit dies AFTER the commit gate (the durable RESERVED row is
+  in effects.ndjson at the crash point, asserted); the response never
+  exists; the successor hydrates, starts, and REFUSES the same-semantic
+  write through the recovery gate (durable M5/M6 truth governs — the
+  uncertainty is never resolved by transport), while the old envelope
+  is stale_authority_instance. The old disconnect-then-death test is
+  relabeled T20/T26. F-96: the three REAL media scenarios — (A) a
+  REAL media_ingest over the wire mints a real artifact_ref; the owner
+  dies; the successor rejects the OLD ref as unknown_artifact and a
+  fresh ingest mints a NEW ref; (B) a REAL ingest crashes between the
+  bounded temp copy and the atomic publish (acquire-wrap barrier):
+  .tmp residue only, NO <sha256>.bin, successor starts safely; (C) a
+  REAL post_photo confirm blocks at the kernel barrier WITH its
+  artifact pinned; stop begins; the artifact survives and the domain
+  stays locked; release terminalizes the work and post-drain retention
+  reclaims the artifact. F-97: the no-TCP proof reads BOTH
+  /proc/net/tcp and tcp6 (fd-inode owned-socket filtering). F-99:
+  corrupt-history split into T13 (effects) and T14 (reconciliations
+  ledgers) process cases; the state dir is 'effects.ndjson' not
+  'journal.ndjson'. HARNESS LESSONS (deep): an invoke-seam barrier
+  OUTSIDE the Dispatcher's invocation lock deadlocks stop()'s
+  lock-then-drain ordering (the released invoke re-enters the lock
+  stop holds) — barriers must sit INSIDE the kernel under the lock;
+  blocking only confirms lets preview-only requests complete and the
+  table never fills (the kernel barrier needs block_all); the
+  RetainedRequestTable bound is a DEF-TIME default parameter — patch
+  the CLASS name the server module resolves, not the constant; the
+  durable RESERVED row is written INSIDE the commit gate (the crash
+  point must sit after it); the token bucket completes unblocked
+  previews (3/3600s) so saturation fills must not depend on them; one
+  flood-client process replaces N client processes (cold-start cost);
+  a stub M5 stack needs ALL the executor attributes present or the
+  adapter lookup itself raises. Gate ALL GREEN: 1414 passed + 37
+  platform-skipped locally (Windows), ruff + mypy clean on 102 files.
+
+
 - **2026-10-07 — M7 Layer 7 round one (branch m7-layer7-posix-
   qualification, from exact main 705ef6b): the multi-process
   qualification harness first.** Per the frozen design ("Layers 7-8 are

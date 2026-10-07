@@ -461,6 +461,45 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 6 MERGED (PR #29, squash `de3551d`).** The
+  merge-gate pass at exact head `79a6658` returned MERGE-READY; F-82
+  through F-91 all closed at the Layer-6 implementation boundary after
+  four review rounds, and the one pre-merge provenance correction was
+  applied (the PR body had claimed the three F-90 Windows one-handle
+  tests execute on Windows CI — they do not: the CI Windows jobs select
+  only the durability/Layer-4-IPC/rule-store suites; the exact
+  provenance — present in the repository, green in the LOCAL Windows
+  gate, skipped by the Linux full-suite job, not selected by Windows CI
+  — now stands in the body; exhaustive Windows/platform qualification
+  is frozen for Layer 8). The merged artifact-referent model: owner-
+  side ingress from a canonical-authority-domain staging root (roots
+  proven real non-symlink directories; staged names walked for symlinks
+  before the open; POSIX dir_fd O_NOFOLLOW walk with the root itself in
+  the no-follow chain; Windows ONE authoritative handle — CreateFileW
+  no-follow, handle-own attributes fail-closed, GetFinalPathNameByHandleW
+  containment, open_osfhandle bridge, no pathname reopen); bounded
+  immutable-copy acquisition (validator-cap streaming, atomic
+  content-addressed publish); opaque instance-scoped ephemeral refs
+  (successor registries never know them; never M5/M6 authority; never
+  durable replay credentials); ordered all-or-nothing resolution;
+  digest re-verification at every resolve (bounded streaming, stable
+  artifact_deleted/unreadable/oversize codes); pinning through admitted
+  mutation (retention never deletes live media); truthful media_release
+  (delete-first; already-absent = complete reclamation; IO failure keeps
+  the reference); bounded registry (256, explicit release, no silent
+  eviction); alt-text withheld from the IPC contract; the six media
+  writes advertised ONLY through artifact_refs with T68/T70 proven
+  through the real Dispatcher/WriteKernel/M5 media executor stack;
+  download_image unadvertised. Advertised surface now: health/read/
+  read_profile/read_thread/read_search + whoami + six non-file writes +
+  seven reconciliation ops + media_ingest/media_release + six media
+  writes. Merge-head evidence (CI #633, all four jobs green): Linux
+  3.11 1412 passed + 16 skipped, Ruff clean, mypy clean on 102 source
+  files; Windows Server 2025 3.11 durability 170+4, named-pipe IPC 46,
+  rule store 57. Layers 1-6 are now FROZEN on main; the next frozen
+  boundary is M7 Layer 7 — POSIX qualification.
+
+
 - **2026-10-07 — M7 Layer 6 fourth repair round (PR #29, F-90/F-91):
   one authoritative Windows handle; already-absent release.** F-90
   (blocker, fixed): the Windows confined open no longer probes one
@@ -1183,15 +1222,16 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: layers 1-5 on main (Layer 5 squash-merged 2026-10-07,
-  13a471c, after five review rounds and a merge-gate pass — all findings
-  F-72..F-81 closed at the Layer-5 implementation boundary; the
-  Layer-5 request/reconciliation model is now FROZEN; POSIX/Windows
-  exhaustive platform qualification remains Layers 7-8 by design).
-  NEXT BUILD (M7 Layer 6): owner-side artifact/media ingress and
-  local-output semantics (download_image output contract only if
-  exposed). Second adapter remains deferred until the M7 boundary is
-  stable.
+  M7 STATUS: layers 1-6 on main, ALL FROZEN (Layer 6 squash-merged
+  2026-10-07, de3551d, after four review rounds and a merge-gate pass —
+  all findings F-82..F-91 closed at the Layer-6 implementation
+  boundary; F-60..F-91 stay closed absent material code changes).
+  download_image remains unadvertised; its local-output contract is a
+  deliberate future decision, not an open defect. NEXT BUILD (M7 Layer
+  7): POSIX qualification (genuine sibling-process runs, crash/fault/
+  response-loss). Layer 8 owns Windows Server 2025 exhaustive
+  qualification. Second adapter remains deferred until the M7 boundary
+  is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

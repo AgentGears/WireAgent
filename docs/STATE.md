@@ -461,6 +461,33 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 sixth repair round (PR #30,
+  F-108/F-109): the ordering difference moved INSIDE the payload; T20
+  gained the oracle.** F-108 (blocker, fixed): the previous T58 varied
+  only ENVELOPE-level key order — but §10.5's canonical identity
+  hashes protocol_version + operation + the schema-normalized PAYLOAD
+  and discards the envelope routing fields whose order that version
+  varied. The test now sends two raw frames with IDENTICAL envelope
+  ordering whose only difference is the key order INSIDE a valid
+  multi-key read_search payload (query/tab/limit in two orders); raw
+  bodies asserted byte-different and semantically equal before sending;
+  same request_id on both: the byte-identical RETAINED response, NOT
+  request_id_reused, invoke count EXACTLY 1. F-109 (high, fixed): a
+  counting-owner T20 test — an otherwise-valid request with a stale
+  instance id returns stale_authority_instance with invoke count ZERO
+  (explicit before-Dispatcher evidence), and the same owner then serves
+  a current-instance request (count exactly 1). Record cleanups: the
+  superseded duplicate-delivery smoke test (self-labeled T23/T58
+  without an oracle) is DELETED — one authoritative proof per law; the
+  PR body's T21 probe count corrected to the actual six (two protocol
+  versions, unknown operation, two schema cases, oversize). Gate ALL
+  GREEN: 1417 passed + 37 platform-skipped locally (Windows), ruff +
+  mypy clean on 102 files. LESSON: canonical-identity qualifications
+  must vary the ordering of exactly the fields the canonicalizer
+  hashes — varying fields the pipeline discards before
+  canonicalization exercises nothing about the §10.5 rule.
+
+
 - **2026-10-08 — M7 Layer 7 fifth repair round (PR #30,
   F-105/F-106/F-107): the raw lane gained an execution oracle, real
   wire-level key ordering, and a genuinely executable pickle.**

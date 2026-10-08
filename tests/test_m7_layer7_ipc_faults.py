@@ -45,51 +45,6 @@ def _payload_file(scratch: Path, payload: dict) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_duplicate_request_id_delivered_twice_returns_retained(tmp_path: Path) -> None:
-    """T23/T58 at the process boundary: the SAME request delivered twice
-    over two real connections returns the SAME retained outcome — one
-    execution, byte-stable response."""
-    scratch = _scratch(tmp_path, "dup")
-    state_dir = scratch / "state"
-    owner, record = _start_full_owner(scratch, state_dir)
-    try:
-        rid = secrets.token_hex(16)
-        env = _payload_file(scratch, {})  # health: browser-free
-
-        def _request_with_retry() -> dict:
-            # Two cold-start client processes can race the pipe's next
-            # instance (a transient connection-level refusal, not the law
-            # under test); retry those.
-            for _attempt in range(4):
-                client = harness.start_worker(
-                    scratch,
-                    "ipc-request",
-                    Path(record["endpoint"]),
-                    record["build_id"],
-                    record["instance_id"],
-                    "health",
-                    env,
-                    rid,
-                    "normal",
-                )
-                out = client.result(timeout=30)
-                client.wait(timeout=15)
-                if "response" in out:
-                    return out
-                time.sleep(0.2)
-            raise AssertionError("the request never reached a response")
-
-        r1 = _request_with_retry()
-        r2 = _request_with_retry()
-        # Any WELL-FORMED frame qualifies (the law under test is retention,
-        # not the read result — the DOM port is stubbed at Layer 7).
-        assert isinstance(r1["response"], dict) and "ok" in r1["response"], r1
-        assert r2["response"] == r1["response"], "the retained frame is byte-stable"
-    finally:
-        harness.open_gate(scratch, "stop")
-        owner.wait()
-
-
 def test_transport_capacity_backpressure_under_real_connections(tmp_path: Path) -> None:
     """TRANSPORT capacity (honestly labeled, F-94): handler-slot
     saturation over real connections refuses the extra connection AT
@@ -689,15 +644,17 @@ def test_T50_executable_pickle_attempt_never_deserialized(tmp_path: Path) -> Non
         owner.wait()
 
 
-def test_T58_raw_wire_key_order_retained_not_violation(tmp_path: Path) -> None:
-    """T58 PROPER (F-105): two COMPLETE envelope JSON documents hand-
-    built with IDENTICAL values under DELIBERATELY DIFFERENT key order
-    — and sent as RAW frame bytes (the client serializer would sort
-    keys; the owner must receive the different orderings). The raw
-    bodies are asserted byte-different BEFORE sending and semantically
-    equal. The SAME request_id on both: the second returns the byte-
-    identical RETAINED response, NOT request_id_reused, and the invoke
-    count stays EXACTLY 1."""
+def test_T58_payload_key_order_retained_not_violation(tmp_path: Path) -> None:
+    """T58 PROPER (F-105/F-108): two raw frames with IDENTICAL envelope
+    ordering whose difference is ONLY the key order INSIDE the
+    schema-normalized payload — the load-bearing §10.5 rule, since
+    canonical_request_identity hashes protocol_version + operation + the
+    normalized payload and DISCARDS the envelope routing fields whose
+    order the previous version varied. A read_search payload with
+    query/tab/limit in two orders; raw bodies asserted byte-different
+    and semantically equal before sending; same request_id on both: the
+    second returns the byte-identical RETAINED response, NOT
+    request_id_reused, invoke count EXACTLY 1."""
     scratch = _scratch(tmp_path, "t58raw")
     state_dir = scratch / "state"
 
@@ -707,26 +664,27 @@ def test_T58_raw_wire_key_order_retained_not_violation(tmp_path: Path) -> None:
         build, instance = record["build_id"], record["instance_id"]
         rid = secrets.token_hex(16)
 
+        # IDENTICAL envelope key order on both frames; ONLY the payload
+        # object's key order differs.
         body_a = (
             '{"protocol_version":1,'
-            '"operation":"health",'
-            '"payload":{},'
+            '"operation":"read_search",'
+            '"payload":{"query":"key order probe","tab":"latest","limit":5},'
             f'"request_id":"{rid}",'
             f'"authority_instance_id":"{instance}",'
             f'"runtime_build_id":"{build}"}}'
         )
         body_b = (
-            "{"
-            f'"runtime_build_id":"{build}",'
-            f'"authority_instance_id":"{instance}",'
+            '{"protocol_version":1,'
+            '"operation":"read_search",'
+            '"payload":{"limit":5,"tab":"latest","query":"key order probe"},'
             f'"request_id":"{rid}",'
-            '"payload":{},'
-            '"operation":"health",'
-            '"protocol_version":1}'
+            f'"authority_instance_id":"{instance}",'
+            f'"runtime_build_id":"{build}"}}'
         )
         bytes_a = body_a.encode("utf-8")
         bytes_b = body_b.encode("utf-8")
-        assert bytes_a != bytes_b, "the WIRE bytes differ (key order, not values)"
+        assert bytes_a != bytes_b, "the WIRE bytes differ (payload key order, not values)"
         assert json.loads(body_a) == json.loads(body_b), "the semantic content is identical"
 
         first = _raw_request_worker(scratch, endpoint, build, bytes_a, "a")
@@ -735,14 +693,63 @@ def test_T58_raw_wire_key_order_retained_not_violation(tmp_path: Path) -> None:
         r2 = second.result()["steps"][1]["response"]
 
         # Any WELL-FORMED frame qualifies: the law is canonical identity +
-        # retention, not the health verdict (the stub DOM surface fails
-        # health's own diagnostics on purpose).
+        # retention, not the read verdict (the DOM surface is stubbed).
         assert isinstance(r1, dict) and "ok" in r1, r1
-        assert r2 == r1, "different wire key order -> the byte-identical retained frame"
+        assert r2 == r1, "different payload key order -> the byte-identical retained frame"
         assert (r2.get("error") or {}).get("code", "") != "request_id_reused", r2
         assert _invoke_count(events_path) == 1, "ONE execution despite two differently-ordered deliveries"
     finally:
         harness.open_gate(scratch, "stop-t58")
+        owner.wait()
+
+
+def test_T20_stale_instance_rejected_before_execution(tmp_path: Path) -> None:
+    """T20 with the execution oracle (F-109): an otherwise-VALID request
+    carrying a stale instance id is rejected as stale_authority_instance
+    and the invoke count stays ZERO — explicit before-Dispatcher
+    evidence — while the same owner then serves a current-instance
+    request (invoke count exactly 1)."""
+    scratch = _scratch(tmp_path, "t20count")
+    state_dir = scratch / "state"
+    owner, record, events_path = _counting_owner(scratch, state_dir, "t20")
+    try:
+        endpoint = Path(record["endpoint"])
+        build, instance = record["build_id"], record["instance_id"]
+
+        stale_env = _payload_file(scratch, {})
+        stale = harness.start_worker(
+            scratch,
+            "ipc-request",
+            endpoint,
+            build,
+            "f" * 64,  # a stale owner instance id
+            "health",
+            stale_env,
+            secrets.token_hex(16),
+            "normal",
+        )
+        stale_response = stale.result()["response"]
+        assert stale_response["ok"] is False
+        assert stale_response["error"]["code"] == "stale_authority_instance"
+        assert _invoke_count(events_path) == 0, "stale instance rejected BEFORE execution"
+
+        current_env = _payload_file(scratch, {})
+        current = harness.start_worker(
+            scratch,
+            "ipc-request",
+            endpoint,
+            build,
+            instance,
+            "health",
+            current_env,
+            secrets.token_hex(16),
+            "normal",
+        )
+        current_record = current.result()
+        assert isinstance(current_record["response"], dict) and "ok" in current_record["response"]
+        assert _invoke_count(events_path) == 1, "exactly the one valid current-instance request"
+    finally:
+        harness.open_gate(scratch, "stop-t20")
         owner.wait()
 
 

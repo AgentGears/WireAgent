@@ -298,7 +298,7 @@ def test_T48_successor_hydrates_before_browser_after_os_release(tmp_path: Path) 
         assert record["started"] is True, record
         deadline = time.monotonic() + 10
         while (
-            not phases_path.exists() or "browser-installing" not in phases_path.read_text(encoding="utf-8")
+            not phases_path.exists() or "ready" not in phases_path.read_text(encoding="utf-8")
         ) and time.monotonic() < deadline:
             time.sleep(0.05)
         phases = [
@@ -306,12 +306,17 @@ def test_T48_successor_hydrates_before_browser_after_os_release(tmp_path: Path) 
             for line in phases_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        # The ordering law: acquire -> hydrate -> browser install -> ready.
+        # F-110: the law is observed at SessionManager.start() ENTRY —
+        # the browser/session boundary — not at the later M5-stack
+        # install. A regression that launched a real browser before
+        # hydration would surface as browser-start-called preceding
+        # hydrated.
         assert phases[0] == "acquiring", phases
-        assert "hydrated" in phases and "browser-installing" in phases, phases
-        assert phases.index("hydrated") < phases.index("browser-installing"), (
-            f"hydration precedes the browser stack: {phases}"
+        assert "hydrated" in phases and "browser-start-called" in phases, phases
+        assert phases.index("hydrated") < phases.index("browser-start-called"), (
+            f"hydration precedes the browser/session start: {phases}"
         )
+        assert phases.index("browser-start-called") < phases.index("ready"), phases
         assert phases[-1] == "ready", phases
     finally:
         harness.open_gate(scratch, "stop")

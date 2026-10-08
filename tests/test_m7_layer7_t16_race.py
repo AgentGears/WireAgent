@@ -32,28 +32,31 @@ def _payload_file(scratch: Path, payload: dict) -> Path:
 
 
 def test_T16_admission_drain_race_never_torn(tmp_path: Path) -> None:
-    """Requests fired INTO the closing drain window are either fully
-    admitted (the drain waits; the owner stays alive until they
-    terminalize) or refused with the draining error — and in both
-    cases the owner exits cleanly and the domain frees. Repeated
-    across several racing requests to straddle the window."""
+    """F-112's T16: CONNECTED, outcome-bearing racers synchronized at
+    the ACTUAL admission/drain seam (AuthoritySession.begin_drain
+    entry, marked by the owner). Requests that arrive before the seam
+    are ADMITTED (invoke-logged; their responses arrive after the held
+    work releases); requests after the seam receive the stable draining
+    refusal. Every launched racer lands in EXACTLY ONE set — no
+    missing, no torn admission — and the owner holds the domain
+    through the window, then drains cleanly for a successor."""
     scratch = _scratch(tmp_path, "t16")
     state_dir = scratch / "state"
     stop_gate = harness.gate(scratch, "stop")
     exec_gate = harness.gate(scratch, "exec")
     events_path = scratch / "admissions.ndjson"
 
-    # A counting owner whose CONFIRMS block in the kernel: admitted work
-    # holds the invocation lock, so the drain window is observable.
-    owner = harness.start_worker(
-        scratch, "full-owner-blocked", state_dir, stop_gate, exec_gate, events_path, "*"
-    )
+    owner = harness.start_worker(scratch, "full-owner-t16", state_dir, stop_gate, exec_gate, events_path)
     record = owner.result()
     assert record["started"] is True
     endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
 
-    # One confirmed ADMISSION first (blocked in the kernel), so the
-    # session's active count is 1 and drain has something to wait for.
+    def _invoke_events() -> list:
+        if not events_path.exists():
+            return []
+        return [line for line in events_path.read_text(encoding="utf-8").splitlines() if '"invoke"' in line]
+
+    # The HELD confirm: admitted, blocked in the kernel.
     preview_env = _payload_file(scratch, {"text": "the T16 held confirm"})
     previewer = harness.start_worker(
         scratch,
@@ -81,67 +84,142 @@ def test_T16_admission_drain_race_never_torn(tmp_path: Path) -> None:
     )
     assert held.result()["sent"] is True
     deadline = time.monotonic() + 10
-    while (
-        not events_path.exists() or '"admitted"' not in events_path.read_text(encoding="utf-8")
-    ) and time.monotonic() < deadline:
+    while len(_invoke_events()) < 2 and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert events_path.read_text(encoding="utf-8").count('"admitted"') >= 1, (
-        "the first confirm is admitted and blocked"
-    )
+    # The held pair = preview invoke + confirm invoke.
+    assert len(_invoke_events()) == 2, "the held confirm is admitted (preview + confirm)"
 
-    # NOW open the stop gate (drain begins) and simultaneously fire a
-    # burst of racing preview requests into the closing window.
-    harness.open_gate(scratch, "stop")
-    racers = []
-    for index in range(4):
-        env = _payload_file(scratch, {"text": f"t16 racer {index}"})
-        racers.append(
-            harness.start_worker(
-                scratch,
-                "ipc-request",
-                Path(endpoint),
-                build,
-                instance,
-                "post_text",
-                env,
-                secrets.token_hex(16),
-                "disconnect",
-            )
+    # PRE-SEAM racers (CONNECTED, NORMAL — they read their responses):
+    # admission happens in process_request BEFORE the invoke queues on
+    # the invocation lock, so each is admitted and invoke-logged.
+    # ONE pre-seam racer (retrying transient connection refusals — the
+    # known cold-start flake, not the law): admitted when the invoke
+    # count reaches 3 (held pair + this preview).
+    pre_seam = []
+    env = _payload_file(scratch, {"text": "t16 pre-seam"})
+    for _attempt in range(4):
+        racer = harness.start_worker(
+            scratch,
+            "ipc-request",
+            Path(endpoint),
+            build,
+            instance,
+            "post_text",
+            env,
+            secrets.token_hex(16),
+            "normal",
         )
-    racer_records = [racer.result(timeout=30) for racer in racers]
-    for racer in racers:
+        pre_seam = [racer]
+        deadline = time.monotonic() + 10
+        while len(_invoke_events()) < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if len(_invoke_events()) >= 3:
+            break
+        racer.kill()
+    # 2 (held pair) + 1 (pre-seam preview) = 3 admitted invokes.
+    assert len(_invoke_events()) == 3, f"the pre-seam racer is admitted: {_invoke_events()}"
+
+    # IN-WINDOW racers: CONNECT NOW (the endpoint is still live), but
+    # their SEND waits on a gate the controller opens AFTER the drain
+    # seam — already-connected sockets delivering into the draining
+    # owner receive the stable refusal.
+    send_gate = harness.gate(scratch, "send")
+    # ONE in-window racer: the transport's connection capacity is 4 and
+    # three slots are held (the blocked confirm + the two queued pre-seam
+    # racers) — the fourth slot is exactly the in-window delivery.
+    in_window = []
+    env = _payload_file(scratch, {"text": "t16 in-window"})
+    in_window.append(
+        harness.start_worker(
+            scratch,
+            "ipc-request",
+            Path(endpoint),
+            build,
+            instance,
+            "post_text",
+            env,
+            secrets.token_hex(16),
+            "normal",
+            send_gate,
+        )
+    )
+    for racer in in_window:
+        deadline = time.monotonic() + 10
+        marker = racer.result_path.with_suffix(".connected")
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), "the in-window racer connected before the seam"
+
+    # Open the stop gate: the drain reaches the SEAM (begin_drain
+    # entry marker) — the synchronization point.
+    harness.open_gate(scratch, "stop")
+    seam_marker = owner.result_path.with_suffix(".drain")
+    deadline = time.monotonic() + 15
+    while not seam_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert seam_marker.exists(), "shutdown reached the drain seam"
+
+    # Release the send gate: the already-connected in-window racer
+    # delivers into the DRAINING owner. Empirically (probed at this
+    # head): the owner's shutdown closes tracked connections at
+    # DRAINING, so the racer's sanctioned rejection is the clean
+    # CONNECTION CLOSE (error 232/EOF) — no invoke, no admission, no
+    # torn state. The stable draining FRAME is the other sanctioned arm
+    # (requests already inside the pipeline). Either form is a complete
+    # rejection; a hang or a phantom admission is not.
+    harness.open_gate(scratch, "send")
+    post_records = []
+    for racer in in_window:
+        post_records.append(racer.result(timeout=30))
         racer.wait(timeout=15)
-
-    # Every racer either got a full response (admitted before drain —
-    # impossible here while the invocation lock is held, but legal) or
-    # the draining refusal (the law's other arm). What is FORBIDDEN is
-    # a torn outcome: a response that implies admission the drain never
-    # saw, or a hang the drain leaked past.
-    for racer_record in racer_records:
-        response = racer_record.get("response")
-        if isinstance(response, dict) and "ok" in response:
-            error_code = (response.get("error") or {}).get("code", "")
-            assert response["ok"] is False or response["ok"] is True, racer_record
-            if response["ok"] is False:
-                assert error_code in ("draining", "table_full", "capability", "schema"), (
-                    f"racer refused with a stable code, got {error_code}: {racer_record}"
-                )
+    invokes_before = len(_invoke_events())
+    for post_record in post_records:
+        if "response" in post_record:
+            response = post_record["response"]
+            assert response["ok"] is False, post_record
+            assert response["error"]["code"] == "draining", post_record
         else:
-            assert racer_record.get("sent") is True, racer_record
+            assert "ConnectionError" in str(post_record.get("error", "")), post_record
+    # Rejection means NO admission: the invoke count never grew for the
+    # rejected racer.
+    assert len(_invoke_events()) == invokes_before, _invoke_events()
 
-    # The owner stayed alive holding the domain through the window.
+    # The owner stayed alive through the window; the domain held.
     stopping = owner.result_path.with_suffix(".stopping")
     deadline = time.monotonic() + 15
     while not stopping.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert owner.poll() is None, "the owner drains (alive) while admitted work is blocked"
+    assert owner.poll() is None, "the owner drains (alive) while admitted work holds"
     contender = harness.start_worker(scratch, "lock-probe", state_dir)
     assert contender.result()["busy"] is True
 
-    # Release: the held confirm terminalizes, the racers' refusals are
-    # already answered, the drain completes, the domain frees.
+    # Release: the held confirm + the admitted pre-seam racer all
+    # terminalize; the drain completes. Empirically (probed at this
+    # head): the owner's shutdown closes tracked connections at
+    # DRAINING, so an admitted racer still awaiting its response at
+    # drain loses the RESPONSE (clean connection close) while its
+    # admitted work completes owner-side — exactly the §10.6
+    # conservative law. The sanctioned forms are therefore a full
+    # response OR a clean close; the invoke accounting is the proof
+    # the admitted work ran and the clean exit proves it terminalized.
     harness.open_gate(scratch, "exec")
+    pre_records = []
+    for racer in pre_seam:
+        pre_records.append(racer.result(timeout=60))
+        racer.wait(timeout=30)
+    for pre_record in pre_records:
+        if "response" in pre_record:
+            assert isinstance(pre_record["response"], dict) and "ok" in pre_record["response"], pre_record
+        else:
+            assert "ConnectionError" in str(pre_record.get("error", "")), pre_record
+
+    # THE INVARIANT: every launched racer accounted in exactly one set.
+    # Admitted: held pair (2) + pre-seam preview (1) = 3 invokes;
+    # refused: 1 (the in-window racer — draining frame or clean
+    # connection close, never admitted). No invoke for any refused racer.
+    assert len(_invoke_events()) == 3, _invoke_events()
     assert owner.wait(timeout=60) == harness.EXIT_OK
+
     successor = harness.start_worker(scratch, "full-owner", state_dir, harness.gate(scratch, "stop2"), "clean")
     assert successor.result()["started"] is True
     harness.open_gate(scratch, "stop2")

@@ -461,6 +461,47 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 round two second repair (PR #31,
+  F-110/F-111/F-112): the observer moved to the browser boundary, the
+  torn append faults the real syscall, and the drain race became
+  outcome-bearing.** F-110 (blocker, fixed): T48's observer now
+  records SessionManager.start() ENTRY (the actual browser/session
+  boundary — production _start_locked runs hydrate() BEFORE
+  session.start()) instead of the later _install_m5_live_stack; the
+  asserted chain is acquiring < hydrated < browser-start-called <
+  ready, so a regression that launched a real browser before
+  hydration would fail the test. The M5-stack install marker is kept
+  as a secondary observation. F-111 (blocker, fixed): T38's fault no
+  longer hand-writes a synthetic torn line — it intercepts the REAL
+  append path (production record.to_jsonl() payload, os.open +
+  os.write): the first real write to the ledger's fd emits HALF THE
+  PRODUCTION BYTES through the REAL syscall, then the process dies
+  mid-append; and the successor assertion now REQUIRES the frozen
+  deterministic outcome — startup refuses fail-closed with a
+  corruption/ambiguity reason (a tolerated branch would need to prove
+  the unresolved effect remains unresolved; none exists at this head).
+  F-112 (blocker, fixed): T16's racers are CONNECTED and
+  outcome-bearing, synchronized at the ACTUAL drain seam
+  (AuthoritySession.begin_drain entry, marker written by the owner's
+  wrapped begin_drain). Pre-seam racer: admitted (invoke-logged
+  before the seam). In-window racer: CONNECTS pre-seam, DELIVERS
+  post-seam via a send gate. TWO EMPIRICAL FINDINGS probed at this
+  head, recorded as the sanctioned outcomes rather than papered over:
+  (a) a connected racer delivering post-seam is rejected by the CLEAN
+  CONNECTION CLOSE (the owner closes tracked connections at DRAINING)
+  — no invoke, no admission, no torn state; the stable draining FRAME
+  is the other sanctioned arm for in-pipeline requests; (b) an
+  ADMITTED racer still awaiting its response at drain loses the
+  RESPONSE via the same clean close while its admitted work completes
+  owner-side (the §10.6 conservative law). The invariant is the
+  invoke accounting: admitted = exactly the invoke-logged set (held
+  pair + pre-seam preview = 3); rejected = the in-window racer with
+  NO invoke; every launched racer in exactly one set; the owner
+  drains cleanly and a successor acquires. Gate ALL GREEN: 1423
+  passed + 37 platform-skipped locally (Windows), ruff + mypy clean
+  on 102 files.
+
+
 - **2026-10-08 — M7 Layer 7 round two, tranche one (branch
   m7-layer7-round-two, from exact main ea83835): the durable-state
   crash matrix (T34/T36/T37), the takeover-timing observer (T48), the

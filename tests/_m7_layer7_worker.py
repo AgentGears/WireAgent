@@ -309,6 +309,7 @@ def ipc_request(
     payload_path: Path,
     request_id: str,
     disconnect_after_send: bool,
+    send_gate: Path = None,  # type: ignore[assignment]
 ) -> int:
     """Connect to the real endpoint, verify hello, send ONE framed
     request. Either read the response (normal) or close the socket
@@ -334,6 +335,11 @@ def ipc_request(
             try:
                 client.connect()
                 _write(result_path.with_suffix(".connected"), {"connected": True})
+                if send_gate is not None:
+                    # T16's in-window racer: CONNECT before the drain
+                    # seam, DELIVER after it — the already-connected
+                    # socket receives the stable draining refusal.
+                    _wait_gate(send_gate, timeout=120)
                 if disconnect_after_send:
                     client._sock.send(encode_json_frame(envelope))
                     client._sock.close()
@@ -1225,8 +1231,21 @@ def full_owner_observing(
 
         dispatcher._m5_recovery.hydrate = _observed_hydrate
 
+        # F-110: the browser/session boundary is SessionManager.start()
+        # ENTRY - production _start_locked() runs hydrate() BEFORE
+        # session.start(); _install_m5_live_stack sits AFTER it and
+        # cannot prove hydrate-before-browser. The law is
+        # hydrated < browser-start-called < ready.
+        original_start = dispatcher._session.start
+
+        async def _observed_start() -> Any:
+            _phase("browser-start-called")
+            return await original_start()
+
+        dispatcher._session.start = _observed_start  # type: ignore[method-assign]
+
         def _observed_install(sb: Any) -> None:
-            _phase("browser-installing")
+            _phase("m5-stack-installing")
             from types import SimpleNamespace
 
             dispatcher._m5_stack = SimpleNamespace(read_broker=_StubSB())
@@ -1277,16 +1296,33 @@ def recon_append_crash(
             return 5
         ledger = dispatcher._m6_reconciliation._reconciliation_ledger
         ledger_path = ledger.path
-        def _torn_append_then_die(record: Any) -> None:
-            line = json.dumps(record, sort_keys=True, default=str)
-            with open(ledger_path, "a", encoding="utf-8") as fh:
-                fh.write(line[: max(1, len(line) // 2)])  # torn: no newline
-                fh.flush()
-            _write(result_path.with_suffix(".torn"), {"torn": True})
-            _wait_gate(die_gate, timeout=60)
-            os._exit(9)
+        # F-111: the production append builds its own JSONL payload
+        # (record.to_jsonl()) and writes it via os.open + os.write. The
+        # fault intercepts the FIRST real write to the ledger's fd: half
+        # the PRODUCTION bytes go out through the REAL syscall, then the
+        # process dies mid-append - no synthetic line is constructed.
+        real_open, real_write = os.open, os.write
+        target_fds: set = set()
+        fault_state = {"armed": True}
 
-        ledger.append_durable = _torn_append_then_die  # type: ignore[method-assign]
+        def _faulting_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            fd = real_open(path, flags, *args, **kwargs)
+            if fault_state["armed"] and os.fspath(path) == str(ledger_path):
+                target_fds.add(fd)
+            return fd
+
+        def _faulting_write(fd: int, view: Any) -> int:
+            if fault_state["armed"] and fd in target_fds:
+                fault_state["armed"] = False
+                half = max(1, len(view) // 2)  # torn: no newline survives
+                real_write(fd, view[:half])
+                _write(result_path.with_suffix(".torn"), {"torn": True, "bytes": half})
+                _wait_gate(die_gate, timeout=60)
+                os._exit(9)
+            return real_write(fd, view)
+
+        os.open = _faulting_open  # type: ignore[assignment]
+        os.write = _faulting_write  # type: ignore[assignment]
         _write(
             result_path,
             {
@@ -1297,6 +1333,60 @@ def recon_append_crash(
             },
         )
         await asyncio.get_event_loop().run_in_executor(None, _wait_gate, die_gate, 240.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+def full_owner_t16(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    exec_gate: Path,
+    events_path: Path,
+) -> int:
+    """F-112's T16 owner: confirmed work blocks in the kernel; the DRAIN
+    SEAM (AuthoritySession.begin_drain ENTRY) writes a process-visible
+    marker the controller synchronizes on; every actual Dispatcher
+    invocation is logged so admission is explicit."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        _wrap_write_kernel_with_barrier(dispatcher, events_path, exec_gate, "*")
+        original_invoke = dispatcher._invoke_admitted
+
+        async def _logging_invoke(name: str, payload: dict) -> Any:
+            with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                fh.write(json.dumps({"invoke": name}) + "\n")
+            return await original_invoke(name, payload)
+
+        dispatcher._ipc_server._invoke = _logging_invoke
+        session = dispatcher._authority_session
+        original_begin_drain = session.begin_drain
+        seam = result_path.with_suffix(".drain")
+
+        def _observed_begin_drain() -> None:
+            _write(seam, {"drain_beginning": True})
+            original_begin_drain()
+
+        session.begin_drain = _observed_begin_drain  # type: ignore[method-assign]
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        _write(result_path.with_suffix(".stopping"), {"stop_begun": True})
         await dispatcher.stop()
         return 0
 
@@ -1337,6 +1427,7 @@ def main(argv: list[str]) -> int:
             Path(raw[4]),
             raw[5],
             raw[6] == "disconnect",
+            Path(raw[7]) if len(raw) > 7 else None,
         )
     if scenario == "ipc-raw":
         return ipc_raw(result_path, Path(raw[0]), raw[1], raw[2])
@@ -1364,6 +1455,8 @@ def main(argv: list[str]) -> int:
         )
     if scenario == "full-owner-m5-crash-at":
         return full_owner_m5_crash_at(result_path, Path(raw[0]), Path(raw[1]), raw[2])
+    if scenario == "full-owner-t16":
+        return full_owner_t16(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
     if scenario == "full-owner-observing":
         return full_owner_observing(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     if scenario == "recon-append-crash":

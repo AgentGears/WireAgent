@@ -461,6 +461,40 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 round two tranche one MERGED (PR #31,
+  squash `6382534`).** The merge-gate pass at exact head `45b927c`
+  returned MERGE-READY; F-110, F-111, and F-112 closed after three
+  repair rounds (the third landing the T38 fail-closed assertion the
+  second round had claimed but not written — a record-integrity
+  failure caught by the reviewer's exact-head check, corrected in the
+  record, and converted into the standing verify-then-claim rule).
+  Qualified in this tranche, all on genuine sibling processes: T16
+  (admission-vs-drain at the ACTUAL begin_drain seam, connected
+  outcome-bearing racers, invoke-accounting invariant — admitted ==
+  exactly the invoke-logged set; the two empirical rejection forms,
+  clean connection close post-seam and conservative response-loss for
+  admitted work, recorded as sanctioned outcomes); T34 (pre-reserved
+  crash — no durable row, fresh successor confirmation, old envelope
+  stale); T36 (post-effect crash at the evidence-reader seam —
+  unresolved RESERVED, recovery gate refuses replay); T37
+  (post-terminal crash — EFFECT_CONFIRMED durable, settled history
+  hydrates, fresh confirmation mints); T38 (the REAL os.open/os.write
+  append path faulted mid-write with the syscall return value
+  recorded; successor REFUSES startup fail-closed per the frozen
+  torn-tail semantics); T48 (hydration before the ACTUAL
+  SessionManager.start() browser boundary, observed at process scale
+  after OS termination of a hung full owner). Scope integrity across
+  both campaigns: ZERO production-source delta from ea83835 —
+  qualification found test/evidence defects, never a falsified
+  production assumption. Merge-head evidence (CI #647, all four jobs
+  green): Linux 3.11 1444 passed + 16 skipped, Ruff clean, mypy clean
+  on 102 files; Windows Server 2025 durability 170+4, named-pipe IPC
+  46, rule store 57. Layer 7 status after this merge: round one +
+  round two tranche one MERGED; qualification STILL IN PROGRESS with
+  T63 spawn/exec, T65, T60 peer-identity, T64, and T33 open; Layer 8
+  NOT STARTED. The next work is Layer 7 round two tranche two.
+
+
 - **2026-10-08 — M7 Layer 7 round two third repair (PR #31, F-111
   completed for real): the T38 fail-closed assertion actually landed.
   A record-integrity correction.** The second-repair STATE entry and
@@ -1679,19 +1713,18 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION IN PROGRESS
-  (round one squash-merged 2026-10-08, a4041ba, after six review
-  rounds and a merge-gate pass — all findings F-92..F-109 closed for
-  this campaign; they stay closed absent material test/harness
-  changes). Layer 7 is NOT yet complete/frozen: the still-open
-  qualification matrix is T16 (admission-vs-drain in-window race),
-  T33 (browser-child survival), T34-T38 beyond T44's RESERVED point,
-  full T48 hydration-chain timing, T63 spawn/exec variants, T64
-  cross-process handshake negatives, T65 supported-fault live
-  ownership-loss, and the full T60 peer-identity half. The next work
-  REMAINS Layer 7 (not Layer 8). Layer 8 owns Windows Server 2025
-  exhaustive qualification. Second adapter remains deferred until the
-  M7 boundary is stable.
+  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION STILL IN
+  PROGRESS (round one merged a4041ba, F-92..F-109 closed; round two
+  tranche one merged 2026-10-08, 6382534, after three repair rounds
+  and a merge-gate pass — T16, T34, T36, T37, T38, and T48 qualified;
+  F-110..F-112 closed; zero production-source delta across both
+  campaigns). STILL OPEN for later Layer-7 rounds: T63 (POSIX
+  spawn/exec child survival), T65 (live ownership-loss qualification),
+  T60 (POSIX peer-identity boundary), T64 (cross-process handshake
+  negatives), T33 (surviving browser-child ownership). The next work
+  REMAINS Layer 7 round two tranche two (not Layer 8 — Layer 8 is NOT
+  STARTED). Second adapter remains deferred until the M7 boundary is
+  stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

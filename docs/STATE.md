@@ -461,6 +461,46 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 qualification round one MERGED (PR #30,
+  squash `a4041ba`).** The merge-gate pass at exact head `cb3c28d`
+  returned MERGE-READY; F-92 through F-109 all closed for this
+  campaign after six review rounds. Layer 7 is NOT yet complete —
+  this is the FIRST qualified multi-process campaign, and the
+  distinction survives here: Layers 1-6 frozen; Layer 7 qualification
+  in progress; this PR = the harness + first evidence set merged.
+  What the campaign delivered: the real-process qualification harness
+  (controller + worker scenarios; gate files as test orchestration
+  only, never authority signals) and, all on genuine sibling
+  processes — true common-start acquisition races (one winner, busy
+  loser, x3); established-owner non-steal; clean-release and
+  OS-death succession; corrupt effects/reconciliation ledgers
+  refusing startup fail-closed; blocked admitted work holding
+  ownership through drain (kernel-level barrier inside the invocation
+  lock); the retained table saturated with disconnected admitted work
+  (table_full backpressure, live-id JOIN, same terminal result); the
+  full transport-coupled T44 (external preview token, external
+  confirm-disconnect, durable RESERVED at the crash point, successor
+  recovery-gate refusal, stale old envelope); media refs dying with
+  the owner, mid-ingress .tmp-only crashes, pin-through-drain with
+  post-drain reclamation; IPv4+IPv6 no-TCP proof; fork-child
+  inherited descriptors not keeping the domain locked; and the raw
+  protocol lane with the invoke-count oracle (T20/T21/T23/T50/T58 —
+  including hand-built payload-key-order frames bypassing the client
+  serializer and a genuinely-executable-if-deserialized pickle proven
+  inert). Scope integrity: ZERO production source delta from base
+  705ef6b — the campaign found test/evidence defects, never a
+  falsified production assumption. Merge-head evidence (CI #641, all
+  four jobs green): Linux 3.11 1438 passed + 16 skipped, Ruff clean,
+  mypy clean on 102 files; Windows Server 2025 durability 170+4,
+  named-pipe IPC 46, rule store 57. STILL OPEN for later Layer-7
+  rounds (the frozen matrix): T16, T33, T34-T38 beyond RESERVED, full
+  T48 hydration-chain timing, T63 spawn/exec, T64 cross-process
+  handshake negatives, T65 supported-fault live ownership-loss, full
+  T60 peer-identity. The fifth-round STATE entry's "five invalid
+  probes" wording is preserved as historical chronology (the
+  sixth-round entry records the correction to six).
+
+
 - **2026-10-08 — M7 Layer 7 sixth repair round (PR #30,
   F-108/F-109): the ordering difference moved INSIDE the payload; T20
   gained the oracle.** F-108 (blocker, fixed): the previous T58 varied
@@ -1521,16 +1561,19 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: layers 1-6 on main, ALL FROZEN (Layer 6 squash-merged
-  2026-10-07, de3551d, after four review rounds and a merge-gate pass —
-  all findings F-82..F-91 closed at the Layer-6 implementation
-  boundary; F-60..F-91 stay closed absent material code changes).
-  download_image remains unadvertised; its local-output contract is a
-  deliberate future decision, not an open defect. NEXT BUILD (M7 Layer
-  7): POSIX qualification (genuine sibling-process runs, crash/fault/
-  response-loss). Layer 8 owns Windows Server 2025 exhaustive
-  qualification. Second adapter remains deferred until the M7 boundary
-  is stable.
+  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION IN PROGRESS
+  (round one squash-merged 2026-10-08, a4041ba, after six review
+  rounds and a merge-gate pass — all findings F-92..F-109 closed for
+  this campaign; they stay closed absent material test/harness
+  changes). Layer 7 is NOT yet complete/frozen: the still-open
+  qualification matrix is T16 (admission-vs-drain in-window race),
+  T33 (browser-child survival), T34-T38 beyond T44's RESERVED point,
+  full T48 hydration-chain timing, T63 spawn/exec variants, T64
+  cross-process handshake negatives, T65 supported-fault live
+  ownership-loss, and the full T60 peer-identity half. The next work
+  REMAINS Layer 7 (not Layer 8). Layer 8 owns Windows Server 2025
+  exhaustive qualification. Second adapter remains deferred until the
+  M7 boundary is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

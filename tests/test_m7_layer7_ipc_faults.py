@@ -487,15 +487,60 @@ def test_T44_uncertain_real_m5_mutation_governed_by_durable_truth(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-def test_T21_unknown_protocol_operation_and_oversized_refused_owner_serving(tmp_path: Path) -> None:
-    """T21 over the real transport: an unknown protocol version, an
-    unknown operation, and an announced oversized frame are each
-    rejected BEFORE execution — and the owner keeps serving afterwards."""
+# ---------------------------------------------------------------------------
+# F-105/F-106/F-107: the raw-protocol lane with an execution oracle
+# ---------------------------------------------------------------------------
+
+
+def _counting_owner(scratch: Path, state_dir: Path, tag: str):
+    """Start the invoke-counting qualification owner; returns (handle,
+    record, events_path). The events file holds one line per ACTUAL
+    Dispatcher invocation — the T21/T23/T58 execution-order evidence."""
+    events_path = scratch / f"invokes-{tag}.ndjson"
+    owner = harness.start_worker(
+        scratch, "full-owner-counting", state_dir, harness.gate(scratch, f"stop-{tag}"), events_path
+    )
+    record = owner.result()
+    assert record["started"] is True, record
+    return owner, record, events_path
+
+
+def _invoke_count(events_path: Path) -> int:
+    if not events_path.exists():
+        return 0
+    return len([line for line in events_path.read_text(encoding="utf-8").splitlines() if '"invoke"' in line])
+
+
+def _raw_request_worker(scratch: Path, endpoint: Path, build: str, body: bytes, tag: str):
+    """One hand-built raw frame on its OWN connection (one request per
+    connection): 8-byte big-endian length + the exact body bytes. The
+    body BYTES are what the owner receives — no client-side serializer
+    can normalize them (F-105)."""
+    import binascii
+
+    frame = len(body).to_bytes(8, "big") + body
+    spec = json.dumps(
+        [
+            {"kind": "bytes", "hex": binascii.hexlify(frame).decode()},
+            {"kind": "read-response"},
+        ]
+    )
+    return harness.start_worker(scratch, "ipc-raw", endpoint, build, spec)
+
+
+def test_T21_unknown_protocol_schema_oversized_refused_before_execution(tmp_path: Path) -> None:
+    """T21 PROPER over the real transport with an execution-count
+    oracle (F-106): unknown protocol version, unknown operation, UNKNOWN
+    SCHEMA (a forbidden payload field), and an announced oversized frame
+    are each rejected — and the invoke count stays ZERO (rejected before
+    execution) — and the owner keeps serving afterwards (which then
+    makes the count 1, exactly the surviving valid request)."""
     scratch = _scratch(tmp_path, "t21raw")
     state_dir = scratch / "state"
-    owner, record = _start_full_owner(scratch, state_dir)
+    owner, record, events_path = _counting_owner(scratch, state_dir, "t21")
     try:
-        endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+        endpoint = Path(record["endpoint"])
+        build, instance = record["build_id"], record["instance_id"]
 
         def _envelope(**overrides):
             envelope = {
@@ -509,11 +554,9 @@ def test_T21_unknown_protocol_operation_and_oversized_refused_owner_serving(tmp_
             envelope.update(overrides)
             return envelope
 
-        # One request per CONNECTION (the wire law): each probe rides
-        # its own ipc-raw invocation.
         def _raw_probe(envelope: dict) -> dict:
             spec = json.dumps([{"kind": "request", "envelope": envelope}, {"kind": "read-response"}])
-            raw = harness.start_worker(scratch, "ipc-raw", Path(endpoint), build, spec)
+            raw = harness.start_worker(scratch, "ipc-raw", endpoint, build, spec)
             return raw.result()["steps"][1]["response"]
 
         assert _raw_probe(_envelope(protocol_version=99))["error"]["code"] == "protocol_mismatch"
@@ -521,6 +564,10 @@ def test_T21_unknown_protocol_operation_and_oversized_refused_owner_serving(tmp_
         assert (
             _raw_probe(_envelope(operation="definitely_not_real"))["error"]["code"] == "unsupported_operation"
         )
+        # F-106: unknown SCHEMA — a forbidden payload field on a valid
+        # operation — dies at strict schema validation, not the allowlist.
+        assert _raw_probe(_envelope(payload={"unexpected_field": 1}))["error"]["code"] == "schema"
+        assert _raw_probe(_envelope(evil_extra="x"))["error"]["code"] == "schema"
 
         spec = json.dumps(
             [
@@ -528,18 +575,20 @@ def test_T21_unknown_protocol_operation_and_oversized_refused_owner_serving(tmp_
                 {"kind": "read-eof", "timeout": 5},
             ]
         )
-        raw = harness.start_worker(scratch, "ipc-raw", Path(endpoint), build, spec)
+        raw = harness.start_worker(scratch, "ipc-raw", endpoint, build, spec)
         steps = raw.result()["steps"]
         refused = any(
             step.get("recv") == "" or "ConnectionError" in str(step.get("error", "")) for step in steps
         )
         assert refused, steps
 
+        assert _invoke_count(events_path) == 0, "every T21 fault rejected BEFORE execution"
+
         env = _payload_file(scratch, {})
         healthy = harness.start_worker(
             scratch,
             "ipc-request",
-            Path(endpoint),
+            endpoint,
             build,
             instance,
             "health",
@@ -549,52 +598,83 @@ def test_T21_unknown_protocol_operation_and_oversized_refused_owner_serving(tmp_
         )
         healthy_record = healthy.result()
         assert isinstance(healthy_record["response"], dict) and "ok" in healthy_record["response"]
+        assert _invoke_count(events_path) == 1, "exactly the one surviving valid request"
     finally:
-        harness.open_gate(scratch, "stop")
+        harness.open_gate(scratch, "stop-t21")
         owner.wait()
 
 
-def test_T50_malformed_non_json_frame_rejected_owner_serving(tmp_path: Path) -> None:
-    """T50 over the real transport: frames whose bodies are NOT JSON
-    (raw garbage, and a pickle-shaped opener for good measure) are
-    rejected safely — no executable deserialization, no execution — and
-    the owner keeps serving."""
+def test_T50_executable_pickle_attempt_never_deserialized(tmp_path: Path) -> None:
+    """T50 PROPER (F-107): a GENUINELY EXECUTABLE benign pickle — its
+    reducer would create a marker file if anything ever unpickled it —
+    sent as raw frame bytes under a valid length header. The owner
+    returns a protocol error, the marker file does NOT exist, and the
+    owner keeps serving: no executable deserialization occurred."""
+    import binascii
+    import pickle
+    import subprocess
+    import sys as _sys
 
     scratch = _scratch(tmp_path, "t50raw")
     state_dir = scratch / "state"
-    owner, record = _start_full_owner(scratch, state_dir)
+    marker = scratch / "PWNED.marker"
+
+    class _MarkerPayload:
+        def __reduce__(self):
+            import os
+
+            return (os.system, (f'echo executed > "{marker}"',))
+
+    pickle_bytes = pickle.dumps(_MarkerPayload())
+    # Sanity in a throwaway subprocess (THIS test process never runs the
+    # reducer): the pickle IS executable-if-deserialized.
+    (scratch / "proof.pickle").write_bytes(pickle_bytes)
+    probe = (
+        "import pickle,sys,os; "
+        "pickle.loads(open(sys.argv[1],'rb').read()); "
+        "print('marker-exists', os.path.exists(sys.argv[2]))"
+    )
+    proof = subprocess.run(
+        [_sys.executable, "-c", probe, str(scratch / "proof.pickle"), str(marker)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "marker-exists True" in proof.stdout, (
+        f"the probe pickle must be genuinely executable: {proof.stdout!r} {proof.stderr!r}"
+    )
+    marker.unlink(missing_ok=True)  # reset: the OWNER run starts clean
+
+    owner, record, events_path = _counting_owner(scratch, state_dir, "t50")
     try:
-        endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+        endpoint = Path(record["endpoint"])
+        build, instance = record["build_id"], record["instance_id"]
 
-        # A pickle-shaped opener and a plain garbage body — each under a
-        # VALID small length header on its own connection: the framing
-        # is non-executable regardless of body content, and every read
-        # yields a protocol-error frame (never a success payload).
-        def _raw_garbage(body: bytes) -> dict:
-            import binascii
-
-            spec = json.dumps(
+        raw = harness.start_worker(
+            scratch,
+            "ipc-raw",
+            endpoint,
+            build,
+            json.dumps(
                 [
-                    {"kind": "bytes", "hex": len(body).to_bytes(8, "big").hex()},
-                    {"kind": "bytes", "hex": binascii.hexlify(body).decode()},
+                    {"kind": "bytes", "hex": len(pickle_bytes).to_bytes(8, "big").hex()},
+                    {"kind": "bytes", "hex": binascii.hexlify(pickle_bytes).decode()},
                     {"kind": "read-response"},
                 ]
-            )
-            raw = harness.start_worker(scratch, "ipc-raw", Path(endpoint), build, spec)
-            return raw.result()["steps"][2]["response"]
+            ),
+        )
+        response = raw.result()["steps"][2]["response"]
+        assert response["ok"] is False
+        assert response["error"]["code"] == "protocol", response
 
-        for response in (
-            _raw_garbage(b"\x80\x04\x95\x00"),  # pickle opener
-            _raw_garbage(b"garbage-body"),  # plain non-JSON
-        ):
-            assert response["ok"] is False, response
-            assert response["error"]["code"] == "protocol", response
+        assert not marker.exists(), "executable deserialization must NOT have occurred"
+        assert _invoke_count(events_path) == 0, "the pickle frame died before execution"
 
         env = _payload_file(scratch, {})
         healthy = harness.start_worker(
             scratch,
             "ipc-request",
-            Path(endpoint),
+            endpoint,
             build,
             instance,
             "health",
@@ -605,62 +685,89 @@ def test_T50_malformed_non_json_frame_rejected_owner_serving(tmp_path: Path) -> 
         healthy_record = healthy.result()
         assert isinstance(healthy_record["response"], dict) and "ok" in healthy_record["response"]
     finally:
-        harness.open_gate(scratch, "stop")
+        harness.open_gate(scratch, "stop-t50")
         owner.wait()
 
 
-def test_T58_same_id_different_key_order_is_retained_not_violation(tmp_path: Path) -> None:
-    """T58 PROPER over the real transport: the SAME request_id with the
-    SAME schema-normalized payload encoded under DIFFERENT JSON object
-    key order produces ONE canonical identity — the second delivery
-    returns the RETAINED response (byte-stable), NOT request_id_reused.
-    Requires a real ingest first (post_photo carries artifact_ref)."""
-    scratch = _scratch(tmp_path, "t58order")
+def test_T58_raw_wire_key_order_retained_not_violation(tmp_path: Path) -> None:
+    """T58 PROPER (F-105): two COMPLETE envelope JSON documents hand-
+    built with IDENTICAL values under DELIBERATELY DIFFERENT key order
+    — and sent as RAW frame bytes (the client serializer would sort
+    keys; the owner must receive the different orderings). The raw
+    bodies are asserted byte-different BEFORE sending and semantically
+    equal. The SAME request_id on both: the second returns the byte-
+    identical RETAINED response, NOT request_id_reused, and the invoke
+    count stays EXACTLY 1."""
+    scratch = _scratch(tmp_path, "t58raw")
     state_dir = scratch / "state"
-    staging = state_dir / "media-staging"
-    staging.mkdir(parents=True, exist_ok=True)
-    (staging / "photo.png").write_bytes(
-        bytes.fromhex(
-            "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
-            "1f15c4890000000d49444154789c626001000000ffff030000060005"
-            "57bfabd40000000049454e44ae426082"
-        )
-    )
 
-    owner, record = _start_full_owner(scratch, state_dir)
+    owner, record, events_path = _counting_owner(scratch, state_dir, "t58")
     try:
-        endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+        endpoint = Path(record["endpoint"])
+        build, instance = record["build_id"], record["instance_id"]
+        rid = secrets.token_hex(16)
 
-        ingest_env = _payload_file(scratch, {"staged_name": "photo.png"})
-        ingester = harness.start_worker(
-            scratch,
-            "ipc-request",
-            Path(endpoint),
-            build,
-            instance,
-            "media_ingest",
-            ingest_env,
-            secrets.token_hex(16),
-            "normal",
+        body_a = (
+            '{"protocol_version":1,'
+            '"operation":"health",'
+            '"payload":{},'
+            f'"request_id":"{rid}",'
+            f'"authority_instance_id":"{instance}",'
+            f'"runtime_build_id":"{build}"}}'
         )
-        artifact = ingester.result()["response"]["data"]["artifact"]
+        body_b = (
+            "{"
+            f'"runtime_build_id":"{build}",'
+            f'"authority_instance_id":"{instance}",'
+            f'"request_id":"{rid}",'
+            '"payload":{},'
+            '"operation":"health",'
+            '"protocol_version":1}'
+        )
+        bytes_a = body_a.encode("utf-8")
+        bytes_b = body_b.encode("utf-8")
+        assert bytes_a != bytes_b, "the WIRE bytes differ (key order, not values)"
+        assert json.loads(body_a) == json.loads(body_b), "the semantic content is identical"
 
-        payload_a = {"text": "key order probe", "artifact_ref": artifact["artifact_ref"]}
-        payload_b = {"artifact_ref": artifact["artifact_ref"], "text": "key order probe"}
-        assert json.dumps(payload_a) != json.dumps(payload_b), "the wire orders differ"
+        first = _raw_request_worker(scratch, endpoint, build, bytes_a, "a")
+        second = _raw_request_worker(scratch, endpoint, build, bytes_b, "b")
+        r1 = first.result()["steps"][1]["response"]
+        r2 = second.result()["steps"][1]["response"]
+
+        # Any WELL-FORMED frame qualifies: the law is canonical identity +
+        # retention, not the health verdict (the stub DOM surface fails
+        # health's own diagnostics on purpose).
+        assert isinstance(r1, dict) and "ok" in r1, r1
+        assert r2 == r1, "different wire key order -> the byte-identical retained frame"
+        assert (r2.get("error") or {}).get("code", "") != "request_id_reused", r2
+        assert _invoke_count(events_path) == 1, "ONE execution despite two differently-ordered deliveries"
+    finally:
+        harness.open_gate(scratch, "stop-t58")
+        owner.wait()
+
+
+def test_T23_completed_duplicate_retained_no_second_execution(tmp_path: Path) -> None:
+    """T23 with the execution oracle (F-106): the first valid request
+    executes (invoke count 1); the SAME request_id with the same payload
+    delivered again returns the byte-identical retained response and the
+    invoke count stays EXACTLY 1 — explicit no-new-execution evidence,
+    not inferred from response bytes."""
+    scratch = _scratch(tmp_path, "t23count")
+    state_dir = scratch / "state"
+    owner, record, events_path = _counting_owner(scratch, state_dir, "t23")
+    try:
+        endpoint = Path(record["endpoint"])
+        build, instance = record["build_id"], record["instance_id"]
 
         def _request_with_retry(env: Path, rid: str) -> dict:
-            # Two cold-start client processes can race the pipe's next
-            # instance (a transient connection-level refusal, not the law
-            # under test); retry those.
             for _attempt in range(4):
                 client = harness.start_worker(
                     scratch,
                     "ipc-request",
-                    Path(endpoint),
+                    endpoint,
                     build,
                     instance,
-                    "post_photo",
+                    "health",
                     env,
                     rid,
                     "normal",
@@ -673,16 +780,13 @@ def test_T58_same_id_different_key_order_is_retained_not_violation(tmp_path: Pat
             raise AssertionError("the request never reached a response")
 
         rid = secrets.token_hex(16)
-        env_a = _payload_file(scratch, payload_a)
-        env_b = _payload_file(scratch, payload_b)
-        r1 = _request_with_retry(env_a, rid)
-        r2 = _request_with_retry(env_b, rid)
-        assert isinstance(r1["response"], dict) and "ok" in r1["response"], r1
-        assert r2["response"] == r1["response"], (
-            "different key order, same canonical identity -> the retained frame"
-        )
-        error_code = (r2["response"].get("error") or {}).get("code", "")
-        assert error_code != "request_id_reused", r2
+        env = _payload_file(scratch, {})
+        r1 = _request_with_retry(env, rid)
+        assert _invoke_count(events_path) == 1, "the first valid request executed once"
+
+        r2 = _request_with_retry(env, rid)
+        assert r2["response"] == r1["response"], "the retained frame, byte-identical"
+        assert _invoke_count(events_path) == 1, "the duplicate did NOT execute again"
     finally:
-        harness.open_gate(scratch, "stop")
+        harness.open_gate(scratch, "stop-t23")
         owner.wait()

@@ -140,6 +140,22 @@ class _StubSB:
     _controller = None
     allowed_methods: set = set()
 
+    def __getattr__(self, name: str) -> Any:
+        """Any OTHER broker method the real capabilities probe becomes an
+        async ok-result: the DOM surface is out of Layer-7 scope, and the
+        laws under qualification (retention, canonical identity, refusal)
+        must not depend on which diagnostics a capability happens to
+        touch. Underscore names raise normally (real attributes only)."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        async def _generic(*args: Any, **kwargs: Any) -> Any:
+            from webwire.envelope import ok_result
+
+            return ok_result(data={})
+
+        return _generic
+
 
 def _build_dispatcher(state_dir: Path, block_submit_path: Path):
     from webwire.config import WebWireConfig
@@ -913,6 +929,50 @@ def ipc_flood(
     return asyncio.run(_run())
 
 
+def full_owner_counting(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    events_path: Path,
+) -> int:
+    """F-106's generic qualification owner: a plain full production
+    owner whose Dispatcher invocation seam writes ONE process-visible
+    event per actual invoke. The T21/T23/T58 laws assert execution
+    counts against this file — 'rejected before execution' and 'no new
+    execution' become explicit rather than inferred from response
+    bytes."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        original_invoke = dispatcher._invoke_admitted
+
+        async def _counting_invoke(name: str, payload: dict) -> Any:
+            with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                fh.write(json.dumps({"invoke": name}) + "\n")
+            return await original_invoke(name, payload)
+
+        dispatcher._ipc_server._invoke = _counting_invoke
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 120.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -972,6 +1032,8 @@ def main(argv: list[str]) -> int:
             raw[6] == "dup",
             raw[7] if len(raw) > 7 else "",
         )
+    if scenario == "full-owner-counting":
+        return full_owner_counting(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     if scenario == "full-owner-m5-serving":
         return full_owner_m5_serving(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "full-owner-tablesat":

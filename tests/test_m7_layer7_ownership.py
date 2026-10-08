@@ -46,7 +46,7 @@ def test_true_simultaneous_race_yields_exactly_one_owner(tmp_path: Path) -> None
             harness.start_worker(scratch, "lock-race", state_dir, acquire_gate, release_gate) for _ in range(2)
         ]
         for contender in contenders:
-            harness.wait_record(contender.result_path.with_suffix(".ready"))
+            harness.wait_record(contender.result_path.with_suffix(".ready"), timeout=30)
         harness.open_gate(scratch, "acquire")
 
         records = [contender.result() for contender in contenders]

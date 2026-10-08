@@ -461,6 +461,51 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 fifth repair round (PR #30,
+  F-105/F-106/F-107): the raw lane gained an execution oracle, real
+  wire-level key ordering, and a genuinely executable pickle.**
+  F-105 (blocker, fixed): the previous T58 sent both payloads through
+  the client serializer — which sorts keys — so the owner received
+  byte-equivalent sorted JSON both times and the frozen condition was
+  never on the wire. The test now hand-builds two COMPLETE envelope
+  JSON documents with identical values under deliberately different
+  key order, asserts the raw frame bodies are BYTE-DIFFERENT and
+  semantically equal BEFORE sending, and transmits them as raw frames
+  (8-byte length prefix + exact bytes) so no serializer can normalize
+  them. The same request_id on both: the second delivery returns the
+  byte-identical RETAINED response, NOT request_id_reused. F-106
+  (blocker, fixed): a new full-owner-counting worker wraps the
+  Dispatcher invocation seam and writes one process-visible event per
+  ACTUAL invoke — the execution-order oracle. T21 now also covers
+  UNKNOWN SCHEMA (a forbidden payload field AND a forbidden envelope
+  field each die at strict schema, not the allowlist) and asserts
+  invoke count ZERO across all five invalid probes (the surviving
+  health request then makes it exactly 1). T23 (split into its own
+  test) asserts invoke count 1 after the first valid request and STILL
+  1 after the same-id duplicate returns the retained frame — explicit
+  no-new-execution evidence. T58 uses the same oracle: count exactly 1
+  after both differently-ordered deliveries. F-107 (high, fixed): the
+  T50 probe is now a GENUINELY EXECUTABLE benign pickle — its reducer
+  would create a marker file via os.system if anything unpickled it —
+  proven executable in a throwaway subprocess (marker appears) before
+  the owner run; sent as raw frame bytes under a valid length header,
+  the owner returns a protocol error, the marker file does NOT exist,
+  the invoke count is ZERO, and the owner keeps serving. Also: the
+  stub broker gained a generic async surface (any non-underscore
+  method returns ok) so qualification laws stop depending on which
+  diagnostics a capability probes, and the race test's ready-wait
+  window doubled (a cold-start flake under full-suite load). Gate ALL
+  GREEN: 1417 passed + 37 platform-skipped locally (Windows), ruff +
+  mypy clean on 102 files. HARNESS LESSONS: encode_json_frame sorts
+  keys — ANY wire-ordering qualification must hand-build frames and
+  bypass the client entirely (the ipc-raw 'request' step ALSO sorts);
+  execution-order claims need a process-visible invoke oracle, not
+  response-byte equality (a deterministic request executed twice
+  produces identical bytes); a pickle-looking byte string proves
+  nothing — build a reducer that would leave forensic evidence, prove
+  it executes in a subprocess, THEN prove the owner never ran it.
+
+
 - **2026-10-08 — M7 Layer 7 fourth repair round (PR #30,
   F-103/F-104): the raw-protocol lane restored; the record again
   matches the tests.** F-103 (blocker, fixed): the round-two rewrite

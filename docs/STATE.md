@@ -461,6 +461,60 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 round two, tranche one (branch
+  m7-layer7-round-two, from exact main ea83835): the durable-state
+  crash matrix (T34/T36/T37), the takeover-timing observer (T48), the
+  reconciliation-append crash (T38), and the admission-drain race
+  (T16).** All on the round-one harness (controller + worker
+  scenarios + the invoke oracle treated as the qualification
+  substrate, per the frozen round-two rule); tests-first; ZERO
+  production delta. T34 (pre-reserved): death during composer fill —
+  after confirm admission, before any submit — leaves NO durable row;
+  the successor starts cleanly, a fresh same-semantic write mints a
+  FRESH confirmation (nothing to reconcile), and the old envelope is
+  stale-instance dead. T36 (post-effect): the click RETURNED success
+  (the external effect plausibly exists) and death lands in the
+  executor's POST-SUBMIT EVIDENCE CAPTURE (through the evidence
+  reader — the seam the executor actually calls after submit; an
+  earlier port-side placement never fired because evidence capture is
+  not a write-broker call); the durable RESERVED attempt is
+  unresolved and the successor's recovery gate REFUSES the
+  same-semantic write. T37 (post-terminal): the full execution
+  completes — verified evidence, EFFECT_CONFIRMED durable — death
+  lands after the terminal result (a kernel-level wrapper dies after
+  the token-bearing execute returns); the successor hydrates the
+  SETTLED history, the semantic key is CLEAR, and a fresh
+  same-semantic write mints a fresh confirmation (the old token died
+  with the owner). T48 (takeover timing): a HUNG full production
+  owner holds the domain; a contender is busy; the controller
+  TERMINATES it (OS release); the successor's recorded start phases
+  prove acquiring -> hydrating -> hydrated -> browser-installing ->
+  ready — hydration BEFORE the browser stack is ever installed, the
+  corrupt-history-can-never-hide-behind-a-live-browser law at the
+  process boundary. T38 (torn reconciliation append): a real
+  reconciliation resolve over IPC crashes MID-APPEND — the ledger's
+  final line is deliberately torn (half the JSON, no newline,
+  flushed) and the owner dies; the successor exhibits exactly the
+  EXISTING M6 semantics for a torn tail (observed fail-closed
+  refusal at startup), never a silent success with lost truth. T16
+  (admission-drain race): with one confirmed request admitted and
+  blocked in the kernel, the stop gate opens and a burst of racing
+  requests fires INTO the closing window — every racer either
+  receives a full response or a stable refusal (draining et al.),
+  never a torn outcome; the owner stays alive holding the domain
+  through the window (contender busy); release terminalizes the held
+  work, the drain completes, the domain frees, and a successor
+  acquires. STILL OPEN for round three (unchanged): T63 spawn/exec
+  variants, T65 supported-fault live ownership-loss, T60 peer-identity
+  half, T64 cross-process handshake negatives, T33 (the browser-child
+  decision). Gate ALL GREEN: 1423 passed + 37 platform-skipped
+  locally (Windows), ruff + mypy clean on 102 files. HARNESS LESSON:
+  the M5 post-text executor captures post-submit evidence through the
+  EVIDENCE READER, not the write broker — crash points between submit
+  and evidence belong in the evidence object; port-side placements
+  silently never fire.
+
+
 - **2026-10-08 — M7 Layer 7 qualification round one MERGED (PR #30,
   squash `a4041ba`).** The merge-gate pass at exact head `cb3c28d`
   returned MERGE-READY; F-92 through F-109 all closed for this

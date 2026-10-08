@@ -974,6 +974,336 @@ def full_owner_counting(
 
 
 # ---------------------------------------------------------------------------
+# Round two: the durable-state crash matrix (T34/T36/T37), the
+# takeover-timing observer (T48), and the reconciliation-append crash
+# (T38).
+# ---------------------------------------------------------------------------
+
+
+class _CrashPointPort_cls:
+    """The real post-text DOM port with a PARAMETERIZED death point:
+
+    - ``pre-reserved``: die during composer fill — the confirm was
+      admitted but nothing was submitted and NO durable row exists.
+    - ``reserved``: die after the commit gate (durable RESERVED) but
+      before the click returns (the T44 point, kept for the matrix).
+    - ``post-effect``: the gate consumed and the click RETURNED success
+      (the external effect plausibly exists) — death before any
+      evidence capture.
+    - ``post-terminal``: the port never dies; a kernel-level wrapper
+      dies AFTER the full execution returns (terminal durable state).
+    """
+
+    def __init__(self, point: str, die_gate: Path, marker: Path) -> None:
+        self.point = point
+        self.die_gate = die_gate
+        self.marker = marker
+        self.composer_text = ""
+
+    def _die(self, detail: str) -> None:
+        _write(self.marker, {"crash_point": self.point, "at": detail})
+        _wait_gate(self.die_gate, timeout=60)
+        os._exit(9)
+
+    async def fill_composer(self, text: str) -> Any:
+        if self.point == "pre-reserved":
+            self._die("fill_composer")
+        self.composer_text = text
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"filled": True})
+
+    async def read_composer_text(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"composer_text": self.composer_text})
+
+    async def verify_attachment_ready(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"ready": True})
+
+    async def count_attachments(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"count": 0})
+
+    async def close_composer(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"cleanup": "closed"})
+
+    async def attach_media(self, image_path: str) -> Any:
+        raise AssertionError("plain post must not attach media")
+
+    async def click_submit(
+        self, *, _commit_gate, _precommit_check, _expected_text, _expected_attachments
+    ) -> Any:
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
+        if self.point == "reserved":
+            self._die("after_commit_gate")
+        # The click itself completes: the external effect plausibly exists.
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"submitted": True})
+
+    async def capture_pre_submit_ids(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"status_ids": ["10", "11"]})
+
+    async def capture_new_post(self, pre_submit_ids: set, *, exclude_ids=None) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"post_id": "99", "post_url": "https://x.com/owner/status/99"})
+
+    async def verify_post_text(self, post_url: str, normalized_text: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(
+            data={
+                "text_matches": True,
+                "direct_status_owned": True,
+                "post_actor": "owner",
+                "post_id": "99",
+                "post_url": "https://x.com/owner/status/99",
+            }
+        )
+
+
+class _CrashPointEvidence:
+    """The post-text evidence reader with the POST-EFFECT death point:
+    the executor captures evidence through THIS object (not the write
+    port), so the after-effect/before-evidence crash lives here. All
+    other points keep the port-side deaths."""
+
+    def __init__(self, point: str, die_gate: Path, marker: Path) -> None:
+        self.point = point
+        self.die_gate = die_gate
+        self.marker = marker
+
+    def _die(self, detail: str) -> None:
+        _write(self.marker, {"crash_point": self.point, "at": detail})
+        _wait_gate(self.die_gate, timeout=60)
+        os._exit(9)
+
+    async def capture_pre_submit_ids(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"status_ids": ["10", "11"]})
+
+    async def capture_new_post(self, pre_submit_ids: set, *, exclude_ids=None) -> Any:
+        if self.point == "post-effect":
+            self._die("before_evidence_capture")
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"post_id": "99", "post_url": "https://x.com/owner/status/99"})
+
+    async def verify_post_text(self, post_url: str, normalized_text: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(
+            data={
+                "text_matches": True,
+                "direct_status_owned": True,
+                "post_actor": "owner",
+                "post_id": "99",
+                "post_url": "https://x.com/owner/status/99",
+            }
+        )
+
+
+def full_owner_m5_crash_at(
+    result_path: Path,
+    state_dir: Path,
+    die_gate: Path,
+    point: str,
+) -> int:
+    """The T44 serving shape with the crash point PARAMETERIZED for the
+    T34/T36/T37 matrix: external clients preview/confirm over the real
+    transport; the REAL actor-bound post-text executor runs; death
+    lands at the requested durable-state boundary."""
+    import asyncio
+
+    async def _run() -> int:
+        from types import SimpleNamespace
+
+        from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+        from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
+        from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+        from webwire.safety.scoped_authority import ScopedAuthorityBroker
+
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        marker = result_path.with_suffix(".crash")
+        port = _CrashPointPort_cls(point, die_gate, marker)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        scoped = ScopedAuthorityBroker(port, dispatcher._m5_gateway, policies=DEFAULT_EFFECT_POLICIES)
+        runtime = M5ExecutionRuntime(
+            scoped_authority=scoped,
+            commit_gateway=dispatcher._m5_gateway,
+            policies=DEFAULT_EFFECT_POLICIES,
+        )
+        dispatcher._m5_stack = SimpleNamespace(
+            read_broker=_StubSB(),
+            post_text_executor=M5ActorBoundPostTextExecutor(
+                runtime=runtime,
+                evidence_reader=_CrashPointEvidence(point, die_gate, marker),
+            ),
+        )
+        if point == "post-terminal":
+            # Die AFTER the token-bearing kernel execution fully returns —
+            # the terminal durable state is written; only the response
+            # (to an already-disconnected client) never existed.
+            kernel = dispatcher._write_kernel
+            original_execute = kernel.execute
+
+            async def _die_after_execute(write_cap, broker, input, **kwargs):
+                result = await original_execute(write_cap, broker, input, **kwargs)
+                if isinstance(input, dict) and input.get("confirmation_token"):
+                    _write(marker, {"crash_point": point, "at": "after_terminal_result"})
+                    await asyncio.get_event_loop().run_in_executor(None, _wait_gate, die_gate, 60)
+                    os._exit(9)
+                return result
+
+            kernel.execute = _die_after_execute
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+                "crash_point": point,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, die_gate, 240.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+def full_owner_observing(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    phases_path: Path,
+) -> int:
+    """T48's observer: a full production owner that records the ORDER of
+    its start phases to a process-visible file — each successful
+    acquisition, the recovery HYDRATION, and the BROWSER stack
+    installation — so a successor's takeover timing is provable at the
+    process boundary (hydrate BEFORE browser)."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+
+        def _phase(name: str) -> None:
+            with open(phases_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"phase": name}) + "\n")
+
+        original_hydrate = dispatcher._m5_recovery.hydrate
+
+        def _observed_hydrate() -> Any:
+            _phase("hydrating")
+            try:
+                original_hydrate()
+            except BaseException:
+                _phase("hydrate-failed")
+                raise
+            _phase("hydrated")
+            return None
+
+        dispatcher._m5_recovery.hydrate = _observed_hydrate
+
+        def _observed_install(sb: Any) -> None:
+            _phase("browser-installing")
+            from types import SimpleNamespace
+
+            dispatcher._m5_stack = SimpleNamespace(read_broker=_StubSB())
+
+        dispatcher._install_m5_live_stack = _observed_install  # type: ignore[method-assign]
+
+        _phase("acquiring")
+        started = await dispatcher.start()
+        if not started.ok:
+            _phase("start-refused")
+            _write(result_path, {"started": False})
+            return 5
+        _phase("ready")
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+def recon_append_crash(
+    result_path: Path,
+    state_dir: Path,
+    die_gate: Path,
+) -> int:
+    """T38: a full owner whose NEXT reconciliation-ledger append writes
+    a TORN final line (half the JSON, no newline, flushed) and then
+    dies uncleanly — the on-disk shape a mid-append crash leaves. The
+    successor must exhibit whatever the EXISTING M6 semantics dictate
+    for that state (fail-closed ambiguity handling or tolerated tail),
+    unchanged by the process boundary."""
+    import asyncio
+
+    async def _run() -> int:
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+        ledger = dispatcher._m6_reconciliation._reconciliation_ledger
+        ledger_path = ledger.path
+        def _torn_append_then_die(record: Any) -> None:
+            line = json.dumps(record, sort_keys=True, default=str)
+            with open(ledger_path, "a", encoding="utf-8") as fh:
+                fh.write(line[: max(1, len(line) // 2)])  # torn: no newline
+                fh.flush()
+            _write(result_path.with_suffix(".torn"), {"torn": True})
+            _wait_gate(die_gate, timeout=60)
+            os._exit(9)
+
+        ledger.append_durable = _torn_append_then_die  # type: ignore[method-assign]
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, die_gate, 240.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1032,6 +1362,12 @@ def main(argv: list[str]) -> int:
             raw[6] == "dup",
             raw[7] if len(raw) > 7 else "",
         )
+    if scenario == "full-owner-m5-crash-at":
+        return full_owner_m5_crash_at(result_path, Path(raw[0]), Path(raw[1]), raw[2])
+    if scenario == "full-owner-observing":
+        return full_owner_observing(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
+    if scenario == "recon-append-crash":
+        return recon_append_crash(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "full-owner-counting":
         return full_owner_counting(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     if scenario == "full-owner-m5-serving":

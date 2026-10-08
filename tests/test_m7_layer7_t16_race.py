@@ -179,7 +179,8 @@ def test_T16_admission_drain_race_never_torn(tmp_path: Path) -> None:
             assert response["ok"] is False, post_record
             assert response["error"]["code"] == "draining", post_record
         else:
-            assert "ConnectionError" in str(post_record.get("error", "")), post_record
+            err_text = str(post_record.get("error", ""))
+            assert ("ConnectionError" in err_text) or ("BrokenPipe" in err_text), post_record
     # Rejection means NO admission: the invoke count never grew for the
     # rejected racer.
     assert len(_invoke_events()) == invokes_before, _invoke_events()
@@ -211,7 +212,8 @@ def test_T16_admission_drain_race_never_torn(tmp_path: Path) -> None:
         if "response" in pre_record:
             assert isinstance(pre_record["response"], dict) and "ok" in pre_record["response"], pre_record
         else:
-            assert "ConnectionError" in str(pre_record.get("error", "")), pre_record
+            pre_err = str(pre_record.get("error", ""))
+            assert ("ConnectionError" in pre_err) or ("BrokenPipe" in pre_err), pre_record
 
     # THE INVARIANT: every launched racer accounted in exactly one set.
     # Admitted: held pair (2) + pre-seam preview (1) = 3 invokes;

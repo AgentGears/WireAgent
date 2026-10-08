@@ -435,40 +435,30 @@ def test_T38_torn_reconciliation_append_successor_semantics_hold(tmp_path: Path)
 
     recon = state_dir / "reconciliations.ndjson"
     assert recon.exists()
-    raw = recon.read_text(encoding="utf-8")
+    raw_bytes = recon.read_bytes()
+    # F-111 evidence hardening: the torn append wrote NON-ZERO real bytes
+    # (an empty file would not be a torn append) and no newline survived.
+    assert raw_bytes, "the real syscall wrote non-zero production bytes"
+    raw = raw_bytes.decode("utf-8")
     assert not raw.endswith("\n"), "the final line is torn (no trailing newline)"
 
-    # The successor: whatever the EXISTING M6 semantics dictate for a
-    # torn tail — refuse fail-closed or hydrate with re-durability —
-    # is the observed outcome; this test pins THAT it is one of the
-    # sanctioned outcomes and never a silent success with lost truth.
+    # F-111: the implementation is deterministic — the reconciliation
+    # ledger's reader rejects every non-empty ledger lacking its final
+    # newline (ReconciliationLedgerCorruptError) — so the successor MUST
+    # refuse startup fail-closed with a corruption reason naming the
+    # reconciliation truth. No sanctioned successful-start alternative
+    # exists at this head; a tolerated branch would need to prove the
+    # seeded unresolved effect remains unresolved.
     successor = harness.start_worker(scratch, "full-owner", state_dir, harness.gate(scratch, "after"), "clean")
     successor_record = successor.result(timeout=30)
     try:
-        if successor_record["started"] is False:
-            # Fail-closed: the torn tail is ambiguous; startup refuses.
-            error = successor_record.get("error", "").lower()
-            assert any(w in error for w in ("ambig", "corrupt", "reconcil", "ledger", "hydrate")), (
-                successor_record
-            )
-        else:
-            # Tolerated: hydration succeeded WITH the torn tail present —
-            # the durable truth survived re-read. (Which of the two the
-            # existing ledger semantics choose is M6's frozen behavior;
-            # both are fail-safe. The unsanctioned third outcome — a
-            # silent start treating the torn record as absent — would
-            # surface as started=True with the recovery guard having
-            # LOST the unresolved effect; probe it.)
-            guard_probe = _request(
-                scratch,
-                successor_record["endpoint"],
-                successor_record["build_id"],
-                successor_record["instance_id"],
-                "reconciliation_open",
-                {"operator_id": "probe"},
-            )
-            probe = guard_probe.result()["response"]
-            assert probe["ok"] is True, probe  # the route works at all
+        assert successor_record["started"] is False, (
+            f"the torn tail must refuse startup fail-closed: {successor_record}"
+        )
+        error = str(successor_record.get("error", "")).lower()
+        assert any(
+            w in error for w in ("ambig", "corrupt", "reconcil", "ledger", "hydrate", "torn", "newline")
+        ), f"the refusal must name the reconciliation corruption: {successor_record}"
     finally:
         harness.open_gate(scratch, "after")
         successor.wait()

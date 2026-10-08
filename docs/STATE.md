@@ -461,6 +461,29 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 round two third repair (PR #31, F-111
+  completed for real): the T38 fail-closed assertion actually landed.
+  A record-integrity correction.** The second-repair STATE entry and
+  commit message claimed T38's successor assertion required the frozen
+  fail-closed outcome — but the edit had NOT landed: the combined
+  patch script died on a formatting mismatch in the T38 block before
+  writing, and only the T48 half was applied afterward. The reviewer's
+  exact-head check caught the code/record contradiction. Now landed:
+  the tolerated-start branch is DELETED; the test REQUIRES
+  started=false with a corruption reason naming the reconciliation
+  truth (the ledger reader deterministically rejects every non-empty
+  ledger lacking its final newline). Evidence hardened per the review:
+  the faulting write records the REAL syscall's return value (not the
+  requested count) and the test asserts the ledger is NON-EMPTY bytes
+  with no trailing newline — an empty file can no longer masquerade as
+  a torn append. Gate ALL GREEN: 1423 passed + 37 platform-skipped
+  locally (Windows), ruff + mypy clean on 102 files. PROCESS LESSON:
+  a multi-block patch script that dies mid-run leaves earlier
+  replacements unwritten (the write_text never runs) — after any
+  partial-failure patch, grep the FILE for the intended new text
+  before claiming the change in commit messages or STATE.
+
+
 - **2026-10-08 — M7 Layer 7 round two second repair (PR #31,
   F-110/F-111/F-112): the observer moved to the browser boundary, the
   torn append faults the real syscall, and the drain race became

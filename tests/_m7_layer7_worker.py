@@ -1315,8 +1315,11 @@ def recon_append_crash(
             if fault_state["armed"] and fd in target_fds:
                 fault_state["armed"] = False
                 half = max(1, len(view) // 2)  # torn: no newline survives
-                real_write(fd, view[:half])
-                _write(result_path.with_suffix(".torn"), {"torn": True, "bytes": half})
+                # Record the REAL syscall's return value (not the
+                # requested count): the torn-append evidence is the
+                # bytes the kernel actually accepted.
+                written = real_write(fd, view[:half])
+                _write(result_path.with_suffix(".torn"), {"torn": True, "requested": half, "written": written})
                 _wait_gate(die_gate, timeout=60)
                 os._exit(9)
             return real_write(fd, view)

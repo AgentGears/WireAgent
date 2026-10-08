@@ -33,8 +33,6 @@ from webwire.authority import AuthorityBusyError, AuthorityOwnerLock  # noqa: E4
 
 QUAL_TABLE_BOUND = 8
 
-QUAL_TABLE_BOUND = 8
-
 
 def _write(result_path: Path, payload: dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -686,17 +684,17 @@ class _DieEvidence:
         )
 
 
-def full_owner_m5_crash(
+def full_owner_m5_serving(
     result_path: Path,
     state_dir: Path,
     die_gate: Path,
-    payload_path: Path,
 ) -> int:
-    """F-95/T44 with the REAL M5 post-text executor: preview (real token)
-    -> confirm through the real pipeline -> the executor reaches
-    click_submit where the attempt is RESERVED durably -> the owner DIES
-    at the controlled point. The response never exists; durable M5
-    truth is whatever the ledger holds at death."""
+    """F-101/T44 SERVING owner: the REAL M5 post-text executor stack with
+    the production IPC endpoint LIVE. The controller drives preview and
+    confirm from EXTERNAL client processes over the real transport; the
+    executor's click_submit dies AFTER the commit gate (durable RESERVED)
+    at the die gate. The confirm's response can never exist — the client
+    is gone and the owner dies inside the mutation."""
     import asyncio
 
     async def _run() -> int:
@@ -729,36 +727,15 @@ def full_owner_m5_crash(
             {
                 "started": True,
                 "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
                 "build_id": dispatcher._ipc_server._runtime_build_id,
             },
         )
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))  # noqa: ASYNC240
-        import secrets as _secrets
-
-        from webwire.authority_ipc_framing import encode_json_frame, parse_frame_header
-
-        def _envelope(operation: str, body: dict) -> dict:
-            return {
-                "protocol_version": 1,
-                "operation": operation,
-                "payload": body,
-                "request_id": _secrets.token_hex(16),
-                "authority_instance_id": dispatcher._authority_session.authority_instance_id,
-                "runtime_build_id": dispatcher._ipc_server._runtime_build_id,
-            }
-
-        async def _dispatch(operation: str, body: dict) -> dict:
-            frame = encode_json_frame(_envelope(operation, body))
-            header, consumed = parse_frame_header(frame)
-            response = await dispatcher._ipc_server.process_request(header, frame[consumed:])
-            return json.loads(response[8:])
-
-        preview = await _dispatch("post_text", payload)
-        token = preview["data"]["data"]["confirmation_token"]
-        _write(result_path.with_suffix(".preview"), {"token_minted": True})
-        confirm = await _dispatch("post_text", {**payload, "confirmation_token": token})
-        # Never returns: the executor dies inside click_submit.
-        _write(result_path.with_suffix(".confirm"), confirm)
+        # Serve until the executor dies inside the mutation (the die gate
+        # is opened by the controller after verifying the durable state).
+        # Off-loop so in-flight transport work keeps progressing.
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, die_gate, 240.0)
+        await dispatcher.stop()
         return 0
 
     return asyncio.run(_run())
@@ -864,12 +841,16 @@ def ipc_flood(
     payload_path: Path,
     count: int,
     duplicate_of_first: bool,
+    explicit_request_id: str = "",
 ) -> int:
     """Send COUNT unique-request-id requests, ONE PER CONNECTION (the
     wire law), disconnecting each immediately after send — from THIS one
     process (spawning one client process per request is needlessly
-    slow). Optionally re-sends the FIRST request_id once more (the
-    duplicate-delivery probe)."""
+    slow). ``explicit_request_id`` (F-100): when supplied, the FIRST
+    send uses THIS id instead of a fresh one — the controller duplicates
+    an ACTUALLY BLOCKED table entry, not a fresh id the full table
+    would refuse. ``duplicate_of_first`` then re-sends that same id once
+    more (the duplicate-delivery probe)."""
     import asyncio
 
     async def _run() -> int:
@@ -877,7 +858,7 @@ def ipc_flood(
         from webwire.authority_ipc_transport import IPCClient
 
         payload = json.loads(payload_path.read_text(encoding="utf-8"))  # noqa: ASYNC240
-        first_rid = secrets.token_hex(16)
+        first_rid = explicit_request_id or secrets.token_hex(16)
 
         def _do() -> dict[str, Any]:
             sent = 0
@@ -981,12 +962,20 @@ def main(argv: list[str]) -> int:
         return ingest_crash(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "ipc-flood":
         return ipc_flood(
-            result_path, Path(raw[0]), raw[1], raw[2], raw[3], Path(raw[4]), int(raw[5]), raw[6] == "dup"
+            result_path,
+            Path(raw[0]),
+            raw[1],
+            raw[2],
+            raw[3],
+            Path(raw[4]),
+            int(raw[5]),
+            raw[6] == "dup",
+            raw[7] if len(raw) > 7 else "",
         )
+    if scenario == "full-owner-m5-serving":
+        return full_owner_m5_serving(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "full-owner-tablesat":
         return full_owner_tablesat(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
-    if scenario == "full-owner-m5-crash":
-        return full_owner_m5_crash(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     print(f"unknown scenario {scenario}", file=sys.stderr)
     return 2
 

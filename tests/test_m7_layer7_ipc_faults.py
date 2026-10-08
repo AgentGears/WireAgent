@@ -164,13 +164,16 @@ def test_transport_capacity_backpressure_under_real_connections(tmp_path: Path) 
 
 
 def test_retained_table_saturation_with_disconnected_admitted_work(tmp_path: Path) -> None:
-    """T57 PROPER (F-94): 64 admitted in-flight requests, each blocked
-    AFTER admission with its client DISCONNECTED — handler slots recycle
-    while the owner tasks stay pinned in the retained table. The 65th
-    NEW request gets table_full (stable backpressure, no eviction); a
-    same-id duplicate of a blocked request JOINS (no second execution);
-    releasing the barriers terminalizes all 64 with exactly one
-    execution each."""
+    """T57 PROPER (F-94/F-100), at the qualification bound of 8 (the
+    tablesat worker documents the bound lowering as law-independent
+    orchestration): 8 admitted in-flight requests, each blocked AFTER
+    admission with its client DISCONNECTED — handler slots recycle while
+    the owner tasks stay pinned in the retained table. The 9th NEW
+    request gets table_full (stable backpressure, no eviction). A
+    duplicate of the FILL'S OWN BLOCKED REQUEST ID joins the live
+    in-flight entry — no table_full, no second invoke — and a
+    normal-mode same-id joiner observes the SAME terminal owner result
+    after release."""
     QUAL_TABLE_BOUND = 8  # the tablesat worker patches the table constant to this value
 
     scratch = _scratch(tmp_path, "tablesat")
@@ -221,8 +224,8 @@ def test_retained_table_saturation_with_disconnected_admitted_work(tmp_path: Pat
     lines = _invoke_events()
     assert len(lines) == QUAL_TABLE_BOUND, f"all {QUAL_TABLE_BOUND} requests admitted; got {len(lines)}"
 
-    # The 65th NEW request: table_full — stable backpressure.
-    env65 = scratch / "payload-65.json"
+    # The 9th NEW request: table_full — stable backpressure.
+    env65 = scratch / "payload-9th.json"
     env65.write_text(json.dumps({"text": "the one too many"}), encoding="utf-8")
     refused = harness.start_worker(
         scratch,
@@ -239,7 +242,11 @@ def test_retained_table_saturation_with_disconnected_admitted_work(tmp_path: Pat
     assert refused_record["response"]["ok"] is False
     assert refused_record["response"]["error"]["code"] == "table_full"
 
-    # A same-id duplicate of BLOCKED work JOINS it — no new execution.
+    # A same-id duplicate of BLOCKED work JOINS it (F-100): the flood
+    # re-sends the FILL's first_request_id — an id with a LIVE inflight
+    # entry — as a NORMAL client that reads the response. It must NOT
+    # get table_full (the entry exists; the duplicate joins its future)
+    # and must NOT create a second invoke.
     dup = harness.start_worker(
         scratch,
         "ipc-flood",
@@ -250,20 +257,47 @@ def test_retained_table_saturation_with_disconnected_admitted_work(tmp_path: Pat
         env,
         "1",
         "dup",
+        flood_record["first_request_id"],
     )
-    dup_record = dup.result(timeout=60)
-    assert dup_record["sent"] == 2, dup_record  # one new + the duplicated first rid
-    dup.wait(timeout=30)
+    # The duplicate BLOCKS reading the joined work's response until the
+    # barrier releases; its result arrives after the release below.
+    dup.wait(timeout=120)
+    dup_result = json.loads(dup.result_path.read_text(encoding="utf-8"))
+    assert dup_result["sent"] == 2, dup_result  # the explicit blocked id + its duplicate
+    assert dup_result["errors"] == [], dup_result
     time.sleep(0.5)
     lines_after = _invoke_events()
     assert len(lines_after) == QUAL_TABLE_BOUND, "the duplicate JOINED existing work — no second execution"
 
-    # Release: all blocked work terminalizes; the owner stops cleanly.
+    # A NORMAL same-id joiner: connects, sends the SAME blocked id, and
+    # READS the response — after release it observes the SAME terminal
+    # owner result the original work produced (the retained frame).
+    joiner = harness.start_worker(
+        scratch,
+        "ipc-request",
+        Path(endpoint),
+        build,
+        instance,
+        "post_text",
+        env,
+        flood_record["first_request_id"],
+        "normal",
+    )
+
+    # Release: all blocked work terminalizes; the joiner observes the
+    # retained result; the owner stops cleanly.
     harness.open_gate(scratch, "exec")
+    joiner_result = joiner.result(timeout=120)
+    joiner.wait(timeout=60)
+    joined_response = joiner_result["response"]
+    assert isinstance(joined_response, dict) and "ok" in joined_response, joiner_result
+    # THE JOIN proof: the same-id joiner did NOT get table_full — it
+    # observed the live entry's terminal result.
+    assert joined_response.get("error", {}).get("code") != "table_full", joined_response
     harness.open_gate(scratch, "stop")
-    # 64 serialized invokes drain through the invocation lock, each with
-    # durable journal/ledger I/O — the drain is bounded but not fast.
     assert owner.wait(timeout=300) == harness.EXIT_OK
+    # And the join was still ONE execution: the invoke count never grew.
+    assert len(_invoke_events()) == QUAL_TABLE_BOUND
 
 
 # ---------------------------------------------------------------------------
@@ -328,40 +362,71 @@ def test_owner_death_after_disconnect_relabels_envelope_stale(tmp_path: Path) ->
 
 
 def test_T44_uncertain_real_m5_mutation_governed_by_durable_truth(tmp_path: Path) -> None:
-    """T44 PROPER (F-95) with the REAL M5 post-text executor: preview
-    mints a real token; the confirm runs the real WriteKernel/executor;
-    the attempt reaches click_submit — RESERVED durably — where the
-    owner DIES at the controlled point. The response never exists. The
-    successor then: hydrates the durable ledger, starts (READY), REFUSES
-    the same-semantic write through the RecoveryGate (uncertainty is
-    resolved by M5/M6 truth, not transport), and the old envelope is
-    stale."""
+    """T44 PROPER (F-95/F-101) — the FULL scenario over the real
+    transport with EXTERNAL clients: the owner serves the REAL M5
+    post-text executor; an external client previews (real token) and
+    sends the confirm over the wire, then DISCONNECTS; the executor
+    passes the commit gate — the attempt durably RESERVED — and dies at
+    the controlled point. The response never exists. The successor
+    hydrates the durable ledger, starts (READY), REFUSES the
+    same-semantic write through the RecoveryGate, and the old envelope
+    is stale."""
     scratch = _scratch(tmp_path, "m5crash")
     state_dir = scratch / "state"
     die_gate = harness.gate(scratch, "die")
-    payload = scratch / "payload.json"
-    payload.write_text(json.dumps({"text": "the uncertain real mutation"}), encoding="utf-8")
 
-    owner = harness.start_worker(scratch, "full-owner-m5-crash", state_dir, die_gate, payload)
+    owner = harness.start_worker(scratch, "full-owner-m5-serving", state_dir, die_gate)
     record = owner.result()
     assert record["started"] is True, record
+    endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
 
-    # Preview done (real token); confirm entered; executor blocked in
-    # submit with RESERVED durable.
-    harness.wait_record(owner.result_path.with_suffix(".preview"))
+    # EXTERNAL preview over the real transport: a real token.
+    preview_env = _payload_file(scratch, {"text": "the uncertain real mutation"})
+    previewer = harness.start_worker(
+        scratch,
+        "ipc-request",
+        Path(endpoint),
+        build,
+        instance,
+        "post_text",
+        preview_env,
+        secrets.token_hex(16),
+        "normal",
+    )
+    preview_response = previewer.result()["response"]
+    token = preview_response["data"]["data"]["confirmation_token"]
+
+    # EXTERNAL confirm over the real transport, then the client is GONE.
+    confirm_env = _payload_file(scratch, {"text": "the uncertain real mutation", "confirmation_token": token})
+    vanished = harness.start_worker(
+        scratch,
+        "ipc-request",
+        Path(endpoint),
+        build,
+        instance,
+        "post_text",
+        confirm_env,
+        secrets.token_hex(16),
+        "disconnect",
+    )
+    assert vanished.result()["sent"] is True
+
+    # The executor reached click_submit and passed the commit gate: the
+    # attempt is durably RESERVED at the crash point.
     blocked = harness.wait_record(owner.result_path.with_suffix(".blocked"))
     assert blocked["m5_submit_blocked"] is True
-
-    # The durable ledger holds the RESERVED attempt at this moment.
     effects = state_dir / "effects.ndjson"
-    ledger_text = effects.read_text(encoding="utf-8")
-    assert "RESERVED" in ledger_text, "the M5 attempt is durably RESERVED at the crash point"
+    assert "RESERVED" in effects.read_text(encoding="utf-8"), (
+        "the M5 attempt is durably RESERVED at the crash point"
+    )
 
+    # The owner dies INSIDE the admitted mutation; the response never
+    # existed for anyone.
     harness.open_gate(scratch, "die")
     deadline = time.monotonic() + 15
     while owner.poll() is None and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert owner.poll() == harness.EXIT_DIED_UNCLEAN, "the owner died INSIDE the mutation"
+    assert owner.poll() == harness.EXIT_DIED_UNCLEAN
 
     # The successor: hydrates the unresolved attempt and starts cleanly.
     successor = harness.start_worker(scratch, "full-owner", state_dir, harness.gate(scratch, "stop2"), "clean")
@@ -371,8 +436,7 @@ def test_T44_uncertain_real_m5_mutation_governed_by_durable_truth(tmp_path: Path
         # The same-semantic write is REFUSED through the recovery gate —
         # durable M5/M6 truth decides, and the uncertainty is NOT
         # resolved by silently re-running the mutation.
-        replay_env = scratch / "replay.json"
-        replay_env.write_text(json.dumps({"text": "the uncertain real mutation"}), encoding="utf-8")
+        replay_env = _payload_file(scratch, {"text": "the uncertain real mutation"})
         replay = harness.start_worker(
             scratch,
             "ipc-request",
@@ -391,6 +455,22 @@ def test_T44_uncertain_real_m5_mutation_governed_by_durable_truth(tmp_path: Path
         assert "reconcil" in message or "recovery" in message or "unknown" in message, (
             f"the replay must be governed by durable recovery truth: {replay_response}"
         )
+
+        # The OLD envelope (old instance) can never reach execution.
+        stale = harness.start_worker(
+            scratch,
+            "ipc-request",
+            Path(successor_record["endpoint"]),
+            successor_record["build_id"],
+            instance,
+            "post_text",
+            confirm_env,
+            secrets.token_hex(16),
+            "normal",
+        )
+        stale_response = stale.result()["response"]
+        assert stale_response["ok"] is False
+        assert stale_response["error"]["code"] == "stale_authority_instance"
     finally:
         harness.open_gate(scratch, "stop2")
         successor.wait()

@@ -461,6 +461,62 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-07 — M7 Layer 7 third repair round (PR #30, F-100..F-102):
+  the JOIN proof and the transport-coupled T44; the record becomes a
+  qualification matrix.** F-100 (blocker, fixed): the T57 duplicate
+  probe now re-sends the FILL'S OWN first_request_id — an id with a
+  LIVE inflight entry — via a new explicit_request_id parameter on the
+  flood worker (a fresh id would just get table_full again and prove
+  nothing about joining). The duplicate of the blocked entry does NOT
+  get table_full, does NOT create a second invoke, and a normal-mode
+  same-id joiner observes the SAME terminal owner result after release
+  (asserted not-table_full). Test prose corrected to the qualification
+  configuration (8 admitted / 9th refused). F-101 (blocker, fixed): the
+  T44 owner is now a SERVING owner — the real M5 post-text executor
+  stack with the production endpoint LIVE; an EXTERNAL client previews
+  over the real transport (real token) and a second EXTERNAL client
+  sends the confirm and DISCONNECTS; the executor passes the commit
+  gate (durable RESERVED asserted at the crash point) and dies at the
+  controlled point; the successor hydrates, starts, the same-semantic
+  write is refused through the recovery gate, and the old envelope is
+  stale_authority_instance. The transport-response-loss half and the
+  durable-M5 half are finally ONE scenario. The superseded in-process
+  full-owner-m5-crash scenario is REMOVED. F-102 (high, fixed): the
+  PR body's stale claims are gone — the false "production deltas"
+  settimeout paragraph (reverted in round two) removed; the summary is
+  now a QUALIFICATION MATRIX. Also removed a duplicated
+  QUAL_TABLE_BOUND definition in the worker. QUALIFICATION MATRIX at
+  this head: QUALIFIED — T2 (common-start race x3), T5/T6 (established
+  owner non-steal), T7/T8 (clean-release succession; OS-death
+  succession after hung-owner kill), T13/T14 (corrupt effects /
+  reconciliation ledgers refuse startup), T17/T18 (blocked admitted
+  work keeps the owner alive and locked through stop), T20/T21/T23/
+  T50/T58 (stale instance, oversized frames, retained duplicates,
+  malformed refusal, canonical dedupe), T49-POSIX (stale socket path
+  rebind under ownership), T57 (real table saturation: table_full
+  backpressure, blocked-id JOIN, no second execution, same terminal
+  result), T44 (full transport-coupled uncertain mutation: external
+  confirm, disconnect, durable RESERVED, successor recovery-gate
+  refusal), T51 (no listening TCP socket incl. tcp6), T63-fork (the
+  inherited descriptor does not keep the domain locked), T69 media
+  (real ingest refs die with the owner; mid-ingress crash .tmp-only;
+  pin-through-drain with post-drain reclamation), T60-partial (socket
+  mode 0600 + domain location, empirically). PARTIALLY QUALIFIED /
+  OPEN FOR LATER LAYER-7 ROUNDS — T16 (admission-vs-drain in-window
+  race), T33 (browser-child survival — the harness stubs browser
+  startup by design), T34-T38 (seeded crash-point matrix beyond T44's
+  RESERVED point), T48's full hydration-chain timing (lock-release
+  proven; the hydrate-before-browser chain is carried by the Layer-3
+  single-process suites at this head), T63 spawn/exec variants, T64
+  cross-process handshake negatives, T65 (no supported-fault
+  live-lock-loss injection yet). LAYER-8 ONLY — Windows Server 2025
+  exhaustive qualification (the three Windows one-handle media tests
+  run in the LOCAL gate only; CI Windows jobs do not select them),
+  remote-reachability/ACL inspection. Gate ALL GREEN: 1414 passed +
+  37 platform-skipped locally (Windows), ruff + mypy clean on 102
+  files.
+
+
 - **2026-10-07 — M7 Layer 7 second repair round (PR #30,
   F-92..F-99): evidence fidelity — every test now exercises the law it
   names.** Qualification-only round; the ONE round-one production delta

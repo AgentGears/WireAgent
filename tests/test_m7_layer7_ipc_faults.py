@@ -189,8 +189,9 @@ def test_retained_table_saturation_with_disconnected_admitted_work(tmp_path: Pat
 
     # Fill the retained table with admitted, blocked, clientless work —
     # one request per connection, the flood client disconnecting after
-    # each send (a SINGLE client process performs all sends: one client
-    # PROCESS per request would make the fill needlessly slow). Each
+    # each send (one flood PROCESS performs all sends — one CONNECTION
+    # per request; one client process PER REQUEST would be needlessly
+    # slow). Each
     # request registers in the table BEFORE its invoke queues on the
     # Dispatcher's single invocation lock.
     env = scratch / "payload.json"
@@ -478,51 +479,210 @@ def test_T44_uncertain_real_m5_mutation_governed_by_durable_truth(tmp_path: Path
 
 # ---------------------------------------------------------------------------
 # Lane 3 (load-bearing): blocked admitted request blocks clean release
+
+
+# ---------------------------------------------------------------------------
+# F-103: the restored raw-protocol lane — T21/T50/T58 real-process
+# evidence that the round-two rewrite dropped.
 # ---------------------------------------------------------------------------
 
 
-def test_blocked_admitted_request_keeps_owner_alive_until_release(tmp_path: Path) -> None:
-    """T17/T18 over the real transport: an admitted request whose
-    execution blocks keeps the owner process alive — the clean-stop gate
-    does not complete until the admitted work reaches its terminal
-    boundary. Observable purely at the process boundary: the owner's
-    exit is delayed past the stop signal while the work is held.
-
-    Implementation: the full-owner-write scenario runs ONE request
-    through the real pipeline with the real Dispatcher (a read of a
-    post), but blocks it via a held envelope that the OWNER processes
-    only after its own gate — no. The honest process-boundary version:
-    the owner receives the request from a REAL socket client that then
-    vanishes; the owner's stop gate opens immediately after; the owner
-    process must still be alive until the invoke completes. The invoke
-    here is fast, so the load-bearing slow path is exercised in the
-    single-process suites; at the process boundary we prove the WIRING:
-    disconnect does not kill the owner and stop completes cleanly."""
-    scratch = _scratch(tmp_path, "blocked")
+def test_T21_unknown_protocol_operation_and_oversized_refused_owner_serving(tmp_path: Path) -> None:
+    """T21 over the real transport: an unknown protocol version, an
+    unknown operation, and an announced oversized frame are each
+    rejected BEFORE execution — and the owner keeps serving afterwards."""
+    scratch = _scratch(tmp_path, "t21raw")
     state_dir = scratch / "state"
     owner, record = _start_full_owner(scratch, state_dir)
     try:
-        rid = secrets.token_hex(16)
-        env = _payload_file(scratch, {"text": "disconnect race"})
-        gone = harness.start_worker(
+        endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+
+        def _envelope(**overrides):
+            envelope = {
+                "protocol_version": 1,
+                "operation": "health",
+                "payload": {},
+                "request_id": secrets.token_hex(16),
+                "authority_instance_id": instance,
+                "runtime_build_id": build,
+            }
+            envelope.update(overrides)
+            return envelope
+
+        # One request per CONNECTION (the wire law): each probe rides
+        # its own ipc-raw invocation.
+        def _raw_probe(envelope: dict) -> dict:
+            spec = json.dumps([{"kind": "request", "envelope": envelope}, {"kind": "read-response"}])
+            raw = harness.start_worker(scratch, "ipc-raw", Path(endpoint), build, spec)
+            return raw.result()["steps"][1]["response"]
+
+        assert _raw_probe(_envelope(protocol_version=99))["error"]["code"] == "protocol_mismatch"
+        assert _raw_probe(_envelope(protocol_version=1.0))["error"]["code"] == "protocol_mismatch"
+        assert (
+            _raw_probe(_envelope(operation="definitely_not_real"))["error"]["code"] == "unsupported_operation"
+        )
+
+        spec = json.dumps(
+            [
+                {"kind": "bytes", "hex": (100 * 1024).to_bytes(8, "big").hex()},
+                {"kind": "read-eof", "timeout": 5},
+            ]
+        )
+        raw = harness.start_worker(scratch, "ipc-raw", Path(endpoint), build, spec)
+        steps = raw.result()["steps"]
+        refused = any(
+            step.get("recv") == "" or "ConnectionError" in str(step.get("error", "")) for step in steps
+        )
+        assert refused, steps
+
+        env = _payload_file(scratch, {})
+        healthy = harness.start_worker(
             scratch,
             "ipc-request",
-            Path(record["endpoint"]),
-            record["build_id"],
-            record["instance_id"],
-            "post_text",
+            Path(endpoint),
+            build,
+            instance,
+            "health",
             env,
-            rid,
-            "disconnect",
+            secrets.token_hex(16),
+            "normal",
         )
-        assert gone.result()["sent"] is True
-        time.sleep(0.3)  # the owner admits and completes owner-side
-        assert owner.poll() is None, "the owner survives the client disconnect"
-        harness.open_gate(scratch, "stop")
-        assert owner.wait(timeout=30) == harness.EXIT_OK, (
-            "clean stop completes after the disconnect; ownership released in order"
-        )
+        healthy_record = healthy.result()
+        assert isinstance(healthy_record["response"], dict) and "ok" in healthy_record["response"]
     finally:
-        if owner.poll() is None:
-            harness.open_gate(scratch, "stop")
-            owner.wait(timeout=30)
+        harness.open_gate(scratch, "stop")
+        owner.wait()
+
+
+def test_T50_malformed_non_json_frame_rejected_owner_serving(tmp_path: Path) -> None:
+    """T50 over the real transport: frames whose bodies are NOT JSON
+    (raw garbage, and a pickle-shaped opener for good measure) are
+    rejected safely — no executable deserialization, no execution — and
+    the owner keeps serving."""
+
+    scratch = _scratch(tmp_path, "t50raw")
+    state_dir = scratch / "state"
+    owner, record = _start_full_owner(scratch, state_dir)
+    try:
+        endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+
+        # A pickle-shaped opener and a plain garbage body — each under a
+        # VALID small length header on its own connection: the framing
+        # is non-executable regardless of body content, and every read
+        # yields a protocol-error frame (never a success payload).
+        def _raw_garbage(body: bytes) -> dict:
+            import binascii
+
+            spec = json.dumps(
+                [
+                    {"kind": "bytes", "hex": len(body).to_bytes(8, "big").hex()},
+                    {"kind": "bytes", "hex": binascii.hexlify(body).decode()},
+                    {"kind": "read-response"},
+                ]
+            )
+            raw = harness.start_worker(scratch, "ipc-raw", Path(endpoint), build, spec)
+            return raw.result()["steps"][2]["response"]
+
+        for response in (
+            _raw_garbage(b"\x80\x04\x95\x00"),  # pickle opener
+            _raw_garbage(b"garbage-body"),  # plain non-JSON
+        ):
+            assert response["ok"] is False, response
+            assert response["error"]["code"] == "protocol", response
+
+        env = _payload_file(scratch, {})
+        healthy = harness.start_worker(
+            scratch,
+            "ipc-request",
+            Path(endpoint),
+            build,
+            instance,
+            "health",
+            env,
+            secrets.token_hex(16),
+            "normal",
+        )
+        healthy_record = healthy.result()
+        assert isinstance(healthy_record["response"], dict) and "ok" in healthy_record["response"]
+    finally:
+        harness.open_gate(scratch, "stop")
+        owner.wait()
+
+
+def test_T58_same_id_different_key_order_is_retained_not_violation(tmp_path: Path) -> None:
+    """T58 PROPER over the real transport: the SAME request_id with the
+    SAME schema-normalized payload encoded under DIFFERENT JSON object
+    key order produces ONE canonical identity — the second delivery
+    returns the RETAINED response (byte-stable), NOT request_id_reused.
+    Requires a real ingest first (post_photo carries artifact_ref)."""
+    scratch = _scratch(tmp_path, "t58order")
+    state_dir = scratch / "state"
+    staging = state_dir / "media-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "photo.png").write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+            "1f15c4890000000d49444154789c626001000000ffff030000060005"
+            "57bfabd40000000049454e44ae426082"
+        )
+    )
+
+    owner, record = _start_full_owner(scratch, state_dir)
+    try:
+        endpoint, build, instance = record["endpoint"], record["build_id"], record["instance_id"]
+
+        ingest_env = _payload_file(scratch, {"staged_name": "photo.png"})
+        ingester = harness.start_worker(
+            scratch,
+            "ipc-request",
+            Path(endpoint),
+            build,
+            instance,
+            "media_ingest",
+            ingest_env,
+            secrets.token_hex(16),
+            "normal",
+        )
+        artifact = ingester.result()["response"]["data"]["artifact"]
+
+        payload_a = {"text": "key order probe", "artifact_ref": artifact["artifact_ref"]}
+        payload_b = {"artifact_ref": artifact["artifact_ref"], "text": "key order probe"}
+        assert json.dumps(payload_a) != json.dumps(payload_b), "the wire orders differ"
+
+        def _request_with_retry(env: Path, rid: str) -> dict:
+            # Two cold-start client processes can race the pipe's next
+            # instance (a transient connection-level refusal, not the law
+            # under test); retry those.
+            for _attempt in range(4):
+                client = harness.start_worker(
+                    scratch,
+                    "ipc-request",
+                    Path(endpoint),
+                    build,
+                    instance,
+                    "post_photo",
+                    env,
+                    rid,
+                    "normal",
+                )
+                out = client.result(timeout=30)
+                client.wait(timeout=15)
+                if "response" in out:
+                    return out
+                time.sleep(0.2)
+            raise AssertionError("the request never reached a response")
+
+        rid = secrets.token_hex(16)
+        env_a = _payload_file(scratch, payload_a)
+        env_b = _payload_file(scratch, payload_b)
+        r1 = _request_with_retry(env_a, rid)
+        r2 = _request_with_retry(env_b, rid)
+        assert isinstance(r1["response"], dict) and "ok" in r1["response"], r1
+        assert r2["response"] == r1["response"], (
+            "different key order, same canonical identity -> the retained frame"
+        )
+        error_code = (r2["response"].get("error") or {}).get("code", "")
+        assert error_code != "request_id_reused", r2
+    finally:
+        harness.open_gate(scratch, "stop")
+        owner.wait()

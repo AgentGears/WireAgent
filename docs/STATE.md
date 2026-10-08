@@ -461,6 +461,49 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 fourth repair round (PR #30,
+  F-103/F-104): the raw-protocol lane restored; the record again
+  matches the tests.** F-103 (blocker, fixed): the round-two rewrite
+  had silently dropped the real-process T21/T50/T58 evidence while the
+  matrix kept claiming it. Restored as three real-process tests on the
+  existing ipc-raw worker, each probe riding its OWN connection (the
+  one-request-per-connection law — the raw worker cannot multiplex
+  requests on one socket because the server closes after each
+  response): T21 — unknown protocol version (99 and float 1.0) →
+  protocol_mismatch, unknown operation → unsupported_operation,
+  announced 100KiB header → refused from the header, and the owner
+  still serves health after all three; T50 — a pickle-shaped opener
+  and plain non-JSON bodies under VALID small length headers →
+  protocol-error frames only (never a success payload), no execution,
+  owner still serving; T58 PROPER — the SAME request_id with the SAME
+  schema-normalized payload under DIFFERENT JSON key order (post_photo
+  with a really-ingested artifact_ref; the two wire encodings asserted
+  byte-different) → the second delivery returns the byte-identical
+  RETAINED response, NOT request_id_reused. F-104 (high, fixed): the
+  obsolete weak T17/T18 test (whose own docstring admitted the invoke
+  was fast) is DELETED — one authoritative proof per law: T17/T18
+  lives in the ownership file's kernel-barrier test; the disconnect
+  wiring is carried by T44 and the tablesat drain. The editorial
+  flood comment now says one CONNECTION per request from one flood
+  process. QUALIFICATION MATRIX correction at this head: QUALIFIED —
+  T2, T5/T6, T7/T8, T13, T14, T17/T18, T20 (stale instance), T21
+  (protocol/operation/oversized raw-frame refusal + owner serving),
+  T23 (retained duplicate), T44 (full transport-coupled uncertain
+  mutation), T50 (malformed non-JSON refusal + owner serving), T51
+  (tcp+tcp6), T57 (table saturation + blocked-id JOIN), T58
+  (key-order canonical identity), T60-partial (socket mode 0600),
+  T63-fork, T69 media, transport capacity backpressure. PARTIAL/OPEN
+  (unchanged from the third-round matrix): T16, T33, T34-T38 beyond
+  RESERVED, T48 full timing, T63 spawn/exec, T64, T65. LAYER-8 ONLY
+  (unchanged): Windows exhaustive, remote reachability/ACL. Gate ALL
+  GREEN: 1416 passed + 37 platform-skipped locally (Windows), ruff +
+  mypy clean on 102 files. HARNESS LESSON: a raw-frame spec runner
+  must open a NEW connection per request step — the server closes
+  after each response (one request per connection), so a multi-request
+  spec on one socket reports peer-close errors that mask the actual
+  verdicts.
+
+
 - **2026-10-07 — M7 Layer 7 third repair round (PR #30, F-100..F-102):
   the JOIN proof and the transport-coupled T44; the record becomes a
   qualification matrix.** F-100 (blocker, fixed): the T57 duplicate

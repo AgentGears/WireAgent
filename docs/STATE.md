@@ -461,6 +461,305 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-08 — M7 Layer 7 sixth repair round (PR #30,
+  F-108/F-109): the ordering difference moved INSIDE the payload; T20
+  gained the oracle.** F-108 (blocker, fixed): the previous T58 varied
+  only ENVELOPE-level key order — but §10.5's canonical identity
+  hashes protocol_version + operation + the schema-normalized PAYLOAD
+  and discards the envelope routing fields whose order that version
+  varied. The test now sends two raw frames with IDENTICAL envelope
+  ordering whose only difference is the key order INSIDE a valid
+  multi-key read_search payload (query/tab/limit in two orders); raw
+  bodies asserted byte-different and semantically equal before sending;
+  same request_id on both: the byte-identical RETAINED response, NOT
+  request_id_reused, invoke count EXACTLY 1. F-109 (high, fixed): a
+  counting-owner T20 test — an otherwise-valid request with a stale
+  instance id returns stale_authority_instance with invoke count ZERO
+  (explicit before-Dispatcher evidence), and the same owner then serves
+  a current-instance request (count exactly 1). Record cleanups: the
+  superseded duplicate-delivery smoke test (self-labeled T23/T58
+  without an oracle) is DELETED — one authoritative proof per law; the
+  PR body's T21 probe count corrected to the actual six (two protocol
+  versions, unknown operation, two schema cases, oversize). Gate ALL
+  GREEN: 1417 passed + 37 platform-skipped locally (Windows), ruff +
+  mypy clean on 102 files. LESSON: canonical-identity qualifications
+  must vary the ordering of exactly the fields the canonicalizer
+  hashes — varying fields the pipeline discards before
+  canonicalization exercises nothing about the §10.5 rule.
+
+
+- **2026-10-08 — M7 Layer 7 fifth repair round (PR #30,
+  F-105/F-106/F-107): the raw lane gained an execution oracle, real
+  wire-level key ordering, and a genuinely executable pickle.**
+  F-105 (blocker, fixed): the previous T58 sent both payloads through
+  the client serializer — which sorts keys — so the owner received
+  byte-equivalent sorted JSON both times and the frozen condition was
+  never on the wire. The test now hand-builds two COMPLETE envelope
+  JSON documents with identical values under deliberately different
+  key order, asserts the raw frame bodies are BYTE-DIFFERENT and
+  semantically equal BEFORE sending, and transmits them as raw frames
+  (8-byte length prefix + exact bytes) so no serializer can normalize
+  them. The same request_id on both: the second delivery returns the
+  byte-identical RETAINED response, NOT request_id_reused. F-106
+  (blocker, fixed): a new full-owner-counting worker wraps the
+  Dispatcher invocation seam and writes one process-visible event per
+  ACTUAL invoke — the execution-order oracle. T21 now also covers
+  UNKNOWN SCHEMA (a forbidden payload field AND a forbidden envelope
+  field each die at strict schema, not the allowlist) and asserts
+  invoke count ZERO across all five invalid probes (the surviving
+  health request then makes it exactly 1). T23 (split into its own
+  test) asserts invoke count 1 after the first valid request and STILL
+  1 after the same-id duplicate returns the retained frame — explicit
+  no-new-execution evidence. T58 uses the same oracle: count exactly 1
+  after both differently-ordered deliveries. F-107 (high, fixed): the
+  T50 probe is now a GENUINELY EXECUTABLE benign pickle — its reducer
+  would create a marker file via os.system if anything unpickled it —
+  proven executable in a throwaway subprocess (marker appears) before
+  the owner run; sent as raw frame bytes under a valid length header,
+  the owner returns a protocol error, the marker file does NOT exist,
+  the invoke count is ZERO, and the owner keeps serving. Also: the
+  stub broker gained a generic async surface (any non-underscore
+  method returns ok) so qualification laws stop depending on which
+  diagnostics a capability probes, and the race test's ready-wait
+  window doubled (a cold-start flake under full-suite load). Gate ALL
+  GREEN: 1417 passed + 37 platform-skipped locally (Windows), ruff +
+  mypy clean on 102 files. HARNESS LESSONS: encode_json_frame sorts
+  keys — ANY wire-ordering qualification must hand-build frames and
+  bypass the client entirely (the ipc-raw 'request' step ALSO sorts);
+  execution-order claims need a process-visible invoke oracle, not
+  response-byte equality (a deterministic request executed twice
+  produces identical bytes); a pickle-looking byte string proves
+  nothing — build a reducer that would leave forensic evidence, prove
+  it executes in a subprocess, THEN prove the owner never ran it.
+
+
+- **2026-10-08 — M7 Layer 7 fourth repair round (PR #30,
+  F-103/F-104): the raw-protocol lane restored; the record again
+  matches the tests.** F-103 (blocker, fixed): the round-two rewrite
+  had silently dropped the real-process T21/T50/T58 evidence while the
+  matrix kept claiming it. Restored as three real-process tests on the
+  existing ipc-raw worker, each probe riding its OWN connection (the
+  one-request-per-connection law — the raw worker cannot multiplex
+  requests on one socket because the server closes after each
+  response): T21 — unknown protocol version (99 and float 1.0) →
+  protocol_mismatch, unknown operation → unsupported_operation,
+  announced 100KiB header → refused from the header, and the owner
+  still serves health after all three; T50 — a pickle-shaped opener
+  and plain non-JSON bodies under VALID small length headers →
+  protocol-error frames only (never a success payload), no execution,
+  owner still serving; T58 PROPER — the SAME request_id with the SAME
+  schema-normalized payload under DIFFERENT JSON key order (post_photo
+  with a really-ingested artifact_ref; the two wire encodings asserted
+  byte-different) → the second delivery returns the byte-identical
+  RETAINED response, NOT request_id_reused. F-104 (high, fixed): the
+  obsolete weak T17/T18 test (whose own docstring admitted the invoke
+  was fast) is DELETED — one authoritative proof per law: T17/T18
+  lives in the ownership file's kernel-barrier test; the disconnect
+  wiring is carried by T44 and the tablesat drain. The editorial
+  flood comment now says one CONNECTION per request from one flood
+  process. QUALIFICATION MATRIX correction at this head: QUALIFIED —
+  T2, T5/T6, T7/T8, T13, T14, T17/T18, T20 (stale instance), T21
+  (protocol/operation/oversized raw-frame refusal + owner serving),
+  T23 (retained duplicate), T44 (full transport-coupled uncertain
+  mutation), T50 (malformed non-JSON refusal + owner serving), T51
+  (tcp+tcp6), T57 (table saturation + blocked-id JOIN), T58
+  (key-order canonical identity), T60-partial (socket mode 0600),
+  T63-fork, T69 media, transport capacity backpressure. PARTIAL/OPEN
+  (unchanged from the third-round matrix): T16, T33, T34-T38 beyond
+  RESERVED, T48 full timing, T63 spawn/exec, T64, T65. LAYER-8 ONLY
+  (unchanged): Windows exhaustive, remote reachability/ACL. Gate ALL
+  GREEN: 1416 passed + 37 platform-skipped locally (Windows), ruff +
+  mypy clean on 102 files. HARNESS LESSON: a raw-frame spec runner
+  must open a NEW connection per request step — the server closes
+  after each response (one request per connection), so a multi-request
+  spec on one socket reports peer-close errors that mask the actual
+  verdicts.
+
+
+- **2026-10-07 — M7 Layer 7 third repair round (PR #30, F-100..F-102):
+  the JOIN proof and the transport-coupled T44; the record becomes a
+  qualification matrix.** F-100 (blocker, fixed): the T57 duplicate
+  probe now re-sends the FILL'S OWN first_request_id — an id with a
+  LIVE inflight entry — via a new explicit_request_id parameter on the
+  flood worker (a fresh id would just get table_full again and prove
+  nothing about joining). The duplicate of the blocked entry does NOT
+  get table_full, does NOT create a second invoke, and a normal-mode
+  same-id joiner observes the SAME terminal owner result after release
+  (asserted not-table_full). Test prose corrected to the qualification
+  configuration (8 admitted / 9th refused). F-101 (blocker, fixed): the
+  T44 owner is now a SERVING owner — the real M5 post-text executor
+  stack with the production endpoint LIVE; an EXTERNAL client previews
+  over the real transport (real token) and a second EXTERNAL client
+  sends the confirm and DISCONNECTS; the executor passes the commit
+  gate (durable RESERVED asserted at the crash point) and dies at the
+  controlled point; the successor hydrates, starts, the same-semantic
+  write is refused through the recovery gate, and the old envelope is
+  stale_authority_instance. The transport-response-loss half and the
+  durable-M5 half are finally ONE scenario. The superseded in-process
+  full-owner-m5-crash scenario is REMOVED. F-102 (high, fixed): the
+  PR body's stale claims are gone — the false "production deltas"
+  settimeout paragraph (reverted in round two) removed; the summary is
+  now a QUALIFICATION MATRIX. Also removed a duplicated
+  QUAL_TABLE_BOUND definition in the worker. QUALIFICATION MATRIX at
+  this head: QUALIFIED — T2 (common-start race x3), T5/T6 (established
+  owner non-steal), T7/T8 (clean-release succession; OS-death
+  succession after hung-owner kill), T13/T14 (corrupt effects /
+  reconciliation ledgers refuse startup), T17/T18 (blocked admitted
+  work keeps the owner alive and locked through stop), T20/T21/T23/
+  T50/T58 (stale instance, oversized frames, retained duplicates,
+  malformed refusal, canonical dedupe), T49-POSIX (stale socket path
+  rebind under ownership), T57 (real table saturation: table_full
+  backpressure, blocked-id JOIN, no second execution, same terminal
+  result), T44 (full transport-coupled uncertain mutation: external
+  confirm, disconnect, durable RESERVED, successor recovery-gate
+  refusal), T51 (no listening TCP socket incl. tcp6), T63-fork (the
+  inherited descriptor does not keep the domain locked), T69 media
+  (real ingest refs die with the owner; mid-ingress crash .tmp-only;
+  pin-through-drain with post-drain reclamation), T60-partial (socket
+  mode 0600 + domain location, empirically). PARTIALLY QUALIFIED /
+  OPEN FOR LATER LAYER-7 ROUNDS — T16 (admission-vs-drain in-window
+  race), T33 (browser-child survival — the harness stubs browser
+  startup by design), T34-T38 (seeded crash-point matrix beyond T44's
+  RESERVED point), T48's full hydration-chain timing (lock-release
+  proven; the hydrate-before-browser chain is carried by the Layer-3
+  single-process suites at this head), T63 spawn/exec variants, T64
+  cross-process handshake negatives, T65 (no supported-fault
+  live-lock-loss injection yet). LAYER-8 ONLY — Windows Server 2025
+  exhaustive qualification (the three Windows one-handle media tests
+  run in the LOCAL gate only; CI Windows jobs do not select them),
+  remote-reachability/ACL inspection. Gate ALL GREEN: 1414 passed +
+  37 platform-skipped locally (Windows), ruff + mypy clean on 102
+  files.
+
+
+- **2026-10-07 — M7 Layer 7 second repair round (PR #30,
+  F-92..F-99): evidence fidelity — every test now exercises the law it
+  names.** Qualification-only round; the ONE round-one production delta
+  (the Windows settimeout no-op) is REVERTED (F-98: it advertised
+  timeout semantics while providing none; the EOF probe is now bounded
+  by the controller killing the worker). F-92: TRUE simultaneous T2 —
+  a lock-race worker signals READY, waits a COMMON acquire gate, and
+  races acquire() against its sibling; exactly one winner and exactly
+  one authority_busy per round, repeated 3x; the serialized
+  established-owner sequence is retained but honestly relabeled
+  T5/T6-style non-steal. F-93: T17/T18 at the real process boundary —
+  a controlled barrier INSIDE the write kernel (under the Dispatcher's
+  invocation lock) blocks an admitted CONFIRM; the stop sequence then
+  begins and the owner process MUST stay alive, a contender MUST get
+  authority_busy, and only after the barrier releases does the clean
+  stop complete and a successor acquire. F-94: REAL retained-table
+  saturation (T57) — a tablesat worker (transport capacity raised, the
+  table bound lowered to 8, both documented as qualification
+  orchestration independent of the law) admits 8 requests that block
+  in the kernel holding their table entries with clients DISCONNECTED;
+  the flood client (one process, one request per connection) provides
+  the fill; the 9th NEW request gets table_full (stable backpressure);
+  a same-id duplicate JOINS (invoke-event count unchanged); release
+  terminalizes all with a clean stop. The old connection-stall test is
+  retained and honestly relabeled TRANSPORT capacity backpressure.
+  F-95: REAL T44 — a full-owner-m5-crash worker installs the REAL
+  actor-bound post-text executor over a controlled DOM port whose
+  click_submit dies AFTER the commit gate (the durable RESERVED row is
+  in effects.ndjson at the crash point, asserted); the response never
+  exists; the successor hydrates, starts, and REFUSES the same-semantic
+  write through the recovery gate (durable M5/M6 truth governs — the
+  uncertainty is never resolved by transport), while the old envelope
+  is stale_authority_instance. The old disconnect-then-death test is
+  relabeled T20/T26. F-96: the three REAL media scenarios — (A) a
+  REAL media_ingest over the wire mints a real artifact_ref; the owner
+  dies; the successor rejects the OLD ref as unknown_artifact and a
+  fresh ingest mints a NEW ref; (B) a REAL ingest crashes between the
+  bounded temp copy and the atomic publish (acquire-wrap barrier):
+  .tmp residue only, NO <sha256>.bin, successor starts safely; (C) a
+  REAL post_photo confirm blocks at the kernel barrier WITH its
+  artifact pinned; stop begins; the artifact survives and the domain
+  stays locked; release terminalizes the work and post-drain retention
+  reclaims the artifact. F-97: the no-TCP proof reads BOTH
+  /proc/net/tcp and tcp6 (fd-inode owned-socket filtering). F-99:
+  corrupt-history split into T13 (effects) and T14 (reconciliations
+  ledgers) process cases; the state dir is 'effects.ndjson' not
+  'journal.ndjson'. HARNESS LESSONS (deep): an invoke-seam barrier
+  OUTSIDE the Dispatcher's invocation lock deadlocks stop()'s
+  lock-then-drain ordering (the released invoke re-enters the lock
+  stop holds) — barriers must sit INSIDE the kernel under the lock;
+  blocking only confirms lets preview-only requests complete and the
+  table never fills (the kernel barrier needs block_all); the
+  RetainedRequestTable bound is a DEF-TIME default parameter — patch
+  the CLASS name the server module resolves, not the constant; the
+  durable RESERVED row is written INSIDE the commit gate (the crash
+  point must sit after it); the token bucket completes unblocked
+  previews (3/3600s) so saturation fills must not depend on them; one
+  flood-client process replaces N client processes (cold-start cost);
+  a stub M5 stack needs ALL the executor attributes present or the
+  adapter lookup itself raises. Gate ALL GREEN: 1414 passed + 37
+  platform-skipped locally (Windows), ruff + mypy clean on 102 files.
+
+
+- **2026-10-07 — M7 Layer 7 round one (branch m7-layer7-posix-
+  qualification, from exact main 705ef6b): the multi-process
+  qualification harness first.** Per the frozen design ("Layers 7-8 are
+  qualification layers; production changes occur only when real
+  multi-process/platform evidence falsifies a frozen assumption"),
+  this round adds a real-process harness and qualification lanes, NOT
+  architecture. The harness (tests/_m7_layer7_harness.py +
+  _m7_layer7_worker.py): a controller spawning REAL worker processes —
+  real AuthorityOwnerLock, real AuthoritySession, real Dispatcher with
+  production IPC — observing only process/OS boundaries (exit codes,
+  worker JSON records, rendezvous/endpoint state, durable rows); gate
+  files are test orchestration only, never authority signals. Worker
+  scenarios: lock-hold/probe, owner-die (unclean os._exit),
+  owner-hung (controller must kill), full-owner (real Dispatcher+IPC;
+  clean stop or unclean death on a gate), full-owner-write, ipc-request
+  (hello-verified send; optional disconnect-after-send fault),
+  ipc-raw (hex frames / oversized announcements / EOF probes), and
+  fork-child (POSIX). Lanes qualified so far, ALL on genuine sibling
+  processes: (1) ownership — simultaneous acquisition yields exactly
+  one owner (loser = authority_busy exit), clean release permits
+  immediate succession, process death permits succession ONLY after
+  the OS kills the hung owner; (2) crash/takeover — a full production
+  owner dies uncleanly, a real successor process acquires, hydrates,
+  reaches READY with a NEW instance id and serving endpoint, while a
+  contender during the live owner fails authority_busy before
+  browser/IPC; corrupt durable history refuses successor startup fail
+  closed; (3) lifecycle — clean stop releases for a successor
+  full-owner; a client disconnect after a mutating send leaves the
+  owner alive and a later clean stop completes in order; (4) IPC
+  faults — duplicate request_id over two real connections returns the
+  byte-stable retained frame; capacity saturation over real
+  connections refuses the extra connection AT THE ENDPOINT and service
+  resumes after the stalls drain; announced-oversized frames are
+  refused (clean EOF on POSIX / peer-close on pipes) with the owner
+  still serving; owner death after an uncertain mutation: the
+  successor starts cleanly and the OLD envelope is rejected as
+  stale_authority_instance — RPC uncertainty never became mutation
+  truth; (6) media boundary — artifact refs die with the owner (a
+  successor's registry is empty; staged bytes re-ingest as a NEW ref —
+  no replay authority survives), unclean death mid-ingress leaves at
+  most inert .tmp residue (never a half-written content-addressed
+  object), and the post-drain retention pass reclaims unpinned
+  artifacts at clean shutdown. POSIX-only lane (Linux CI): empirical
+  socket mode 0600 in the authority domain; stale-path successor
+  rebinding; fork-child — the inherited descriptor does NOT keep the
+  domain locked after parent death while the child lives; and
+  /proc-based proof the production owner holds NO listening TCP
+  socket. ONE production delta, each evidence-driven and
+  mechanism-tiny: _WindowsPipeConnection.settimeout became a no-op
+  (socket-API compatibility — socket-shaped callers work unchanged on
+  both platforms; needed by the real-transport fault probes). The
+  inherited M5/M6 contracts carry via the full gate + CI unchanged
+  (lane 7 = the suites themselves). 15 cross-platform tests (Windows-
+  native locally) + 4 POSIX-only (CI Linux). Gate ALL GREEN: full
+  suite + ruff + mypy clean on 102 files. HARNESS LESSONS: a worker
+  must run gate waits OFF the event loop (blocking the loop deadlocks
+  every in-flight run_coroutine_threadsafe); the DOM port is stubbed
+  at Layer 7 so read-op assertions accept any well-formed frame (the
+  laws under test are retention/service, not the read result); the
+  fifth connection at capacity is refused at the ENDPOINT on Windows
+  (ConnectionError at connect) — that IS the saturation law observed
+  live; and a stub M5 read broker must be shaped (allowed_methods) or
+  even health raises.
+
+
 - **2026-10-07 — M7 Layer 6 MERGED (PR #29, squash `de3551d`).** The
   merge-gate pass at exact head `79a6658` returned MERGE-READY; F-82
   through F-91 all closed at the Layer-6 implementation boundary after

@@ -461,6 +461,305 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two FOURTH REPAIR (PR
+  #32, F-128..F-130): the harness's safety guarantee becomes
+  fail-closed, and the durable claim binds to the expected intent.**
+  The fourth-pass review (REQUEST CHANGES at `2ef95bf`, F-123/F-124/
+  F-127 confirmed closed, F-125 partial, F-126 reopened) found the
+  kill helper failed OPEN and two contained corrections; all repairs
+  tests/harness/record only. **F-128 (high, merge blocker, fixed):**
+  kill_pid_if_same_process previously killed on PRESENCE when the
+  recorded start time was unknown or /proc could not supply the
+  current one — the documented "a reused pid is never killed" was
+  not established. The helper is now FAIL-CLOSED: no recorded start
+  time, or no readable /proc record, or a mismatch PREVENTS the kill;
+  where /proc identity is unavailable (Windows, non-procfs POSIX)
+  the helper never kills (cleanup relies on gates, worker handles,
+  and the child's self-termination timeout — the claim is no longer
+  described as identity-safe there). ACCEPTANCE CONTROLS in the new
+  tests/test_m7_layer7_harness_safety.py: a LIVE pid with an unknown
+  recorded start time and a LIVE pid with a mismatched recorded
+  start time each receive NO termination (both run on every
+  platform), plus a /proc-gated positive path proving an
+  identity-MATCHED kill still acts. **F-129 (medium, fixed):** the
+  fork negative control's identity assertion previously required the
+  start-time record to disappear — invalid while the killed child
+  lingers as an unreaped zombie (same /proc record, same start time,
+  state Z). The control now distinguishes identity persisting as a
+  TERMINAL corpse (state Z/X/x accepted) from identity still
+  executing (the harness gains proc_state). **F-130 (medium,
+  fixed):** T65's durable claim is bound to the EXPECTED intent: the
+  expected hash is computed by PRODUCTION code
+  (PostTextCapability().compose(text, "@owner").intent_hash() — no
+  test-side reimplementation of normalization), and the assertions
+  require the exactly-one EFFECT_CONFIRMED row to carry that hash,
+  its RESERVED row to carry the same effect_id AND hash, and the
+  reservation to PRECEDE the terminal in append order; the ENOSPC
+  test asserts the FAULTED intent holds no confirmed terminal both
+  before and after the recovered mutation terminalizes. Validation
+  after this repair: Linux container lane 17/17 (prior 14 plus the
+  two fail-closed controls and the positive identity-matched kill);
+  local Windows full suite 1431 passed + 43 platform-skipped (the two
+  fail-closed controls run everywhere; the positive kill path rides
+  the /proc gate); final exact-head CI recorded in the PR. Zero
+  production-source delta unchanged from `36423cf`.
+
+
+- **2026-10-09 — M7 Layer 7 round two tranche two THIRD REPAIR (PR
+  #32, F-123..F-127): the fork variant receives the same survivor
+  discipline, and the evidence claims are bound to their intents.**
+  The third-pass review (REQUEST CHANGES at `997f3ab`) confirmed
+  F-117..F-122 closed in their repaired paths and found the SAME
+  survivor-liveness gap in the pre-existing fork test — T63's frozen
+  requirement covers fork AND spawn/exec, so Layer 7 could not close
+  while the fork branch passed without a surviving child. All repairs
+  tests/harness/record only. **F-123 (blocker, fixed):** the
+  fork-child worker now self-reports its kernel start time, and the
+  fork test verifies the SAME child — alive, zombie-rejected,
+  identity-tied — immediately before successor acquisition and again
+  after it acquired and exited, reusing the F-117 machinery (harness
+  pid_alive/proc_starttime). A FORK NEGATIVE CONTROL kills the fork
+  child after its readiness record and asserts the oracle reports it
+  dead. **F-124 (high, fixed):** the browser-child hold script now
+  writes a PER-CHILD readiness marker (browser-child-<pid>.pid)
+  whose content carries the child's own pid AND kernel start time;
+  T33 requires the SUCCESSOR's child's own readiness record — pid
+  and starttime matched against the live process — before accepting
+  the child-start claim, not merely a spawned non-zombie pid.
+  **F-125 (medium, fixed):** T65's durable assertions are now
+  STRUCTURED — the ledger is parsed as records and the claim is
+  exactly ONE lifecycle reaching EFFECT_CONFIRMED with its terminal
+  row bound (by effect_id) to a lifecycle that durably RESERVED
+  first; the ENOSPC test additionally asserts the FAULTED attempt
+  produced NO confirmed terminal before the recovered mutation
+  completes its own. **F-126 (medium, fixed):** harness gains
+  safe_open_gate (one gate's cleanup error cannot strand the others)
+  and kill_pid_if_same_process (a last-resort pid kill only under
+  /proc starttime identity — a reused pid is never killed); every
+  finally block in the child-survival lanes now uses both.
+  **F-127 (low, fixed):** the T33 docstrings consistently describe
+  the implemented preview-token oracle (the stale health-request
+  wording is gone). Validation after this repair: Linux container
+  lane 14/14 (prior 13 plus the fork negative control); local
+  Windows full suite 1429 passed + 42 platform-skipped (the fork
+  control rides the POSIX-only gate); final exact-head CI recorded in
+  the PR. Zero production-source delta unchanged from `36423cf`.
+
+
+- **2026-10-09 — M7 Layer 7 round two tranche two SECOND REPAIR (PR
+  #32, F-117..F-122): survivor liveness proven at every checkpoint,
+  and T33's service oracle upgraded to an execution oracle with
+  adversarial negative controls.** The second-pass review (REQUEST
+  CHANGES at `a0a4700`) confirmed F-113..F-116 closed and found two
+  false-positive opportunities plus contained environment/record
+  issues; all repairs are tests/harness/record only. **F-117
+  (blocker, fixed):** T63 previously never checked the exec'd child
+  was alive WHEN the successor acquired — a child that died early
+  would have let the takeover assertion pass vacuously. The child now
+  self-reports its kernel start time (field 22 of /proc/self/stat) for
+  a PID-identity tie, and zombie-rejecting liveness (harness
+  pid_alive — /proc state Z/X/x fails) is asserted at THREE
+  checkpoints: before the parent dies, immediately before successor
+  acquisition, and after the successor acquired and exited (same
+  starttime = same process, not a reused pid). NEGATIVE CONTROL: a
+  test deliberately kills the child after its readiness record and
+  asserts the oracle reports it dead — the survivor assertions cannot
+  pass vacuously. **F-118 (blocker, fixed):** T33's service check —
+  "a dict with an ok field" — accepted well-formed PRE-ADMISSION
+  rejections (draining, stale-instance) as service. The
+  owner-browser-child worker now logs every Dispatcher invocation
+  (the established _ipc_server._invoke seam), and the oracle requires
+  exactly ONE invoke reaching the successor's real Dispatcher PLUS a
+  REAL minted confirmation token in the response structure (only the
+  successor's live confirmation machinery can produce it; error
+  outcomes carry no token over the wire). NEGATIVE CONTROL: a
+  stale-instance preview request demonstrably satisfies the OLD
+  oracle while the execution oracle rejects it (invoke count zero, no
+  token). **F-119 (high, fixed):** the T60 foreign-uid experiment now
+  runs in an INDEPENDENTLY OWNED disposable tree directly under /tmp
+  (mkdtemp) — pytest's shared tmp_path hierarchy is never widened;
+  only the run's own directories are chmod'd, and the tree is
+  destroyed in a finally block, so no widened permission survives the
+  test. **F-120 (medium, fixed):** T33 and T63 cleanup is now
+  exception-safe across the WHOLE lifecycle — outer try/finally with
+  independent best-effort handling of each process (owner kill,
+  successor kill, orphan gate + pid kill), so one cleanup failure
+  cannot strand the others. **F-121 (medium, fixed):** T65's claim
+  boundary tightened to what the evidence shows — production
+  mutation-admission and commit machinery exercised with a CONTROLLED
+  external-effect adapter (no real external post occurs; the port and
+  evidence reader are labeled as such in the worker), and the durable
+  side is now ASSERTED directly: "EFFECT_CONFIRMED" in
+  state_dir/effects.ndjson after each confirmed mutation (the
+  crash-matrix precedent). **F-122 (medium, fixed):** the record now
+  distinguishes intermediate CI evidence (the red runner-home run
+  37891164909 at e9b066a; then green runs 37892020434 at fdfbb4d,
+  37897545430 at 53c0ad0, and 37898312615 at a0a4700) from the FINAL
+  exact-head run,
+  which is recorded in the PR once this repair round's CI completes;
+  the historical sequence is preserved, not rewritten. Validation
+  after this repair: Linux container lane 13/13 (the prior 11 plus
+  the two negative controls); local Windows full suite 1429 passed +
+  41 platform-skipped (the T33 negative control is Windows-active;
+  the T63 control rides the POSIX-only gate); final exact-head CI
+  recorded in the PR. Zero production-source
+  delta unchanged from `36423cf`.
+
+
+- **2026-10-09 — M7 Layer 7 round two tranche two FIRST REPAIR (PR
+  #32, F-113..F-116): the RV03 hazard moved INSIDE the owner, and
+  T33 now exercises PRODUCTION SessionManager.start().** The
+  first-pass review (DO NOT MERGE at `ed6ab25`) found two
+  qualification mechanisms incomplete and a liveness-oracle defect;
+  all four repairs are tests/harness/record only — no production
+  change is justified, and none was made. **F-113 (blocker, fixed):**
+  the descriptor-churn experiment ran in the CONTROLLER process, so a
+  disallowed process-associated record-lock implementation could have
+  passed it — RV03's hazard is a descriptor closed INSIDE the
+  lock-owning process. The PROPER experiment now runs owner-locally:
+  the serving owner ITSELF opens and closes a SECOND descriptor to
+  authority.lock 40 times while its private owner handle stays held
+  (a POSIX fcntl record-lock primitive RELEASES on any same-process
+  descriptor close; the qualified open-file-description primitive
+  must not); a real successor is still refused; and the owner then
+  completes a full real mutation end-to-end (token mint through
+  durable confirmed effect, invoke count exactly the preview+confirm
+  pair). The foreign-process churn is retained, explicitly demoted to
+  SUPPLEMENTARY cross-process noise tolerance. **F-114 (blocker,
+  fixed):** T33 no longer replaces SessionManager.start() — the
+  PRODUCTION method runs unmodified (attach gate, owned-launch
+  selection, _restore_session; session_state "no_file" asserted from
+  the real restore path), with only the SuperBrowser dependency
+  substituted at its module boundary (webwire.session.SuperBrowser)
+  by a controlled subprocess-backed adapter whose start() launches
+  the real OS child and stop() terminates it. Browser-binary platform
+  mechanics remain Layer 8's claim; the production launch/attach
+  decision is no longer bypassed. **F-115 (high, fixed):** _pid_alive
+  is now ZOMBIE-REJECTING (reads /proc/<pid>/stat state — Z/X/x fail;
+  the Windows exit-code path is unchanged), the child's OWN readiness
+  record (its self-written pid file, compared against the recorded
+  browser_child_pid) is required before the owner dies, and
+  non-zombie liveness of BOTH the orphan and the successor's child is
+  verified while the successor runs. **F-116 (medium, fixed):** the
+  foreign-uid launcher preflight now executes the ACTUAL interpreter
+  (importing json and socket) under the dropped identity instead of
+  running `id -u`, so a root-private Python installation can no
+  longer pass the preflight and then fail the probe. PR-body record
+  corrections: the stale peer-probe worker listing removed (the
+  standalone /tmp probe replaced it) and the CI run reference updated
+  to the final verified run. Gates after repair: exact-head CI run
+  37897545430 all four jobs green — Linux 3.11 and 3.12 both 1452
+  passed + 16 skipped (all eight new tests active; +1 over the
+  pre-repair 1451 is the owner-local churn test); local Windows full
+  suite 1428 passed + 40 platform-skipped; Linux container lane 11/11
+  (posix_endpoint 6 incl. T60 with the interpreter preflight,
+  supported_faults 4 incl. the new owner-local churn, browser_child
+  1). Zero production-source delta unchanged from `36423cf`.
+
+
+- **2026-10-09 — M7 Layer 7 round two tranche two CANDIDATE (from exact
+  main `36423cf`): the remaining qualification matrix — T63, T65, T60,
+  T64, T33 — exercised on real sibling processes; zero
+  production-source delta.** Built tests-first per the frozen handoff
+  order; every scenario observes process/OS boundaries only (exit
+  codes, JSON records, /proc fd tables, durable rows, real transport
+  exchanges). **T63 spawn/exec (the half round one left open):** the
+  owner parent spawns a REAL exec'd child — a fresh interpreter image
+  through the qualified subprocess path launched with
+  `close_fds=False`, the adverse setting where the production
+  close-on-exec contract is the ONLY barrier — and three laws hold:
+  the child's OWN fd table contains no descriptor resolving to
+  authority.lock (self-inspected via /proc on Linux), the child's own
+  AuthorityOwnerLock.acquire() is refused authority_busy while the
+  parent lives (it cannot USE the parent's ownership), and after the
+  parent's unclean death a successor acquires while the exec'd child
+  still survives. **T65 supported-fault live ownership-loss (§9.4/
+  RV03/RV17):** three fault classes against a live SERVING full owner,
+  each proving the OS lock cannot disappear while the owner stays
+  alive and mutation-capable — (1) descriptor churn (as first written
+  this was the CONTROLLER-process half only, which F-113 corrected:
+  RV03's hazard is a descriptor closed INSIDE the owner process, and
+  the first repair added that PROPER experiment — the owner itself
+  opens/closes a second descriptor to authority.lock 40 times while
+  holding the private handle; the foreign-process churn remains as
+  supplementary cross-process noise tolerance: 40 open/read/close +
+  O_RDWR open/close cycles by the controller; empirically the
+  Windows CRT region lock is MANDATORY (a foreign read INSIDE the
+  locked byte is OS-refused — recorded as an observation, and POSIX
+  flock stays advisory so foreign reads succeed there, asserted), (2)
+  endpoint rendezvous unlink while the owner lives (POSIX): the T49
+  fault family striking a live owner — an ESTABLISHED connection
+  still delivers and is served (a real confirmation token is minted
+  past the fault), a real successor is still refused, and only after
+  the controller kills the owner does a successor acquire and rebind
+  the endpoint pathname, (3) an injected one-shot ENOSPC at the
+  confirm's durable reservation append (the effect-ledger
+  append_durable seam commit_gateway drives): the REQUEST degrades to
+  an error outcome over the real transport (never a false success),
+  the owner survives, a real successor is still refused, and the very
+  next mutation completes end-to-end through the real executor stack.
+  Adversarial destruction of authority.lock itself is explicitly NOT
+  injected — that is outside the supported-fault contract (the same
+  explicitly-outside-claim class as T56). **T60 peer-identity half
+  (the part the round-one socket-mode test left open):** a GENUINELY
+  foreign-uid process — sudo+nobody on non-root runners, setpriv→uid
+  65534 under root (containers) — reaches the live endpoint after the
+  controller deliberately widens only directory traversal and the
+  rendezvous mode to 0666, exposing the SECOND boundary: production
+  SO_PEERCRED closes the connection BEFORE any hello byte, the
+  listener keeps serving (same-user peers from other processes are
+  still served after the rejection), and the probe's own uid is in the
+  record so the identity difference is proven, not assumed. **T64
+  cross-process handshake negatives (build-id half; the
+  protocol-version half was already carried by T21's round-one raw
+  probes):** forged-foreign, truncated, empty, non-string, and OMITTED
+  runtime_build_id each receive the specific compatibility outcome
+  (build_mismatch / missing_build_id) over the real transport, the
+  invoke count stays ZERO — rejected BEFORE request admission, T64's
+  exact phrase — and the owner then serves exactly one same-build
+  valid request. **T33 surviving browser-child ownership:** the
+  harness's process-less browser stub is replaced by a REAL OS child
+  process (as first written, a SessionManager SUBCLASS launched the
+  child — F-114 corrected this so PRODUCTION SessionManager.start()
+  runs unmodified and only the SuperBrowser dependency is substituted;
+  the child is a fresh standing interpreter launched by the
+  production start path, terminated by production stop()) — real
+  surviving-child evidence at the boundary where the ownership law
+  lives; claim-scope: browser-binary mechanics remain Layer 8's
+  qualification, and the ambient-attach refusal half is production
+  code already unit-qualified in
+  test_session_persistence.py::test_attach_refused_without_allow_attach.
+  The owner dies uncleanly WITHOUT stopping its child; the orphan
+  survives (pid-observed at the OS boundary); the successor acquires
+  while the orphan lives, hydrates, starts its OWN child (a different
+  pid — never the orphan's), and serves a production request over the
+  real transport while the orphan is still alive: the orphan carries
+  no production authority. Harness additions (tests/_m7_layer7_worker.py):
+  owner-spawn-child/child-exec, owner-browser-child, full-owner-serving
+  (invoke-logged real M5 stack with a fully-serving port; a
+  qualification-wide token bucket on BOTH the dispatcher and the
+  write-kernel reference — the kernel captured its own at construction
+  — so T65's later mutations are not denied by the production 3/hour
+  post limit for reasons unrelated to the law under test). The T60
+  foreign-uid probe is a SELF-CONTAINED instrument staged under /tmp
+  (1777), born of two CI repair rounds: runner home directories are
+  750, so a foreign uid cannot traverse the checkout at all — the
+  probe needs no repo access, and its own uid ships in its stdout
+  record so the identity difference is proven, not assumed. Gates at
+  this head: GitHub Actions Linux (both 3.11 and 3.12) 1451 passed +
+  16 skipped — all SEVEN new tests active (tranche-one CI baseline
+  1444+16); local Windows full suite 1427 passed + 40 platform-skipped
+  (baseline 1423+37; +4 newly-active tests, +3 new platform skips);
+  Windows Server 2025 selected suites green (durability 170+4,
+  named-pipe IPC 46, rule store 57); ruff clean on src+tests; mypy
+  clean on src; zero production-source changes. Layer 7 status if
+  this tranche merges: round one + round two tranches one and two
+  MERGED and the qualification matrix
+  T16/T33/T34-T38/T48/T60/T63/T64/T65 fully qualified — Layer 7
+  qualification COMPLETE pending the merge-gate review; Layer 8 (NOT
+  STARTED) then owns the exhaustive Windows/native-browser claims.
+
+
 - **2026-10-08 — M7 Layer 7 round two tranche one MERGED (PR #31,
   squash `6382534`).** The merge-gate pass at exact head `45b927c`
   returned MERGE-READY; F-110, F-111, and F-112 closed after three
@@ -1713,18 +2012,18 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION STILL IN
-  PROGRESS (round one merged a4041ba, F-92..F-109 closed; round two
-  tranche one merged 2026-10-08, 6382534, after three repair rounds
-  and a merge-gate pass — T16, T34, T36, T37, T38, and T48 qualified;
-  F-110..F-112 closed; zero production-source delta across both
-  campaigns). STILL OPEN for later Layer-7 rounds: T63 (POSIX
-  spawn/exec child survival), T65 (live ownership-loss qualification),
-  T60 (POSIX peer-identity boundary), T64 (cross-process handshake
-  negatives), T33 (surviving browser-child ownership). The next work
-  REMAINS Layer 7 round two tranche two (not Layer 8 — Layer 8 is NOT
-  STARTED). Second adapter remains deferred until the M7 boundary is
-  stable.
+  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION NEARLY
+  COMPLETE (round one merged a4041ba, F-92..F-109 closed; round two
+  tranche one merged 2026-10-08, 6382534, T16/T34/T36/T37/T38/T48
+  qualified, F-110..F-112 closed; round two TRANCHE TWO submitted
+  2026-10-09 from exact 36423cf covering the ENTIRE remaining matrix —
+  T63 spawn/exec, T65 supported-fault live ownership-loss, T60
+  peer-identity, T64 handshake negatives, T33 surviving browser-child
+  with real child-process evidence — zero production delta across all
+  campaigns). If tranche two merges, the Layer-7 qualification matrix
+  is COMPLETE and the next milestone is Layer 8 (Windows/native
+  exhaustive qualification, NOT STARTED). Second adapter remains
+  deferred until the M7 boundary is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

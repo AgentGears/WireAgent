@@ -26,6 +26,74 @@ EXIT_BUSY = 23
 EXIT_DIED_UNCLEAN = 9  # os._exit code the owner-die scenarios use
 
 
+def pid_alive(pid: int) -> bool:
+    """Zombie-rejecting OS observation that a process is alive (F-115/
+    F-117): on /proc platforms the process STATE is read directly — a
+    PID that exists only as an unreaped corpse (state Z) or a dead/x
+    corpse is NOT alive; on Windows the exit-code probe decides; on
+    other POSIX the kill(0) presence check is the fallback."""
+
+    if pid <= 0:
+        return False
+    stat_path = Path(f"/proc/{pid}/stat")
+    if stat_path.exists():
+        try:
+            raw = stat_path.read_text(encoding="utf-8")
+            # Field 3 is the state letter; comm (field 2) may contain
+            # spaces/parens, so parse AFTER the last ')'.
+            state = raw[raw.rindex(")") + 1 :].split()[0]
+            return state not in {"Z", "X", "x"}
+        except (OSError, ValueError, IndexError):
+            return False
+    try:
+        import sys
+
+        if sys.platform == "win32":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(  # noqa: S606
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))  # noqa: S606
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)  # noqa: S606
+        import os
+
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError, PermissionError):
+        # PermissionError on POSIX: the process EXISTS but belongs to
+        # another uid — still alive for survival purposes.
+        import sys
+
+        return sys.platform != "win32" and isinstance(sys.exc_info()[1], PermissionError)
+
+
+def proc_starttime(pid: int):
+    """The kernel start time (field 22 of /proc/<pid>/stat, clock ticks)
+    — a stable process-IDENTITY tie for a PID across the whole
+    qualification window (F-117): the same pid with a different
+    starttime is a REUSED pid, not the same process. None where /proc
+    does not expose the stat file."""
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    if not stat_path.exists():
+        return None
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        fields = raw[raw.rindex(")") + 1 :].split()
+        return int(fields[19])  # field 22 overall; field 1 = pid, 2 = comm
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class WorkerHandle:
     """One running worker process plus its result plumbing."""
 
@@ -108,6 +176,57 @@ def gate(scratch: Path, name: str) -> Path:
 
 def open_gate(scratch: Path, name: str) -> None:
     gate(scratch, name).write_text("go", encoding="utf-8")
+
+
+def safe_open_gate(scratch: Path, name: str) -> None:
+    """Best-effort gate release that can never mask the active failure
+    (F-126): one gate's cleanup error must not strand the others."""
+
+    try:
+        open_gate(scratch, name)
+    except OSError:
+        pass
+
+
+def kill_pid_if_same_process(pid: int, starttime) -> bool:
+    """Identity-aware last-resort kill (F-126/F-128), FAIL-CLOSED: a
+    pid is terminated only when the recorded kernel start time is
+    KNOWN and /proc still shows the SAME process. Missing identity
+    evidence — no recorded start time, or no readable /proc record —
+    PREVENTS the kill rather than permitting it; a reused pid must
+    never be terminated. Where /proc identity is unavailable (Windows,
+    non-procfs POSIX), this helper never kills: cleanup relies on
+    gates, worker handles, and the child's own self-termination
+    timeout instead."""
+
+    if pid <= 0 or starttime is None:
+        return False
+    current = proc_starttime(pid)
+    if current is None or current != starttime:
+        return False
+    import os
+
+    try:
+        os.kill(pid, 9)
+        return True
+    except OSError:
+        return False
+
+
+def proc_state(pid: int):
+    """The state letter (field 3 of /proc/<pid>/stat) — used to
+    distinguish an identity persisting as an unreaped TERMINAL corpse
+    (Z/X/x) from one still executing (F-129). None where /proc does
+    not expose the record."""
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    if not stat_path.exists():
+        return None
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        return raw[raw.rindex(")") + 1 :].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def wait_exit(handle: WorkerHandle, timeout: float = 30.0) -> int:

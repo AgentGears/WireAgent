@@ -559,6 +559,77 @@ def test_T21_unknown_protocol_schema_oversized_refused_before_execution(tmp_path
         owner.wait()
 
 
+def test_T64_build_id_negatives_rejected_before_admission(tmp_path: Path) -> None:
+    """T64 PROPER cross-process: a client envelope whose EXACT
+    runtime_build_id differs from the owner's — a forged foreign build
+    id, an empty string, a non-string, or the field omitted entirely —
+    is rejected with the specific compatibility outcome over the REAL
+    transport, the invoke count stays ZERO (rejected before request
+    admission, which is T64's exact phrase), and the owner keeps
+    serving the same-build client afterwards. The protocol-version
+    half of T64 is already carried by the T21 raw probes above; this
+    test owns the build-id half."""
+    scratch = _scratch(tmp_path, "t64")
+    state_dir = scratch / "state"
+    owner, record, events_path = _counting_owner(scratch, state_dir, "t64")
+    try:
+        endpoint = Path(record["endpoint"])
+        build, instance = record["build_id"], record["instance_id"]
+
+        def _envelope(**overrides):
+            envelope = {
+                "protocol_version": 1,
+                "operation": "health",
+                "payload": {},
+                "request_id": secrets.token_hex(16),
+                "authority_instance_id": instance,
+                "runtime_build_id": build,
+            }
+            envelope.update(overrides)
+            return envelope
+
+        def _raw_probe(envelope: dict) -> dict:
+            spec = json.dumps([{"kind": "request", "envelope": envelope}, {"kind": "read-response"}])
+            raw = harness.start_worker(scratch, "ipc-raw", endpoint, build, spec)
+            return raw.result()["steps"][1]["response"]
+
+        # A different-artifact client: the envelope claims a build the
+        # owner is not. Exact-match means exact — no prefix, no shape.
+        assert (
+            _raw_probe(_envelope(runtime_build_id="0" * 64))["error"]["code"] == "build_mismatch"
+        )
+        assert (
+            _raw_probe(_envelope(runtime_build_id=build[:-1]))["error"]["code"] == "build_mismatch"
+        )
+        # Omission and degenerate forms cannot bypass the exact gate.
+        assert _raw_probe(_envelope(runtime_build_id=""))["error"]["code"] == "missing_build_id"
+        assert _raw_probe(_envelope(runtime_build_id=12345))["error"]["code"] == "missing_build_id"
+        forged = _envelope()
+        del forged["runtime_build_id"]
+        assert _raw_probe(forged)["error"]["code"] == "missing_build_id"
+
+        assert _invoke_count(events_path) == 0, "every T64 incompatibility rejected BEFORE admission"
+
+        env = _payload_file(scratch, {})
+        healthy = harness.start_worker(
+            scratch,
+            "ipc-request",
+            endpoint,
+            build,
+            instance,
+            "health",
+            env,
+            secrets.token_hex(16),
+            "normal",
+        )
+        healthy_record = healthy.result()
+        assert isinstance(healthy_record["response"], dict) and "ok" in healthy_record["response"]
+        assert _invoke_count(events_path) == 1, "exactly the one same-build valid request"
+    finally:
+        harness.open_gate(scratch, "stop-t64")
+        owner.wait()
+
+
 def test_T50_executable_pickle_attempt_never_deserialized(tmp_path: Path) -> None:
     """T50 PROPER (F-107): a GENUINELY EXECUTABLE benign pickle — its
     reducer would create a marker file if anything ever unpickled it —

@@ -421,7 +421,10 @@ def fork_child(result_path: Path, state_dir: Path, release_gate: Path) -> int:
     """(POSIX only) Acquire ownership, FORK a child, parent dies
     uncleanly; the child — which inherited the raw descriptor — must be
     unable to keep the domain locked: a successor must acquire while the
-    child lives. The child writes its own record and exits on the gate."""
+    child lives. The child writes its own record — including its
+    self-reported kernel start time (F-123: the controller proves the
+    SAME fork child survives the parent's death through takeover, not
+    merely that a child once existed) — and exits on the gate."""
     import os as _os
 
     if not hasattr(_os, "fork"):
@@ -440,7 +443,16 @@ def fork_child(result_path: Path, state_dir: Path, release_gate: Path) -> int:
     if pid == 0:
         # Child: inherited descriptors only, no release path. Hold until
         # the gate, then exit WITHOUT releasing (it never owned).
-        _write(child_result, {"child_alive": True, "pid": _os.getpid()})
+        record: dict[str, Any] = {"child_alive": True, "pid": _os.getpid()}
+        self_stat = Path("/proc/self/stat")
+        if self_stat.exists():
+            try:
+                raw = self_stat.read_text(encoding="utf-8")
+                fields = raw[raw.rindex(")") + 1 :].split()
+                record["starttime"] = int(fields[19])
+            except (OSError, ValueError, IndexError):
+                pass
+        _write(child_result, record)
         try:
             _wait_gate(release_gate, timeout=60)
         except Exception:
@@ -1397,6 +1409,493 @@ def full_owner_t16(
 
 
 # ---------------------------------------------------------------------------
+# T63: POSIX spawn/exec child survival (extends the fork lane)
+# ---------------------------------------------------------------------------
+
+
+def owner_spawn_child(
+    result_path: Path, state_dir: Path, die_gate: Path, child_gate: Path
+) -> int:
+    """(POSIX only) T63's spawn/exec parent: acquire the domain, spawn a
+    REAL exec'd child — a fresh interpreter image through the qualified
+    subprocess path, launched with close_fds=False so the ONLY thing
+    standing between the child and the owner descriptor is the
+    production close-on-exec contract — then die uncleanly on the gate
+    with the child still alive."""
+    import subprocess as _sp
+
+    if os.name != "posix":
+        _write(result_path, {"unsupported": True})
+        return 27
+
+    lock = AuthorityOwnerLock(state_dir)
+    try:
+        lock.acquire()
+    except AuthorityBusyError:
+        _write(result_path, {"acquired": False, "busy": True})
+        return 23
+
+    child_result = result_path.with_suffix(".child.json")
+    child = _sp.Popen(  # noqa: S603 - fixed interpreter + repo worker file
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "child-exec",
+            str(child_result),
+            str(state_dir),
+            str(child_gate),
+        ],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        close_fds=False,  # adverse setting: close-on-exec alone must suffice
+    )
+    _write(result_path, {"acquired": True, "busy": False, "child_pid": child.pid})
+    _wait_gate(die_gate)
+    os._exit(9)  # parent dies uncleanly with the exec'd child alive
+
+
+def child_exec(result_path: Path, state_dir: Path, release_gate: Path) -> int:
+    """(POSIX only) T63's exec'd child: a fresh interpreter image that
+    survived exec from an owner parent. It self-reports (a) whether any
+    descriptor in its OWN fd table still resolves to the authority lock
+    file — the empirical close-on-exec observation at the /proc OS
+    boundary, absent where the platform exposes no /proc — and (b) that
+    it cannot USE the living parent's ownership: its own
+    AuthorityOwnerLock.acquire() is refused authority_busy while the
+    parent holds the domain. It releases nothing (it never owned) and
+    exits on its gate."""
+    record: dict[str, Any] = {"child_alive": True, "pid": os.getpid()}
+
+    lock_path = str((state_dir / "authority.lock").resolve())
+    inherited = False
+    saw_procfs = False
+    proc_fd = Path("/proc/self/fd")
+    if proc_fd.exists():
+        saw_procfs = True
+        for fd_link in proc_fd.iterdir():
+            try:
+                if str(fd_link.readlink()) == lock_path:
+                    inherited = True
+            except OSError:
+                continue
+    if saw_procfs:
+        record["inherited_lock_fd"] = inherited
+    # F-117: the child self-reports its kernel start time (field 22 of
+    # /proc/self/stat) so the controller can prove the pid that
+    # survives the parent's death is THIS process, not a reused pid.
+    self_stat = Path("/proc/self/stat")
+    if self_stat.exists():
+        try:
+            raw = self_stat.read_text(encoding="utf-8")
+            fields = raw[raw.rindex(")") + 1 :].split()
+            record["starttime"] = int(fields[19])
+        except (OSError, ValueError, IndexError):
+            pass
+
+    child_lock = AuthorityOwnerLock(state_dir)
+    try:
+        child_lock.acquire()
+        record["child_acquire"] = "acquired"
+        child_lock.release()
+    except AuthorityBusyError:
+        record["child_acquire"] = "busy"
+    _write(result_path, record)
+    try:
+        _wait_gate(release_gate, timeout=120)
+    except Exception:  # noqa: BLE001 - the gate is best-effort cleanup
+        pass
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# T33: full owner whose runtime is a REAL OS child process
+# ---------------------------------------------------------------------------
+
+_CHILD_HOLD_SCRIPT = (
+    "import json, sys, time\n"
+    "marker_dir, gate, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+    "pid = __import__('os').getpid()\n"
+    "record = {'pid': pid}\n"
+    "try:\n"
+    "    raw = open(f'/proc/{pid}/stat').read()\n"
+    "    record['starttime'] = int(raw[raw.rindex(')') + 1:].split()[19])\n"
+    "except (OSError, ValueError, IndexError):\n"
+    "    pass\n"
+    # Per-child readiness marker (F-124): the file NAME binds the pid,
+    # the CONTENT carries the child's own identity (pid + kernel start
+    # time) — the controller matches BOTH against the live process.
+    "open(f'{marker_dir}/browser-child-{pid}.pid', 'w').write(json.dumps(record))\n"
+    "deadline = time.monotonic() + timeout\n"
+    "while not __import__('pathlib').Path(gate).exists():\n"
+    "    if time.monotonic() >= deadline:\n"
+    "        break\n"
+    "    time.sleep(0.1)\n"
+)
+
+
+class _ChildBackedBrowser:
+    """F-114: a controlled, subprocess-backed stand-in for SuperBrowser
+    injected at the DEPENDENCY boundary (``webwire.session.SuperBrowser``)
+    so PRODUCTION SessionManager.start() executes its real decision path —
+    attach gate, owned-launch selection, _restore_session. ``start()``
+    launches a REAL OS child process (the standing browser-child
+    surrogate); ``stop()`` terminates it. Test orchestration in THIS
+    process only; no production source is changed."""
+
+    def __init__(self, config: Any) -> None:
+        self.config = config
+        self._child: Any = None
+        self._stopped = False
+
+    async def start(self) -> Any:
+        from webwire.envelope import ok_result
+
+        if self._child is not None:
+            return ok_result(data={"already_started": True})
+        import subprocess as _sp
+
+        marker_dir = Path(self._ww_state_dir)  # noqa: ASYNC240
+        self._child = _sp.Popen(  # noqa: S603, ASYNC220 - fixed interpreter + inline hold script
+            [
+                sys.executable,
+                "-c",
+                _CHILD_HOLD_SCRIPT,
+                str(marker_dir),
+                str(self._child_gate),
+                "120",
+            ],
+            cwd=str(Path(__file__).resolve().parent.parent),  # noqa: ASYNC240
+        )
+        return ok_result(data={"child_pid": self._child.pid})
+
+    async def stop(self) -> Any:
+        import subprocess as _sp
+
+        from webwire.envelope import ok_result
+
+        self._stopped = True
+        if self._child is not None and self._child.poll() is None:
+            self._child.terminate()
+            try:
+                self._child.wait(timeout=10)
+            except _sp.TimeoutExpired:
+                self._child.kill()
+                self._child.wait(timeout=10)
+        return ok_result(data={"stopped": True})
+
+    async def save_session(self, path: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"saved": path})
+
+    async def load_session(self, path: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"loaded": path})
+
+
+def owner_browser_child(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    child_gate: Path,
+    die: bool,
+    events_path: Path = None,  # type: ignore[assignment]
+) -> int:
+    """T33's owner: a full production owner (real Dispatcher, real
+    authority, production IPC) whose runtime is a REAL OS child process
+    launched through PRODUCTION SessionManager.start() — the attach-gate
+    and owned-launch decision are the production code under
+    qualification (F-114); only the SuperBrowser dependency is a
+    controlled subprocess-backed stand-in. With ``events_path`` set
+    (F-118), every actual Dispatcher invocation is logged — the
+    controller's execution oracle for "the successor SERVES while the
+    orphan lives". The browser-child law (§17.6): the child is not
+    authority; a successor must start its OWN child and must never
+    attach to a survivor."""
+    import asyncio
+
+    import webwire.session as _session_module
+
+    def _build() -> Any:
+        from webwire.config import WebWireConfig
+        from webwire.dispatcher import Dispatcher
+        from webwire.session import SessionManager
+
+        def _child_backed_factory(config: Any) -> "_ChildBackedBrowser":
+            browser = _ChildBackedBrowser(config)
+            browser._child_gate = child_gate  # noqa: SLF001 - worker-side orchestration
+            browser._ww_state_dir = state_dir  # noqa: SLF001 - worker-side orchestration
+            return browser
+
+        # F-114: substitute ONLY the dependency; SessionManager.start()
+        # below is the untouched production method.
+        _session_module.SuperBrowser = _child_backed_factory  # type: ignore[assignment]
+
+        cfg = WebWireConfig(state_dir=state_dir, kill_env_var=None)
+        sm = SessionManager(cfg)  # production default config: LAUNCH (owned)
+        dispatcher = Dispatcher(cfg, session_manager=sm, enable_ipc=True)  # type: ignore[arg-type]
+        from types import SimpleNamespace
+
+        dispatcher._install_m5_live_stack = (  # type: ignore[method-assign]
+            lambda sb: setattr(
+                dispatcher,
+                "_m5_stack",
+                SimpleNamespace(
+                    read_broker=_StubSB(),
+                    post_text_executor=object(),
+                    reply_executor=object(),
+                    quote_executor=object(),
+                    delete_executor=object(),
+                    effect_executor=object(),
+                    media_executor=object(),
+                ),
+            )
+        )
+        return dispatcher
+
+    async def _run() -> int:
+        dispatcher = _build()
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(
+                result_path,
+                {"started": False, "error": getattr(started.error, "message", str(started))},
+            )
+            return 5
+        if events_path is not None:
+            original_invoke = dispatcher._invoke_admitted
+
+            async def _logging_invoke(name: str, payload: dict) -> Any:
+                with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                    fh.write(json.dumps({"invoke": name}) + "\n")
+                return await original_invoke(name, payload)
+
+            dispatcher._ipc_server._invoke = _logging_invoke
+        # Actor identity, established the way whoami would in
+        # production (M5 migrated writes require a resolved handle).
+        # Worker-side orchestration AFTER production start() has run —
+        # the startup decision under qualification (F-114) is untouched.
+        dispatcher._session.set_resolved_handle("@owner")
+        session = dispatcher._authority_session
+        browser = dispatcher._session._sb
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+                "browser_child_pid": browser._child.pid,
+                "ownership_mode": dispatcher._session.ownership,
+                "session_state": dispatcher._session.session_loaded_state,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        if die:
+            # Owner dies WITHOUT stopping its child: the child survives
+            # as an orphan exactly like a launched browser would.
+            os._exit(9)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# T65: serving owner for supported-fault qualification (invoke-counted)
+# ---------------------------------------------------------------------------
+
+
+class _ServingPostPort:
+    """The post-text DOM port shape, fully serving: fill/verify ok, and
+    a click_submit that runs the production commit gate (durable
+    RESERVED), then completes — no barrier, no death. Used by T65 where
+    the mutation must actually finish so the owner's mutation
+    capability after a fault is observable. CONTROLLED ADAPTER (F-121):
+    no external post occurs — the external-effect boundary is this
+    adapter; the qualification claim stops at production admission,
+    durable commit, and the terminal effect row. Paired with
+    _DieEvidence, which likewise supplies predetermined verification
+    data rather than observing a real surface."""
+
+    def __init__(self) -> None:
+        self.composer_text = ""
+
+    async def fill_composer(self, text: str) -> Any:
+        self.composer_text = text
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"filled": True})
+
+    async def read_composer_text(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"composer_text": self.composer_text})
+
+    async def verify_attachment_ready(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"ready": True})
+
+    async def count_attachments(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"count": 0})
+
+    async def close_composer(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"cleanup": "closed"})
+
+    async def attach_media(self, image_path: str) -> Any:
+        raise AssertionError("plain post must not attach media")
+
+    async def open_reply_on_target(self, post_url: str, target_post_id: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"opened": True})
+
+    async def open_quote_on_target(self, post_url: str, target_post_id: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"opened": True})
+
+    async def click_submit(
+        self, *, _commit_gate, _precommit_check, _expected_text, _expected_attachments
+    ) -> Any:
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"post_id": "99", "post_url": "https://x.com/owner/status/99"})
+
+
+def full_owner_serving(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    events_path: Path,
+    fault_ledger_once: str = "",
+    churn_marker: str = "",
+) -> int:
+    """T65's serving owner: a full production owner with the REAL M5
+    post-text executor stack (previews mint real tokens; confirms run
+    the durable commit gate and complete) and production IPC LIVE,
+    invoke-logged per actual Dispatcher invocation. With
+    ``fault_ledger_once`` set to a marker path, the M5 attempt-ledger
+    append raises one injected OSError(ENOSPC) — a supported I/O fault —
+    exactly once, then passes through untouched. With ``churn_marker``
+    set, the OWNER PROCESS ITSELF (F-113/RV03's exact hazard) opens and
+    closes a SECOND descriptor to authority.lock 40 times while the
+    private owner handle stays held, then writes the marker — a
+    process-associated record-lock implementation would release here;
+    the qualified open-file-description primitive must not."""
+    import asyncio
+
+    async def _run() -> int:
+        from types import SimpleNamespace
+
+        from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+        from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
+        from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+        from webwire.safety.scoped_authority import ScopedAuthorityBroker
+
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        # Qualification bucket: T65 drives several post previews/confirms
+        # against ONE owner process; the production default (3/hour) would
+        # deny the later mutations for rate reasons unrelated to the law
+        # under test. Worker-side orchestration only.
+        from webwire.safety.token_bucket import BucketLimits, TokenBucket
+
+        wide_bucket = TokenBucket(
+            limits={
+                "post": BucketLimits(max_count=100, window_seconds=3600),
+                "_global": BucketLimits(max_count=1000, window_seconds=300),
+            }
+        )
+        dispatcher._bucket = wide_bucket
+        # The kernel captured its own reference at construction time
+        # (write_kernel.py stores token_bucket on self._bucket) — widen
+        # BOTH, or the policy gate keeps the production 3/hour limits.
+        dispatcher._write_kernel._bucket = wide_bucket
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+
+        if churn_marker:
+            # F-113: RV03's hazard executes INSIDE the lock-owning
+            # process — a second descriptor to the very lock file (the
+            # canonical authority-domain rendezvous), opened and closed
+            # 40 times while the private owner handle stays held. A
+            # process-associated record-lock primitive (POSIX fcntl
+            # record locks) RELEASES on any same-process descriptor
+            # close; the qualified primitive must survive.
+            owner_lock_path = state_dir / "authority.lock"
+            for _cycle in range(40):
+                fd = os.open(owner_lock_path, os.O_RDWR)
+                os.close(fd)
+            _write(Path(churn_marker), {"owner_local_churn_done": True})
+
+        if fault_ledger_once:
+            # Supported I/O fault at the FIRST durable append of the next
+            # mutation (the confirm's durable reservation seam — the same
+            # append commit_gateway.py drives through the effect ledger).
+            # Instance-level patch: one owner, one ledger, no class-wide
+            # mutation.
+            marker = Path(fault_ledger_once)
+            ledger = dispatcher._m5_gateway._ledger
+            original_append = ledger.append_durable
+
+            def _faulting_append(*args: Any, **kwargs: Any) -> Any:
+                if not marker.exists():
+                    marker.write_text("armed", encoding="utf-8")
+                    raise OSError(28, "injected ENOSPC: supported I/O fault")
+                return original_append(*args, **kwargs)
+
+            ledger.append_durable = _faulting_append  # type: ignore[method-assign]
+
+        port = _ServingPostPort()
+        scoped = ScopedAuthorityBroker(port, dispatcher._m5_gateway, policies=DEFAULT_EFFECT_POLICIES)
+        runtime = M5ExecutionRuntime(
+            scoped_authority=scoped,
+            commit_gateway=dispatcher._m5_gateway,
+            policies=DEFAULT_EFFECT_POLICIES,
+        )
+        dispatcher._m5_stack = SimpleNamespace(
+            read_broker=_StubSB(),
+            post_text_executor=M5ActorBoundPostTextExecutor(runtime=runtime, evidence_reader=_DieEvidence()),
+        )
+
+        original_invoke = dispatcher._invoke_admitted
+
+        async def _logging_invoke(name: str, payload: dict) -> Any:
+            with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                fh.write(json.dumps({"invoke": name}) + "\n")
+            return await original_invoke(name, payload)
+
+        dispatcher._ipc_server._invoke = _logging_invoke
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1470,6 +1969,28 @@ def main(argv: list[str]) -> int:
         return full_owner_m5_serving(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "full-owner-tablesat":
         return full_owner_tablesat(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
+    if scenario == "owner-spawn-child":
+        return owner_spawn_child(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
+    if scenario == "child-exec":
+        return child_exec(result_path, Path(raw[0]), Path(raw[1]))
+    if scenario == "owner-browser-child":
+        return owner_browser_child(
+            result_path,
+            Path(raw[0]),
+            Path(raw[1]),
+            Path(raw[2]),
+            raw[3] == "die",
+            Path(raw[4]) if len(raw) > 4 else None,
+        )
+    if scenario == "full-owner-serving":
+        return full_owner_serving(
+            result_path,
+            Path(raw[0]),
+            Path(raw[1]),
+            Path(raw[2]),
+            raw[3] if len(raw) > 3 else "",
+            raw[4] if len(raw) > 4 else "",
+        )
     print(f"unknown scenario {scenario}", file=sys.stderr)
     return 2
 

@@ -531,21 +531,26 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   pid — never the orphan's), and serves a production request over the
   real transport while the orphan is still alive: the orphan carries
   no production authority. Harness additions (tests/_m7_layer7_worker.py):
-  owner-spawn-child/child-exec, peer-probe (stdout-record foreign-uid
-  probe), owner-browser-child, full-owner-serving (invoke-logged real
-  M5 stack with a fully-serving port; a qualification-wide token
-  bucket on BOTH the dispatcher and the write-kernel reference — the
-  kernel captured its own at construction — so T65's later mutations
-  are not denied by the production 3/hour post limit for reasons
-  unrelated to the law under test). Gates at this head: local Windows
-  full suite 1427 passed + 40 platform-skipped (tranche one baseline
-  1423+37; +4 newly-active tests, +3 new platform skips); a real
-  Linux container run (python:3.11, the CI install recipe)
-  1447 passed + 16 skipped (CI Linux baseline 1444+16; +3 newly-active
-  POSIX tests: T63 spawn/exec, T60 foreign-uid via setpriv, T65-B
-  rendezvous unlink); ruff clean on src+tests; zero production-source
-  changes. Layer 7 status if this tranche merges: round one + round
-  two tranches one and two MERGED and the qualification matrix
+  owner-spawn-child/child-exec, owner-browser-child, full-owner-serving
+  (invoke-logged real M5 stack with a fully-serving port; a
+  qualification-wide token bucket on BOTH the dispatcher and the
+  write-kernel reference — the kernel captured its own at construction
+  — so T65's later mutations are not denied by the production 3/hour
+  post limit for reasons unrelated to the law under test). The T60
+  foreign-uid probe is a SELF-CONTAINED instrument staged under /tmp
+  (1777), born of two CI repair rounds: runner home directories are
+  750, so a foreign uid cannot traverse the checkout at all — the
+  probe needs no repo access, and its own uid ships in its stdout
+  record so the identity difference is proven, not assumed. Gates at
+  this head: GitHub Actions Linux (both 3.11 and 3.12) 1451 passed +
+  16 skipped — all SEVEN new tests active (tranche-one CI baseline
+  1444+16); local Windows full suite 1427 passed + 40 platform-skipped
+  (baseline 1423+37; +4 newly-active tests, +3 new platform skips);
+  Windows Server 2025 selected suites green (durability 170+4,
+  named-pipe IPC 46, rule store 57); ruff clean on src+tests; mypy
+  clean on src; zero production-source changes. Layer 7 status if
+  this tranche merges: round one + round two tranches one and two
+  MERGED and the qualification matrix
   T16/T33/T34-T38/T48/T60/T63/T64/T65 fully qualified — Layer 7
   qualification COMPLETE pending the merge-gate review; Layer 8 (NOT
   STARTED) then owns the exhaustive Windows/native-browser claims.

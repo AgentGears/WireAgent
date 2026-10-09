@@ -461,6 +461,51 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two MERGED (PR #32,
+  squash `a91b677`): the qualification matrix is COMPLETE — Layer 7
+  closes within its stated boundaries.** The fifth-pass review
+  returned APPROVED FOR MERGE at exact head `c7af8ce` ("no
+  substantive qualification blocker remains in the reviewed scope");
+  the approval covered that head only, so F-131 (low, non-blocking —
+  a pid-reuse else-branch in the fork negative control) was NOT
+  folded in and is tracked above as follow-up cleanup. The tranche
+  went five review passes and four repair rounds (F-113..F-116
+  owner-local RV03 churn + production SessionManager.start() seam +
+  zombie oracle + interpreter preflight; F-117..F-122 survivor
+  liveness at every checkpoint with starttime identity + execution
+  oracle, both with adversarial negative controls + isolated /tmp
+  T60 tree + exception-safe cleanup + claim boundary; F-123..F-127
+  the fork variant's identical survivor discipline + per-child
+  readiness markers + structured ledger binding + fail-safe gates +
+  docstrings; F-128..F-130 fail-closed kill helper with live-pid
+  acceptance controls + zombie-aware control + intent-hash-bound
+  durable claims via production compose()). Qualified, all on real
+  sibling processes: T63 (fork AND spawn/exec — close-on-exec proven
+  at /proc, contender-busy, successor acquires while the SAME
+  identity-tied child survives, dead-child negative controls), T65
+  (three supported-fault classes vs a live serving owner: owner-local
+  descriptor churn inside the lock-owning process, endpoint
+  rendezvous loss with established-connection service, one-shot
+  ENOSPC at the durable reservation seam with the faulted intent
+  proven terminal-free), T60 (genuinely foreign-uid peer rejected
+  before hello by SO_PEERCRED, listener survives), T64 (build-id
+  handshake negatives rejected before admission, invoke count zero),
+  T33 (production start() launches a REAL OS child through
+  owned-launch; orphan survives pid- and starttime-verified;
+  successor starts its OWN child and executes a real preview-token
+  mint while the orphan lives). Final gates at the approved head
+  (CI 37915175948, all four jobs green first-try): Linux 3.11 and
+  3.12 both 1458 passed + 16 skipped; Windows durability 170+4,
+  named-pipe IPC 46, rule store 57; ruff + mypy clean; local Windows
+  full suite 1431 passed + 43 platform-skipped; Linux container lane
+  17/17. Zero production-source delta from `36423cf` (and across all
+  Layer-7 campaigns from `ea83835`): qualification found test and
+  evidence defects, never a falsified production assumption. THE
+  NEXT MILESTONE IS LAYER 8 (Windows/native exhaustive
+  qualification, NOT STARTED) — including the real browser-binary
+  behavior the controlled T33 adapter deliberately does not qualify.
+
+
 - **2026-10-09 — M7 Layer 7 round two tranche two FOURTH REPAIR (PR
   #32, F-128..F-130): the harness's safety guarantee becomes
   fail-closed, and the durable claim binds to the expected intent.**
@@ -2012,17 +2057,27 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION NEARLY
-  COMPLETE (round one merged a4041ba, F-92..F-109 closed; round two
-  tranche one merged 2026-10-08, 6382534, T16/T34/T36/T37/T38/T48
-  qualified, F-110..F-112 closed; round two TRANCHE TWO submitted
-  2026-10-09 from exact 36423cf covering the ENTIRE remaining matrix —
-  T63 spawn/exec, T65 supported-fault live ownership-loss, T60
-  peer-identity, T64 handshake negatives, T33 surviving browser-child
-  with real child-process evidence — zero production delta across all
-  campaigns). If tranche two merges, the Layer-7 qualification matrix
-  is COMPLETE and the next milestone is Layer 8 (Windows/native
-  exhaustive qualification, NOT STARTED). Second adapter remains
+  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION COMPLETE
+  within its explicitly defined boundaries (round one merged a4041ba,
+  F-92..F-109 closed; round two tranche one merged 6382534,
+  T16/T34/T36/T37/T38/T48 qualified, F-110..F-112 closed; round two
+  tranche two merged 2026-10-09, a91b677, after five review passes
+  and four repair rounds — T63 fork+spawn/exec survival, T65
+  supported-fault live ownership-loss, T60 peer identity, T64
+  handshake negatives, T33 surviving browser-child takeover all
+  qualified; F-113..F-130 closed; zero production delta across every
+  Layer-7 campaign from ea83835). Boundaries: T33's browser child is
+  a controlled subprocess-backed adapter (production
+  SessionManager.start() runs unmodified; browser-BINARY behavior is
+  Layer 8's claim), and T65's external effect is the controlled
+  adapter (durable admission/commit/evidence claims only, no real
+  external post). NEXT MILESTONE: Layer 8 — Windows/native exhaustive
+  qualification (NOT STARTED). Follow-ups tracked separately, neither
+  blocking: F-131 (low — pid-reuse else-branch in the fork negative
+  control could false-fail under an unusual reuse sequence; small
+  test cleanup) and the pre-existing Layer-4 Windows pipe-busy 231
+  flake (any future retry must be limited to demonstrably
+  pre-admission connection failures). Second adapter remains
   deferred until the M7 boundary is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion

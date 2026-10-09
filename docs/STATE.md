@@ -461,6 +461,50 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two FOURTH REPAIR (PR
+  #32, F-128..F-130): the harness's safety guarantee becomes
+  fail-closed, and the durable claim binds to the expected intent.**
+  The fourth-pass review (REQUEST CHANGES at `2ef95bf`, F-123/F-124/
+  F-127 confirmed closed, F-125 partial, F-126 reopened) found the
+  kill helper failed OPEN and two contained corrections; all repairs
+  tests/harness/record only. **F-128 (high, merge blocker, fixed):**
+  kill_pid_if_same_process previously killed on PRESENCE when the
+  recorded start time was unknown or /proc could not supply the
+  current one — the documented "a reused pid is never killed" was
+  not established. The helper is now FAIL-CLOSED: no recorded start
+  time, or no readable /proc record, or a mismatch PREVENTS the kill;
+  where /proc identity is unavailable (Windows, non-procfs POSIX)
+  the helper never kills (cleanup relies on gates, worker handles,
+  and the child's self-termination timeout — the claim is no longer
+  described as identity-safe there). ACCEPTANCE CONTROLS in the new
+  tests/test_m7_layer7_harness_safety.py: a LIVE pid with an unknown
+  recorded start time and a LIVE pid with a mismatched recorded
+  start time each receive NO termination (both run on every
+  platform), plus a /proc-gated positive path proving an
+  identity-MATCHED kill still acts. **F-129 (medium, fixed):** the
+  fork negative control's identity assertion previously required the
+  start-time record to disappear — invalid while the killed child
+  lingers as an unreaped zombie (same /proc record, same start time,
+  state Z). The control now distinguishes identity persisting as a
+  TERMINAL corpse (state Z/X/x accepted) from identity still
+  executing (the harness gains proc_state). **F-130 (medium,
+  fixed):** T65's durable claim is bound to the EXPECTED intent: the
+  expected hash is computed by PRODUCTION code
+  (PostTextCapability().compose(text, "@owner").intent_hash() — no
+  test-side reimplementation of normalization), and the assertions
+  require the exactly-one EFFECT_CONFIRMED row to carry that hash,
+  its RESERVED row to carry the same effect_id AND hash, and the
+  reservation to PRECEDE the terminal in append order; the ENOSPC
+  test asserts the FAULTED intent holds no confirmed terminal both
+  before and after the recovered mutation terminalizes. Validation
+  after this repair: Linux container lane 17/17 (prior 14 plus the
+  two fail-closed controls and the positive identity-matched kill);
+  local Windows full suite 1431 passed + 43 platform-skipped (the two
+  fail-closed controls run everywhere; the positive kill path rides
+  the /proc gate); final exact-head CI recorded in the PR. Zero
+  production-source delta unchanged from `36423cf`.
+
+
 - **2026-10-09 — M7 Layer 7 round two tranche two THIRD REPAIR (PR
   #32, F-123..F-127): the fork variant receives the same survivor
   discipline, and the evidence claims are bound to their intents.**

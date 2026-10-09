@@ -85,19 +85,58 @@ def _ledger_rows(state_dir: Path) -> list:
     ]
 
 
-def _assert_one_lifecycle_confirmed_terminal(state_dir: Path, why: str) -> None:
-    """Exactly ONE effect lifecycle reached the durable EFFECT_CONFIRMED
-    terminal, and that terminal row belongs to a lifecycle that also
-    durably RESERVED (F-125: the terminal state is bound to the
-    confirmed mutation, not asserted as a bare substring)."""
+def _expected_intent_hash(text: str) -> str:
+    """The expected durable intent hash for one post mutation, computed
+    by PRODUCTION code (F-130): the capability's own compose() builds
+    the WriteIntent exactly as the serving path does, and the intent's
+    canonical hash is what the effect ledger persists. No test-side
+    reimplementation of normalization or hashing."""
+
+    from webwire.capabilities.post_text import PostTextCapability
+
+    return PostTextCapability().compose({"text": text}, "@owner").intent_hash()
+
+
+def _assert_intent_confirmed_terminal(state_dir: Path, text: str, why: str) -> None:
+    """F-125/F-130: the EXPECTED mutation's durable lifecycle — its
+    RESERVED record (same effect_id, same intent_hash) PRECEDES its
+    exactly-one EFFECT_CONFIRMED terminal in append order. The claim
+    is bound to the specific mutation, not to a substring any
+    unrelated row could satisfy."""
 
     rows = _ledger_rows(state_dir)
+    expected = _expected_intent_hash(text)
     confirmed = [r for r in rows if r.get("state") == "EFFECT_CONFIRMED"]
     assert len(confirmed) == 1, f"{why}: exactly one confirmed terminal row, got {len(confirmed)}"
-    reserved_ids = {r.get("effect_id") for r in rows if r.get("state") == "RESERVED"}
-    assert confirmed[0].get("effect_id") in reserved_ids, (
-        f"{why}: the terminal row belongs to a lifecycle that durably RESERVED first"
+    terminal = confirmed[0]
+    assert terminal.get("intent_hash") == expected, (
+        f"{why}: the terminal row carries the EXPECTED mutation's intent hash "
+        f"({terminal.get('intent_hash')!r} != {expected!r})"
     )
+    term_idx = rows.index(terminal)
+    reserved = [
+        i
+        for i, r in enumerate(rows)
+        if r.get("state") == "RESERVED"
+        and r.get("effect_id") == terminal.get("effect_id")
+        and r.get("intent_hash") == expected
+    ]
+    assert reserved, f"{why}: the same lifecycle (effect_id + intent hash) durably RESERVED first"
+    assert max(reserved) < term_idx, (
+        f"{why}: the reservation PRECEDES the terminal record in append order"
+    )
+
+
+def _assert_intent_not_confirmed(state_dir: Path, text: str, why: str) -> None:
+    """F-130: the named mutation must NOT hold a durable confirmed
+    terminal — the faulted attempt cannot terminalize."""
+
+    rows = _ledger_rows(state_dir)
+    expected = _expected_intent_hash(text)
+    offenders = [
+        r for r in rows if r.get("state") == "EFFECT_CONFIRMED" and r.get("intent_hash") == expected
+    ]
+    assert not offenders, f"{why}: the faulted mutation must not hold a confirmed terminal"
 
 
 def _preview(scratch: Path, record: dict, text: str) -> str:
@@ -185,8 +224,8 @@ def test_T65_owner_local_descriptor_churn_never_releases_live_ownership(tmp_path
             f"after owner-local churn: {response}"
         )
         assert _invoke_count(events_path) == 2, "exactly the preview + confirm pair"
-        _assert_one_lifecycle_confirmed_terminal(
-            state_dir, "the churn-surviving owner's confirmed mutation"
+        _assert_intent_confirmed_terminal(
+            state_dir, "t65 owner-local churn mutation", "the churn-surviving owner's confirmed mutation"
         )
     finally:
         harness.open_gate(scratch, "stop-ownchurn")
@@ -371,11 +410,10 @@ def test_T65_durable_append_io_fault_degrades_the_request_not_the_ownership(tmp_
         _assert_successor_refused(
             scratch, state_dir, "an in-owner I/O fault must not release live ownership"
         )
-        # F-125: the faulted attempt must NOT have terminalized durably —
-        # no lifecycle reaches EFFECT_CONFIRMED while its durability
-        # seam is faulted.
-        assert not [r for r in _ledger_rows(state_dir) if r.get("state") == "EFFECT_CONFIRMED"], (
-            "the faulted confirmation must not produce a durable confirmed terminal"
+        # F-125/F-130: the FAULTED mutation must not have terminalized
+        # durably — its own intent holds no confirmed terminal.
+        _assert_intent_not_confirmed(
+            state_dir, "t65 io faulted mutation", "the faulted confirmation"
         )
 
         # Mutation 2 — the transient fault is spent; the owner completes
@@ -387,8 +425,13 @@ def test_T65_durable_append_io_fault_degrades_the_request_not_the_ownership(tmp_
         assert isinstance(response2, dict) and response2.get("ok"), (
             f"the owner remains mutation-capable after the I/O fault: {response2}"
         )
-        _assert_one_lifecycle_confirmed_terminal(
-            state_dir, "the recovered mutation after the one-shot I/O fault"
+        _assert_intent_confirmed_terminal(
+            state_dir, "t65 io recovered mutation", "the recovered mutation after the one-shot I/O fault"
+        )
+        # The RECOVERED mutation terminalized; the FAULTED one never did
+        # (F-130's exclusivity: two different intents, one terminal).
+        _assert_intent_not_confirmed(
+            state_dir, "t65 io faulted mutation", "the faulted confirmation, after recovery"
         )
     finally:
         harness.open_gate(scratch, "stop-io")

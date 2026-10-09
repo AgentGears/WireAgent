@@ -189,20 +189,21 @@ def safe_open_gate(scratch: Path, name: str) -> None:
 
 
 def kill_pid_if_same_process(pid: int, starttime) -> bool:
-    """Identity-aware last-resort kill (F-126): terminate by pid ONLY
-    when /proc still shows the SAME process (matching kernel start
-    time, when the caller recorded one), so a reused pid is never
-    killed. Returns whether a kill was issued."""
+    """Identity-aware last-resort kill (F-126/F-128), FAIL-CLOSED: a
+    pid is terminated only when the recorded kernel start time is
+    KNOWN and /proc still shows the SAME process. Missing identity
+    evidence — no recorded start time, or no readable /proc record —
+    PREVENTS the kill rather than permitting it; a reused pid must
+    never be terminated. Where /proc identity is unavailable (Windows,
+    non-procfs POSIX), this helper never kills: cleanup relies on
+    gates, worker handles, and the child's own self-termination
+    timeout instead."""
 
-    if pid <= 0:
+    if pid <= 0 or starttime is None:
         return False
     current = proc_starttime(pid)
-    if current is None:
-        # No /proc identity available: fall back to presence-only.
-        if not pid_alive(pid):
-            return False
-    elif starttime is not None and current != starttime:
-        return False  # a different process now owns this pid
+    if current is None or current != starttime:
+        return False
     import os
 
     try:
@@ -210,6 +211,22 @@ def kill_pid_if_same_process(pid: int, starttime) -> bool:
         return True
     except OSError:
         return False
+
+
+def proc_state(pid: int):
+    """The state letter (field 3 of /proc/<pid>/stat) — used to
+    distinguish an identity persisting as an unreaped TERMINAL corpse
+    (Z/X/x) from one still executing (F-129). None where /proc does
+    not expose the record."""
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    if not stat_path.exists():
+        return None
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        return raw[raw.rindex(")") + 1 :].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def wait_exit(handle: WorkerHandle, timeout: float = 30.0) -> int:

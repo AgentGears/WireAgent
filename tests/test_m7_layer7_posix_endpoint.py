@@ -236,9 +236,19 @@ def test_T63_fork_negative_control_dead_child_is_detected(tmp_path: Path) -> Non
             "the liveness oracle must detect a terminated fork child"
         )
         if child_starttime is not None:
-            # The identity tie agrees: no same-starttime process remains.
+            # F-129: the identity may LINGER as an unreaped corpse —
+            # /proc/<pid>/stat can still exist with the SAME start time
+            # while the process state is a terminal Z/X/x. Same identity
+            # present as a zombie is NOT the child executing; assert
+            # terminal state when the identity record persists.
             current = harness.proc_starttime(child_pid)
-            assert current is None or current != child_starttime
+            if current == child_starttime:
+                state = harness.proc_state(child_pid)
+                assert state in {"Z", "X", "x"}, (
+                    f"persisting identity must be a terminal corpse, got state {state!r}"
+                )
+            else:
+                assert current is None, "the identity record is gone or reused"
     finally:
         harness.safe_open_gate(scratch, "release")
         if parent is not None and parent.poll() is None:

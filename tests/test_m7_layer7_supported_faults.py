@@ -70,6 +70,14 @@ def _invoke_count(events_path: Path) -> int:
     return len([line for line in events_path.read_text(encoding="utf-8").splitlines() if '"invoke"' in line])
 
 
+def _ledger_text(state_dir: Path) -> str:
+    """Durable M5 effect rows (the crash-matrix precedent): what the
+    confirmed mutation actually persisted."""
+
+    effects = state_dir / "effects.ndjson"
+    return effects.read_text(encoding="utf-8") if effects.exists() else ""
+
+
 def _preview(scratch: Path, record: dict, text: str) -> str:
     """One REAL preview through the production transport: mints a real
     confirmation token — mutation authority — from a separate client
@@ -142,14 +150,22 @@ def test_T65_owner_local_descriptor_churn_never_releases_live_ownership(tmp_path
             scratch, state_dir, "owner-local churn must not release live ownership"
         )
 
-        # The owner remains mutation-capable past the fault: a full real
-        # mutation (token mint through durable confirmed effect).
+        # The owner remains mutation-capable past the fault: a full
+        # confirmed mutation through the production admission+commit
+        # machinery. Claim boundary (F-121): the EXTERNAL effect itself
+        # is represented by the controlled adapter (no real post
+        # occurs); what IS asserted as real is the production
+        # admission, durable commit, and terminal effect row.
         token = _preview(scratch, record, "t65 owner-local churn mutation")
         response = _confirm(scratch, record, "t65 owner-local churn mutation", token)
         assert isinstance(response, dict) and response.get("ok"), (
-            f"the owner completes a real admitted mutation after owner-local churn: {response}"
+            f"the production commit machinery completes the confirmed mutation "
+            f"after owner-local churn: {response}"
         )
         assert _invoke_count(events_path) == 2, "exactly the preview + confirm pair"
+        assert "EFFECT_CONFIRMED" in _ledger_text(state_dir), (
+            "the confirmed mutation's terminal effect row is durably persisted"
+        )
     finally:
         harness.open_gate(scratch, "stop-ownchurn")
         owner.wait()
@@ -335,12 +351,16 @@ def test_T65_durable_append_io_fault_degrades_the_request_not_the_ownership(tmp_
         )
 
         # Mutation 2 — the transient fault is spent; the owner completes
-        # the full real mutation (durable reservation through verified
-        # effect) through the same live process.
+        # the full confirmed mutation through the same live process
+        # (production admission + durable commit + terminal effect row;
+        # the external effect itself is the controlled adapter — F-121).
         token2 = _preview(scratch, record, "t65 io recovered mutation")
         response2 = _confirm(scratch, record, "t65 io recovered mutation", token2)
         assert isinstance(response2, dict) and response2.get("ok"), (
             f"the owner remains mutation-capable after the I/O fault: {response2}"
+        )
+        assert "EFFECT_CONFIRMED" in _ledger_text(state_dir), (
+            "the recovered mutation's terminal effect row is durably persisted"
         )
     finally:
         harness.open_gate(scratch, "stop-io")

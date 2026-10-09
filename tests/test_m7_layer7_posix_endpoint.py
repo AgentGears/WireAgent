@@ -157,60 +157,159 @@ def test_spawn_exec_child_cannot_inherit_use_or_keep_ownership(tmp_path: Path) -
     interpreter image through the qualified subprocess path, launched
     with close_fds=False so the production close-on-exec contract is
     the ONLY thing standing between the child and the owner descriptor.
-    Three laws, all observed at process/OS boundaries: (1) the child's
+    Four laws, all observed at process/OS boundaries: (1) the child's
     OWN fd table contains no descriptor resolving to authority.lock
     (self-inspected through /proc, where the platform exposes it);
     (2) the child cannot USE the living parent's ownership — its own
     AuthorityOwnerLock.acquire() is refused authority_busy while the
-    parent holds; (3) after the parent's unclean death a successor
-    acquires while the exec'd child still lives — no retained, extended,
-    released, or exercised ownership survives exec."""
+    parent holds; (3) the exec'd child is STILL ALIVE — zombie-
+    rejecting, identity-tied to its self-reported /proc starttime —
+    both immediately before and immediately after the successor's
+    acquisition (F-117: takeover must occur WHILE the child survives,
+    not merely after a child existed); (4) after the parent's unclean
+    death a successor acquires — no retained, extended, released, or
+    exercised ownership survives exec."""
     scratch = _scratch(tmp_path, "spawn")
     state_dir = scratch / "state"
+    parent = successor = None
+    child_pid = None
 
-    parent = harness.start_worker(
-        scratch,
-        "owner-spawn-child",
-        state_dir,
-        harness.gate(scratch, "die"),
-        harness.gate(scratch, "child"),
-    )
-    record = parent.result()
-    assert record["acquired"] is True, record
-    child_json = parent.result_path.with_suffix(".child.json")
-    child_record = harness.wait_record(child_json)
-    assert child_record["child_alive"] is True
-    assert child_record["pid"] == record["child_pid"], "the exec'd child is the parent's spawned child"
-
-    # Law 2 — the contender observation is only meaningful while the
-    # parent provably still lives (it dies on its gate, still closed).
-    assert parent.poll() is None, "the parent must still be alive at the child's acquire attempt"
-    assert child_record["child_acquire"] == "busy", (
-        "a surviving exec'd child cannot use the living parent's ownership"
-    )
-
-    # Law 1 — the empirical close-on-exec observation (where /proc
-    # exposes the child's own fd table; Linux CI carries it).
-    if "inherited_lock_fd" in child_record:
-        assert child_record["inherited_lock_fd"] is False, (
-            "the owner descriptor must not survive exec into the child's fd table"
+    try:
+        parent = harness.start_worker(
+            scratch,
+            "owner-spawn-child",
+            state_dir,
+            harness.gate(scratch, "die"),
+            harness.gate(scratch, "child"),
         )
+        record = parent.result()
+        assert record["acquired"] is True, record
+        child_json = parent.result_path.with_suffix(".child.json")
+        child_record = harness.wait_record(child_json)
+        assert child_record["child_alive"] is True
+        child_pid = child_record["pid"]
+        assert child_pid == record["child_pid"], "the exec'd child is the parent's spawned child"
+        child_starttime = child_record.get("starttime")
 
-    harness.open_gate(scratch, "die")
-    deadline = time.monotonic() + 15
-    while parent.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert parent.poll() == harness.EXIT_DIED_UNCLEAN, "the parent died uncleanly with the child alive"
+        # Law 2 — the contender observation is only meaningful while the
+        # parent provably still lives (it dies on its gate, still closed).
+        assert parent.poll() is None, "the parent must still be alive at the child's acquire attempt"
+        assert child_record["child_acquire"] == "busy", (
+            "a surviving exec'd child cannot use the living parent's ownership"
+        )
+        # The surviving child is ALIVE and is THE SAME process (identity
+        # tie) BEFORE the parent dies.
+        assert harness.pid_alive(child_pid), "the exec'd child is executing before the parent dies"
+        if child_starttime is not None:
+            assert harness.proc_starttime(child_pid) == child_starttime, (
+                "the surviving child is the same process (starttime identity tie)"
+            )
 
-    # Law 3 — successor acquisition follows the chosen primitive
-    # contract: while the exec'd child still lives, a successor acquires.
-    successor = harness.start_worker(scratch, "lock-probe", state_dir)
-    assert successor.result()["acquired"] is True, (
-        "an exec'd child must not keep the domain locked after parent death"
-    )
-    assert successor.wait() == harness.EXIT_OK
+        # Law 1 — the empirical close-on-exec observation (where /proc
+        # exposes the child's own fd table; Linux CI carries it).
+        if "inherited_lock_fd" in child_record:
+            assert child_record["inherited_lock_fd"] is False, (
+                "the owner descriptor must not survive exec into the child's fd table"
+            )
 
-    harness.open_gate(scratch, "child")  # let the exec'd child exit
+        harness.open_gate(scratch, "die")
+        deadline = time.monotonic() + 15
+        while parent.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert parent.poll() == harness.EXIT_DIED_UNCLEAN, "the parent died uncleanly with the child alive"
+
+        # F-117 checkpoint A: the child SURVIVES the parent's death —
+        # alive, non-zombie, identity-tied — immediately BEFORE the
+        # successor acquisition.
+        assert harness.pid_alive(child_pid), (
+            "the exec'd child must still be alive when the successor acquires"
+        )
+        if child_starttime is not None:
+            assert harness.proc_starttime(child_pid) == child_starttime
+
+        # Law 4 — successor acquisition follows the chosen primitive
+        # contract: while the exec'd child still lives, a successor acquires.
+        successor = harness.start_worker(scratch, "lock-probe", state_dir)
+        assert successor.result()["acquired"] is True, (
+            "an exec'd child must not keep the domain locked after parent death"
+        )
+        assert successor.wait() == harness.EXIT_OK
+
+        # F-117 checkpoint B: the SAME child is STILL alive after the
+        # successor acquired and exited — the takeover happened while
+        # the child genuinely survived.
+        assert harness.pid_alive(child_pid), (
+            "the same exec'd child is still alive after the successor acquired"
+        )
+        if child_starttime is not None:
+            assert harness.proc_starttime(child_pid) == child_starttime, (
+                "the surviving pid is the SAME process, not a reused pid"
+            )
+    finally:
+        # Exception-safe cleanup (F-120): each process is handled
+        # independently — one failure must not strand the others.
+        harness.open_gate(scratch, "die")
+        harness.open_gate(scratch, "child")
+        if parent is not None and parent.poll() is None:
+            parent.kill()
+        if successor is not None and successor.poll() is None:
+            successor.kill()
+        if child_pid is not None:
+            deadline = time.monotonic() + 5
+            while harness.pid_alive(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if harness.pid_alive(child_pid):
+                try:
+                    os.kill(child_pid, 9)
+                except OSError:
+                    pass
+
+
+def test_T63_negative_control_dead_child_is_detected(tmp_path: Path) -> None:
+    """F-117's adversarial acceptance test: deliberately terminate the
+    exec'd child AFTER it writes its readiness record but BEFORE the
+    parent dies. The liveness oracle MUST detect the dead child —
+    proving the survivor assertions in the T63 test above cannot pass
+    vacuously with a child that died early."""
+    scratch = _scratch(tmp_path, "spawnctl")
+    state_dir = scratch / "state"
+    parent = None
+    child_pid = None
+
+    try:
+        parent = harness.start_worker(
+            scratch,
+            "owner-spawn-child",
+            state_dir,
+            harness.gate(scratch, "die"),
+            harness.gate(scratch, "child"),
+        )
+        record = parent.result()
+        assert record["acquired"] is True, record
+        child_json = parent.result_path.with_suffix(".child.json")
+        child_record = harness.wait_record(child_json)
+        assert child_record["child_alive"] is True
+        child_pid = child_record["pid"]
+        assert harness.pid_alive(child_pid)
+
+        # The adversarial act: kill the child while the parent still
+        # holds the domain.
+        os.kill(child_pid, 9)
+        deadline = time.monotonic() + 10
+        while harness.pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        # THE NEGATIVE CONTROL: the oracle reports the child dead. If
+        # this fails, the survivor assertion in the real T63 test is
+        # vacuous (a zombie or stale pid would satisfy it).
+        assert harness.pid_alive(child_pid) is False, (
+            "the liveness oracle must detect a terminated child"
+        )
+    finally:
+        harness.open_gate(scratch, "die")
+        harness.open_gate(scratch, "child")
+        if parent is not None and parent.poll() is None:
+            parent.kill()
 
 
 def _foreign_uid_launcher():
@@ -260,13 +359,15 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
     left open): a genuinely FOREIGN-UID process — a real identity
     difference at the kernel boundary, not a same-uid stand-in —
     connects to the live production endpoint. The 0600 socket mode and
-    the 0700 scratch tree are the FIRST boundary, so the controller
+    the 0700 tree are the FIRST boundary, so the controller
     deliberately widens traversal and the rendezvous mode to 0666 to
     let the foreign process REACH the endpoint and probe the SECOND
     boundary: production SO_PEERCRED checking. The foreign peer is
     closed BEFORE any hello byte; the listener keeps serving same-user
-    peers afterwards (rejection is not a listener failure). Skips
-    where no foreign uid can be obtained."""
+    peers afterwards (rejection is not a listener failure). F-119: the
+    ENTIRE experiment runs in an independently owned, disposable tree
+    directly under /tmp — pytest's shared tmp_path hierarchy is never
+    touched or widened. Skips where no foreign uid can be obtained."""
     import subprocess
 
     if not hasattr(socket, "SO_PEERCRED"):
@@ -275,16 +376,22 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
     if launcher is None:
         pytest.skip("no foreign-uid launcher here; the foreign-uid rejection half cannot be probed")
 
-    scratch = _scratch(tmp_path, "peerid")
-    state_dir = scratch / "state"
+    import tempfile
 
-    owner = harness.start_worker(scratch, "full-owner", state_dir, harness.gate(scratch, "stop"), "clean")
-    record = owner.result()
-    assert record["started"] is True
-    endpoint = Path(record["endpoint"])
-    staging: Path | None = None
+    root = Path(tempfile.mkdtemp(prefix="webwire-t60-", dir="/tmp"))
+    scratch = root / "peerid"
+    scratch.mkdir()
+    state_dir = scratch / "state"
+    owner = None
 
     try:
+        owner = harness.start_worker(
+            scratch, "full-owner", state_dir, harness.gate(scratch, "stop"), "clean"
+        )
+        record = owner.result()
+        assert record["started"] is True
+        endpoint = Path(record["endpoint"])
+
         # Baseline: a same-user peer from a DIFFERENT process is served
         # (the peer check must not over-restrict valid local clients).
         # T21 precedent: with the stub DOM surface, health returns a
@@ -312,27 +419,27 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
 
         _same_user_served("baseline")
 
-        # Deliberately widen ONLY the traversal + rendezvous mode so the
-        # foreign-uid process can reach the endpoint at all; the
-        # production peer check underneath is the boundary under
-        # qualification.
-        endpoint.chmod(0o666)
-        for directory in (endpoint.parent, scratch, tmp_path, *tmp_path.parents[:2]):
-            directory.chmod(directory.stat().st_mode | 0o111)
-
-        # Stage a SELF-CONTAINED probe script under /tmp (1777): the
-        # probe is a test INSTRUMENT — the boundary under test is the
-        # server's SO_PEERCRED check — so it needs no repo access.
+        # Stage a SELF-CONTAINED probe script in the SAME isolated tree:
+        # the probe is a test INSTRUMENT — the boundary under test is
+        # the server's SO_PEERCRED check — so it needs no repo access.
         # (Runner home directories are typically 750: a foreign uid
         # cannot traverse into the checkout at all, and widening the
         # runner's home is not ours to do.)
-        import tempfile
-
-        staging = Path(tempfile.mkdtemp(prefix="webwire-peer-probe-", dir="/tmp"))
-        staging.chmod(0o755)
+        staging = root / "probe"
+        staging.mkdir()
         probe_script = staging / "peer_probe.py"
         probe_script.write_text(_PEER_PROBE_SOURCE, encoding="utf-8")
-        probe_script.chmod(0o644)
+
+        # Deliberately widen ONLY this disposable tree — the rendezvous
+        # mode to 0666, traversal on THIS RUN'S OWN directories — so the
+        # foreign-uid process can reach the endpoint at all; the
+        # production peer check underneath is the boundary under
+        # qualification. /tmp itself is 1777; the tree is destroyed in
+        # the finally block, so no widening survives the test.
+        endpoint.chmod(0o666)
+        for directory in (staging, scratch, root):
+            directory.chmod(0o755)
+        state_dir.chmod(state_dir.stat().st_mode | 0o111)
 
         foreign = subprocess.run(
             [
@@ -357,12 +464,15 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
         # different process is still served after the rejection.
         _same_user_served("after-rejection")
     finally:
+        if owner is not None:
+            harness.open_gate(scratch, "stop")
+            try:
+                owner.wait(timeout=30)
+            except Exception:  # noqa: BLE001 - cleanup must never mask the failure
+                owner.kill()
         import shutil
 
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
-        harness.open_gate(scratch, "stop")
-        owner.wait()
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_no_tcp_listener_anywhere_in_the_owner(tmp_path: Path) -> None:

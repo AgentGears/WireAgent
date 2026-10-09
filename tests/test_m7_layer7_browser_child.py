@@ -22,6 +22,16 @@ production code already qualified in
 tests/test_session_persistence.py::test_attach_refused_without_allow_attach;
 this tranche owns the process-boundary half: production startup always
 selects owned-launch, even with a live orphan present.
+
+Execution oracle (F-118): "the successor SERVES a production request
+while the orphan lives" is proven by the Dispatcher invocation log —
+exactly ONE preview invoke reached the successor's real dispatcher —
+plus a REAL minted confirmation token in the response (a structure only
+the successor's live confirmation machinery can produce), not merely
+the presence of an ``ok`` field (a well-formed pre-admission rejection
+also carries ``ok``; the negative control below demonstrates that
+difference). Liveness is zombie-rejecting (F-115) and is re-verified
+while the successor runs (F-117 discipline).
 """
 
 from __future__ import annotations
@@ -42,50 +52,34 @@ def _scratch(tmp_path: Path, name: str) -> Path:
     return scratch
 
 
-def _pid_alive(pid: int) -> bool:
-    """Real OS observation of a child process's life, cross-platform —
-    and ZOMBIE-REJECTING (F-115): a PID that exists only as an unreaped
-    corpse is NOT a surviving child. On /proc platforms the process
-    state is read directly (state Z fails); elsewhere os.kill(pid, 0)
-    presence is the fallback."""
+def _invoke_count(events_path: Path) -> int:
+    if not events_path.exists():
+        return 0
+    return len([line for line in events_path.read_text(encoding="utf-8").splitlines() if '"invoke"' in line])
 
-    if pid <= 0:
-        return False
-    stat_path = Path(f"/proc/{pid}/stat")
-    if stat_path.exists():
-        try:
-            # Field 3 is the state letter; the comm field (2) may contain
-            # spaces/parens, so parse AFTER the last ')'.
-            raw = stat_path.read_text(encoding="utf-8")
-            state = raw[raw.rindex(")") + 1 :].split()[0]
-            return state not in {"Z", "X", "x"}
-        except (OSError, ValueError, IndexError):
-            return False
-    try:
-        if sys.platform == "win32":
-            import ctypes
 
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            STILL_ACTIVE = 259
-            handle = ctypes.windll.kernel32.OpenProcess(  # noqa: S606
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            if not handle:
-                return False
-            try:
-                code = ctypes.c_ulong()
-                ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))  # noqa: S606
-                return bool(ok) and code.value == STILL_ACTIVE
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)  # noqa: S606
-        import os as _os
-
-        _os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError, PermissionError):
-        # PermissionError on POSIX: the process EXISTS but belongs to
-        # another uid — still alive for survival purposes.
-        return sys.platform != "win32" and isinstance(sys.exc_info()[1], PermissionError)
+def _preview_request(scratch: Path, record: dict, text: str, *, instance_override: str = None):  # type: ignore[assignment]
+    """One REAL post_text preview over the production transport.
+    ``instance_override`` (the negative control) addresses a DEAD owner
+    instance — the request is rejected pre-admission with a
+    well-formed envelope. The preview response carries the minted
+    confirmation token in a distinctive structure — the token is
+    produced only by the successor's real confirmation machinery, so
+    its presence is execution evidence, not envelope shape."""
+    env = scratch / f"preview-{secrets.token_hex(4)}.json"
+    env.write_text(json.dumps({"text": text}), encoding="utf-8")
+    client = harness.start_worker(
+        scratch,
+        "ipc-request",
+        Path(record["endpoint"]),
+        record["build_id"],
+        instance_override if instance_override is not None else record["instance_id"],
+        "post_text",
+        env,
+        secrets.token_hex(16),
+        "normal",
+    )
+    return client.result()["response"]
 
 
 def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_path: Path) -> None:
@@ -98,62 +92,80 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
     SURVIVES as a genuinely-executing orphan (child-produced readiness
     record + zombie-rejecting liveness, F-115). The successor's
     production start() selects owned-launch again, starts its OWN child
-    (a different pid, never the orphan's), and serves a production
-    request over the real transport while the orphan still lives. The
-    orphan is never adopted, never blocks takeover, and carries no
-    production authority."""
+    (a different pid, never the orphan's), and EXECUTES a production
+    request while the orphan still lives — proven by the invocation log
+    (exactly one health invoke reached the successor's Dispatcher) and
+    the health diagnostic structure (F-118). The orphan is never
+    adopted, never blocks takeover, and carries no production
+    authority."""
     scratch = _scratch(tmp_path, "t33")
     state_dir = scratch / "state"
     child_gate = harness.gate(scratch, "child")
+    owner = successor = None
+    orphan_pid = successor_child_pid = None
 
-    owner = harness.start_worker(
-        scratch, "owner-browser-child", state_dir, harness.gate(scratch, "die"), child_gate, "die"
-    )
-    record = owner.result()
-    assert record["started"] is True, record
-    assert record["ownership_mode"] == "owned", (
-        "the PRODUCTION start() decision selected owned-launch (the attach gate + mode config)"
-    )
-    assert record["session_state"] == "no_file", (
-        "production _restore_session ran through the real start() path"
-    )
-    orphan_pid = record["browser_child_pid"]
-
-    # F-115: child-produced readiness — the CHILD ITSELF wrote its pid
-    # record; the orphan is proven executing (not zombie) BEFORE the
-    # owner dies.
-    readiness = state_dir / "browser-child.pid"
-    deadline = time.monotonic() + 10
-    while not readiness.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert readiness.read_text(encoding="utf-8").strip() == str(orphan_pid), (
-        "the child itself produced its readiness record"
-    )
-    assert _pid_alive(orphan_pid), "the browser child is executing before the owner dies"
-
-    # The owner dies uncleanly WITHOUT stopping its child: the child
-    # survives exactly like a launched browser would.
-    harness.open_gate(scratch, "die")
-    deadline = time.monotonic() + 15
-    while owner.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert owner.poll() == harness.EXIT_DIED_UNCLEAN, "the owner died uncleanly"
-
-    # THE SURVIVAL OBSERVATION: the orphan child is really still alive
-    # and executing — present AND not a zombie (F-115).
-    deadline = time.monotonic() + 10
-    while not _pid_alive(orphan_pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert _pid_alive(orphan_pid), "the browser child must survive the owner's unclean death"
-
-    # The successor: production start() runs again — owned-launch, its
-    # OWN child — while the orphan lives. The orphan never blocks
-    # takeover and is never adopted.
-    successor = harness.start_worker(
-        scratch, "owner-browser-child", state_dir, harness.gate(scratch, "done"), child_gate, "clean"
-    )
-    successor_record = successor.result()
     try:
+        events = scratch / "events.ndjson"
+        owner = harness.start_worker(
+            scratch,
+            "owner-browser-child",
+            state_dir,
+            harness.gate(scratch, "die"),
+            child_gate,
+            "die",
+            events,
+        )
+        record = owner.result()
+        assert record["started"] is True, record
+        assert record["ownership_mode"] == "owned", (
+            "the PRODUCTION start() decision selected owned-launch (the attach gate + mode config)"
+        )
+        assert record["session_state"] == "no_file", (
+            "production _restore_session ran through the real start() path"
+        )
+        orphan_pid = record["browser_child_pid"]
+
+        # F-115: child-produced readiness — the CHILD ITSELF wrote its
+        # pid record; the orphan is proven executing (not zombie) BEFORE
+        # the owner dies.
+        readiness = state_dir / "browser-child.pid"
+        deadline = time.monotonic() + 10
+        while not readiness.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert readiness.read_text(encoding="utf-8").strip() == str(orphan_pid), (
+            "the child itself produced its readiness record"
+        )
+        assert harness.pid_alive(orphan_pid), "the browser child is executing before the owner dies"
+
+        # The owner dies uncleanly WITHOUT stopping its child: the child
+        # survives exactly like a launched browser would.
+        harness.open_gate(scratch, "die")
+        deadline = time.monotonic() + 15
+        while owner.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert owner.poll() == harness.EXIT_DIED_UNCLEAN, "the owner died uncleanly"
+
+        # THE SURVIVAL OBSERVATION: the orphan child is really still
+        # alive and executing — present AND not a zombie (F-115).
+        deadline = time.monotonic() + 10
+        while not harness.pid_alive(orphan_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert harness.pid_alive(orphan_pid), "the browser child must survive the owner's unclean death"
+
+        # The successor: production start() runs again — owned-launch,
+        # its OWN child — while the orphan lives. The orphan never
+        # blocks takeover and is never adopted.
+        successor_events = scratch / "successor-events.ndjson"
+        successor = harness.start_worker(
+            scratch,
+            "owner-browser-child",
+            state_dir,
+            harness.gate(scratch, "done"),
+            child_gate,
+            "clean",
+            successor_events,
+        )
+        successor_record = successor.result()
         assert successor_record["started"] is True, successor_record
         assert successor_record["instance_id"] != record["instance_id"], "a fresh authority instance"
         assert successor_record["ownership_mode"] == "owned", (
@@ -167,49 +179,122 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
         # Both children are alive and executing simultaneously: the
         # orphan was never adopted, and the successor's runtime is its
         # own fresh process.
-        assert _pid_alive(orphan_pid), "the orphan is untouched by the takeover"
-        assert _pid_alive(successor_child_pid), "the successor's own child is executing"
+        assert harness.pid_alive(orphan_pid), "the orphan is untouched by the takeover"
+        assert harness.pid_alive(successor_child_pid), "the successor's own child is executing"
 
-        # The successor is a working production owner over the real
-        # transport WHILE the orphan still lives: mutation authority
-        # flows through the successor's runtime, not the orphan.
-        env = scratch / "health-payload.json"
-        env.write_text(json.dumps({}), encoding="utf-8")
-        client = harness.start_worker(
-            scratch,
-            "ipc-request",
-            Path(successor_record["endpoint"]),
-            successor_record["build_id"],
-            successor_record["instance_id"],
-            "health",
-            env,
-            secrets.token_hex(16),
-            "normal",
+        # F-118 EXECUTION ORACLE: the request must reach the successor's
+        # real Dispatcher (exactly one invoke) AND return a REAL minted
+        # confirmation token — a structure only the successor's live
+        # confirmation machinery can produce. A well-formed rejection
+        # alone does not qualify as service (the negative control below
+        # demonstrates the difference).
+        response = _preview_request(scratch, successor_record, "t33 successor serves while orphan lives")
+        assert isinstance(response, dict), response
+        token = (response.get("data") or {}).get("data", {}).get("confirmation_token")
+        assert token, f"a real confirmation token was minted by the successor: {response}"
+        assert _invoke_count(successor_events) == 1, (
+            "exactly one preview invocation reached the successor's real Dispatcher"
         )
-        response = client.result()["response"]
-        # T21 precedent: with the stub DOM surface the health operation
-        # returns a well-formed ok:false diagnostic — "serving" means the
-        # successor's transport+dispatch executed the operation, not that
-        # the stub browser reports green.
-        assert isinstance(response, dict) and "ok" in response, (
-            f"the successor serves production requests while the orphan lives: {response}"
-        )
-        assert _pid_alive(orphan_pid), "the orphan still carries no production authority"
+        assert harness.pid_alive(orphan_pid), "the orphan still carries no production authority"
     finally:
-        harness.open_gate(scratch, "done")
-        successor.wait(timeout=30)
-        # Orphan cleanup: the dead owner can never stop it; the CHILD
-        # GATE releases its self-termination loop, then the controller
-        # makes sure (kill by pid if the graceful exit lost the race).
-        harness.open_gate(scratch, "child")
-        deadline = time.monotonic() + 10
-        while _pid_alive(orphan_pid) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if _pid_alive(orphan_pid):
-            import os
+        # Exception-safe cleanup (F-120): each process independently.
+        for gate_name in ("die", "done", "child"):
+            harness.open_gate(scratch, gate_name)
+        for handle in (owner, successor):
+            if handle is not None and handle.poll() is None:
+                try:
+                    handle.kill()
+                except OSError:
+                    pass
+        for pid in (orphan_pid, successor_child_pid):
+            if pid is None:
+                continue
+            deadline = time.monotonic() + 10
+            while harness.pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if harness.pid_alive(pid):
+                import os
 
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        for handle in (owner, successor):
+            if handle is not None:
+                try:
+                    handle.wait(timeout=30)
+                except Exception:  # noqa: BLE001 - cleanup must never mask the failure
+                    pass
+
+
+def test_T33_negative_control_unadmitted_request_does_not_count_as_service(tmp_path: Path) -> None:
+    """F-118's adversarial acceptance test: force a PRE-ADMISSION IPC
+    rejection whose response envelope is well-formed (a stale
+    authority-instance health request). The OLD oracle — "a dict with
+    an ok field" — accepts this response, which is exactly the
+    false-positive path; the EXECUTION oracle (invoke count plus health
+    diagnostic structure) must reject it. This control proves the
+    service assertion in the T33 test above cannot pass on an
+    unadmitted request."""
+    scratch = _scratch(tmp_path, "t33ctl")
+    state_dir = scratch / "state"
+    child_gate = harness.gate(scratch, "child")
+    owner = None
+    orphan_pid = None
+
+    try:
+        events = scratch / "events.ndjson"
+        owner = harness.start_worker(
+            scratch,
+            "owner-browser-child",
+            state_dir,
+            harness.gate(scratch, "stop"),
+            child_gate,
+            "clean",
+            events,
+        )
+        record = owner.result()
+        assert record["started"] is True, record
+        orphan_pid = record["browser_child_pid"]
+
+        # The pre-admission fault: the envelope addresses a DEAD owner
+        # instance. The response is well-formed... but the request was
+        # never admitted.
+        response = _preview_request(scratch, record, "t33 negative control", instance_override="0" * 32)
+
+        # The FALSE-POSITIVE PATH, demonstrated: the old oracle accepts.
+        assert isinstance(response, dict) and "ok" in response, (
+            f"the old oracle would have accepted this rejection: {response}"
+        )
+        assert response.get("ok") is False, response
+
+        # The EXECUTION oracle rejects: nothing reached the Dispatcher,
+        # and no confirmation token was minted.
+        assert _invoke_count(events) == 0, "the stale-instance request was rejected BEFORE admission"
+        assert not (response.get("data") or {}).get("data", {}).get("confirmation_token"), (
+            "a pre-admission rejection mints no confirmation token"
+        )
+    finally:
+        harness.open_gate(scratch, "stop")
+        harness.open_gate(scratch, "child")
+        if owner is not None:
+            if owner.poll() is None:
+                try:
+                    owner.kill()
+                except OSError:
+                    pass
             try:
-                os.kill(orphan_pid, 9)
-            except OSError:
+                owner.wait(timeout=30)
+            except Exception:  # noqa: BLE001 - cleanup must never mask the failure
                 pass
-        owner.wait(timeout=30)
+        if orphan_pid is not None:
+            deadline = time.monotonic() + 10
+            while harness.pid_alive(orphan_pid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if harness.pid_alive(orphan_pid):
+                import os
+
+                try:
+                    os.kill(orphan_pid, 9)
+                except OSError:
+                    pass

@@ -461,6 +461,66 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two SECOND REPAIR (PR
+  #32, F-117..F-122): survivor liveness proven at every checkpoint,
+  and T33's service oracle upgraded to an execution oracle with
+  adversarial negative controls.** The second-pass review (REQUEST
+  CHANGES at `a0a4700`) confirmed F-113..F-116 closed and found two
+  false-positive opportunities plus contained environment/record
+  issues; all repairs are tests/harness/record only. **F-117
+  (blocker, fixed):** T63 previously never checked the exec'd child
+  was alive WHEN the successor acquired — a child that died early
+  would have let the takeover assertion pass vacuously. The child now
+  self-reports its kernel start time (field 22 of /proc/self/stat) for
+  a PID-identity tie, and zombie-rejecting liveness (harness
+  pid_alive — /proc state Z/X/x fails) is asserted at THREE
+  checkpoints: before the parent dies, immediately before successor
+  acquisition, and after the successor acquired and exited (same
+  starttime = same process, not a reused pid). NEGATIVE CONTROL: a
+  test deliberately kills the child after its readiness record and
+  asserts the oracle reports it dead — the survivor assertions cannot
+  pass vacuously. **F-118 (blocker, fixed):** T33's service check —
+  "a dict with an ok field" — accepted well-formed PRE-ADMISSION
+  rejections (draining, stale-instance) as service. The
+  owner-browser-child worker now logs every Dispatcher invocation
+  (the established _ipc_server._invoke seam), and the oracle requires
+  exactly ONE invoke reaching the successor's real Dispatcher PLUS a
+  REAL minted confirmation token in the response structure (only the
+  successor's live confirmation machinery can produce it; error
+  outcomes carry no token over the wire). NEGATIVE CONTROL: a
+  stale-instance preview request demonstrably satisfies the OLD
+  oracle while the execution oracle rejects it (invoke count zero, no
+  token). **F-119 (high, fixed):** the T60 foreign-uid experiment now
+  runs in an INDEPENDENTLY OWNED disposable tree directly under /tmp
+  (mkdtemp) — pytest's shared tmp_path hierarchy is never widened;
+  only the run's own directories are chmod'd, and the tree is
+  destroyed in a finally block, so no widened permission survives the
+  test. **F-120 (medium, fixed):** T33 and T63 cleanup is now
+  exception-safe across the WHOLE lifecycle — outer try/finally with
+  independent best-effort handling of each process (owner kill,
+  successor kill, orphan gate + pid kill), so one cleanup failure
+  cannot strand the others. **F-121 (medium, fixed):** T65's claim
+  boundary tightened to what the evidence shows — production
+  mutation-admission and commit machinery exercised with a CONTROLLED
+  external-effect adapter (no real external post occurs; the port and
+  evidence reader are labeled as such in the worker), and the durable
+  side is now ASSERTED directly: "EFFECT_CONFIRMED" in
+  state_dir/effects.ndjson after each confirmed mutation (the
+  crash-matrix precedent). **F-122 (medium, fixed):** the record now
+  distinguishes intermediate CI evidence (the red runner-home run
+  37891164909 at e9b066a; then green runs 37892020434 at fdfbb4d,
+  37897545430 at 53c0ad0, and 37898312615 at a0a4700) from the FINAL
+  exact-head run,
+  which is recorded in the PR once this repair round's CI completes;
+  the historical sequence is preserved, not rewritten. Validation
+  after this repair: Linux container lane 13/13 (the prior 11 plus
+  the two negative controls); local Windows full suite 1429 passed +
+  41 platform-skipped (the T33 negative control is Windows-active;
+  the T63 control rides the POSIX-only gate); final exact-head CI
+  recorded in the PR. Zero production-source
+  delta unchanged from `36423cf`.
+
+
 - **2026-10-09 — M7 Layer 7 round two tranche two FIRST REPAIR (PR
   #32, F-113..F-116): the RV03 hazard moved INSIDE the owner, and
   T33 now exercises PRODUCTION SessionManager.start().** The

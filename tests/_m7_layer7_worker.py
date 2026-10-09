@@ -1467,6 +1467,17 @@ def child_exec(result_path: Path, state_dir: Path, release_gate: Path) -> int:
                 continue
     if saw_procfs:
         record["inherited_lock_fd"] = inherited
+    # F-117: the child self-reports its kernel start time (field 22 of
+    # /proc/self/stat) so the controller can prove the pid that
+    # survives the parent's death is THIS process, not a reused pid.
+    self_stat = Path("/proc/self/stat")
+    if self_stat.exists():
+        try:
+            raw = self_stat.read_text(encoding="utf-8")
+            fields = raw[raw.rindex(")") + 1 :].split()
+            record["starttime"] = int(fields[19])
+        except (OSError, ValueError, IndexError):
+            pass
 
     child_lock = AuthorityOwnerLock(state_dir)
     try:
@@ -1566,15 +1577,19 @@ def owner_browser_child(
     stop_gate: Path,
     child_gate: Path,
     die: bool,
+    events_path: Path = None,  # type: ignore[assignment]
 ) -> int:
     """T33's owner: a full production owner (real Dispatcher, real
     authority, production IPC) whose runtime is a REAL OS child process
     launched through PRODUCTION SessionManager.start() — the attach-gate
     and owned-launch decision are the production code under
     qualification (F-114); only the SuperBrowser dependency is a
-    controlled subprocess-backed stand-in. The browser-child law (§17.6):
-    the child is not authority; a successor must start its OWN child
-    and must never attach to a survivor."""
+    controlled subprocess-backed stand-in. With ``events_path`` set
+    (F-118), every actual Dispatcher invocation is logged — the
+    controller's execution oracle for "the successor SERVES while the
+    orphan lives". The browser-child law (§17.6): the child is not
+    authority; a successor must start its OWN child and must never
+    attach to a survivor."""
     import asyncio
 
     import webwire.session as _session_module
@@ -1625,6 +1640,20 @@ def owner_browser_child(
                 {"started": False, "error": getattr(started.error, "message", str(started))},
             )
             return 5
+        if events_path is not None:
+            original_invoke = dispatcher._invoke_admitted
+
+            async def _logging_invoke(name: str, payload: dict) -> Any:
+                with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                    fh.write(json.dumps({"invoke": name}) + "\n")
+                return await original_invoke(name, payload)
+
+            dispatcher._ipc_server._invoke = _logging_invoke
+        # Actor identity, established the way whoami would in
+        # production (M5 migrated writes require a resolved handle).
+        # Worker-side orchestration AFTER production start() has run —
+        # the startup decision under qualification (F-114) is untouched.
+        dispatcher._session.set_resolved_handle("@owner")
         session = dispatcher._authority_session
         browser = dispatcher._session._sb
         _write(
@@ -1656,11 +1685,16 @@ def owner_browser_child(
 
 
 class _ServingPostPort:
-    """The real post-text DOM port shape, fully serving: fill/verify ok,
-    and a click_submit that runs the production commit gate (durable
+    """The post-text DOM port shape, fully serving: fill/verify ok, and
+    a click_submit that runs the production commit gate (durable
     RESERVED), then completes — no barrier, no death. Used by T65 where
-    the mutation must actually finish so the owner's mutation capability
-    after a fault is observable."""
+    the mutation must actually finish so the owner's mutation
+    capability after a fault is observable. CONTROLLED ADAPTER (F-121):
+    no external post occurs — the external-effect boundary is this
+    adapter; the qualification claim stops at production admission,
+    durable commit, and the terminal effect row. Paired with
+    _DieEvidence, which likewise supplies predetermined verification
+    data rather than observing a real surface."""
 
     def __init__(self) -> None:
         self.composer_text = ""
@@ -1919,7 +1953,12 @@ def main(argv: list[str]) -> int:
         return child_exec(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "owner-browser-child":
         return owner_browser_child(
-            result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), raw[3] == "die"
+            result_path,
+            Path(raw[0]),
+            Path(raw[1]),
+            Path(raw[2]),
+            raw[3] == "die",
+            Path(raw[4]) if len(raw) > 4 else None,
         )
     if scenario == "full-owner-serving":
         return full_owner_serving(

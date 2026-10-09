@@ -292,6 +292,20 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
         for directory in (endpoint.parent, scratch, tmp_path, *tmp_path.parents[:2]):
             directory.chmod(directory.stat().st_mode | 0o111)
 
+        # The foreign-uid probe must be able to READ the worker file and
+        # the editable-installed package source; CI checkouts are
+        # runner-only by default. Widen read/traverse on exactly those
+        # two trees — orchestration of the probe's ENVIRONMENT, not of
+        # the boundary under test (the endpoint's own boundary is
+        # widened separately and deliberately below).
+        repo_root = Path(__file__).resolve().parent.parent
+        subprocess.run(
+            ["chmod", "-R", "a+rX", "tests", "src"],  # noqa: S603, S607 - probe environment setup
+            cwd=str(repo_root),
+            check=False,
+            timeout=120,
+        )
+
         foreign = subprocess.run(
             [
                 *launcher,  # noqa: S603 - the qualification probe itself

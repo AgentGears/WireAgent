@@ -219,42 +219,39 @@ def _foreign_uid_launcher():
     obtained (the T60 rejection half then skips rather than probing
     with a same-uid stand-in). Non-root environments use passwordless
     sudo + nobody; root environments (containers, some runners) use
-    setpriv to drop to the classic unprivileged uid directly."""
+    setpriv to drop to the classic unprivileged uid directly. The
+    preflight (F-116) runs the ACTUAL interpreter under the foreign
+    identity — executing ``id`` proves nothing about whether that uid
+    can load this Python and its dependencies, and a root-private
+    installation would otherwise pass the preflight and fail the
+    probe."""
     import subprocess
 
     if os.name != "posix":
         return None
-    if os.geteuid() == 0:
+    candidates = (
+        (["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"], os.geteuid() == 0),
+        (["sudo", "-n", "-u", "nobody"], os.geteuid() != 0),
+    )
+    for prefix, applicable in candidates:
+        if not applicable:
+            continue
         try:
             probe = subprocess.run(
                 [
-                    "setpriv",  # noqa: S603, S607 - qualification probe
-                    "--reuid=65534",
-                    "--regid=65534",
-                    "--clear-groups",
-                    "id",
-                    "-u",
+                    *prefix,  # noqa: S603, S607 - qualification preflight
+                    sys.executable,
+                    "-c",
+                    "import json, socket; print('interpreter-ok')",
                 ],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=15,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return None
-        if probe.returncode == 0 and probe.stdout.strip() == "65534":
-            return ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"]
-        return None
-    try:
-        probe = subprocess.run(
-            ["sudo", "-n", "-u", "nobody", "id", "-u"],  # noqa: S603, S607 - qualification probe
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if probe.returncode == 0 and probe.stdout.strip().isdigit():
-        return ["sudo", "-n", "-u", "nobody"]
+            continue
+        if probe.returncode == 0 and "interpreter-ok" in probe.stdout:
+            return prefix
     return None
 
 

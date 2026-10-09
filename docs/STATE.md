@@ -461,6 +461,54 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two FIRST REPAIR (PR
+  #32, F-113..F-116): the RV03 hazard moved INSIDE the owner, and
+  T33 now exercises PRODUCTION SessionManager.start().** The
+  first-pass review (DO NOT MERGE at `ed6ab25`) found two
+  qualification mechanisms incomplete and a liveness-oracle defect;
+  all four repairs are tests/harness/record only — no production
+  change is justified, and none was made. **F-113 (blocker, fixed):**
+  the descriptor-churn experiment ran in the CONTROLLER process, so a
+  disallowed process-associated record-lock implementation could have
+  passed it — RV03's hazard is a descriptor closed INSIDE the
+  lock-owning process. The PROPER experiment now runs owner-locally:
+  the serving owner ITSELF opens and closes a SECOND descriptor to
+  authority.lock 40 times while its private owner handle stays held
+  (a POSIX fcntl record-lock primitive RELEASES on any same-process
+  descriptor close; the qualified open-file-description primitive
+  must not); a real successor is still refused; and the owner then
+  completes a full real mutation end-to-end (token mint through
+  durable confirmed effect, invoke count exactly the preview+confirm
+  pair). The foreign-process churn is retained, explicitly demoted to
+  SUPPLEMENTARY cross-process noise tolerance. **F-114 (blocker,
+  fixed):** T33 no longer replaces SessionManager.start() — the
+  PRODUCTION method runs unmodified (attach gate, owned-launch
+  selection, _restore_session; session_state "no_file" asserted from
+  the real restore path), with only the SuperBrowser dependency
+  substituted at its module boundary (webwire.session.SuperBrowser)
+  by a controlled subprocess-backed adapter whose start() launches
+  the real OS child and stop() terminates it. Browser-binary platform
+  mechanics remain Layer 8's claim; the production launch/attach
+  decision is no longer bypassed. **F-115 (high, fixed):** _pid_alive
+  is now ZOMBIE-REJECTING (reads /proc/<pid>/stat state — Z/X/x fail;
+  the Windows exit-code path is unchanged), the child's OWN readiness
+  record (its self-written pid file, compared against the recorded
+  browser_child_pid) is required before the owner dies, and
+  non-zombie liveness of BOTH the orphan and the successor's child is
+  verified while the successor runs. **F-116 (medium, fixed):** the
+  foreign-uid launcher preflight now executes the ACTUAL interpreter
+  (importing json and socket) under the dropped identity instead of
+  running `id -u`, so a root-private Python installation can no
+  longer pass the preflight and then fail the probe. PR-body record
+  corrections: the stale peer-probe worker listing removed (the
+  standalone /tmp probe replaced it) and the CI run reference updated
+  to the final verified run. Gates after repair: Linux container lane
+  11/11 (posix_endpoint 6 incl. T60 with the interpreter preflight,
+  supported_faults 4 incl. the new owner-local churn, browser_child
+  1); local Windows and exact-head CI numbers in the PR once green.
+  Zero production-source delta unchanged from `36423cf`.
+
+
 - **2026-10-09 — M7 Layer 7 round two tranche two CANDIDATE (from exact
   main `36423cf`): the remaining qualification matrix — T63, T65, T60,
   T64, T33 — exercised on real sibling processes; zero
@@ -480,9 +528,14 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   still survives. **T65 supported-fault live ownership-loss (§9.4/
   RV03/RV17):** three fault classes against a live SERVING full owner,
   each proving the OS lock cannot disappear while the owner stays
-  alive and mutation-capable — (1) foreign descriptor churn, RV03's
-  exact threat: 40 open/read/close + O_RDWR open/close cycles by the
-  controller process on the live authority.lock; empirically the
+  alive and mutation-capable — (1) descriptor churn (as first written
+  this was the CONTROLLER-process half only, which F-113 corrected:
+  RV03's hazard is a descriptor closed INSIDE the owner process, and
+  the first repair added that PROPER experiment — the owner itself
+  opens/closes a second descriptor to authority.lock 40 times while
+  holding the private handle; the foreign-process churn remains as
+  supplementary cross-process noise tolerance: 40 open/read/close +
+  O_RDWR open/close cycles by the controller; empirically the
   Windows CRT region lock is MANDATORY (a foreign read INSIDE the
   locked byte is OS-refused — recorded as an observation, and POSIX
   flock stays advisory so foreign reads succeed there, asserted), (2)
@@ -518,8 +571,11 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   exact phrase — and the owner then serves exactly one same-build
   valid request. **T33 surviving browser-child ownership:** the
   harness's process-less browser stub is replaced by a REAL OS child
-  process (a fresh standing interpreter launched by the owner's
-  SessionManager.start(), terminated by stop()) — real
+  process (as first written, a SessionManager SUBCLASS launched the
+  child — F-114 corrected this so PRODUCTION SessionManager.start()
+  runs unmodified and only the SuperBrowser dependency is substituted;
+  the child is a fresh standing interpreter launched by the
+  production start path, terminated by production stop()) — real
   surviving-child evidence at the boundary where the ownership law
   lives; claim-scope: browser-binary mechanics remain Layer 8's
   qualification, and the ambient-attach refusal half is production

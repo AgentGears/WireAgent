@@ -44,12 +44,20 @@ def _payload_file(scratch: Path, payload: dict) -> Path:
 
 
 def _serving_owner(
-    scratch: Path, state_dir: Path, tag: str, fault_marker: Path = None  # type: ignore[assignment]
+    scratch: Path,
+    state_dir: Path,
+    tag: str,
+    fault_marker: Path = None,  # type: ignore[assignment]
+    churn_marker: Path = None,  # type: ignore[assignment]
 ):
     events_path = scratch / f"events-{tag}.ndjson"
-    args = [str(state_dir), str(harness.gate(scratch, f"stop-{tag}")), str(events_path)]
-    if fault_marker is not None:
-        args.append(str(fault_marker))
+    args = [
+        str(state_dir),
+        str(harness.gate(scratch, f"stop-{tag}")),
+        str(events_path),
+        str(fault_marker) if fault_marker is not None else "",
+        str(churn_marker) if churn_marker is not None else "",
+    ]
     owner = harness.start_worker(scratch, "full-owner-serving", *args)
     record = owner.result()
     assert record["started"] is True, record
@@ -108,15 +116,61 @@ def _assert_successor_refused(scratch: Path, state_dir: Path, why: str) -> None:
     assert successor.wait() == harness.EXIT_BUSY
 
 
+def test_T65_owner_local_descriptor_churn_never_releases_live_ownership(tmp_path: Path) -> None:
+    """T65 fault class 1 PROPER (F-113): RV03's hazard executes INSIDE
+    the lock-owning process — while the owner holds its private owner
+    handle and runs a production Dispatcher, the OWNER ITSELF opens and
+    closes a SECOND descriptor to authority.lock 40 times. A
+    process-associated record-lock primitive (POSIX fcntl record locks)
+    RELEASES on any same-process descriptor close; the qualified
+    open-file-description primitive must not. Then a real successor is
+    refused, and the owner completes a REAL admitted mutation (preview
+    + confirm through the durable commit gate to verified effect)
+    afterwards — alive and mutation-capable through the whole fault."""
+    scratch = _scratch(tmp_path, "t65ownchurn")
+    state_dir = scratch / "state"
+    churn_marker = scratch / "owner-local-churn.marker"
+
+    owner, record, events_path = _serving_owner(
+        scratch, state_dir, "ownchurn", churn_marker=churn_marker
+    )
+    try:
+        churn = harness.wait_record(churn_marker)
+        assert churn == {"owner_local_churn_done": True}
+
+        _assert_successor_refused(
+            scratch, state_dir, "owner-local churn must not release live ownership"
+        )
+
+        # The owner remains mutation-capable past the fault: a full real
+        # mutation (token mint through durable confirmed effect).
+        token = _preview(scratch, record, "t65 owner-local churn mutation")
+        response = _confirm(scratch, record, "t65 owner-local churn mutation", token)
+        assert isinstance(response, dict) and response.get("ok"), (
+            f"the owner completes a real admitted mutation after owner-local churn: {response}"
+        )
+        assert _invoke_count(events_path) == 2, "exactly the preview + confirm pair"
+    finally:
+        harness.open_gate(scratch, "stop-ownchurn")
+        owner.wait()
+
+    successor = harness.start_worker(scratch, "lock-probe", state_dir)
+    assert successor.result()["acquired"] is True
+    assert successor.wait() == harness.EXIT_OK
+
+
 def test_T65_foreign_descriptor_churn_never_releases_live_ownership(tmp_path: Path) -> None:
-    """T65 fault class 1 — RV03's exact threat: "ownership can be lost
-    when an unrelated descriptor closes". A foreign process (this
-    controller) churns the authority lock file — repeated open/read/
-    close and O_RDWR open/close cycles — against a live, serving,
-    full-production owner. The owner's OS ownership must survive every
-    cycle: a real successor is still refused, and the owner still mints
-    confirmation tokens (mutation-capable) through the real transport
-    afterwards."""
+    """T65 fault class 1, SUPPLEMENTARY foreign-process half: a
+    DIFFERENT process (this controller) churns the authority lock file —
+    repeated open/read/close and O_RDWR open/close cycles — against a
+    live, serving, full-production owner. This is cross-process noise
+    the owner must also tolerate, but it is NOT RV03's owner-local
+    hazard (that is the test above); a disallowed process-associated
+    record-lock implementation could pass this half, which is why it is
+    supplementary and not the RV03 experiment. The owner's OS ownership
+    must survive every cycle: a real successor is still refused, and
+    the owner still mints confirmation tokens (mutation-capable)
+    through the real transport afterwards."""
     scratch = _scratch(tmp_path, "t65churn")
     state_dir = scratch / "state"
     lock_path = state_dir / "authority.lock"

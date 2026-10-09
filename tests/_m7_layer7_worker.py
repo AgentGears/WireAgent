@@ -1499,6 +1499,67 @@ _CHILD_HOLD_SCRIPT = (
 )
 
 
+class _ChildBackedBrowser:
+    """F-114: a controlled, subprocess-backed stand-in for SuperBrowser
+    injected at the DEPENDENCY boundary (``webwire.session.SuperBrowser``)
+    so PRODUCTION SessionManager.start() executes its real decision path —
+    attach gate, owned-launch selection, _restore_session. ``start()``
+    launches a REAL OS child process (the standing browser-child
+    surrogate); ``stop()`` terminates it. Test orchestration in THIS
+    process only; no production source is changed."""
+
+    def __init__(self, config: Any) -> None:
+        self.config = config
+        self._child: Any = None
+        self._stopped = False
+
+    async def start(self) -> Any:
+        from webwire.envelope import ok_result
+
+        if self._child is not None:
+            return ok_result(data={"already_started": True})
+        import subprocess as _sp
+
+        marker = Path(self._ww_state_dir) / "browser-child.pid"  # noqa: ASYNC240
+        self._child = _sp.Popen(  # noqa: S603, ASYNC220 - fixed interpreter + inline hold script
+            [
+                sys.executable,
+                "-c",
+                _CHILD_HOLD_SCRIPT,
+                str(marker),
+                str(self._child_gate),
+                "120",
+            ],
+            cwd=str(Path(__file__).resolve().parent.parent),  # noqa: ASYNC240
+        )
+        return ok_result(data={"child_pid": self._child.pid})
+
+    async def stop(self) -> Any:
+        import subprocess as _sp
+
+        from webwire.envelope import ok_result
+
+        self._stopped = True
+        if self._child is not None and self._child.poll() is None:
+            self._child.terminate()
+            try:
+                self._child.wait(timeout=10)
+            except _sp.TimeoutExpired:
+                self._child.kill()
+                self._child.wait(timeout=10)
+        return ok_result(data={"stopped": True})
+
+    async def save_session(self, path: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"saved": path})
+
+    async def load_session(self, path: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"loaded": path})
+
+
 def owner_browser_child(
     result_path: Path,
     state_dir: Path,
@@ -1507,59 +1568,34 @@ def owner_browser_child(
     die: bool,
 ) -> int:
     """T33's owner: a full production owner (real Dispatcher, real
-    authority, production IPC) whose SessionManager.start() LAUNCHES A
-    REAL OS CHILD PROCESS — a fresh interpreter that holds standing
-    state exactly like a launched browser child would — and whose stop()
-    terminates it. This replaces the process-less stub with real
-    surviving-child evidence at the OS boundary while keeping every
-    authority surface production. The browser-child decision (§17.6):
+    authority, production IPC) whose runtime is a REAL OS child process
+    launched through PRODUCTION SessionManager.start() — the attach-gate
+    and owned-launch decision are the production code under
+    qualification (F-114); only the SuperBrowser dependency is a
+    controlled subprocess-backed stand-in. The browser-child law (§17.6):
     the child is not authority; a successor must start its OWN child
     and must never attach to a survivor."""
     import asyncio
-    import subprocess as _sp
+
+    import webwire.session as _session_module
 
     def _build() -> Any:
         from webwire.config import WebWireConfig
         from webwire.dispatcher import Dispatcher
         from webwire.session import SessionManager
 
-        class _ChildSessionManager(SessionManager):
-            def __init__(self, config: Any) -> None:
-                super().__init__(config)
-                self._child: Any = None
-                self._sb = _StubSB()  # type: ignore[assignment]
-                self._started = False
-                self._resolved_handle = "@owner"
+        def _child_backed_factory(config: Any) -> "_ChildBackedBrowser":
+            browser = _ChildBackedBrowser(config)
+            browser._child_gate = child_gate  # noqa: SLF001 - worker-side orchestration
+            browser._ww_state_dir = state_dir  # noqa: SLF001 - worker-side orchestration
+            return browser
 
-            async def start(self) -> Any:
-                from webwire.envelope import ok_result
-
-                if self._started:
-                    return ok_result(data={"already_started": True})
-                marker = state_dir / "browser-child.pid"
-                worker_root = str(Path(__file__).resolve().parent.parent)  # noqa: ASYNC240
-                self._child = _sp.Popen(  # noqa: S603, ASYNC220 - fixed interpreter + inline hold script
-                    [sys.executable, "-c", _CHILD_HOLD_SCRIPT, str(marker), str(child_gate), "120"],
-                    cwd=worker_root,
-                )
-                self._started = True
-                return ok_result(data={"child_pid": self._child.pid})
-
-            async def stop(self) -> Any:
-                from webwire.envelope import ok_result
-
-                if self._child is not None and self._child.poll() is None:
-                    self._child.terminate()
-                    try:
-                        self._child.wait(timeout=10)
-                    except _sp.TimeoutExpired:
-                        self._child.kill()
-                        self._child.wait(timeout=10)
-                self._started = False
-                return ok_result(data={})
+        # F-114: substitute ONLY the dependency; SessionManager.start()
+        # below is the untouched production method.
+        _session_module.SuperBrowser = _child_backed_factory  # type: ignore[assignment]
 
         cfg = WebWireConfig(state_dir=state_dir, kill_env_var=None)
-        sm = _ChildSessionManager(cfg)
+        sm = SessionManager(cfg)  # production default config: LAUNCH (owned)
         dispatcher = Dispatcher(cfg, session_manager=sm, enable_ipc=True)  # type: ignore[arg-type]
         from types import SimpleNamespace
 
@@ -1590,6 +1626,7 @@ def owner_browser_child(
             )
             return 5
         session = dispatcher._authority_session
+        browser = dispatcher._session._sb
         _write(
             result_path,
             {
@@ -1597,8 +1634,9 @@ def owner_browser_child(
                 "instance_id": session.authority_instance_id,
                 "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
                 "build_id": dispatcher._ipc_server._runtime_build_id,
-                "browser_child_pid": dispatcher._session._child.pid,
+                "browser_child_pid": browser._child.pid,
                 "ownership_mode": dispatcher._session.ownership,
+                "session_state": dispatcher._session.session_loaded_state,
             },
         )
         await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
@@ -1686,6 +1724,7 @@ def full_owner_serving(
     stop_gate: Path,
     events_path: Path,
     fault_ledger_once: str = "",
+    churn_marker: str = "",
 ) -> int:
     """T65's serving owner: a full production owner with the REAL M5
     post-text executor stack (previews mint real tokens; confirms run
@@ -1693,7 +1732,12 @@ def full_owner_serving(
     invoke-logged per actual Dispatcher invocation. With
     ``fault_ledger_once`` set to a marker path, the M5 attempt-ledger
     append raises one injected OSError(ENOSPC) — a supported I/O fault —
-    exactly once, then passes through untouched."""
+    exactly once, then passes through untouched. With ``churn_marker``
+    set, the OWNER PROCESS ITSELF (F-113/RV03's exact hazard) opens and
+    closes a SECOND descriptor to authority.lock 40 times while the
+    private owner handle stays held, then writes the marker — a
+    process-associated record-lock implementation would release here;
+    the qualified open-file-description primitive must not."""
     import asyncio
 
     async def _run() -> int:
@@ -1726,6 +1770,20 @@ def full_owner_serving(
         if not started.ok:
             _write(result_path, {"started": False})
             return 5
+
+        if churn_marker:
+            # F-113: RV03's hazard executes INSIDE the lock-owning
+            # process — a second descriptor to the very lock file (the
+            # canonical authority-domain rendezvous), opened and closed
+            # 40 times while the private owner handle stays held. A
+            # process-associated record-lock primitive (POSIX fcntl
+            # record locks) RELEASES on any same-process descriptor
+            # close; the qualified primitive must survive.
+            owner_lock_path = state_dir / "authority.lock"
+            for _cycle in range(40):
+                fd = os.open(owner_lock_path, os.O_RDWR)
+                os.close(fd)
+            _write(Path(churn_marker), {"owner_local_churn_done": True})
 
         if fault_ledger_once:
             # Supported I/O fault at the FIRST durable append of the next
@@ -1870,6 +1928,7 @@ def main(argv: list[str]) -> int:
             Path(raw[1]),
             Path(raw[2]),
             raw[3] if len(raw) > 3 else "",
+            raw[4] if len(raw) > 4 else "",
         )
     print(f"unknown scenario {scenario}", file=sys.stderr)
     return 2

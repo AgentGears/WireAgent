@@ -1397,6 +1397,433 @@ def full_owner_t16(
 
 
 # ---------------------------------------------------------------------------
+# T63: POSIX spawn/exec child survival (extends the fork lane)
+# ---------------------------------------------------------------------------
+
+
+def owner_spawn_child(
+    result_path: Path, state_dir: Path, die_gate: Path, child_gate: Path
+) -> int:
+    """(POSIX only) T63's spawn/exec parent: acquire the domain, spawn a
+    REAL exec'd child — a fresh interpreter image through the qualified
+    subprocess path, launched with close_fds=False so the ONLY thing
+    standing between the child and the owner descriptor is the
+    production close-on-exec contract — then die uncleanly on the gate
+    with the child still alive."""
+    import subprocess as _sp
+
+    if os.name != "posix":
+        _write(result_path, {"unsupported": True})
+        return 27
+
+    lock = AuthorityOwnerLock(state_dir)
+    try:
+        lock.acquire()
+    except AuthorityBusyError:
+        _write(result_path, {"acquired": False, "busy": True})
+        return 23
+
+    child_result = result_path.with_suffix(".child.json")
+    child = _sp.Popen(  # noqa: S603 - fixed interpreter + repo worker file
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "child-exec",
+            str(child_result),
+            str(state_dir),
+            str(child_gate),
+        ],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        close_fds=False,  # adverse setting: close-on-exec alone must suffice
+    )
+    _write(result_path, {"acquired": True, "busy": False, "child_pid": child.pid})
+    _wait_gate(die_gate)
+    os._exit(9)  # parent dies uncleanly with the exec'd child alive
+
+
+def child_exec(result_path: Path, state_dir: Path, release_gate: Path) -> int:
+    """(POSIX only) T63's exec'd child: a fresh interpreter image that
+    survived exec from an owner parent. It self-reports (a) whether any
+    descriptor in its OWN fd table still resolves to the authority lock
+    file — the empirical close-on-exec observation at the /proc OS
+    boundary, absent where the platform exposes no /proc — and (b) that
+    it cannot USE the living parent's ownership: its own
+    AuthorityOwnerLock.acquire() is refused authority_busy while the
+    parent holds the domain. It releases nothing (it never owned) and
+    exits on its gate."""
+    record: dict[str, Any] = {"child_alive": True, "pid": os.getpid()}
+
+    lock_path = str((state_dir / "authority.lock").resolve())
+    inherited = False
+    saw_procfs = False
+    proc_fd = Path("/proc/self/fd")
+    if proc_fd.exists():
+        saw_procfs = True
+        for fd_link in proc_fd.iterdir():
+            try:
+                if str(fd_link.readlink()) == lock_path:
+                    inherited = True
+            except OSError:
+                continue
+    if saw_procfs:
+        record["inherited_lock_fd"] = inherited
+
+    child_lock = AuthorityOwnerLock(state_dir)
+    try:
+        child_lock.acquire()
+        record["child_acquire"] = "acquired"
+        child_lock.release()
+    except AuthorityBusyError:
+        record["child_acquire"] = "busy"
+    _write(result_path, record)
+    try:
+        _wait_gate(release_gate, timeout=120)
+    except Exception:  # noqa: BLE001 - the gate is best-effort cleanup
+        pass
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# T60: foreign-identity peer probe (stdout record; runs under a foreign uid)
+# ---------------------------------------------------------------------------
+
+
+def peer_probe(result_path: Path, endpoint: Path) -> int:
+    """(POSIX only) T60's foreign-identity probe: connect a plain
+    AF_UNIX socket to the live production endpoint and report — as
+    stdout JSON, because a foreign-uid process cannot write the
+    controller's scratch — whether the owner served the connection or
+    closed it before any hello byte. The production transport speaks
+    first (hello frame on accept), so an accepted peer reads a byte
+    immediately and a rejected peer reads clean EOF. The probe's own
+    uid ships in the record so the controller proves the identity
+    boundary actually differed. ``result_path`` is unused (stdout is
+    the channel) but kept for the uniform worker contract."""
+    import socket as _socket
+
+    record: dict[str, Any] = {
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "pid": os.getpid(),
+    }
+    try:
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(str(endpoint))
+        record["connected"] = True
+        try:
+            data = sock.recv(1)
+            record["first_byte"] = data.hex() if data else ""
+        except _socket.timeout:
+            record["first_byte"] = "timeout"
+        except ConnectionError as exc:
+            record["first_byte"] = f"reset:{type(exc).__name__}"
+        sock.close()
+    except OSError as exc:
+        record["connected"] = False
+        record["connect_error"] = repr(exc)
+    print(json.dumps(record, sort_keys=True), flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# T33: full owner whose runtime is a REAL OS child process
+# ---------------------------------------------------------------------------
+
+_CHILD_HOLD_SCRIPT = (
+    "import sys, time\n"
+    "marker, gate, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+    "open(marker, 'w').write(str(__import__('os').getpid()))\n"
+    "deadline = time.monotonic() + timeout\n"
+    "while not __import__('pathlib').Path(gate).exists():\n"
+    "    if time.monotonic() >= deadline:\n"
+    "        break\n"
+    "    time.sleep(0.1)\n"
+)
+
+
+def owner_browser_child(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    child_gate: Path,
+    die: bool,
+) -> int:
+    """T33's owner: a full production owner (real Dispatcher, real
+    authority, production IPC) whose SessionManager.start() LAUNCHES A
+    REAL OS CHILD PROCESS — a fresh interpreter that holds standing
+    state exactly like a launched browser child would — and whose stop()
+    terminates it. This replaces the process-less stub with real
+    surviving-child evidence at the OS boundary while keeping every
+    authority surface production. The browser-child decision (§17.6):
+    the child is not authority; a successor must start its OWN child
+    and must never attach to a survivor."""
+    import asyncio
+    import subprocess as _sp
+
+    def _build() -> Any:
+        from webwire.config import WebWireConfig
+        from webwire.dispatcher import Dispatcher
+        from webwire.session import SessionManager
+
+        class _ChildSessionManager(SessionManager):
+            def __init__(self, config: Any) -> None:
+                super().__init__(config)
+                self._child: Any = None
+                self._sb = _StubSB()  # type: ignore[assignment]
+                self._started = False
+                self._resolved_handle = "@owner"
+
+            async def start(self) -> Any:
+                from webwire.envelope import ok_result
+
+                if self._started:
+                    return ok_result(data={"already_started": True})
+                marker = state_dir / "browser-child.pid"
+                worker_root = str(Path(__file__).resolve().parent.parent)  # noqa: ASYNC240
+                self._child = _sp.Popen(  # noqa: S603, ASYNC220 - fixed interpreter + inline hold script
+                    [sys.executable, "-c", _CHILD_HOLD_SCRIPT, str(marker), str(child_gate), "120"],
+                    cwd=worker_root,
+                )
+                self._started = True
+                return ok_result(data={"child_pid": self._child.pid})
+
+            async def stop(self) -> Any:
+                from webwire.envelope import ok_result
+
+                if self._child is not None and self._child.poll() is None:
+                    self._child.terminate()
+                    try:
+                        self._child.wait(timeout=10)
+                    except _sp.TimeoutExpired:
+                        self._child.kill()
+                        self._child.wait(timeout=10)
+                self._started = False
+                return ok_result(data={})
+
+        cfg = WebWireConfig(state_dir=state_dir, kill_env_var=None)
+        sm = _ChildSessionManager(cfg)
+        dispatcher = Dispatcher(cfg, session_manager=sm, enable_ipc=True)  # type: ignore[arg-type]
+        from types import SimpleNamespace
+
+        dispatcher._install_m5_live_stack = (  # type: ignore[method-assign]
+            lambda sb: setattr(
+                dispatcher,
+                "_m5_stack",
+                SimpleNamespace(
+                    read_broker=_StubSB(),
+                    post_text_executor=object(),
+                    reply_executor=object(),
+                    quote_executor=object(),
+                    delete_executor=object(),
+                    effect_executor=object(),
+                    media_executor=object(),
+                ),
+            )
+        )
+        return dispatcher
+
+    async def _run() -> int:
+        dispatcher = _build()
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(
+                result_path,
+                {"started": False, "error": getattr(started.error, "message", str(started))},
+            )
+            return 5
+        session = dispatcher._authority_session
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+                "browser_child_pid": dispatcher._session._child.pid,
+                "ownership_mode": dispatcher._session.ownership,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        if die:
+            # Owner dies WITHOUT stopping its child: the child survives
+            # as an orphan exactly like a launched browser would.
+            os._exit(9)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# T65: serving owner for supported-fault qualification (invoke-counted)
+# ---------------------------------------------------------------------------
+
+
+class _ServingPostPort:
+    """The real post-text DOM port shape, fully serving: fill/verify ok,
+    and a click_submit that runs the production commit gate (durable
+    RESERVED), then completes — no barrier, no death. Used by T65 where
+    the mutation must actually finish so the owner's mutation capability
+    after a fault is observable."""
+
+    def __init__(self) -> None:
+        self.composer_text = ""
+
+    async def fill_composer(self, text: str) -> Any:
+        self.composer_text = text
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"filled": True})
+
+    async def read_composer_text(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"composer_text": self.composer_text})
+
+    async def verify_attachment_ready(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"ready": True})
+
+    async def count_attachments(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"count": 0})
+
+    async def close_composer(self) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"cleanup": "closed"})
+
+    async def attach_media(self, image_path: str) -> Any:
+        raise AssertionError("plain post must not attach media")
+
+    async def open_reply_on_target(self, post_url: str, target_post_id: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"opened": True})
+
+    async def open_quote_on_target(self, post_url: str, target_post_id: str) -> Any:
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"opened": True})
+
+    async def click_submit(
+        self, *, _commit_gate, _precommit_check, _expected_text, _expected_attachments
+    ) -> Any:
+        checked = await _precommit_check()
+        if checked is not None:
+            return checked
+        denied = _commit_gate()
+        if denied is not None:
+            return denied
+        from webwire.envelope import ok_result
+
+        return ok_result(data={"post_id": "99", "post_url": "https://x.com/owner/status/99"})
+
+
+def full_owner_serving(
+    result_path: Path,
+    state_dir: Path,
+    stop_gate: Path,
+    events_path: Path,
+    fault_ledger_once: str = "",
+) -> int:
+    """T65's serving owner: a full production owner with the REAL M5
+    post-text executor stack (previews mint real tokens; confirms run
+    the durable commit gate and complete) and production IPC LIVE,
+    invoke-logged per actual Dispatcher invocation. With
+    ``fault_ledger_once`` set to a marker path, the M5 attempt-ledger
+    append raises one injected OSError(ENOSPC) — a supported I/O fault —
+    exactly once, then passes through untouched."""
+    import asyncio
+
+    async def _run() -> int:
+        from types import SimpleNamespace
+
+        from webwire.safety.effect_policy import DEFAULT_EFFECT_POLICIES
+        from webwire.safety.m5_actor_bound_post_executor import M5ActorBoundPostTextExecutor
+        from webwire.safety.m5_execution_runtime import M5ExecutionRuntime
+        from webwire.safety.scoped_authority import ScopedAuthorityBroker
+
+        dispatcher = _build_dispatcher(state_dir, state_dir)
+        # Qualification bucket: T65 drives several post previews/confirms
+        # against ONE owner process; the production default (3/hour) would
+        # deny the later mutations for rate reasons unrelated to the law
+        # under test. Worker-side orchestration only.
+        from webwire.safety.token_bucket import BucketLimits, TokenBucket
+
+        wide_bucket = TokenBucket(
+            limits={
+                "post": BucketLimits(max_count=100, window_seconds=3600),
+                "_global": BucketLimits(max_count=1000, window_seconds=300),
+            }
+        )
+        dispatcher._bucket = wide_bucket
+        # The kernel captured its own reference at construction time
+        # (write_kernel.py stores token_bucket on self._bucket) — widen
+        # BOTH, or the policy gate keeps the production 3/hour limits.
+        dispatcher._write_kernel._bucket = wide_bucket
+        started = await dispatcher.start()
+        if not started.ok:
+            _write(result_path, {"started": False})
+            return 5
+
+        if fault_ledger_once:
+            # Supported I/O fault at the FIRST durable append of the next
+            # mutation (the confirm's durable reservation seam — the same
+            # append commit_gateway.py drives through the effect ledger).
+            # Instance-level patch: one owner, one ledger, no class-wide
+            # mutation.
+            marker = Path(fault_ledger_once)
+            ledger = dispatcher._m5_gateway._ledger
+            original_append = ledger.append_durable
+
+            def _faulting_append(*args: Any, **kwargs: Any) -> Any:
+                if not marker.exists():
+                    marker.write_text("armed", encoding="utf-8")
+                    raise OSError(28, "injected ENOSPC: supported I/O fault")
+                return original_append(*args, **kwargs)
+
+            ledger.append_durable = _faulting_append  # type: ignore[method-assign]
+
+        port = _ServingPostPort()
+        scoped = ScopedAuthorityBroker(port, dispatcher._m5_gateway, policies=DEFAULT_EFFECT_POLICIES)
+        runtime = M5ExecutionRuntime(
+            scoped_authority=scoped,
+            commit_gateway=dispatcher._m5_gateway,
+            policies=DEFAULT_EFFECT_POLICIES,
+        )
+        dispatcher._m5_stack = SimpleNamespace(
+            read_broker=_StubSB(),
+            post_text_executor=M5ActorBoundPostTextExecutor(runtime=runtime, evidence_reader=_DieEvidence()),
+        )
+
+        original_invoke = dispatcher._invoke_admitted
+
+        async def _logging_invoke(name: str, payload: dict) -> Any:
+            with open(events_path, "a", encoding="utf-8") as fh:  # noqa: ASYNC230 — worker-side orchestration
+                fh.write(json.dumps({"invoke": name}) + "\n")
+            return await original_invoke(name, payload)
+
+        dispatcher._ipc_server._invoke = _logging_invoke
+        _write(
+            result_path,
+            {
+                "started": True,
+                "instance_id": dispatcher._authority_session.authority_instance_id,
+                "endpoint": str(dispatcher._ipc_transport.endpoint_path or ""),
+                "build_id": dispatcher._ipc_server._runtime_build_id,
+            },
+        )
+        await asyncio.get_event_loop().run_in_executor(None, _wait_gate, stop_gate, 240.0)
+        await dispatcher.stop()
+        return 0
+
+    return asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1470,6 +1897,24 @@ def main(argv: list[str]) -> int:
         return full_owner_m5_serving(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "full-owner-tablesat":
         return full_owner_tablesat(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
+    if scenario == "owner-spawn-child":
+        return owner_spawn_child(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
+    if scenario == "child-exec":
+        return child_exec(result_path, Path(raw[0]), Path(raw[1]))
+    if scenario == "peer-probe":
+        return peer_probe(result_path, Path(raw[0]))
+    if scenario == "owner-browser-child":
+        return owner_browser_child(
+            result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), raw[3] == "die"
+        )
+    if scenario == "full-owner-serving":
+        return full_owner_serving(
+            result_path,
+            Path(raw[0]),
+            Path(raw[1]),
+            Path(raw[2]),
+            raw[3] if len(raw) > 3 else "",
+        )
     print(f"unknown scenario {scenario}", file=sys.stderr)
     return 2
 

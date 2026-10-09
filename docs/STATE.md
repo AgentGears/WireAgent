@@ -461,6 +461,96 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two CANDIDATE (from exact
+  main `36423cf`): the remaining qualification matrix — T63, T65, T60,
+  T64, T33 — exercised on real sibling processes; zero
+  production-source delta.** Built tests-first per the frozen handoff
+  order; every scenario observes process/OS boundaries only (exit
+  codes, JSON records, /proc fd tables, durable rows, real transport
+  exchanges). **T63 spawn/exec (the half round one left open):** the
+  owner parent spawns a REAL exec'd child — a fresh interpreter image
+  through the qualified subprocess path launched with
+  `close_fds=False`, the adverse setting where the production
+  close-on-exec contract is the ONLY barrier — and three laws hold:
+  the child's OWN fd table contains no descriptor resolving to
+  authority.lock (self-inspected via /proc on Linux), the child's own
+  AuthorityOwnerLock.acquire() is refused authority_busy while the
+  parent lives (it cannot USE the parent's ownership), and after the
+  parent's unclean death a successor acquires while the exec'd child
+  still survives. **T65 supported-fault live ownership-loss (§9.4/
+  RV03/RV17):** three fault classes against a live SERVING full owner,
+  each proving the OS lock cannot disappear while the owner stays
+  alive and mutation-capable — (1) foreign descriptor churn, RV03's
+  exact threat: 40 open/read/close + O_RDWR open/close cycles by the
+  controller process on the live authority.lock; empirically the
+  Windows CRT region lock is MANDATORY (a foreign read INSIDE the
+  locked byte is OS-refused — recorded as an observation, and POSIX
+  flock stays advisory so foreign reads succeed there, asserted), (2)
+  endpoint rendezvous unlink while the owner lives (POSIX): the T49
+  fault family striking a live owner — an ESTABLISHED connection
+  still delivers and is served (a real confirmation token is minted
+  past the fault), a real successor is still refused, and only after
+  the controller kills the owner does a successor acquire and rebind
+  the endpoint pathname, (3) an injected one-shot ENOSPC at the
+  confirm's durable reservation append (the effect-ledger
+  append_durable seam commit_gateway drives): the REQUEST degrades to
+  an error outcome over the real transport (never a false success),
+  the owner survives, a real successor is still refused, and the very
+  next mutation completes end-to-end through the real executor stack.
+  Adversarial destruction of authority.lock itself is explicitly NOT
+  injected — that is outside the supported-fault contract (the same
+  explicitly-outside-claim class as T56). **T60 peer-identity half
+  (the part the round-one socket-mode test left open):** a GENUINELY
+  foreign-uid process — sudo+nobody on non-root runners, setpriv→uid
+  65534 under root (containers) — reaches the live endpoint after the
+  controller deliberately widens only directory traversal and the
+  rendezvous mode to 0666, exposing the SECOND boundary: production
+  SO_PEERCRED closes the connection BEFORE any hello byte, the
+  listener keeps serving (same-user peers from other processes are
+  still served after the rejection), and the probe's own uid is in the
+  record so the identity difference is proven, not assumed. **T64
+  cross-process handshake negatives (build-id half; the
+  protocol-version half was already carried by T21's round-one raw
+  probes):** forged-foreign, truncated, empty, non-string, and OMITTED
+  runtime_build_id each receive the specific compatibility outcome
+  (build_mismatch / missing_build_id) over the real transport, the
+  invoke count stays ZERO — rejected BEFORE request admission, T64's
+  exact phrase — and the owner then serves exactly one same-build
+  valid request. **T33 surviving browser-child ownership:** the
+  harness's process-less browser stub is replaced by a REAL OS child
+  process (a fresh standing interpreter launched by the owner's
+  SessionManager.start(), terminated by stop()) — real
+  surviving-child evidence at the boundary where the ownership law
+  lives; claim-scope: browser-binary mechanics remain Layer 8's
+  qualification, and the ambient-attach refusal half is production
+  code already unit-qualified in
+  test_session_persistence.py::test_attach_refused_without_allow_attach.
+  The owner dies uncleanly WITHOUT stopping its child; the orphan
+  survives (pid-observed at the OS boundary); the successor acquires
+  while the orphan lives, hydrates, starts its OWN child (a different
+  pid — never the orphan's), and serves a production request over the
+  real transport while the orphan is still alive: the orphan carries
+  no production authority. Harness additions (tests/_m7_layer7_worker.py):
+  owner-spawn-child/child-exec, peer-probe (stdout-record foreign-uid
+  probe), owner-browser-child, full-owner-serving (invoke-logged real
+  M5 stack with a fully-serving port; a qualification-wide token
+  bucket on BOTH the dispatcher and the write-kernel reference — the
+  kernel captured its own at construction — so T65's later mutations
+  are not denied by the production 3/hour post limit for reasons
+  unrelated to the law under test). Gates at this head: local Windows
+  full suite 1427 passed + 40 platform-skipped (tranche one baseline
+  1423+37; +4 newly-active tests, +3 new platform skips); a real
+  Linux container run (python:3.11, the CI install recipe)
+  1447 passed + 16 skipped (CI Linux baseline 1444+16; +3 newly-active
+  POSIX tests: T63 spawn/exec, T60 foreign-uid via setpriv, T65-B
+  rendezvous unlink); ruff clean on src+tests; zero production-source
+  changes. Layer 7 status if this tranche merges: round one + round
+  two tranches one and two MERGED and the qualification matrix
+  T16/T33/T34-T38/T48/T60/T63/T64/T65 fully qualified — Layer 7
+  qualification COMPLETE pending the merge-gate review; Layer 8 (NOT
+  STARTED) then owns the exhaustive Windows/native-browser claims.
+
+
 - **2026-10-08 — M7 Layer 7 round two tranche one MERGED (PR #31,
   squash `6382534`).** The merge-gate pass at exact head `45b927c`
   returned MERGE-READY; F-110, F-111, and F-112 closed after three
@@ -1713,18 +1803,18 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   rounds, all resolved before merge. Merged-tree qualification: local
   gate 1217 + 9 skipped; Linux 3.11 CI 1220 + 6 = 1226; Windows 170 + 4
   and rule-store 57; mypy clean on 95 files both platform resolutions.
-  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION STILL IN
-  PROGRESS (round one merged a4041ba, F-92..F-109 closed; round two
-  tranche one merged 2026-10-08, 6382534, after three repair rounds
-  and a merge-gate pass — T16, T34, T36, T37, T38, and T48 qualified;
-  F-110..F-112 closed; zero production-source delta across both
-  campaigns). STILL OPEN for later Layer-7 rounds: T63 (POSIX
-  spawn/exec child survival), T65 (live ownership-loss qualification),
-  T60 (POSIX peer-identity boundary), T64 (cross-process handshake
-  negatives), T33 (surviving browser-child ownership). The next work
-  REMAINS Layer 7 round two tranche two (not Layer 8 — Layer 8 is NOT
-  STARTED). Second adapter remains deferred until the M7 boundary is
-  stable.
+  M7 STATUS: Layers 1-6 FROZEN; Layer 7 QUALIFICATION NEARLY
+  COMPLETE (round one merged a4041ba, F-92..F-109 closed; round two
+  tranche one merged 2026-10-08, 6382534, T16/T34/T36/T37/T38/T48
+  qualified, F-110..F-112 closed; round two TRANCHE TWO submitted
+  2026-10-09 from exact 36423cf covering the ENTIRE remaining matrix —
+  T63 spawn/exec, T65 supported-fault live ownership-loss, T60
+  peer-identity, T64 handshake negatives, T33 surviving browser-child
+  with real child-process evidence — zero production delta across all
+  campaigns). If tranche two merges, the Layer-7 qualification matrix
+  is COMPLETE and the next milestone is Layer 8 (Windows/native
+  exhaustive qualification, NOT STARTED). Second adapter remains
+  deferred until the M7 boundary is stable.
 - **2026-10-02 — PR #26 second repair round: F-59 — revocation is
   lifecycle-atomic and single-flight.** The F-57 repair made completion
   durable but left revoke_authority() legal on a freely admitting READY

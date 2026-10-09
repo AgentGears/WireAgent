@@ -30,6 +30,36 @@ def _scratch(tmp_path: Path, name: str) -> Path:
     return scratch
 
 
+# The foreign-uid probe: a standalone instrument (no repo imports) that
+# connects a plain AF_UNIX socket to the live endpoint and reports, as
+# stdout JSON, whether the owner served the connection or closed it
+# before any hello byte. The production transport speaks first (hello
+# on accept), so an accepted peer reads a byte immediately and a
+# rejected peer reads clean EOF. Its own uid ships in the record so the
+# controller proves the identity boundary actually differed.
+_PEER_PROBE_SOURCE = (
+    "import json, os, socket, sys\n"
+    "record = {'uid': os.getuid(), 'pid': os.getpid()}\n"
+    "try:\n"
+    "    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+    "    s.settimeout(10)\n"
+    "    s.connect(sys.argv[1])\n"
+    "    record['connected'] = True\n"
+    "    try:\n"
+    "        data = s.recv(1)\n"
+    "        record['first_byte'] = data.hex() if data else ''\n"
+    "    except socket.timeout:\n"
+    "        record['first_byte'] = 'timeout'\n"
+    "    except ConnectionError as exc:\n"
+    "        record['first_byte'] = 'reset:' + type(exc).__name__\n"
+    "    s.close()\n"
+    "except OSError as exc:\n"
+    "    record['connected'] = False\n"
+    "    record['connect_error'] = repr(exc)\n"
+    "print(json.dumps(record, sort_keys=True), flush=True)\n"
+)
+
+
 def test_socket_permissions_are_owner_restricted(tmp_path: Path) -> None:
     """T60 EMPIRICAL: the live domain socket's mode is 0600 (owner
     read/write only) and its parent directory is the canonical authority
@@ -255,6 +285,7 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
     record = owner.result()
     assert record["started"] is True
     endpoint = Path(record["endpoint"])
+    staging: Path | None = None
 
     try:
         # Baseline: a same-user peer from a DIFFERENT process is served
@@ -292,33 +323,30 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
         for directory in (endpoint.parent, scratch, tmp_path, *tmp_path.parents[:2]):
             directory.chmod(directory.stat().st_mode | 0o111)
 
-        # The foreign-uid probe must be able to READ the worker file and
-        # the editable-installed package source; CI checkouts are
-        # runner-only by default. Widen read/traverse on exactly those
-        # two trees — orchestration of the probe's ENVIRONMENT, not of
-        # the boundary under test (the endpoint's own boundary is
-        # widened separately and deliberately below).
-        repo_root = Path(__file__).resolve().parent.parent
-        subprocess.run(
-            ["chmod", "-R", "a+rX", "tests", "src"],  # noqa: S603, S607 - probe environment setup
-            cwd=str(repo_root),
-            check=False,
-            timeout=120,
-        )
+        # Stage a SELF-CONTAINED probe script under /tmp (1777): the
+        # probe is a test INSTRUMENT — the boundary under test is the
+        # server's SO_PEERCRED check — so it needs no repo access.
+        # (Runner home directories are typically 750: a foreign uid
+        # cannot traverse into the checkout at all, and widening the
+        # runner's home is not ours to do.)
+        import tempfile
+
+        staging = Path(tempfile.mkdtemp(prefix="webwire-peer-probe-", dir="/tmp"))
+        staging.chmod(0o755)
+        probe_script = staging / "peer_probe.py"
+        probe_script.write_text(_PEER_PROBE_SOURCE, encoding="utf-8")
+        probe_script.chmod(0o644)
 
         foreign = subprocess.run(
             [
                 *launcher,  # noqa: S603 - the qualification probe itself
                 sys.executable,
-                str(harness.WORKER),
-                "peer-probe",
-                str(scratch / "unused-result.json"),
+                str(probe_script),
                 str(endpoint),
             ],
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=str(Path(__file__).resolve().parent.parent),
         )
         assert foreign.returncode == 0, f"peer probe failed: {foreign.stderr[-400:]!r}"
         probe_record = json.loads(foreign.stdout.strip().splitlines()[-1])
@@ -332,6 +360,10 @@ def test_foreign_uid_peer_rejected_before_hello_listener_survives(tmp_path: Path
         # different process is still served after the rejection.
         _same_user_served("after-rejection")
     finally:
+        import shutil
+
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
         harness.open_gate(scratch, "stop")
         owner.wait()
 

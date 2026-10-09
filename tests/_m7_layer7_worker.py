@@ -1484,48 +1484,6 @@ def child_exec(result_path: Path, state_dir: Path, release_gate: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# T60: foreign-identity peer probe (stdout record; runs under a foreign uid)
-# ---------------------------------------------------------------------------
-
-
-def peer_probe(result_path: Path, endpoint: Path) -> int:
-    """(POSIX only) T60's foreign-identity probe: connect a plain
-    AF_UNIX socket to the live production endpoint and report — as
-    stdout JSON, because a foreign-uid process cannot write the
-    controller's scratch — whether the owner served the connection or
-    closed it before any hello byte. The production transport speaks
-    first (hello frame on accept), so an accepted peer reads a byte
-    immediately and a rejected peer reads clean EOF. The probe's own
-    uid ships in the record so the controller proves the identity
-    boundary actually differed. ``result_path`` is unused (stdout is
-    the channel) but kept for the uniform worker contract."""
-    import socket as _socket
-
-    record: dict[str, Any] = {
-        "uid": os.getuid() if hasattr(os, "getuid") else None,
-        "pid": os.getpid(),
-    }
-    try:
-        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect(str(endpoint))
-        record["connected"] = True
-        try:
-            data = sock.recv(1)
-            record["first_byte"] = data.hex() if data else ""
-        except _socket.timeout:
-            record["first_byte"] = "timeout"
-        except ConnectionError as exc:
-            record["first_byte"] = f"reset:{type(exc).__name__}"
-        sock.close()
-    except OSError as exc:
-        record["connected"] = False
-        record["connect_error"] = repr(exc)
-    print(json.dumps(record, sort_keys=True), flush=True)
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # T33: full owner whose runtime is a REAL OS child process
 # ---------------------------------------------------------------------------
 
@@ -1901,8 +1859,6 @@ def main(argv: list[str]) -> int:
         return owner_spawn_child(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     if scenario == "child-exec":
         return child_exec(result_path, Path(raw[0]), Path(raw[1]))
-    if scenario == "peer-probe":
-        return peer_probe(result_path, Path(raw[0]))
     if scenario == "owner-browser-child":
         return owner_browser_child(
             result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), raw[3] == "die"

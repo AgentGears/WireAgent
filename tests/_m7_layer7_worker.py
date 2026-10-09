@@ -421,7 +421,10 @@ def fork_child(result_path: Path, state_dir: Path, release_gate: Path) -> int:
     """(POSIX only) Acquire ownership, FORK a child, parent dies
     uncleanly; the child — which inherited the raw descriptor — must be
     unable to keep the domain locked: a successor must acquire while the
-    child lives. The child writes its own record and exits on the gate."""
+    child lives. The child writes its own record — including its
+    self-reported kernel start time (F-123: the controller proves the
+    SAME fork child survives the parent's death through takeover, not
+    merely that a child once existed) — and exits on the gate."""
     import os as _os
 
     if not hasattr(_os, "fork"):
@@ -440,7 +443,16 @@ def fork_child(result_path: Path, state_dir: Path, release_gate: Path) -> int:
     if pid == 0:
         # Child: inherited descriptors only, no release path. Hold until
         # the gate, then exit WITHOUT releasing (it never owned).
-        _write(child_result, {"child_alive": True, "pid": _os.getpid()})
+        record: dict[str, Any] = {"child_alive": True, "pid": _os.getpid()}
+        self_stat = Path("/proc/self/stat")
+        if self_stat.exists():
+            try:
+                raw = self_stat.read_text(encoding="utf-8")
+                fields = raw[raw.rindex(")") + 1 :].split()
+                record["starttime"] = int(fields[19])
+            except (OSError, ValueError, IndexError):
+                pass
+        _write(child_result, record)
         try:
             _wait_gate(release_gate, timeout=60)
         except Exception:
@@ -1499,9 +1511,19 @@ def child_exec(result_path: Path, state_dir: Path, release_gate: Path) -> int:
 # ---------------------------------------------------------------------------
 
 _CHILD_HOLD_SCRIPT = (
-    "import sys, time\n"
-    "marker, gate, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
-    "open(marker, 'w').write(str(__import__('os').getpid()))\n"
+    "import json, sys, time\n"
+    "marker_dir, gate, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+    "pid = __import__('os').getpid()\n"
+    "record = {'pid': pid}\n"
+    "try:\n"
+    "    raw = open(f'/proc/{pid}/stat').read()\n"
+    "    record['starttime'] = int(raw[raw.rindex(')') + 1:].split()[19])\n"
+    "except (OSError, ValueError, IndexError):\n"
+    "    pass\n"
+    # Per-child readiness marker (F-124): the file NAME binds the pid,
+    # the CONTENT carries the child's own identity (pid + kernel start
+    # time) — the controller matches BOTH against the live process.
+    "open(f'{marker_dir}/browser-child-{pid}.pid', 'w').write(json.dumps(record))\n"
     "deadline = time.monotonic() + timeout\n"
     "while not __import__('pathlib').Path(gate).exists():\n"
     "    if time.monotonic() >= deadline:\n"
@@ -1531,13 +1553,13 @@ class _ChildBackedBrowser:
             return ok_result(data={"already_started": True})
         import subprocess as _sp
 
-        marker = Path(self._ww_state_dir) / "browser-child.pid"  # noqa: ASYNC240
+        marker_dir = Path(self._ww_state_dir)  # noqa: ASYNC240
         self._child = _sp.Popen(  # noqa: S603, ASYNC220 - fixed interpreter + inline hold script
             [
                 sys.executable,
                 "-c",
                 _CHILD_HOLD_SCRIPT,
-                str(marker),
+                str(marker_dir),
                 str(self._child_gate),
                 "120",
             ],

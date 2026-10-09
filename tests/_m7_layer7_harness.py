@@ -178,6 +178,40 @@ def open_gate(scratch: Path, name: str) -> None:
     gate(scratch, name).write_text("go", encoding="utf-8")
 
 
+def safe_open_gate(scratch: Path, name: str) -> None:
+    """Best-effort gate release that can never mask the active failure
+    (F-126): one gate's cleanup error must not strand the others."""
+
+    try:
+        open_gate(scratch, name)
+    except OSError:
+        pass
+
+
+def kill_pid_if_same_process(pid: int, starttime) -> bool:
+    """Identity-aware last-resort kill (F-126): terminate by pid ONLY
+    when /proc still shows the SAME process (matching kernel start
+    time, when the caller recorded one), so a reused pid is never
+    killed. Returns whether a kill was issued."""
+
+    if pid <= 0:
+        return False
+    current = proc_starttime(pid)
+    if current is None:
+        # No /proc identity available: fall back to presence-only.
+        if not pid_alive(pid):
+            return False
+    elif starttime is not None and current != starttime:
+        return False  # a different process now owns this pid
+    import os
+
+    try:
+        os.kill(pid, 9)
+        return True
+    except OSError:
+        return False
+
+
 def wait_exit(handle: WorkerHandle, timeout: float = 30.0) -> int:
     return handle.wait(timeout=timeout)
 

@@ -461,6 +461,47 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
 
 ## History
 
+- **2026-10-09 — M7 Layer 7 round two tranche two THIRD REPAIR (PR
+  #32, F-123..F-127): the fork variant receives the same survivor
+  discipline, and the evidence claims are bound to their intents.**
+  The third-pass review (REQUEST CHANGES at `997f3ab`) confirmed
+  F-117..F-122 closed in their repaired paths and found the SAME
+  survivor-liveness gap in the pre-existing fork test — T63's frozen
+  requirement covers fork AND spawn/exec, so Layer 7 could not close
+  while the fork branch passed without a surviving child. All repairs
+  tests/harness/record only. **F-123 (blocker, fixed):** the
+  fork-child worker now self-reports its kernel start time, and the
+  fork test verifies the SAME child — alive, zombie-rejected,
+  identity-tied — immediately before successor acquisition and again
+  after it acquired and exited, reusing the F-117 machinery (harness
+  pid_alive/proc_starttime). A FORK NEGATIVE CONTROL kills the fork
+  child after its readiness record and asserts the oracle reports it
+  dead. **F-124 (high, fixed):** the browser-child hold script now
+  writes a PER-CHILD readiness marker (browser-child-<pid>.pid)
+  whose content carries the child's own pid AND kernel start time;
+  T33 requires the SUCCESSOR's child's own readiness record — pid
+  and starttime matched against the live process — before accepting
+  the child-start claim, not merely a spawned non-zombie pid.
+  **F-125 (medium, fixed):** T65's durable assertions are now
+  STRUCTURED — the ledger is parsed as records and the claim is
+  exactly ONE lifecycle reaching EFFECT_CONFIRMED with its terminal
+  row bound (by effect_id) to a lifecycle that durably RESERVED
+  first; the ENOSPC test additionally asserts the FAULTED attempt
+  produced NO confirmed terminal before the recovered mutation
+  completes its own. **F-126 (medium, fixed):** harness gains
+  safe_open_gate (one gate's cleanup error cannot strand the others)
+  and kill_pid_if_same_process (a last-resort pid kill only under
+  /proc starttime identity — a reused pid is never killed); every
+  finally block in the child-survival lanes now uses both.
+  **F-127 (low, fixed):** the T33 docstrings consistently describe
+  the implemented preview-token oracle (the stale health-request
+  wording is gone). Validation after this repair: Linux container
+  lane 14/14 (prior 13 plus the fork negative control); local
+  Windows full suite 1429 passed + 42 platform-skipped (the fork
+  control rides the POSIX-only gate); final exact-head CI recorded in
+  the PR. Zero production-source delta unchanged from `36423cf`.
+
+
 - **2026-10-09 — M7 Layer 7 round two tranche two SECOND REPAIR (PR
   #32, F-117..F-122): survivor liveness proven at every checkpoint,
   and T33's service oracle upgraded to an execution oracle with

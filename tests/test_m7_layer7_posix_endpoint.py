@@ -121,34 +121,128 @@ def test_unclean_death_leaves_stale_path_successor_rebinds_only_when_owning(tmp_
 
 
 def test_fork_child_cannot_keep_domain_locked_after_parent_death(tmp_path: Path) -> None:
-    """T63's core: a parent acquires ownership, FORKS; the parent dies
-    uncleanly with the child alive (the child inherited the raw
-    descriptor). A successor process MUST acquire the domain while the
-    child still lives — the child cannot preserve or extend the dead
-    parent's ownership through the inherited descriptor."""
+    """T63's fork core (F-123: the same survivor-liveness discipline the
+    spawn/exec variant received in F-117): a parent acquires ownership,
+    FORKS; the parent dies uncleanly with the child alive (the child
+    inherited the raw descriptor). The fork child self-reports its pid
+    AND kernel start time, and the SAME child — alive, non-zombie,
+    identity-consistent — is verified immediately BEFORE the successor
+    acquires and again AFTER: a successor MUST acquire the domain while
+    the fork child genuinely survives, not merely after a child once
+    existed. The inherited descriptor cannot preserve or extend the
+    dead parent's ownership."""
     scratch = _scratch(tmp_path, "fork")
     state_dir = scratch / "state"
+    parent = successor = None
+    child_pid = None
+    child_starttime = None
 
-    parent = harness.start_worker(scratch, "fork-child", state_dir, harness.gate(scratch, "release"))
-    record = parent.result()
-    assert record["acquired"] is True, record
-    child_json = parent.result_path.with_suffix(".child.json")
-    child_record = harness.wait_record(child_json)
-    assert child_record["child_alive"] is True
+    try:
+        parent = harness.start_worker(scratch, "fork-child", state_dir, harness.gate(scratch, "release"))
+        record = parent.result()
+        assert record["acquired"] is True, record
+        child_json = parent.result_path.with_suffix(".child.json")
+        child_record = harness.wait_record(child_json)
+        assert child_record["child_alive"] is True
+        child_pid = child_record["pid"]
+        child_starttime = child_record.get("starttime")
+        assert child_pid == record["child_pid"], "the fork child is the parent's forked child"
 
-    deadline = time.monotonic() + 15
-    while parent.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert parent.poll() == harness.EXIT_DIED_UNCLEAN, "the parent died uncleanly"
+        # The fork child is alive and identity-tied BEFORE the parent dies.
+        assert harness.pid_alive(child_pid), "the fork child is executing before the parent dies"
+        if child_starttime is not None:
+            assert harness.proc_starttime(child_pid) == child_starttime
 
-    # THE LAW: with the forked child still alive, a successor acquires.
-    successor = harness.start_worker(scratch, "lock-probe", state_dir)
-    assert successor.result()["acquired"] is True, (
-        "an inherited descriptor must not keep the domain locked after parent death"
-    )
-    assert successor.wait() == harness.EXIT_OK
+        # Parent dies uncleanly: fork-child's parent os._exit(9)s
+        # immediately after writing its record; the release gate is the
+        # CHILD's exit gate. Wait for the parent's unclean death now.
+        deadline = time.monotonic() + 15
+        while parent.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert parent.poll() == harness.EXIT_DIED_UNCLEAN, "the parent died uncleanly"
 
-    harness.open_gate(scratch, "release")  # let the child exit
+        # F-123 checkpoint A: the fork child SURVIVED the parent's
+        # death — alive, non-zombie, identity-tied — immediately BEFORE
+        # the successor acquisition.
+        assert harness.pid_alive(child_pid), (
+            "the fork child must still be alive when the successor acquires"
+        )
+        if child_starttime is not None:
+            assert harness.proc_starttime(child_pid) == child_starttime
+
+        # THE LAW: with the forked child still alive, a successor acquires.
+        successor = harness.start_worker(scratch, "lock-probe", state_dir)
+        assert successor.result()["acquired"] is True, (
+            "an inherited descriptor must not keep the domain locked after parent death"
+        )
+        assert successor.wait() == harness.EXIT_OK
+
+        # F-123 checkpoint B: the SAME fork child is still alive AFTER
+        # the successor acquired — takeover happened under genuine
+        # child survival.
+        assert harness.pid_alive(child_pid), (
+            "the same fork child is still alive after the successor acquired"
+        )
+        if child_starttime is not None:
+            assert harness.proc_starttime(child_pid) == child_starttime
+    finally:
+        # F-126: independent best-effort cleanup per gate/process, with
+        # identity-aware last-resort kills.
+        harness.safe_open_gate(scratch, "release")
+        if parent is not None and parent.poll() is None:
+            parent.kill()
+        if successor is not None and successor.poll() is None:
+            successor.kill()
+        if child_pid is not None:
+            deadline = time.monotonic() + 5
+            while harness.pid_alive(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            harness.kill_pid_if_same_process(child_pid, child_starttime)
+
+
+def test_T63_fork_negative_control_dead_child_is_detected(tmp_path: Path) -> None:
+    """F-123's adversarial acceptance test (fork variant): deliberately
+    terminate the fork child AFTER its readiness record but BEFORE the
+    parent's death is observed by the controller. The liveness oracle
+    MUST report the child dead — proving the fork-survivor assertions
+    above cannot pass vacuously with a child that died early."""
+    scratch = _scratch(tmp_path, "forkctl")
+    state_dir = scratch / "state"
+    parent = None
+    child_pid = None
+    child_starttime = None
+
+    try:
+        parent = harness.start_worker(scratch, "fork-child", state_dir, harness.gate(scratch, "release"))
+        record = parent.result()
+        assert record["acquired"] is True, record
+        child_json = parent.result_path.with_suffix(".child.json")
+        child_record = harness.wait_record(child_json)
+        child_pid = child_record["pid"]
+        child_starttime = child_record.get("starttime")
+        assert harness.pid_alive(child_pid)
+
+        # The adversarial act: kill the fork child while the parent has
+        # written its record (the parent exit(9)s immediately after, so
+        # it is dead or dying — the takeover precondition is what the
+        # oracle must now refuse).
+        os.kill(child_pid, 9)
+        deadline = time.monotonic() + 10
+        while harness.pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        # THE NEGATIVE CONTROL: the oracle reports the fork child dead.
+        assert harness.pid_alive(child_pid) is False, (
+            "the liveness oracle must detect a terminated fork child"
+        )
+        if child_starttime is not None:
+            # The identity tie agrees: no same-starttime process remains.
+            current = harness.proc_starttime(child_pid)
+            assert current is None or current != child_starttime
+    finally:
+        harness.safe_open_gate(scratch, "release")
+        if parent is not None and parent.poll() is None:
+            parent.kill()
 
 
 def test_spawn_exec_child_cannot_inherit_use_or_keep_ownership(tmp_path: Path) -> None:
@@ -246,10 +340,12 @@ def test_spawn_exec_child_cannot_inherit_use_or_keep_ownership(tmp_path: Path) -
                 "the surviving pid is the SAME process, not a reused pid"
             )
     finally:
-        # Exception-safe cleanup (F-120): each process is handled
-        # independently — one failure must not strand the others.
-        harness.open_gate(scratch, "die")
-        harness.open_gate(scratch, "child")
+        # Exception-safe cleanup (F-120/F-126): each gate and process is
+        # handled independently — one failure must not strand the others
+        # — and the last-resort pid kill is identity-aware (a reused pid
+        # is never killed).
+        harness.safe_open_gate(scratch, "die")
+        harness.safe_open_gate(scratch, "child")
         if parent is not None and parent.poll() is None:
             parent.kill()
         if successor is not None and successor.poll() is None:
@@ -258,11 +354,7 @@ def test_spawn_exec_child_cannot_inherit_use_or_keep_ownership(tmp_path: Path) -
             deadline = time.monotonic() + 5
             while harness.pid_alive(child_pid) and time.monotonic() < deadline:
                 time.sleep(0.05)
-            if harness.pid_alive(child_pid):
-                try:
-                    os.kill(child_pid, 9)
-                except OSError:
-                    pass
+            harness.kill_pid_if_same_process(child_pid, child_starttime)
 
 
 def test_T63_negative_control_dead_child_is_detected(tmp_path: Path) -> None:
@@ -306,8 +398,8 @@ def test_T63_negative_control_dead_child_is_detected(tmp_path: Path) -> None:
             "the liveness oracle must detect a terminated child"
         )
     finally:
-        harness.open_gate(scratch, "die")
-        harness.open_gate(scratch, "child")
+        harness.safe_open_gate(scratch, "die")
+        harness.safe_open_gate(scratch, "child")
         if parent is not None and parent.poll() is None:
             parent.kill()
 

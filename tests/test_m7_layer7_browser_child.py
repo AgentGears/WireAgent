@@ -82,6 +82,20 @@ def _preview_request(scratch: Path, record: dict, text: str, *, instance_overrid
     return client.result()["response"]
 
 
+def _child_readiness(state_dir: Path, pid: int) -> dict:
+    """Wait for and return one child's OWN readiness record — the
+    per-child marker ``browser-child-<pid>.pid`` whose content carries
+    the child's self-reported pid AND kernel start time (F-124). The
+    marker's existence proves the child interpreter reached its holding
+    loop, not merely that a process was spawned."""
+
+    marker = state_dir / f"browser-child-{pid}.pid"
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return json.loads(marker.read_text(encoding="utf-8"))
+
+
 def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_path: Path) -> None:
     """T33: a full production owner whose SessionManager.start() is the
     UNTOUCHED production method — the attach-gate and owned-launch
@@ -89,20 +103,22 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
     dependency is a controlled subprocess-backed stand-in injected at
     its module boundary. The production launch path starts a REAL OS
     child; the owner dies uncleanly without stopping it; the child
-    SURVIVES as a genuinely-executing orphan (child-produced readiness
-    record + zombie-rejecting liveness, F-115). The successor's
-    production start() selects owned-launch again, starts its OWN child
-    (a different pid, never the orphan's), and EXECUTES a production
-    request while the orphan still lives — proven by the invocation log
-    (exactly one health invoke reached the successor's Dispatcher) and
-    the health diagnostic structure (F-118). The orphan is never
-    adopted, never blocks takeover, and carries no production
-    authority."""
+    SURVIVES as a genuinely-executing orphan (its OWN readiness record,
+    matched to pid and kernel start time, plus zombie-rejecting
+    liveness, F-115/F-124). The successor's production start() selects
+    owned-launch again, starts its OWN child — whose OWN readiness
+    record and start-time identity are verified (F-124) — and EXECUTES
+    a production request while the orphan still lives: proven by the
+    invocation log (exactly one preview invoke reached the successor's
+    Dispatcher) and a real minted confirmation token (F-118). The
+    orphan is never adopted, never blocks takeover, and carries no
+    production authority."""
     scratch = _scratch(tmp_path, "t33")
     state_dir = scratch / "state"
     child_gate = harness.gate(scratch, "child")
     owner = successor = None
-    orphan_pid = successor_child_pid = None
+    orphan_pid = orphan_starttime = None
+    successor_child_pid = successor_child_starttime = None
 
     try:
         events = scratch / "events.ndjson"
@@ -125,17 +141,17 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
         )
         orphan_pid = record["browser_child_pid"]
 
-        # F-115: child-produced readiness — the CHILD ITSELF wrote its
-        # pid record; the orphan is proven executing (not zombie) BEFORE
-        # the owner dies.
-        readiness = state_dir / "browser-child.pid"
-        deadline = time.monotonic() + 10
-        while not readiness.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert readiness.read_text(encoding="utf-8").strip() == str(orphan_pid), (
+        # F-115/F-124: child-produced readiness — the CHILD ITSELF wrote
+        # its per-pid marker (pid + starttime), and the orphan is proven
+        # executing (not zombie) BEFORE the owner dies.
+        orphan_readiness = _child_readiness(state_dir, orphan_pid)
+        assert orphan_readiness["pid"] == orphan_pid, (
             "the child itself produced its readiness record"
         )
+        orphan_starttime = orphan_readiness.get("starttime")
         assert harness.pid_alive(orphan_pid), "the browser child is executing before the owner dies"
+        if orphan_starttime is not None:
+            assert harness.proc_starttime(orphan_pid) == orphan_starttime
 
         # The owner dies uncleanly WITHOUT stopping its child: the child
         # survives exactly like a launched browser would.
@@ -146,11 +162,13 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
         assert owner.poll() == harness.EXIT_DIED_UNCLEAN, "the owner died uncleanly"
 
         # THE SURVIVAL OBSERVATION: the orphan child is really still
-        # alive and executing — present AND not a zombie (F-115).
+        # alive and executing — present, not a zombie, identity-tied.
         deadline = time.monotonic() + 10
         while not harness.pid_alive(orphan_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert harness.pid_alive(orphan_pid), "the browser child must survive the owner's unclean death"
+        if orphan_starttime is not None:
+            assert harness.proc_starttime(orphan_pid) == orphan_starttime
 
         # The successor: production start() runs again — owned-launch,
         # its OWN child — while the orphan lives. The orphan never
@@ -176,6 +194,17 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
             "the successor must start its OWN child, never attach to the orphan"
         )
 
+        # F-124: the SUCCESSOR's own child reached its readiness loop —
+        # its OWN per-pid marker, matched to pid and kernel start time —
+        # before the child-start claim is accepted.
+        successor_readiness = _child_readiness(state_dir, successor_child_pid)
+        assert successor_readiness["pid"] == successor_child_pid
+        successor_child_starttime = successor_readiness.get("starttime")
+        if successor_child_starttime is not None:
+            assert harness.proc_starttime(successor_child_pid) == successor_child_starttime, (
+                "the successor's child is the same process its readiness record describes"
+            )
+
         # Both children are alive and executing simultaneously: the
         # orphan was never adopted, and the successor's runtime is its
         # own fresh process.
@@ -197,28 +226,26 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
         )
         assert harness.pid_alive(orphan_pid), "the orphan still carries no production authority"
     finally:
-        # Exception-safe cleanup (F-120): each process independently.
+        # Exception-safe cleanup (F-120/F-126): each gate and process is
+        # handled independently, with identity-aware last-resort kills.
         for gate_name in ("die", "done", "child"):
-            harness.open_gate(scratch, gate_name)
+            harness.safe_open_gate(scratch, gate_name)
         for handle in (owner, successor):
             if handle is not None and handle.poll() is None:
                 try:
                     handle.kill()
                 except OSError:
                     pass
-        for pid in (orphan_pid, successor_child_pid):
+        for pid, starttime in (
+            (orphan_pid, orphan_starttime),
+            (successor_child_pid, successor_child_starttime),
+        ):
             if pid is None:
                 continue
             deadline = time.monotonic() + 10
             while harness.pid_alive(pid) and time.monotonic() < deadline:
                 time.sleep(0.1)
-            if harness.pid_alive(pid):
-                import os
-
-                try:
-                    os.kill(pid, 9)
-                except OSError:
-                    pass
+            harness.kill_pid_if_same_process(pid, starttime)
         for handle in (owner, successor):
             if handle is not None:
                 try:
@@ -230,10 +257,10 @@ def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_pa
 def test_T33_negative_control_unadmitted_request_does_not_count_as_service(tmp_path: Path) -> None:
     """F-118's adversarial acceptance test: force a PRE-ADMISSION IPC
     rejection whose response envelope is well-formed (a stale
-    authority-instance health request). The OLD oracle — "a dict with
+    authority-instance post_text preview). The OLD oracle — "a dict with
     an ok field" — accepts this response, which is exactly the
-    false-positive path; the EXECUTION oracle (invoke count plus health
-    diagnostic structure) must reject it. This control proves the
+    false-positive path; the EXECUTION oracle (invoke count plus a real
+    minted confirmation token) must reject it. This control proves the
     service assertion in the T33 test above cannot pass on an
     unadmitted request."""
     scratch = _scratch(tmp_path, "t33ctl")
@@ -275,8 +302,8 @@ def test_T33_negative_control_unadmitted_request_does_not_count_as_service(tmp_p
             "a pre-admission rejection mints no confirmation token"
         )
     finally:
-        harness.open_gate(scratch, "stop")
-        harness.open_gate(scratch, "child")
+        harness.safe_open_gate(scratch, "stop")
+        harness.safe_open_gate(scratch, "child")
         if owner is not None:
             if owner.poll() is None:
                 try:
@@ -291,10 +318,4 @@ def test_T33_negative_control_unadmitted_request_does_not_count_as_service(tmp_p
             deadline = time.monotonic() + 10
             while harness.pid_alive(orphan_pid) and time.monotonic() < deadline:
                 time.sleep(0.1)
-            if harness.pid_alive(orphan_pid):
-                import os
-
-                try:
-                    os.kill(orphan_pid, 9)
-                except OSError:
-                    pass
+            harness.kill_pid_if_same_process(orphan_pid, None)

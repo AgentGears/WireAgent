@@ -70,12 +70,34 @@ def _invoke_count(events_path: Path) -> int:
     return len([line for line in events_path.read_text(encoding="utf-8").splitlines() if '"invoke"' in line])
 
 
-def _ledger_text(state_dir: Path) -> str:
-    """Durable M5 effect rows (the crash-matrix precedent): what the
-    confirmed mutation actually persisted."""
+def _ledger_rows(state_dir: Path) -> list:
+    """The durable effect ledger as STRUCTURED records (F-125): terminal
+    claims are bound to the specific mutation's lifecycle (effect_id),
+    not to a substring that any unrelated row could satisfy."""
 
     effects = state_dir / "effects.ndjson"
-    return effects.read_text(encoding="utf-8") if effects.exists() else ""
+    if not effects.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in effects.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _assert_one_lifecycle_confirmed_terminal(state_dir: Path, why: str) -> None:
+    """Exactly ONE effect lifecycle reached the durable EFFECT_CONFIRMED
+    terminal, and that terminal row belongs to a lifecycle that also
+    durably RESERVED (F-125: the terminal state is bound to the
+    confirmed mutation, not asserted as a bare substring)."""
+
+    rows = _ledger_rows(state_dir)
+    confirmed = [r for r in rows if r.get("state") == "EFFECT_CONFIRMED"]
+    assert len(confirmed) == 1, f"{why}: exactly one confirmed terminal row, got {len(confirmed)}"
+    reserved_ids = {r.get("effect_id") for r in rows if r.get("state") == "RESERVED"}
+    assert confirmed[0].get("effect_id") in reserved_ids, (
+        f"{why}: the terminal row belongs to a lifecycle that durably RESERVED first"
+    )
 
 
 def _preview(scratch: Path, record: dict, text: str) -> str:
@@ -163,8 +185,8 @@ def test_T65_owner_local_descriptor_churn_never_releases_live_ownership(tmp_path
             f"after owner-local churn: {response}"
         )
         assert _invoke_count(events_path) == 2, "exactly the preview + confirm pair"
-        assert "EFFECT_CONFIRMED" in _ledger_text(state_dir), (
-            "the confirmed mutation's terminal effect row is durably persisted"
+        _assert_one_lifecycle_confirmed_terminal(
+            state_dir, "the churn-surviving owner's confirmed mutation"
         )
     finally:
         harness.open_gate(scratch, "stop-ownchurn")
@@ -349,6 +371,12 @@ def test_T65_durable_append_io_fault_degrades_the_request_not_the_ownership(tmp_
         _assert_successor_refused(
             scratch, state_dir, "an in-owner I/O fault must not release live ownership"
         )
+        # F-125: the faulted attempt must NOT have terminalized durably —
+        # no lifecycle reaches EFFECT_CONFIRMED while its durability
+        # seam is faulted.
+        assert not [r for r in _ledger_rows(state_dir) if r.get("state") == "EFFECT_CONFIRMED"], (
+            "the faulted confirmation must not produce a durable confirmed terminal"
+        )
 
         # Mutation 2 — the transient fault is spent; the owner completes
         # the full confirmed mutation through the same live process
@@ -359,8 +387,8 @@ def test_T65_durable_append_io_fault_degrades_the_request_not_the_ownership(tmp_
         assert isinstance(response2, dict) and response2.get("ok"), (
             f"the owner remains mutation-capable after the I/O fault: {response2}"
         )
-        assert "EFFECT_CONFIRMED" in _ledger_text(state_dir), (
-            "the recovered mutation's terminal effect row is durably persisted"
+        _assert_one_lifecycle_confirmed_terminal(
+            state_dir, "the recovered mutation after the one-shot I/O fault"
         )
     finally:
         harness.open_gate(scratch, "stop-io")

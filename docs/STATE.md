@@ -502,11 +502,14 @@ Supported remote mutations use the M5 adapters/scoped authority stack.
   longer pass the preflight and then fail the probe. PR-body record
   corrections: the stale peer-probe worker listing removed (the
   standalone /tmp probe replaced it) and the CI run reference updated
-  to the final verified run. Gates after repair: Linux container lane
-  11/11 (posix_endpoint 6 incl. T60 with the interpreter preflight,
+  to the final verified run. Gates after repair: exact-head CI run
+  37897545430 all four jobs green — Linux 3.11 and 3.12 both 1452
+  passed + 16 skipped (all eight new tests active; +1 over the
+  pre-repair 1451 is the owner-local churn test); local Windows full
+  suite 1428 passed + 40 platform-skipped; Linux container lane 11/11
+  (posix_endpoint 6 incl. T60 with the interpreter preflight,
   supported_faults 4 incl. the new owner-local churn, browser_child
-  1); local Windows and exact-head CI numbers in the PR once green.
-  Zero production-source delta unchanged from `36423cf`.
+  1). Zero production-source delta unchanged from `36423cf`.
 
 
 - **2026-10-09 — M7 Layer 7 round two tranche two CANDIDATE (from exact

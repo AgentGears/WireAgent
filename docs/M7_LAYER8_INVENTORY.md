@@ -14,7 +14,7 @@
 | Local development gate | Windows 11 (build 10.0.26200), real Super-Browser SDK importable, NTFS | Local full-suite runs recorded in STATE (1431 passed + 43 skipped at `c7af8ce`) |
 | CI Linux jobs | ubuntu-latest, stub Super-Browser (`tests/stubs/super_browser` via conftest) | Full-suite job, 1458+16 at `c7af8ce` |
 
-**Finding L8-R1 (scope-sharpening):** the CI Windows jobs already execute on the qualified OS *edition*. The handoff's "ordinary Windows CI does not independently prove qualification" resolves precisely: the gap is not the edition but (a) *which suites* the CI Windows job selects (see L8-R2) and (b) the per-run evidence record (§4's fingerprint requirement — the job already prints an OS/python fingerprint; the qualification record must capture it per native execution).
+**Finding L8-R1 (scope-sharpening):** the CI Windows jobs already execute on the qualified OS *edition*. The handoff's "ordinary Windows CI does not independently prove qualification" resolves precisely: the gap is not the edition but (a) *which suites* the CI Windows job selects (see L8-R2) and (b) the per-run evidence record (§4's fingerprint requirement — the job already prints an OS/python fingerprint; the qualification record must capture it per native execution). Per review L8-F06: the image is *observed*, not *pinned* — `windows-latest` is a moving label, and the future workflow must pin an explicit Server 2025 label or fail on the wrong edition at runtime.
 
 ---
 
@@ -27,7 +27,7 @@ From `.github/workflows/ci.yml` `windows-durability`:
 - `test_m7_layer4_transport_windows.py` + `test_m7_layer4_ipc.py` — real named-pipe transport and the IPC pipeline.
 - `test_user_rules.py` — the rule-store interprocess fence on its msvcrt branch.
 
-**Finding L8-R2 (the central environment gap):** the CI Windows job selects **no Layer 7 multi-process harness scenarios** (`test_m7_layer7_*` is absent). Every process-scale Windows qualification — sibling contention, unclean death and takeover, drain races, crash matrix, supported faults, browser-child takeover — currently runs on Windows **only in the local dev gate, i.e. on Windows 11, not Server 2025**. The harness itself is platform-portable (the full-owner family runs on named pipes there); closing this gap is a CI-selection change plus native execution, not new mechanism code.
+**Finding L8-R2 (revised per review L8-F01 — the central environment gap, now stated precisely):** the CI Windows job selects **no Layer 7 integrated multi-process harness scenarios** (`test_m7_layer7_*` is absent) — no dispatcher-backed owner contention, no takeover-with-hydration, no drain races, no crash matrix, no supported-fault injection, no browser-child scenarios on Server 2025. What the job DOES select already includes genuine sibling-process evidence at the **Layer 1 primitive level**: `test_m7_authority_owner_lock.py::test_two_fresh_processes_racing_same_domain_admit_exactly_one_owner` (two real subprocesses, common start gate, exactly one owner, the other `authority_busy`), `::test_os_lock_excludes_fresh_process_then_allows_clean_successor`, and the real fail-stopped-process suites in `test_m7_authority_owner_lock_failstop_processes.py` — all executed on the Server 2025 image. The gap is therefore the *integrated harness* (Dispatcher + IPC + recovery under contention, death, and takeover), not primitive-level sibling exclusion, which is qualified on Server 2025 today. The harness is platform-portable (the full-owner family runs on named pipes in the local gate on Windows 11); closing this is a CI-selection change plus native execution, not new mechanism code.
 
 **Finding L8-R6:** the M7 media-ingress Windows one-handle tests (`test_m7_layer6_ingress.py:683/703/728`, skipped on Linux) are not selected by the CI Windows job either — Windows coverage for them exists only on the dev box.
 
@@ -43,11 +43,11 @@ The endpoint builds a single-ACE DACL (creating user's SID, `FILE_ALL_ACCESS`) v
 
 ### 3.2 Pipe-busy error 231 (the Layer-4 flake) — admission-phase analysis
 
-Source establishes the mechanism precisely. `WindowsNamedPipeEndpoint.accept()` blocks in `ConnectNamedPipe`, then creates the next instance *after* the current one connects. A second concurrent client whose `CreateFileW` (in `_WindowsPipeConnection.open_client`) lands in the window between those two steps finds zero listening instances and receives `ERROR_PIPE_BUSY` (231). The failure occurs during **connection establishment**: before the hello frame is written, before any request bytes exist, before admission is reachable. Per the handoff §7's classification question: **the error is demonstrably pre-admission by construction**. A future retry confined to `CreateFileW`-phase `ERROR_PIPE_BUSY` in `open_client` would be pre-admission by mechanism; the repair itself remains a separately reviewed delta and must not be folded into qualification work.
+Source inspection supports a causal hypothesis for the observed flake. `WindowsNamedPipeEndpoint.accept()` blocks in `ConnectNamedPipe`, then creates the next instance *after* the current one connects; a second concurrent client whose `CreateFileW` (in `_WindowsPipeConnection.open_client`) lands in the window between those two steps finds zero listening instances and receives `ERROR_PIPE_BUSY` (231). Per the handoff §7's classification question, what is **proven** is the admission phase: the failure occurs during **connection establishment** — before the hello frame is written, before any request bytes exist, before admission is reachable — so an `ERROR_PIPE_BUSY` originating from that call is **pre-admission by construction**. The accept-loop window is a **source-supported causal hypothesis** for the observed occurrences, not a proven unique cause: the same error can arise whenever all instantiated pipe instances are busy for other timing or capacity reasons. Confirming the observed mechanism requires instrumented native execution. A future retry confined to `CreateFileW`-phase `ERROR_PIPE_BUSY` in `open_client` would be pre-admission by mechanism; the repair itself remains a separately reviewed delta and must not be folded into qualification work.
 
 ### 3.3 Owner lock (`authority.py`, Windows branch)
 
-`msvcrt.locking(LK_NBLCK)` on a dedicated `O_RDWR|O_CREAT` fd opened non-inheritable, with the at-fork gates, registry reservation, and fail-stop ambiguity handling. The known CRT property — byte-range locks are enforced against other processes' access to the locked range — is *observed in evidence* (T65's foreign churn test records OS-refused foreign reads inside the locked byte on Windows 11; POSIX flock advisory asserted symmetric). The same-process unrelated-descriptor hazard (RV03) is qualified by the owner-local churn test — again on Windows 11 only.
+`msvcrt.locking(LK_NBLCK)` on a dedicated `O_RDWR|O_CREAT` fd opened non-inheritable, with the at-fork gates, registry reservation, and fail-stop ambiguity handling. The known CRT property — byte-range locks enforced against other processes' access to the locked range — is **tolerated but not asserted** by the T65 foreign-churn test: it counts refused reads and asserts `reads_blocked == 0 or os.name == "nt"`, so on Windows it passes for any count from zero to forty. A `PermissionError` from `os.read` inside the locked byte WAS observed on the dev box during test development, but that observation is development history, not recorded test evidence. The qualified claim is therefore: foreign descriptor churn plus continued ownership; positive foreign-read refusal is NOT established evidence. The same-process unrelated-descriptor hazard (RV03) is qualified by the owner-local churn test — again on Windows 11 only.
 
 ### 3.4 Browser-launch reality
 
@@ -55,15 +55,17 @@ The real Super-Browser SDK is importable on the dev box, yet **no test in the re
 
 ---
 
-## 4. Simulation and stub map (what "green" currently means where)
+## 4. Simulation and stub map (revised per review L8-F02 — per-suite, not universal)
 
-| Surface | Production code exercised | Substituted | Where |
+What "green" means differs by suite family. No single row covers all suites:
+
+| Suite family | Production components exercised | Controlled substitutions | Not exercised |
 |---|---|---|---|
-| Authority chain (lock, session, dispatcher, IPC server/transport, gateway, ledgers, recovery) | **Always production, never stubbed** | — | All suites |
-| DOM/broker surface (`_StubSB`) | Kernel admission, confirmation, policy gates | Browser DOM | All m5-stack scenarios |
-| Session manager (pre-T33 scenarios) | — | `SessionManager` replaced (stubbed start) | Older Layer-7 scenarios |
-| T33 browser dependency | Production `SessionManager.start()`/`stop()`, attach gate, restore | `webwire.session.SuperBrowser` → real OS child | `owner-browser-child` |
-| M5 executors | Real executor/runtime/gateway in serving scenarios | Port + evidence reader (controlled adapters, labeled) | `full-owner-serving` and crash matrix |
+| Layer 4 component suites (`test_m7_layer4_transport_windows.py`, `test_m7_layer4_ipc.py`) | Real `AuthorityIPCServer`, real named-pipe/AF_UNIX transport, real framing/admission gates | Synthetic `AuthoritySession`; `invoke()` callback returning `ok_result` | No production `AuthorityOwnerLock`, no Dispatcher, no M5 gateway, no durable ledgers |
+| Layer 4/5 lifecycle + startup suites | Real session/lifecycle state machines, real request table | Controlled dispatcher seams where noted | Browser binary |
+| Layer 7 full-owner scenarios (`full-owner*` family incl. serving, crash matrix, T16) | **The integrated production chain**: real lock, real `AuthoritySession`, production Dispatcher + IPC, real M5 executors/gateway/durable ledgers/recovery | `_StubSB` DOM surface; ports/evidence readers as labeled controlled adapters; invoke-logging seams | Real browser binary; real external effects |
+| T33 browser-child scenarios | Production `SessionManager.start()/stop()`, attach gate, restore path | `webwire.session.SuperBrowser` → controlled real OS child | Real browser binary |
+| Single-process lock suites (incl. Server-2025 sibling races) | Real `AuthorityOwnerLock`, real subprocesses | — | Everything above the primitive |
 | Super-Browser SDK | Real on dev box (stub-parity enforced); stub on CI Linux; absent from CI Windows selections | `tests/stubs/super_browser` | Per environment |
 
 ---
@@ -74,14 +76,14 @@ Legend: **QUALIFIED-25** = real-process evidence on Server 2025 (CI Windows job)
 
 | Workstream | Classification today | Basis and gaps |
 |---|---|---|
-| W8-01 Native owner lock | QUALIFIED-25 (single-process lock suites, fail-stop processes) + QUALIFIED-11 (sibling contention, death release, takeover, rendezvous persistence via the L7 harness) | Server-2025 process-scale execution missing (L8-R2) |
-| W8-02 Windows lock lifetime | QUALIFIED-11 (owner-local churn, foreign churn, ENOSPC fault, rendezvous loss) + QUALIFIED-25 (primitive suites) | Same environment gap; CRT same-process semantics rest on Win-11 evidence |
-| W8-03 Windows IPC security | PARTIAL: transport roundtrips, framing, oversized refusal, build/instance gates QUALIFIED-25; DACL inspection and remote-client rejection UNTESTED (L8-R3); T59 open |
+| W8-01 Native owner lock | QUALIFIED-25 for primitive-level sibling evidence (two-fresh-process race, exclusion + clean successor, fail-stopped process + successor) and single-process suites; QUALIFIED-11 for the integrated harness (dispatcher-backed contention, unclean death, takeover-with-hydration, rendezvous persistence) | Integrated-harness execution on Server 2025 missing (L8-R2 revised) |
+| W8-02 Windows lock lifetime | QUALIFIED-11 (owner-local churn, foreign churn — foreign-read refusal tolerated, not asserted — ENOSPC fault, rendezvous loss) + QUALIFIED-25 (primitive suites) | Same environment gap; CRT same-process semantics rest on Win-11 evidence |
+| W8-03 Windows IPC security | PARTIAL: transport roundtrips, framing, oversized refusal, build/instance gates QUALIFIED-25 (component-level: synthetic session + invoke callback); DACL inspection and remote-client rejection UNTESTED (L8-R3); T59 open |
 | W8-04 Lifecycle/admission | QUALIFIED-11 (L7 harness: drain races T16, blocked work retention, hung-owner kill, shutdown ordering) | Server-2025 execution missing |
 | W8-05 Durable crash recovery | QUALIFIED-11 (crash matrix T34–T38, torn-append, takeover hydration) + QUALIFIED-25 (ledger durability/recovery suites) | Process-scale crash matrix on Server 2025 missing |
-| W8-06 Request identity | QUALIFIED-11 (retained table, saturation, canonical identity, lost responses) + QUALIFIED-25 (IPC pipeline suite) | Same environment gap |
+| W8-06 Request identity | QUALIFIED-11 (retained table, saturation, canonical identity, lost responses) + QUALIFIED-25 (IPC pipeline suite, component-level) | Same environment gap |
 | W8-07 Native browser lifecycle | **UNTESTED** (no real browser binary in any test; T33 evidence is within its recorded adapter boundary) | Greenfield; see §6 constraints below |
-| W8-08 Regressions/support boundaries | QUALIFIED-25 (M5/M6 ledger/recovery regressions, rules fence) except media-ingress one-handle tests: QUALIFIED-11 only (L8-R6) | Add ingress suite to Server-2025 selection |
+| W8-08 Regressions/support boundaries | **PARTIAL, not near-complete:** Server 2025 runs only the SELECTED M5/M6 ledger/recovery modules — the full mandatory inherited M5/M6 regression surface (M7_DESIGN §23/§25) is NOT established on Server 2025; media-ingress one-handle tests are QUALIFIED-11 only (L8-R6) | The candidate matrix must enumerate the inherited set: which tests require Server-2025 execution, which have valid platform-independent evidence, which remain unqualified |
 
 ---
 
@@ -95,21 +97,24 @@ Legend: **QUALIFIED-25** = real-process evidence on Server 2025 (CI Windows job)
 
 ---
 
-## 7. Findings register (initial inspection)
+## 7. Findings register (initial inspection, corrected after first review)
 
-- **L8-R1** — CI Windows jobs already run Windows Server 2025 (`windows-2025-vs2026`); the qualification gap is suite selection and evidence recording, not OS edition.
-- **L8-R2** — No Layer 7 multi-process scenarios in the CI Windows selection; all process-scale Windows evidence is Windows 11 local-gate evidence.
-- **L8-R3** — T59 unestablished: the DACL is never inspected on a live pipe and no remote client is ever driven; the existing test proves construction success only.
+- **L8-R1** — CI Windows jobs already run Windows Server 2025 (`windows-2025-vs2026`); the qualification gap is suite selection and evidence recording, not OS edition. **(L8-F06, applied):** `windows-latest` is a moving label — observed, not pinned. The future workflow change must select an explicit Server 2025 runner label or enforce the OS identity at runtime (a fingerprint that prints but cannot fail the job on the wrong edition is evidence, not enforcement).
+- **L8-R2** (revised, L8-F01) — No Layer 7 *integrated* multi-process scenarios in the CI Windows selection; primitive-level sibling evidence (two-process race, exclusion + clean successor, fail-stop + successor) IS qualified on Server 2025 today.
+- **L8-R3** — T59 unestablished: the DACL is never inspected on a live pipe and no remote client is ever driven; the existing test proves construction success only. Any future remote-negative test must also prove its remote path was genuinely reachable (a network failure would otherwise produce a false green).
 - **L8-R4** — No real browser binary in any automated test; W8-07 is greenfield under the §6 constraints (surviving-child case mandatory-adversarial or explicitly reported; surrogate evidence may not be presented as browser-binary behavior).
-- **L8-R5** — Pipe-busy 231 classified from source: rendezvous-capacity race in `accept()` between `ConnectNamedPipe` and next-instance creation; the client error arises in `CreateFileW` — pre-admission by construction. Repair is a separate reviewed delta.
+- **L8-R5** (revised, L8-F05) — Pipe-busy 231 proven **pre-admission by construction** (arises in `CreateFileW` connection establishment, before hello/request/admission); the accept-loop next-instance window is a source-supported causal **hypothesis**, not a proven unique cause. Retry restriction unchanged: pre-admission connection establishment only. Repair is a separate reviewed delta.
 - **L8-R6** — M7 media-ingress Windows one-handle tests not in the CI Windows selection (dev-box only).
+- **L8-F02** (applied) — The stub map is now per-suite; the earlier universal "always production, never stubbed" row overstated the component suites, which run a synthetic session and an `ok_result` invoke callback.
+- **L8-F03** (applied) — T65's foreign-churn test tolerates refused reads on Windows without asserting them; positive foreign-read refusal is development history, not recorded evidence.
+- **L8-F04** (applied) — W8-08 now distinguishes the selected native ledger/recovery regressions from the full mandatory inherited M5/M6 regression surface; the candidate matrix must enumerate that set.
 - **F-131** — unchanged: low-severity PID-reuse assertion in the Layer 7 fork negative control; own delta, no silent incorporation.
 
 ---
 
 ## 8. Proposed next steps (for maintainer review, not yet executed)
 
-1. Extend the CI Windows job selection to the Layer 7 harness scenarios and the media-ingress suite, with the §4 evidence fingerprint captured per run (tests/workflow only).
+1. Extend the CI Windows job selection to the Layer 7 harness scenarios and the media-ingress suite, with the §4 evidence fingerprint captured per run — **pinned to an explicit Windows Server 2025 runner label or with runtime OS-identity enforcement that fails the job on the wrong edition** (L8-F06; tests/workflow only).
 2. Build the T59 native pair: live-pipe DACL readback (`GetSecurityInfo` → assert single user-SID ACE) and a real remote-client attempt against `PIPE_REJECT_REMOTE_CLIENTS`.
 3. Design the W8-07 browser-binary campaign within §6: real launch through production `start()`, owner-crash both survivor and non-survivor cases, successor isolation, explicit reporting if the binary's lifecycle cannot produce the survivor case.
 4. F-131 and any 231 retry as their own reviewed deltas.

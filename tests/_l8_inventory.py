@@ -94,11 +94,15 @@ def verify_run(xml_path: str) -> int:
             continue  # a non-mandatory companion test (e.g. the E-1 gate tests)
         node = f"{path}::{name}"
         child = list(case)
-        if not child:
-            outcomes[node] = ("passed", "")
+        outcome = (
+            ("passed", "")
+            if not child
+            else (child[0].tag, child[0].get("message", "") or (child[0].text or "")[:200])
+        )
+        if node in outcomes:  # L8-EF06: duplicates are ambiguous evidence
+            outcomes[node] = ("duplicate", f"{outcomes[node]} THEN {outcome}")
         else:
-            kind = child[0].tag  # skipped / failure / error
-            outcomes[node] = (kind, child[0].get("message", "") or (child[0].text or "")[:200])
+            outcomes[node] = outcome
 
     failures = []
     expected = {line.strip() for line in MANIFEST.read_text(encoding="utf-8").splitlines() if line.strip()}
@@ -115,7 +119,8 @@ def verify_run(xml_path: str) -> int:
             else:
                 print(f"expected skip, labeled legitimate: {node} ({EXPECTED_SKIPS[node]})")
             continue
-        failures.append(f"{kind}: {node} ({message[:120]})")
+        label = "duplicate identity" if kind == "duplicate" else kind
+        failures.append(f"{label}: {node} ({message[:120]})")
     for node, (kind, _msg) in sorted(outcomes.items()):
         if node not in expected:
             failures.append(f"unexpected outcome for non-mandatory test: {node} {kind}")

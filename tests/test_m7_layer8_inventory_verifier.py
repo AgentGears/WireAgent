@@ -45,16 +45,22 @@ F90 = "tests/test_m7_layer6_ingress.py::test_F90_substituted_pathname_bytes_come
 
 
 def _good_xml(tmp_path: Path) -> Path:
-    cases = [_case(n, None) for n in ALL_NODES]
-    for node, reason in inv.EXPECTED_SKIPS.items():
-        cases.append(_case(node, "skipped", f"SKIPPED [1] {node}: {reason}"))
+    # Exactly ONE outcome per expected identity (L8-EF06): the permitted
+    # skips REPLACE their passed entry rather than adding a second one.
+    cases = [
+        _case(n, "skipped", inv.EXPECTED_SKIPS[n]) if n in inv.EXPECTED_SKIPS else _case(n, None)
+        for n in ALL_NODES
+    ]
     p = tmp_path / "good.xml"
     p.write_text(_xml(cases), encoding="utf-8")
     return p
 
 
 def _mutate(tmp_path: Path, name: str, transform) -> Path:
-    cases = [_case(n, None) for n in ALL_NODES]
+    cases = [
+        _case(n, "skipped", inv.EXPECTED_SKIPS[n]) if n in inv.EXPECTED_SKIPS else _case(n, None)
+        for n in ALL_NODES
+    ]
     cases.append(_case(F90, None))
     for node, reason in inv.EXPECTED_SKIPS.items():
         cases.append(_case(node, "skipped", reason))
@@ -129,4 +135,35 @@ def test_verifier_rejects_failed_mandatory_test(tmp_path: Path) -> None:
 def test_verifier_rejects_malformed_xml(tmp_path: Path) -> None:
     p = tmp_path / "bad.xml"
     p.write_text("<testsuite><testcase>", encoding="utf-8")
+    assert inv.verify_run(str(p)) == 1
+
+
+def test_verifier_rejects_duplicate_failure_then_pass(tmp_path: Path) -> None:
+    """L8-EF06: a later PASSING duplicate must never erase an earlier
+    FAILURE for the same identity — order-independent rejection."""
+
+    def dup(cases):
+        cases.append(_case(sorted(ALL_NODES)[0], None))
+        return cases
+
+    base = _mutate(tmp_path, "dupbase", lambda cs: cs)
+    tree = ET.parse(base)
+    root = tree.getroot()
+    first = list(root)[0]
+    root.remove(first)
+    root.append(_case(sorted(ALL_NODES)[0], "failure", "boom"))
+    root.append(_case(sorted(ALL_NODES)[0], None))
+    p = tmp_path / "dup1.xml"
+    tree.write(str(p), encoding="utf-8")
+    assert inv.verify_run(str(p)) == 1
+
+
+def test_verifier_rejects_duplicate_skip_then_pass(tmp_path: Path) -> None:
+    skip_node = next(iter(inv.EXPECTED_SKIPS))
+
+    def dup(cases):
+        cases.append(_case(skip_node, None))
+        return cases
+
+    p = _mutate(tmp_path, "dupskip", dup)
     assert inv.verify_run(str(p)) == 1

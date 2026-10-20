@@ -58,16 +58,28 @@ jobs:
         run: python tests/_l8_native_gate.py
       - name: L8-E2 expected-inventory verification (pre-run)
         run: python tests/_l8_inventory.py verify-collect
-      - name: L8-E3 evidence record
-        # OS product+build (native), filesystem, python, dependency digest,
-        # source revision, runtime build identity, configuration.
+      - name: L8-E3 evidence record (complete reproducibility, L8-EF02)
+        # One structured record: environment, FULL dependency inventory,
+        # resolved revisions (merge + PR head + frozen baseline), runtime
+        # identity, and qualification configuration incl. SDK mode.
         run: >-
-          powershell -NoProfile -Command "Write-Output ('OS=' + (Get-CimInstance Win32_OperatingSystem).Caption + ' build=' + (Get-CimInstance Win32_OperatingSystem).BuildNumber)";
-          fsutil fsinfo volumeinfo C:;
-          python -c "import sys; print('python=', sys.version)";
-          pip freeze | python -c "import sys,hashlib; d=hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16]; print('deps-sha256=', d)";
-          git rev-parse HEAD;
-          python -c "from webwire.authority_ipc_protocol import compute_runtime_build_id; print('runtime_build_id=', compute_runtime_build_id())"
+          $r = @();
+          $r += 'OS=' + (Get-CimInstance Win32_OperatingSystem).Caption + ' build=' + (Get-CimInstance Win32_OperatingSystem).BuildNumber;
+          $r += 'merge_sha=' + $env:GITHUB_SHA;
+          $r += 'pr_head=' + (git rev-parse HEAD);
+          $r += 'frozen_baseline=31d3688def12268d8f40654310f6760ef6bb9e6f';
+          $r += 'python=' + $env:PYTHON_VERSION;
+          $r += (fsutil fsinfo volumeinfo C:) -join ' | ';
+          $r += 'runtime_build_id=' + (python -c "from webwire.authority_ipc_protocol import compute_runtime_build_id; print(compute_runtime_build_id(), end='')");
+          $r += 'sdk_mode=' + (python -c "import importlib.util; print('real' if importlib.util.find_spec('super_browser') else 'offline-stub', end='')");
+          $r >> l8-evidence.txt;
+          pip freeze >> l8-evidence.txt;
+          Get-Content l8-evidence.txt;
+      - name: Upload L8 evidence record
+        uses: actions/upload-artifact@v4
+        with:
+          name: l8-evidence-${{ matrix.python-version }}
+          path: l8-evidence.txt
       - name: Windows safety-ledger qualification
         run: >-
           python -m pytest -q
@@ -96,12 +108,20 @@ jobs:
         # exercises the flock side in CI. Run the store suite — including
         # the two-process fence falsification — on Windows too.
         run: python -m pytest -q tests/test_user_rules.py
+      - name: Enable Windows Developer Mode (F90 symlink privilege, L8-EF01)
+        # The F90 substituted-pathname test is a MANDATORY Windows-native
+        # scenario; its symlink-creation skip is a native evidence gap, not
+        # a platform boundary. Developer Mode grants symlink creation.
+        run: reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1
       - name: Windows L8 integrated Layer-7 harness qualification (E-2)
         # The frozen matrix's M-1..M-5 native evidence: the integrated
-        # multi-process harness on the pinned qualified image. The
-        # post-run inventory check fails the job on any unexpected skip.
+        # multi-process harness on the pinned qualified image. Structured
+        # JUnit XML drives the inventory verifier (L8-EF01: console parsing
+        # was vacuous on Windows); the job fails on any test failure,
+        # missing/deselected scenario, or unexpected skip.
         run: >-
           python -m pytest -q -ra
+          --junitxml=l7-run.xml
           tests/test_m7_layer7_ownership.py
           tests/test_m7_layer7_crash_matrix.py
           tests/test_m7_layer7_t16_race.py
@@ -111,7 +131,6 @@ jobs:
           tests/test_m7_layer7_browser_child.py
           tests/test_m7_layer7_harness_safety.py
           tests/test_m7_layer6_ingress.py
-          tests/test_m7_layer8_native_gate.py
-          2>&1 | Tee-Object -FilePath l7-run.log;
+          tests/test_m7_layer8_native_gate.py;
           if ($LASTEXITCODE -ne 0) { Write-Host "L7 harness FAILED: $LASTEXITCODE"; exit 1 };
-          python tests/_l8_inventory.py verify-run l7-run.log
+          python tests/_l8_inventory.py verify-run l7-run.xml

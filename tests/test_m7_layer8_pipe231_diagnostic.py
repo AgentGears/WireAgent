@@ -139,7 +139,9 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
                 "client": detail.split(":")[0],
                 "ms_since_prev_instance": _ms(prev_created, ts, before=True),
                 "ms_until_next_instance": _ms(next_created, ts, before=False),
-                "in_accept_window": prev_created is not None and (ts - prev_created) < 0.05,
+                "near_instance_creation_within_50ms": (
+                    prev_created is not None and (ts - prev_created) < 0.05
+                ),  # NOT causal (retired rule; samples only)
             }
         )
     record["failure_event_samples"] = windows[:20]
@@ -155,12 +157,19 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
         # consecutive successor creations while clients were failing.
         "event_count": len(events),
     }
-    record["events_head"] = [
-        f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events[:30]
-    ]
-    record["events_tail"] = [
-        f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events[-30:]
-    ]
+    saw_232 = any("232" in e for e in progress["server_errors"])
+    if saw_232:
+        # Full chronological stream for the 232 investigation (audit trail).
+        record["events_full"] = [
+            f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events
+        ]
+    else:
+        record["events_head"] = [
+            f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events[:30]
+        ]
+        record["events_tail"] = [
+            f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events[-30:]
+        ]
     print("M13-DIAG:", json.dumps(record, default=str))
     (tmp_path / "m13-diag.json").write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
 
@@ -284,35 +293,38 @@ def test_M13_controlled_accept_gap_falsification(tmp_path: Path) -> None:
 
 
 def test_M13_F04_client_disconnect_listener_termination(tmp_path: Path) -> None:
-    """M-13-F04 (HIGH, review-raised): can an ORDINARY client disconnect
-    permanently disable the production listener? The production
-    _accept_loop breaks on RuntimeError from accept(); the F03 evidence
-    observed ConnectNamedPipe returning error 232 (ERROR_NO_DATA) after a
-    connect-and-immediately-close client. This reproduction mirrors the
-    PRODUCTION loop semantics (break on OSError/RuntimeError) around the
-    real endpoint and fires single connect+instant-close clients at it,
-    one fresh endpoint per round. OUTCOMES recorded honestly:
-    REPRODUCED (232 broke the loop; subsequent clients refused) or
-    NOT_REPRODUCED across N rounds. Diagnostic only — no production
-    change; a fix follows the frozen six-part evidence rule."""
+    """M-13-F04, rev 2 (F04-F01/F02 corrections): TWO arms around the real
+    endpoint with production-semantics accept loops (break on
+    OSError/RuntimeError — exactly _accept_loop's behavior).
+
+    ARM 1 — the DECISIVE pre-accept ordering (F04-F01): the client
+    connects and closes BEFORE the server ever calls accept(); the real
+    accept() is invoked only afterward. If ConnectNamedPipe returns 232
+    on the already-disconnected instance, the loop dies mid-traffic.
+
+    ARM 2 — the sustained quick-close pattern from the prior rounds,
+    retained for accumulation.
+
+    Both arms (F04-F02): when a mid-traffic listener death is detected,
+    the post-death client connection is attempted BEFORE any teardown,
+    so unavailability is attributable to the death, not the test's own
+    shutdown. Diagnostic only; no production change."""
     import threading
 
     from webwire.authority_ipc_endpoint import WindowsNamedPipeEndpoint, _WindowsPipeConnection
 
     rounds = []
-    for i in range(15):
+
+    def run_round(i: int, pre_accept_disconnect: bool) -> None:
         rnd_dir = tmp_path / f"r{i}"
         rnd_dir.mkdir()
         endpoint = WindowsNamedPipeEndpoint(rnd_dir)
         endpoint.bind()
         stop = threading.Event()
-        outcome: dict[str, object] = {"round": i}
+        arm = "pre_accept" if pre_accept_disconnect else "quick_close"
+        outcome: dict[str, object] = {"round": i, "arm": arm}
 
-        def production_semantics_loop(
-            ep=endpoint, out=outcome, stop_flag=stop
-        ) -> None:
-            # Mirrors AuthorityIPCTransport._accept_loop: break on
-            # OSError/RuntimeError once running.
+        def production_semantics_loop(ep=endpoint, out=outcome, stop_flag=stop) -> None:
             while not stop_flag.is_set():
                 try:
                     conn = ep.accept()
@@ -322,20 +334,40 @@ def test_M13_F04_client_disconnect_listener_termination(tmp_path: Path) -> None:
                     out["loop_error"] = repr(exc)[:100]
                     return  # production breaks
 
-        srv = threading.Thread(target=production_semantics_loop, daemon=True)
-        srv.start()
-        time.sleep(0.1)
-        # The adversarial-but-ordinary client: connect, then close at once —
-        # a disconnect DURING connection establishment.
-        try:
-            quick = _WindowsPipeConnection.open_client(endpoint.path)
-            quick.close()
-            outcome["quick_client_connected"] = True
-        except Exception as exc:  # noqa: BLE001
-            outcome["quick_client_connected"] = repr(exc)[:80]
+        if pre_accept_disconnect:
+            # F04-F01: connect AND close BEFORE any accept() call — the
+            # server's ConnectNamedPipe will face an already-gone client.
+            try:
+                quick = _WindowsPipeConnection.open_client(endpoint.path)
+                quick.close()
+                outcome["pre_accept_client"] = "connected_and_closed"
+            except Exception as exc:  # noqa: BLE001
+                outcome["pre_accept_client"] = repr(exc)[:80]
+            srv = threading.Thread(target=production_semantics_loop, daemon=True)
+            srv.start()
+        else:
+            srv = threading.Thread(target=production_semantics_loop, daemon=True)
+            srv.start()
+            time.sleep(0.1)
+            try:
+                quick = _WindowsPipeConnection.open_client(endpoint.path)
+                quick.close()
+                outcome["quick_client_connected"] = True
+            except Exception as exc:  # noqa: BLE001
+                outcome["quick_client_connected"] = repr(exc)[:80]
+
         time.sleep(0.15)
         died_mid_traffic = not srv.is_alive()
         outcome["listener_died_mid_traffic"] = died_mid_traffic
+        if died_mid_traffic and "loop_error" in outcome:
+            # F04-F02: probe reachability BEFORE any teardown — a failure
+            # here is attributable to the listener death alone.
+            try:
+                late = _WindowsPipeConnection.open_client(endpoint.path)
+                outcome["post_death_client_before_teardown"] = "connected"
+                late.close()
+            except Exception as exc:  # noqa: BLE001
+                outcome["post_death_client_before_teardown"] = repr(exc)[:80]
         stop.set()
         try:
             endpoint.close()
@@ -343,28 +375,29 @@ def test_M13_F04_client_disconnect_listener_termination(tmp_path: Path) -> None:
             pass
         srv.join(timeout=5)
         outcome["listener_alive_after_shutdown"] = srv.is_alive()
-        if not srv.is_alive() and "loop_error" in outcome:
-            # The loop died on an error: can a later client still connect
-            # to whatever the endpoint left behind?
-            try:
-                late = _WindowsPipeConnection.open_client(endpoint.path)
-                outcome["late_client"] = "connected"
-                late.close()
-            except Exception as exc:  # noqa: BLE001
-                outcome["late_client"] = repr(exc)[:80]
         rounds.append(outcome)
+
+    for i in range(10):
+        run_round(i, pre_accept_disconnect=True)
+    for i in range(10, 20):
+        run_round(i, pre_accept_disconnect=False)
 
     reproduced = [
         r
         for r in rounds
         if r.get("loop_error") and "232" in str(r["loop_error"]) and r.get("listener_died_mid_traffic")
     ]
+    pre_accept_232 = [r for r in reproduced if r.get("arm") == "pre_accept"]
     record = {
         "rounds": rounds,
         "error_232_loop_deaths": len(reproduced),
-        "status": "REPRODUCED" if reproduced else "NOT_REPRODUCED",
+        "pre_accept_232_deaths": len(pre_accept_232),
+        "status": (
+            "REPRODUCED_PRE_ACCEPT" if pre_accept_232
+            else "REPRODUCED_UNDER_LOAD" if reproduced
+            else "NOT_REPRODUCED"
+        ),
     }
     print("M13-F04-REPRO:", json.dumps(record, default=str))
     (tmp_path / "f04.json").write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
-    # Instrument invariants only: every round ran and reported.
-    assert len(rounds) == 15
+    assert len(rounds) == 20

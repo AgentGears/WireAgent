@@ -83,7 +83,10 @@ def verify_run(log_path: str) -> int:
             skipped.add(m.group(1))
     unexpected = skipped - set(EXPECTED_SKIPS)
     if unexpected:
-        print(f"INVENTORY FAIL: unexpected skips in mandatory Windows-active set: {sorted(unexpected)}", file=sys.stderr)
+        print(
+            f"INVENTORY FAIL: unexpected skips in mandatory Windows-active set: {sorted(unexpected)}",
+            file=sys.stderr,
+        )
         return 1
     for sid, reason in EXPECTED_SKIPS.items():
         label = f"({reason})" if reason else ""

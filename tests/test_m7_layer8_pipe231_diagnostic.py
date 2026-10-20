@@ -105,12 +105,18 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
     server.join(timeout=5)
 
     failures = [e for e in events if e[1] == "client_fail" and "231" in e[2]]
+    other_failures = [e for e in events if e[1] == "client_fail" and "231" not in e[2]]
     clean_attempts = sum(1 for e in events if e[1] == "client_ok")
+    alive = [c1.is_alive(), c2.is_alive()].count(True)
+    completed_threads = 2 - alive
 
     record: dict[str, object] = {
-        "attempts": clean_attempts + len(failures),
+        "intended_attempts": 2 * ROUNDS,
+        "completed_client_threads": completed_threads,
         "clean": clean_attempts,
         "pipe_busy_231": len(failures),
+        "other_failures": [f[2] for f in other_failures],
+        "attempts": clean_attempts + len(failures) + len(other_failures),
     }
 
     # Correlate every 231 against the nearest instance-lifecycle events.
@@ -128,7 +134,8 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
                 "in_accept_window": prev_created is not None and (ts - prev_created) < 0.05,
             }
         )
-    record["correlations"] = windows[:20]
+    record["correlations_head"] = windows[:20]
+    record["correlations_all_count"] = len(windows)
     if failures:
         in_window = sum(1 for w in windows if w["in_accept_window"])
         record["status"] = "OBSERVED" if in_window == len(failures) else "PARTIALLY_CORRELATED"
@@ -139,6 +146,114 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
     print("M13-DIAG:", json.dumps(record, default=str))
     (tmp_path / "m13-diag.json").write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
 
-    # Instrument invariants only.
-    assert record["attempts"] == record["clean"] + record["pipe_busy_231"]
-    assert record["attempts"] > 0
+    # Instrument invariants only (M-13-F02: exact accounting).
+    assert completed_threads == 2, "both client threads must complete their rounds"
+    assert record["attempts"] == 2 * ROUNDS, "every attempted connection is accounted"
+
+
+def test_M13_controlled_accept_gap_falsification(tmp_path: Path) -> None:
+    """The review-prescribed decisive experiment. Through the production
+    accept() path, the _create_instance seam is held at the successor
+    creation (E4) — the suspected window is DELIBERATELY open. Client B
+    then attempts CreateFileW (E5). If B receives 231 and connectivity
+    resumes after the barrier releases (E7/E8), the gap demonstrably
+    causes the observed failure: DEMONSTRATED, not correlated. If B
+    connects during the held gap, the hypothesis is FALSIFIED — recorded
+    honestly either way. Event ordering uses perf_counter_ns."""
+    import threading
+
+    from webwire.authority_ipc_endpoint import WindowsNamedPipeEndpoint, _WindowsPipeConnection
+
+    order: list[tuple[int, str]] = []
+    olock = threading.Lock()
+
+    def mark(event: str) -> None:
+        with olock:
+            order.append((time.perf_counter_ns(), event))
+
+    endpoint = WindowsNamedPipeEndpoint(tmp_path)
+    original_create = endpoint._create_instance
+    barrier = threading.Event()
+    reached = threading.Event()
+
+    def _gated_create(*, first: bool):
+        if first:
+            handle = original_create(first=True)
+            mark("E1_first_instance_created")
+            return handle
+        mark("E3_accept_reached_successor_creation")
+        reached.set()
+        assert barrier.wait(timeout=10), "barrier never released"
+        mark("E7_barrier_released_successor_created")
+        return original_create(first=False)
+
+    endpoint._create_instance = _gated_create  # type: ignore[method-assign]
+    endpoint.bind()  # E1 happens here
+
+    def server() -> None:
+        conn = endpoint.accept()  # blocks in ConnectNamedPipe until A connects
+        conn.close()
+
+    srv = threading.Thread(target=server, daemon=True)
+    srv.start()
+    time.sleep(0.2)
+
+    # E2: client A connects to the listening first instance.
+    a = _WindowsPipeConnection.open_client(endpoint.path)
+    mark("E2_client_A_connected")
+    a.close()
+
+    # E3: production accept() must reach successor creation (ConnectNamedPipe done).
+    assert reached.wait(timeout=5), "accept never reached successor creation"
+    mark("E4_gap_open_barrier_holding")
+
+    # E5/E6: client B attempts CreateFileW while the gap is open.
+    b_outcome: dict[str, object] = {}
+    try:
+        b = _WindowsPipeConnection.open_client(endpoint.path)
+        b_outcome["connected"] = True
+        b.close()
+    except Exception as exc:  # noqa: BLE001 - the record is the point
+        b_outcome["connected"] = False
+        b_outcome["error"] = repr(exc)
+    mark("E6_client_B_attempt_finished")
+
+    # E7: release; the successor instance is created; accept returns.
+    barrier.set()
+    srv.join(timeout=10)
+    time.sleep(0.2)
+
+    # E8: a new client connects successfully.
+    try:
+        c = _WindowsPipeConnection.open_client(endpoint.path)
+        e8 = True
+        c.close()
+    except Exception:  # noqa: BLE001
+        e8 = False
+    mark("E8_new_client_attempt_finished")
+    try:
+        endpoint.close()
+    except Exception:  # noqa: BLE001 - shutdown hygiene
+        pass
+
+    record = {
+        "events": [name for _, name in order],
+        "client_B": b_outcome,
+        "E8_new_client_connected": e8,
+        "status": (
+            "DEMONSTRATED"
+            if (
+                not b_outcome.get("connected")
+                and "231" in str(b_outcome.get("error", ""))
+                and e8
+            )
+            else "FALSIFIED_OR_ANOMALOUS"
+        ),
+    }
+    print("M13-GAP-EXPERIMENT:", json.dumps(record, default=str))
+
+    # Ordering invariants: the gap opened before B attempted, and the
+    # successor was created only after the barrier released.
+    names = [n for _, n in order]
+    assert names.index("E4_gap_open_barrier_holding") < names.index("E6_client_B_attempt_finished")
+    assert names.index("E6_client_B_attempt_finished") < names.index("E7_barrier_released_successor_created")

@@ -54,6 +54,9 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
 
     def _instrumented_create(*, first: bool):
         handle = original_create(first=first)
+        if not first:
+            with lock:
+                progress["successor_instances"] += 1
         log("instance_created", "first" if first else "next")
         return handle
 
@@ -68,14 +71,19 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
     endpoint.bind()
 
     stop = threading.Event()
+    progress = {"accepts": 0, "successor_instances": 0, "server_errors": []}
 
     def server_loop() -> None:
         while not stop.is_set():
             try:
                 conn = endpoint.accept()
                 conn.close()
+                with lock:
+                    progress["accepts"] += 1
                 log("accepted_closed")
             except Exception as exc:  # noqa: BLE001 - record and continue
+                with lock:
+                    progress["server_errors"].append(repr(exc)[:80])
                 log("server_error", repr(exc)[:80])
                 return
 
@@ -143,6 +151,20 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
     else:
         record["status"] = "NOT_REPRODUCED"
 
+    record["server_progress"] = {
+        **progress,
+        "server_thread_alive_after": server.is_alive(),
+        # Longest gap with NO listening instance (successor creation is
+        # the only path back to availability): longest stretch between
+        # consecutive successor creations while clients were failing.
+        "event_count": len(events),
+    }
+    record["events_head"] = [
+        f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events[:30]
+    ]
+    record["events_tail"] = [
+        f"{ts:.6f} {kind} {detail}".strip() for ts, kind, detail in events[-30:]
+    ]
     print("M13-DIAG:", json.dumps(record, default=str))
     (tmp_path / "m13-diag.json").write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
 
@@ -184,8 +206,11 @@ def test_M13_controlled_accept_gap_falsification(tmp_path: Path) -> None:
         mark("E3_accept_reached_successor_creation")
         reached.set()
         assert barrier.wait(timeout=10), "barrier never released"
-        mark("E7_barrier_released_successor_created")
-        return original_create(first=False)
+        mark("E7a_barrier_released")
+        mark("E7b_successor_creation_started")
+        handle = original_create(first=False)
+        mark("E7c_successor_creation_completed")
+        return handle
 
     endpoint._create_instance = _gated_create  # type: ignore[method-assign]
     endpoint.bind()  # E1 happens here
@@ -237,7 +262,7 @@ def test_M13_controlled_accept_gap_falsification(tmp_path: Path) -> None:
         pass
 
     record = {
-        "events": [name for _, name in order],
+        "events": [{"ns": ns, "event": name} for ns, name in order],
         "client_B": b_outcome,
         "E8_new_client_connected": e8,
         "status": (
@@ -255,5 +280,8 @@ def test_M13_controlled_accept_gap_falsification(tmp_path: Path) -> None:
     # Ordering invariants: the gap opened before B attempted, and the
     # successor was created only after the barrier released.
     names = [n for _, n in order]
-    assert names.index("E4_gap_open_barrier_holding") < names.index("E6_client_B_attempt_finished")
-    assert names.index("E6_client_B_attempt_finished") < names.index("E7_barrier_released_successor_created")
+    i4 = names.index("E4_gap_open_barrier_holding")
+    i6 = names.index("E6_client_B_attempt_finished")
+    i7a = names.index("E7a_barrier_released")
+    i7c = names.index("E7c_successor_creation_completed")
+    assert i4 < i6 < i7a < i7c, "the gap closed only after B attempted"

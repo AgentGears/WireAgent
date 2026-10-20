@@ -144,7 +144,35 @@ class WorkerHandle:
 
 
 def _tail(process: subprocess.Popen[Any]) -> str:
-    return ""
+    """The worker's captured stderr/stdout tail for timeout diagnostics.
+
+    Pipes are consumed non-blockingly: what the process has flushed so far
+    is returned without waiting (a dead worker flushes everything; a live
+    one may still hold buffered output).
+    """
+    import threading
+
+    chunks: list[str] = []
+
+    def _drain(stream: Any) -> None:
+        try:
+            data = stream.read()
+            if not data:
+                return
+            if not isinstance(data, str):
+                data = data.decode("utf-8", "replace")
+            chunks.append(data[-1500:])
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the failure
+            pass
+
+    streams = [s for s in (process.stderr, process.stdout) if s is not None]
+    threads = [threading.Thread(target=_drain, args=(s,)) for s in streams]
+    for th in threads:
+        th.daemon = True
+        th.start()
+    for th in threads:
+        th.join(timeout=2)
+    return chr(10).join(chunks)
 
 
 def start_worker(

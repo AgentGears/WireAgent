@@ -113,4 +113,5 @@ jobs:
           tests/test_m7_layer6_ingress.py
           tests/test_m7_layer8_native_gate.py
           2>&1 | Tee-Object -FilePath l7-run.log;
+          if ($LASTEXITCODE -ne 0) { Write-Host "L7 harness FAILED: $LASTEXITCODE"; exit 1 };
           python tests/_l8_inventory.py verify-run l7-run.log

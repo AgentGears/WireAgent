@@ -129,7 +129,7 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
 
     # Correlate every 231 against the nearest instance-lifecycle events.
     instances = [e for e in events if e[1] == "instance_created"]
-    windows: list[dict[str, object]] = []
+    windows: list[dict[str, object]] = []  # event samples only; the retired proximity rule is NOT applied
     for ts, _, detail in failures:
         prev_created = max((t for t, k, _ in instances if t <= ts), default=None)
         next_created = min((t for t, k, _ in instances if t > ts), default=None)
@@ -142,14 +142,10 @@ def test_M13_pipe231_diagnostic(tmp_path: Path) -> None:
                 "in_accept_window": prev_created is not None and (ts - prev_created) < 0.05,
             }
         )
-    record["correlations_head"] = windows[:20]
-    record["correlations_all_count"] = len(windows)
-    if failures:
-        in_window = sum(1 for w in windows if w["in_accept_window"])
-        record["status"] = "OBSERVED" if in_window == len(failures) else "PARTIALLY_CORRELATED"
-        record["in_accept_window_count"] = in_window
-    else:
-        record["status"] = "NOT_REPRODUCED"
+    record["failure_event_samples"] = windows[:20]
+    record["stress_status"] = (
+        "FAILURES_OBSERVED_SEE_SERVER_PROGRESS" if failures else "NOT_REPRODUCED"
+    )  # causal attribution lives ONLY in the controlled experiment
 
     record["server_progress"] = {
         **progress,
@@ -285,3 +281,90 @@ def test_M13_controlled_accept_gap_falsification(tmp_path: Path) -> None:
     i7a = names.index("E7a_barrier_released")
     i7c = names.index("E7c_successor_creation_completed")
     assert i4 < i6 < i7a < i7c, "the gap closed only after B attempted"
+
+
+def test_M13_F04_client_disconnect_listener_termination(tmp_path: Path) -> None:
+    """M-13-F04 (HIGH, review-raised): can an ORDINARY client disconnect
+    permanently disable the production listener? The production
+    _accept_loop breaks on RuntimeError from accept(); the F03 evidence
+    observed ConnectNamedPipe returning error 232 (ERROR_NO_DATA) after a
+    connect-and-immediately-close client. This reproduction mirrors the
+    PRODUCTION loop semantics (break on OSError/RuntimeError) around the
+    real endpoint and fires single connect+instant-close clients at it,
+    one fresh endpoint per round. OUTCOMES recorded honestly:
+    REPRODUCED (232 broke the loop; subsequent clients refused) or
+    NOT_REPRODUCED across N rounds. Diagnostic only — no production
+    change; a fix follows the frozen six-part evidence rule."""
+    import threading
+
+    from webwire.authority_ipc_endpoint import WindowsNamedPipeEndpoint, _WindowsPipeConnection
+
+    rounds = []
+    for i in range(15):
+        rnd_dir = tmp_path / f"r{i}"
+        rnd_dir.mkdir()
+        endpoint = WindowsNamedPipeEndpoint(rnd_dir)
+        endpoint.bind()
+        stop = threading.Event()
+        outcome: dict[str, object] = {"round": i}
+
+        def production_semantics_loop(
+            ep=endpoint, out=outcome, stop_flag=stop
+        ) -> None:
+            # Mirrors AuthorityIPCTransport._accept_loop: break on
+            # OSError/RuntimeError once running.
+            while not stop_flag.is_set():
+                try:
+                    conn = ep.accept()
+                    conn.close()
+                    out["accepts"] = out.get("accepts", 0) + 1
+                except (OSError, RuntimeError) as exc:
+                    out["loop_error"] = repr(exc)[:100]
+                    return  # production breaks
+
+        srv = threading.Thread(target=production_semantics_loop, daemon=True)
+        srv.start()
+        time.sleep(0.1)
+        # The adversarial-but-ordinary client: connect, then close at once —
+        # a disconnect DURING connection establishment.
+        try:
+            quick = _WindowsPipeConnection.open_client(endpoint.path)
+            quick.close()
+            outcome["quick_client_connected"] = True
+        except Exception as exc:  # noqa: BLE001
+            outcome["quick_client_connected"] = repr(exc)[:80]
+        time.sleep(0.15)
+        died_mid_traffic = not srv.is_alive()
+        outcome["listener_died_mid_traffic"] = died_mid_traffic
+        stop.set()
+        try:
+            endpoint.close()
+        except Exception:  # noqa: BLE001 - hygiene
+            pass
+        srv.join(timeout=5)
+        outcome["listener_alive_after_shutdown"] = srv.is_alive()
+        if not srv.is_alive() and "loop_error" in outcome:
+            # The loop died on an error: can a later client still connect
+            # to whatever the endpoint left behind?
+            try:
+                late = _WindowsPipeConnection.open_client(endpoint.path)
+                outcome["late_client"] = "connected"
+                late.close()
+            except Exception as exc:  # noqa: BLE001
+                outcome["late_client"] = repr(exc)[:80]
+        rounds.append(outcome)
+
+    reproduced = [
+        r
+        for r in rounds
+        if r.get("loop_error") and "232" in str(r["loop_error"]) and r.get("listener_died_mid_traffic")
+    ]
+    record = {
+        "rounds": rounds,
+        "error_232_loop_deaths": len(reproduced),
+        "status": "REPRODUCED" if reproduced else "NOT_REPRODUCED",
+    }
+    print("M13-F04-REPRO:", json.dumps(record, default=str))
+    (tmp_path / "f04.json").write_text(json.dumps(record, default=str, indent=2), encoding="utf-8")
+    # Instrument invariants only: every round ran and reported.
+    assert len(rounds) == 15

@@ -79,7 +79,11 @@ def verify_collect() -> int:
 
 
 def verify_run(xml_path: str) -> int:
-    tree = ET.parse(xml_path)  # noqa: S320 - pytest's own structured output
+    try:
+        tree = ET.parse(xml_path)  # noqa: S320 - pytest's own structured output
+    except ET.ParseError as exc:
+        print(f"INVENTORY FAIL: malformed junit xml: {exc}", file=sys.stderr)
+        return 1
     outcomes: dict[str, tuple[str, str]] = {}
     for case in tree.iter("testcase"):
         classname = case.get("classname", "").replace(".", "/")

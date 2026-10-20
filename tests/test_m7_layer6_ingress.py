@@ -149,8 +149,8 @@ async def test_ingest_rejects_symlink_escape(tmp_path: Path) -> None:
     try:
         (staging.parent / "link.png").symlink_to(outside)
 
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
 
     with pytest.raises(MediaIngressError, match="outside|symlink"):
         registry.ingest("link.png")
@@ -386,8 +386,8 @@ async def test_root_symlink_rejected_at_construction(tmp_path: Path) -> None:
     alias = domain / "media-staging"
     try:
         alias.symlink_to(real_staging, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     with pytest.raises(MediaIngressError, match="root_symlink_rejected"):
         MediaArtifactRegistry(
             staging_root=alias,
@@ -421,8 +421,8 @@ async def test_alias_directory_component_rejected(tmp_path: Path) -> None:
     (staging / "photo.png").write_bytes(_PNG_1X1)
     try:
         (staging / "alias").symlink_to(staging, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     with pytest.raises(MediaIngressError, match="symlink_rejected"):
         registry.ingest("alias/photo.png")
 
@@ -593,8 +593,8 @@ async def test_F88_final_component_symlink_refused_at_open(tmp_path: Path) -> No
     try:
         target.unlink()
         target.symlink_to(outside)
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     with pytest.raises(MediaIngressError, match="symlink_rejected"):
         registry.ingest("photo.png")
     assert registry.artifact_count == 0
@@ -750,8 +750,8 @@ async def test_F90_substituted_pathname_bytes_come_from_validated_handle(tmp_pat
     registry._win_create_validated = _validated_then_substitute  # type: ignore[method-assign]
     try:
         minted = registry.ingest("photo.png")
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     assert minted.byte_size == len(_PNG_1X1), "bytes came from the validated handle"
     assert Path(minted.owner_path).read_bytes() == _PNG_1X1  # noqa: ASYNC240
 

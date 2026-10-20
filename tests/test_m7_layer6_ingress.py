@@ -753,7 +753,7 @@ async def test_F90_substituted_pathname_bytes_come_from_validated_handle(tmp_pat
     staged = _stage(registry, "photo.png")
 
     real_validated = registry._win_create_validated
-    seam: dict[str, object] = {}
+    seam: dict[str, object] = {"substituted": False}
 
     def _validated_then_substitute(staged_name: str) -> object:
         handle = real_validated(staged_name)
@@ -794,7 +794,19 @@ async def test_F90_substituted_pathname_bytes_come_from_validated_handle(tmp_pat
         f"unexpected refusal kind while handle held: {seam['unlink_while_held']!r}"
     )
     staged.unlink()
-    staged.symlink_to(outside)
+    try:
+        staged.symlink_to(outside)
+    except OSError as exc:
+        # Property 3 requires symlink privilege. The qualified image HAS
+        # it (the workflow's SYMLINK PROBE step proves os.symlink works
+        # there before this suite runs, so this branch is unreachable on
+        # Server 2025). WinError 1314 is the LOCAL development box's
+        # missing privilege — a labeled environment limitation, distinct
+        # from any qualification outcome.
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"local environment lacks symlink privilege (1314); "
+                        f"property 3 is carried by the qualified image's probe: {exc!r}")
+        raise
     assert staged.resolve() == outside.resolve(), "post-release substitution succeeds"
 
 

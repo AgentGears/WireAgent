@@ -1,6 +1,6 @@
 # M7 Layer 8 — Proposal: Listener Recovery for ConnectNamedPipe Error 232
 
-**Status: PROPOSAL — for separate review under the frozen six-part production-change rule. No production code is modified by this document.**
+**Status: PROPOSAL, REVISED — for separate review. No production code is modified by this document.** Revision 2 incorporates the design review: F04-RP01 (namespace continuity — close-last-handle-then-create DROPPED as the primary; reset-existing evaluated FIRST, create-before-retire SECOND) and F04-RP02 (a linearizable recovery-versus-shutdown lifecycle rule replacing the insufficient `_running`-only guard, with its deterministic barrier test).
 
 ## 1. The demonstrated defect (accepted evidence)
 
@@ -19,12 +19,31 @@ Sustained stress traffic independently strikes the same window (the accepted CI 
 
 Microsoft documents that a previously connected pipe instance must be disconnected before it can be reused for another client. On error 232 the instance is in a disconnected-client state; merely looping back to `ConnectNamedPipe` on the same handle is not a supported reuse. The repair must explicitly RESTORE A VALID LISTENING INSTANCE.
 
-## 3. Candidate approaches (evaluation order per the review)
+## 3. Candidate approaches (evaluation order REVISED per F04-RP01)
 
-| Approach | Mechanism | Consideration |
-|---|---|---|
-| **Retire-and-recreate (preferred for evaluation first)** | Close the disconnected instance's handle; create a fresh listening instance via the existing validated `_create_instance(first=False)` path; continue the loop | Fits the current instance-creation architecture; must preserve listener identity and shutdown ordering |
-| Reset-existing | `DisconnectNamedPipe` on the instance, then resume accepting on the same handle | Smaller allocation change; requires careful handle-state management and the same identity/shutdown proofs |
+The original revision preferred close-last-handle-then-create. The review identified the flaw: the ownership lock does NOT reserve the Windows named-pipe NAMESPACE — closing the final server handle can vacate the pipe NAME, and a competing process could create a pipe under that name during the interval before replacement. That ordering is **DROPPED as the primary candidate** and may be reconsidered only with an explicit namespace-continuity argument plus a native falsification test proving the vacancy cannot be exploited.
+
+| Order | Approach | Mechanism | Why |
+|---|---|---|---|
+| **1st** | **Reset existing instance** | `DisconnectNamedPipe` on the disconnected instance, returning THE SAME pipe object and handle to a valid listening state | Preserves the original handle, pipe object, and security attributes — no namespace vacancy is ever created (Microsoft documents this exact lifecycle for instance reuse) |
+| 2nd | **Create-before-retire** | Create the replacement instance WHILE the original handle remains valid; verify; publish under lifecycle control; only then retire the dead instance; continue accepting | Never drops the final reference before replacement exists — but feasibility with the current instance attributes must be established natively first |
+
+The preferred decision flow (candidate 1):
+
+```text
+ConnectNamedPipe
+    +-- connected            existing path unchanged
+    +-- ERROR_NO_DATA (232)
+    |       +-- endpoint ACTIVE (per the §4.5 lifecycle rule)?
+    |       |       +-- no  -> exit for shutdown
+    |       |       +-- yes -> DisconnectNamedPipe
+    |       |                   +-- success -> instance returns to listening; loop continues
+    |       |                   +-- failure -> FAIL CLOSED (Win32 code preserved; endpoint
+    |       |                                  enters an explicitly unusable state)
+    +-- any other error      existing failure path
+```
+
+## 4. Binding invariants
 
 ## 4. Binding invariants (any implementation must preserve all six)
 
@@ -35,6 +54,20 @@ Microsoft documents that a previously connected pipe instance must be disconnect
 5. Unexpected instance-creation failure remains visible and fail-closed — if the replacement `_create_instance` fails, the loop breaks exactly as today (availability loss is observable, never silently degraded), with the error logged with its Win32 code.
 6. Recovery replays nothing and bypasses nothing — no request, handshake, or identity validation is affected; a recovered listener serves only fresh connections through the unchanged protocol gates.
 
+### 4.5 The linearizable recovery-versus-shutdown rule (F04-RP02)
+
+`_running` alone CANNOT gate recovery: `stop()` sets it False, closes the endpoint, and RELEASES the security-descriptor/ACL backing allocations — a recovery thread that checked `_running` before that sequence could create a new instance against freed security resources or publish a handle after close. The implementation must instead define:
+
+- **Explicit endpoint states**: `ACTIVE` → `RECOVERING` → back to `ACTIVE`, or → `CLOSING` (terminal).
+- **A synchronized publication decision**: whether a replacement/reset instance may be published is decided under one lock that the shutdown path ALSO acquires when entering `CLOSING` — publication after `CLOSING` is impossible by construction. The lock covers the recovery decision, handle publication, and close-entry ONLY; it is never held across a blocking `ConnectNamedPipe`.
+- **Exact handle ownership**: the listener thread owns the live instance handle; a replacement is owned by its creator until published (then the listener owns it) or until cleaned up (never published → creator closes it exactly once).
+- **Cleanup of unpublished work**: if shutdown wins while a recovery is in flight, the unpublished reset/replacement is closed by its owning thread and the endpoint remains `CLOSING` — no resurrection.
+- **Security-descriptor lifetime**: the `SECURITY_ATTRIBUTES`/ACL buffers live as long as ANY instance creation or publication can reference them — released only after `CLOSING` is entered under the same lock.
+
+**Deterministic negative test (required):** a barrier immediately before recovery publishes its reset/replacement; shutdown is triggered from another thread AT the barrier; the oracle must prove — recovery reached the barrier → shutdown began → endpoint entered `CLOSING` → barrier released → NO new listening instance published → every handle closed exactly once → no client accepted after shutdown.
+
+**Namespace-continuity negative test (required, F04-RP01):** throughout the ENTIRE recovery sequence — including a deliberately faulted `DisconnectNamedPipe` — a competing-process probe repeatedly attempts to create/open the pipe name; it must NEVER observe a creatable or foreign-owned name. (For create-before-retire, the probe runs while the original handle is held.)
+
 ## 5. Qualification plan (the review's ten scenarios)
 
 | Scenario | Required result | Test vehicle |
@@ -43,11 +76,13 @@ Microsoft documents that a previously connected pipe instance must be disconnect
 | Client disconnects after `ConnectNamedPipe` | Existing behavior preserved | The quick-close arm + existing transport tests |
 | Repeated pre-accept disconnects | Listener remains available | N consecutive pre-accept rounds, all followed by successful service |
 | Fresh client after recovery | Completes a REAL hello and request round trip | A full `IPCClient` exchange after each recovery — not merely a connect |
-| Recovery instance creation fails | Explicit fail-closed outcome | Faulted `_create_instance` during recovery; loop exits, error visible |
+| Recovery instance reset/creation fails | Explicit fail-closed outcome: the original Win32 error preserved, the endpoint left in an explicitly unusable state, and every handle closed exactly once | Faulted `DisconnectNamedPipe` and faulted `_create_instance` during recovery |
 | Shutdown during recovery | No listener resurrection | Stop requested mid-recovery; no further accepts |
 | Foreign-user access after recovery | Remains denied | The M-7 non-owner local-identity negative re-run post-recovery |
-| Remote-client access after recovery | Remains rejected | DACL/flag inspection on the recreated instance; T59's remote campaign stays separate |
+| Remote-client access after recovery | Remains rejected | DACL/flag inspection on the reset/replacement instance — STRUCTURAL evidence only; it does NOT close T59 or M-8, whose genuine remote-host campaigns remain separate blocked requirements |
 | Authority successor after recovery | Existing identity rules preserved | The RP-02 successor-transition negative |
+| Shutdown raced against recovery at the publication barrier | No instance published after CLOSING; handles closed exactly once; no client accepted after shutdown | The F04-RP02 deterministic barrier test (§4.5) |
+| Pipe name vacated or foreign-creatable at ANY point during recovery | Never — namespace continuity holds throughout, including faulted recovery | The F04-RP01 competing-process probe (§4.5) |
 | Windows Server 2025, Python 3.11/3.12 | Native qualification passes | The pinned `windows-2025` job |
 
 ## 6. Oracle promotion — the critical qualification requirement

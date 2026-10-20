@@ -142,9 +142,11 @@ jobs:
           tests/test_m7_layer7_browser_child.py
           tests/test_m7_layer7_harness_safety.py
           tests/test_m7_layer6_ingress.py
-          tests/test_m7_layer8_native_gate.py
-          tests/test_m7_layer8_race_diagnostic.py;
+          tests/test_m7_layer8_native_gate.py;
           $rc = $LASTEXITCODE;
+          Write-Host "=== RACE01 DIAGNOSTIC (streamed, instruments only) ===";
+          python -m pytest -q -s tests/test_m7_layer8_race_diagnostic.py;
+          if ($LASTEXITCODE -ne 0) { Write-Host "RACE DIAG: FAILED"; exit 1 };
           python tests/_l8_inventory.py verify-run l7-run.xml;
           $inv = $LASTEXITCODE;
           if ($rc -ne 0) { Write-Host "PYTEST: FAILED ($rc)" } else { Write-Host "PYTEST: PASSED" };

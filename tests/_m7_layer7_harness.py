@@ -11,6 +11,7 @@ TEST ORCHESTRATION, never authority signals.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -147,6 +148,21 @@ def _tail(process: subprocess.Popen[Any]) -> str:
     return ""
 
 
+_TAG_SEQ = 0
+
+
+def _next_tag(scenario: str) -> str:
+    """Collision-proof worker tag. ``time.monotonic_ns()`` alone collides
+    on Windows: back-to-back calls land in the same QPC tick, two workers
+    then SHARE one result file, and the controller reads it twice — the
+    L8-RACE01 both-busy 'failure' was exactly this artifact (both racers
+    reported one pid). A process-unique sequence number makes the tag
+    unique regardless of timer resolution."""
+    global _TAG_SEQ
+    _TAG_SEQ += 1
+    return f"{scenario}-{os.getpid()}-{_TAG_SEQ}-{time.monotonic_ns()}"
+
+
 def start_worker(
     scratch: Path,
     scenario: str,
@@ -155,7 +171,7 @@ def start_worker(
     """Launch one worker scenario. Result files and gates live under
     ``scratch``; each call mints a unique result name."""
     scratch.mkdir(parents=True, exist_ok=True)
-    tag = f"{scenario}-{time.monotonic_ns()}"
+    tag = _next_tag(scenario)
     result_path = scratch / f"{tag}.json"
     argv = [sys.executable, str(WORKER), scenario, str(result_path), *map(str, args)]
     process = subprocess.Popen(  # noqa: S603 - fixed interpreter + repo file

@@ -1409,6 +1409,93 @@ def full_owner_t16(
 
 
 # ---------------------------------------------------------------------------
+# L8-RACE01 diagnostic: capture WHY a racer sees busy (not an acceptance test)
+# ---------------------------------------------------------------------------
+
+
+def _chain(exc: BaseException) -> list[str]:
+    out = []
+    cur = exc
+    while cur is not None:
+        out.append(
+            f"{type(cur).__name__}: {cur} "
+            f"[errno={getattr(cur, 'errno', None)} winerror={getattr(cur, 'winerror', None)}]"
+        )
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
+def race_diag(result_path: Path, state_dir: Path, acquire_gate: Path, release_gate: Path) -> int:
+    """L8-RACE01 instrument: a common-gate racer that records EVERYTHING
+    about its acquisition attempt — pid, timestamps at each step, the
+    resolved domain and lock path, and on failure the FULL exception chain
+    with errno/winerror. Never retries; the record is the deliverable."""
+    record: dict[str, Any] = {"pid": os.getpid(), "ts_spawn": time.time()}
+    lock = AuthorityOwnerLock(state_dir)
+    record["domain"] = str(lock.authority_domain)
+    record["lock_path"] = str(lock.lock_path)
+    _wait_gate(acquire_gate)
+    record["ts_go"] = time.time()
+    try:
+        lock.acquire()
+        record["acquired"] = True
+        record["ts_acquired"] = time.time()
+        _write(result_path, record)
+        _wait_gate(release_gate, timeout=60)
+        lock.release()
+        return 0
+    except BaseException as exc:  # noqa: BLE001 - capture is the point
+        record["acquired"] = False
+        record["ts_fail"] = time.time()
+        record["exc_chain"] = _chain(exc)
+        _write(result_path, record)
+        return 23
+
+
+def raw_lock_race(result_path: Path, lock_file: Path, acquire_gate: Path, release_gate: Path = None) -> int:  # type: ignore[assignment]
+    """L8-RACE01 control arm: the SAME simultaneous race against the RAW
+    msvcrt/flock primitive, no AuthorityOwnerLock, no registry, no
+    process-local gates — isolates the OS primitive's behavior from the
+    production wrapper's."""
+    _wait_gate(acquire_gate)
+    record: dict[str, Any] = {"pid": os.getpid(), "ts_go": time.time(), "lock_file": str(lock_file)}
+    import time as _time
+
+    fd = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            os.lseek(fd, 0, os.SEEK_SET)
+            _time.sleep(0)  # no artificial delay: the gate IS the race
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record["acquired"] = True
+        record["ts_acquired"] = _time.time()
+        _write(result_path, record)
+        if release_gate is not None:
+            _wait_gate(release_gate, timeout=60)
+        os.close(fd)
+        return 0
+    except BaseException as exc:  # noqa: BLE001 - capture is the point
+        record["acquired"] = False
+        record["ts_fail"] = _time.time()
+        record["exc_chain"] = _chain(exc)
+        _write(result_path, record)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return 23
+
+
+# ---------------------------------------------------------------------------
 # T63: POSIX spawn/exec child survival (extends the fork lane)
 # ---------------------------------------------------------------------------
 
@@ -1969,6 +2056,12 @@ def main(argv: list[str]) -> int:
         return full_owner_m5_serving(result_path, Path(raw[0]), Path(raw[1]))
     if scenario == "full-owner-tablesat":
         return full_owner_tablesat(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]), Path(raw[3]))
+    if scenario == "race-diag":
+        return race_diag(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
+    if scenario == "raw-lock-race":
+        return raw_lock_race(
+            result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]) if len(raw) > 2 else None
+        )
     if scenario == "owner-spawn-child":
         return owner_spawn_child(result_path, Path(raw[0]), Path(raw[1]), Path(raw[2]))
     if scenario == "child-exec":

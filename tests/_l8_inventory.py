@@ -31,6 +31,8 @@ SELECTION = [
     "tests/test_m7_layer7_browser_child.py",
     "tests/test_m7_layer7_harness_safety.py",
     "tests/test_m7_layer6_ingress.py",
+    "tests/test_m7_layer8_native_gate.py",
+    "tests/test_m7_layer8_race_diagnostic.py",
 ]
 
 # The ONLY skips permitted in the manifest set on the qualified Windows

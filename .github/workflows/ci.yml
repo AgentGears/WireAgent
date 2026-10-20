@@ -33,7 +33,9 @@ jobs:
 
   windows-durability:
     name: windows durability (${{ matrix.python-version }})
-    runs-on: windows-latest
+    # L8-E1: the QUALIFIED environment, pinned by label (not windows-latest,
+    # a moving label) AND verified at runtime by the native identity gate.
+    runs-on: windows-2025
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +51,23 @@ jobs:
           pip install "pytest>=8.0" "pytest-asyncio>=0.23"
       - name: Platform fingerprint
         run: python -c "import os,platform,sys; print('os.name=',os.name); print('sys.platform=',sys.platform); print('platform=',platform.platform()); print('python=',sys.version)"
+      - name: L8-E1 native identity gate (Windows Server 2025)
+        # Fails the job on any other edition BEFORE qualification runs. The
+        # gate's refusal behavior is qualified by its negative-control tests
+        # (tests/test_m7_layer8_native_gate.py) which run in every suite.
+        run: python tests/_l8_native_gate.py
+      - name: L8-E2 expected-inventory verification (pre-run)
+        run: python tests/_l8_inventory.py verify-collect
+      - name: L8-E3 evidence record
+        # OS product+build (native), filesystem, python, dependency digest,
+        # source revision, runtime build identity, configuration.
+        run: >-
+          powershell -NoProfile -Command "Write-Output ('OS=' + (Get-CimInstance Win32_OperatingSystem).Caption + ' build=' + (Get-CimInstance Win32_OperatingSystem).BuildNumber)";
+          fsutil fsinfo volumeinfo C:;
+          python -c "import sys; print('python=', sys.version)";
+          pip freeze | python -c "import sys,hashlib; d=hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16]; print('deps-sha256=', d)";
+          git rev-parse HEAD;
+          python -c "from webwire.authority_ipc_protocol import compute_runtime_build_id; print('runtime_build_id=', compute_runtime_build_id())"
       - name: Windows safety-ledger qualification
         run: >-
           python -m pytest -q
@@ -77,3 +96,21 @@ jobs:
         # exercises the flock side in CI. Run the store suite — including
         # the two-process fence falsification — on Windows too.
         run: python -m pytest -q tests/test_user_rules.py
+      - name: Windows L8 integrated Layer-7 harness qualification (E-2)
+        # The frozen matrix's M-1..M-5 native evidence: the integrated
+        # multi-process harness on the pinned qualified image. The
+        # post-run inventory check fails the job on any unexpected skip.
+        run: >-
+          python -m pytest -q -ra
+          tests/test_m7_layer7_ownership.py
+          tests/test_m7_layer7_crash_matrix.py
+          tests/test_m7_layer7_t16_race.py
+          tests/test_m7_layer7_supported_faults.py
+          tests/test_m7_layer7_ipc_faults.py
+          tests/test_m7_layer7_media_boundary.py
+          tests/test_m7_layer7_browser_child.py
+          tests/test_m7_layer7_harness_safety.py
+          tests/test_m7_layer6_ingress.py
+          tests/test_m7_layer8_native_gate.py
+          2>&1 | Tee-Object -FilePath l7-run.log;
+          python tests/_l8_inventory.py verify-run l7-run.log

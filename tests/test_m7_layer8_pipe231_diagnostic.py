@@ -367,7 +367,10 @@ def test_M13_F04_client_disconnect_listener_termination(tmp_path: Path) -> None:
                 outcome["post_death_client_before_teardown"] = "connected"
                 late.close()
             except Exception as exc:  # noqa: BLE001
-                outcome["post_death_client_before_teardown"] = repr(exc)[:80]
+                # Full error + Win32 code preserved (F04-F02 evidence
+                # improvement): distinguishes an unavailable listening
+                # instance from other failure conditions.
+                outcome["post_death_client_before_teardown"] = repr(exc)
         stop.set()
         try:
             endpoint.close()

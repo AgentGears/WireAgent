@@ -200,10 +200,21 @@ class IPCTransportServer:
             self._listener_thread = None
 
     def _accept_loop(self) -> None:
-        """Accept connections via the QUALIFIED endpoint; bounded handlers."""
+        """Accept connections via the QUALIFIED endpoint; bounded handlers.
+
+        F04-IR07: the endpoint reference is captured ONCE per iteration
+        and used for BOTH accept() and admit_and_dispatch() — stop()
+        clears self._endpoint, and re-dereferencing the field after
+        accept() returned would raise AttributeError before the
+        endpoint's synchronized lifecycle decision could refuse the
+        connection cleanly. The captured object's own terminal state
+        decides admission."""
         while self._running and self._endpoint is not None:
+            endpoint = self._endpoint
+            if endpoint is None:
+                break
             try:
-                conn = self._endpoint.accept()
+                conn = endpoint.accept()
             except (OSError, RuntimeError):
                 if self._running:
                     logger.warning("IPC accept loop: accept failed", exc_info=True)
@@ -218,7 +229,7 @@ class IPCTransportServer:
             # ONE indivisible critical section relative to shutdown — the
             # endpoint's synchronized decision covers the dispatch call
             # itself, so no handler can start in the check-to-start gap.
-            if not self._endpoint.admit_and_dispatch(conn, self._dispatch_connection):
+            if not endpoint.admit_and_dispatch(conn, self._dispatch_connection):
                 continue
             # (dispatched atomically inside admit_and_dispatch above)
 

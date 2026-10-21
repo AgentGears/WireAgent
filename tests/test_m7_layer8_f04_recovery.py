@@ -22,8 +22,7 @@ from typing import Any
 import pytest
 
 from webwire.authority_ipc_endpoint import WindowsNamedPipeEndpoint, _WindowsPipeConnection
-from webwire.authority_ipc_protocol import IPC_PROTOCOL_VERSION
-from webwire.authority_ipc_protocol import compute_runtime_build_id
+from webwire.authority_ipc_protocol import IPC_PROTOCOL_VERSION, compute_runtime_build_id
 from webwire.authority_ipc_server import AuthorityIPCServer
 from webwire.authority_ipc_transport import IPCClient, IPCTransportServer
 from webwire.authority_session import AuthoritySession
@@ -226,7 +225,7 @@ def test_post_accept_admission_rejects_after_shutdown(tmp_path: Path) -> None:
     refuses — the connection is closed without any protocol byte."""
     endpoint = WindowsNamedPipeEndpoint(tmp_path)
     endpoint.bind()
-    held = _WindowsPipeConnection.open_client(endpoint.path)  # occupies the instance
+    client_side = _WindowsPipeConnection.open_client(endpoint.path)  # occupies the instance
 
     results: list = []
 
@@ -242,6 +241,7 @@ def test_post_accept_admission_rejects_after_shutdown(tmp_path: Path) -> None:
 
     endpoint.close()  # shutdown wins AFTER accept returned, BEFORE admission
     assert endpoint.admit(conn) is False, "admission must be refused after CLOSING"
+    client_side.close()  # noqa: SIM115 — explicit teardown of the held client
     # The refused connection is unusable: any byte operation fails.
     with pytest.raises(OSError):
         conn.send(b"x")

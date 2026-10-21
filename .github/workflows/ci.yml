@@ -65,6 +65,11 @@ jobs:
           tests/test_m7_authority_owner_lock_setup_failures.py
           tests/test_m7_authority_owner_lock_callback_failures.py
           tests/test_m7_authority_owner_lock_failstop_processes.py
+      - name: F04 listener-recovery acceptance (authorized implementation)
+        run: >-
+          python -m pytest -v -ra tests/test_m7_layer8_f04_recovery.py;
+          if ($LASTEXITCODE -ne 0) { Write-Host "F04 ORACLES: FAILED"; exit 1 };
+          Write-Host "F04 ORACLES: PASSED"
       - name: Windows named-pipe IPC qualification (F-64)
         # The Layer-4 transport's Windows half: real named pipes, the
         # current-user DACL, the accept loop's next-instance behavior,

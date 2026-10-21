@@ -214,29 +214,35 @@ class IPCTransportServer:
             # None for "shutdown won a synchronized decision".
             if conn is None:
                 continue
-            # F04-RP08: application-level admission — a connection returned
-            # by accept() enters handler processing only if the endpoint's
-            # synchronized lifecycle decision still permits it; otherwise it
-            # was closed without any protocol byte.
-            if not self._endpoint.admit(conn):
+            # F04-IR03: admission AND handler-dispatch commitment run as
+            # ONE indivisible critical section relative to shutdown — the
+            # endpoint's synchronized decision covers the dispatch call
+            # itself, so no handler can start in the check-to-start gap.
+            if not self._endpoint.admit_and_dispatch(conn, self._dispatch_connection):
                 continue
-            # F-62: acquire a handler slot BEFORE spawning; saturation
-            # refuses the connection immediately (no unlimited waiters).
-            if not self._handler_slots.acquire(blocking=False):
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                continue
-            with self._connections_lock:
-                self._connections.add(conn)
-            thread = threading.Thread(
-                target=self._handle_connection,
-                args=(conn,),
-                daemon=True,
-                name="webwire-ipc-handler",
-            )
-            thread.start()
+            # (dispatched atomically inside admit_and_dispatch above)
+
+    def _dispatch_connection(self, conn: Any) -> None:
+        """F04-IR03 dispatch body: runs INSIDE the endpoint's admission
+        critical section — slot acquisition, registration, and handler
+        start commit together with the admission decision."""
+        # F-62: acquire a handler slot BEFORE spawning; saturation
+        # refuses the connection immediately (no unlimited waiters).
+        if not self._handler_slots.acquire(blocking=False):
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        with self._connections_lock:
+            self._connections.add(conn)
+        thread = threading.Thread(
+            target=self._handle_connection,
+            args=(conn,),
+            daemon=True,
+            name="webwire-ipc-handler",
+        )
+        thread.start()
 
     def _handle_connection(self, conn: Any) -> None:
         """One connection: hello → one framed request → response → close."""

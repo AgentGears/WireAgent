@@ -622,6 +622,13 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._acl = acl  # LocalAlloc'd by the API; LocalFree'd in close()
         return sa
 
+    def _before_accept_attempt(self, listen_handle: Any) -> None:
+        """F04-IR05 test seam: invoked immediately BEFORE each
+        ConnectNamedPipe, while the accept lease is held. Production
+        behavior is a no-op; the deterministic repeated-recovery
+        qualification parks here to fire a pre-accept disconnect while
+        no thread is inside ConnectNamedPipe."""
+
     def _before_recovery_permission(self) -> None:
         """F04-RP04 test seam: invoked on ERROR_NO_DATA BEFORE the
         lifecycle lock is acquired. Production behavior is a no-op; the
@@ -666,6 +673,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
                 self._pending_accepts += 1
             released = False
             try:
+                self._before_accept_attempt(listen_handle)
                 connected = k32.ConnectNamedPipe(listen_handle, None)
                 connect_err = None if connected else _get_last_win32_error()
                 needs_recovery = False

@@ -1,6 +1,6 @@
 # M7 Layer 8 — Proposal: Listener Recovery for ConnectNamedPipe Error 232
 
-**Status: PROPOSAL, REVISED — for separate review. No production code is modified by this document.** Revision 2 incorporates the design review: F04-RP01 (namespace continuity — close-last-handle-then-create DROPPED as the primary; reset-existing evaluated FIRST, create-before-retire SECOND) and F04-RP02 (a linearizable recovery-versus-shutdown lifecycle rule replacing the insufficient `_running`-only guard, with its deterministic barrier test).
+**Status: PROPOSAL, REVISED — for separate review. No production code is modified by this document.** Revision 3 incorporates design-review round 2: F04-RP03 (namespace continuity scoped to ACTIVE/RECOVERING — the terminal-failure path demonstrates WITHDRAWAL, never an impossible post-teardown name reservation; the competing-server probe uses CreateNamedPipeW with FILE_FLAG_FIRST_PIPE_INSTANCE plus a positive control); F04-RP04 (the lifecycle lock is held across the SHORT kernel-visible operations themselves — reset, creation, close-entry — because a new instance becomes KERNEL-visible at CreateNamedPipeW success, before Python publication; resource lifetime therefore ends only when no in-flight kernel operation remains); F04-RP05 (one authoritative invariant set replaces the contradictory revision-2 carryovers).
 
 ## 1. The demonstrated defect (accepted evidence)
 
@@ -43,16 +43,14 @@ ConnectNamedPipe
     +-- any other error      existing failure path
 ```
 
-## 4. Binding invariants
+## 4. Binding invariants (rev 3 — the single authoritative set)
 
-## 4. Binding invariants (any implementation must preserve all six)
-
-1. The authority ownership lock remains held throughout recovery — recovery is transport-local and never touches ownership.
-2. The current-user DACL and remote-client rejection (`PIPE_REJECT_REMOTE_CLIENTS` + the single-ACE descriptor) remain enforced on every recreated instance — `_create_instance` already constructs both.
-3. No disconnected pipe handle is reused incorrectly — the retire-and-recreate path closes the dead handle before creating its replacement; no handle is shared across recovery cycles.
-4. Intentional shutdown cannot trigger listener resurrection — recovery runs only inside the accept loop's own error path while `_running` is set; the existing `close()`/stop sequence keeps precedence, and an instance-creation failure during shutdown surfaces as shutdown, not resurrection.
-5. Unexpected instance-creation failure remains visible and fail-closed — if the replacement `_create_instance` fails, the loop breaks exactly as today (availability loss is observable, never silently degraded), with the error logged with its Win32 code.
-6. Recovery replays nothing and bypasses nothing — no request, handshake, or identity validation is affected; a recovered listener serves only fresh connections through the unchanged protocol gates.
+1. **Ownership is untouched.** The authority ownership lock remains held throughout recovery; recovery is transport-local and never modifies ownership state.
+2. **Security attributes persist on every listening instance.** Reset-existing preserves the ORIGINAL instance's DACL and `PIPE_REJECT_REMOTE_CLIENTS` by construction (same pipe object). Any created replacement (fallback) constructs both through the existing `_create_instance` path.
+3. **Namespace continuity, correctly scoped (F04-RP03).** While the endpoint is `ACTIVE` or in a recoverable `RECOVERING` state, a competing process must NOT be able to create or claim a SERVER-side instance of the pipe name: a `CreateNamedPipeW` probe carrying `FILE_FLAG_FIRST_PIPE_INSTANCE` must be refused, while a LEGITIMATE client's `CreateFileW` on the existing instance must keep succeeding (the two operations are distinct threats and distinct tests). The probe carries a positive control — the same adversarial process successfully creates a DIFFERENT, unoccupied pipe name — so repeated refusals prove protection rather than a broken probe. TERMINAL failure is out of this scope by design: a failed recovery legitimately closes the last handle, after which the name may cease to exist; that path instead demonstrates SAFE WITHDRAWAL (the endpoint enters an explicitly unusable state; any later successor binding of the same domain is governed by the unchanged ownership and stale-instance gates).
+4. **CLOSING is terminal, and kernel operations are serialized with it (F04-RP04).** The lifecycle lock is held ACROSS the short kernel-visible operations — `DisconnectNamedPipe`, any `CreateNamedPipeW`, and close-entry — and is NEVER held across a blocking `ConnectNamedPipe`. This is stronger than publication-only synchronization, which the review showed insufficient: a new instance becomes KERNEL-visible the moment `CreateNamedPipeW` succeeds, before any Python-level publication. Consequences: shutdown cannot invalidate a handle being reset, cannot free security allocations an in-flight kernel call still uses, and cannot interleave with the creation of a new externally accessible instance. The security-descriptor/ACL buffers are released only after `CLOSING` is entered AND no in-flight kernel operation remains — guaranteed by the lock covering the operations themselves.
+5. **Recovery failure is explicit.** A failed `DisconnectNamedPipe` (or failed creation in the fallback) records the original Win32 code, enters a terminal failure state, and fails closed: no silent service, every handle closed exactly once.
+6. **Nothing is replayed.** Recovery is transport-local; no request, handshake, or identity validation is replayed or bypassed, and the protocol gates are unchanged.
 
 ### 4.5 The linearizable recovery-versus-shutdown rule (F04-RP02)
 
@@ -62,11 +60,11 @@ ConnectNamedPipe
 - **A synchronized publication decision**: whether a replacement/reset instance may be published is decided under one lock that the shutdown path ALSO acquires when entering `CLOSING` — publication after `CLOSING` is impossible by construction. The lock covers the recovery decision, handle publication, and close-entry ONLY; it is never held across a blocking `ConnectNamedPipe`.
 - **Exact handle ownership**: the listener thread owns the live instance handle; a replacement is owned by its creator until published (then the listener owns it) or until cleaned up (never published → creator closes it exactly once).
 - **Cleanup of unpublished work**: if shutdown wins while a recovery is in flight, the unpublished reset/replacement is closed by its owning thread and the endpoint remains `CLOSING` — no resurrection.
-- **Security-descriptor lifetime**: the `SECURITY_ATTRIBUTES`/ACL buffers live as long as ANY instance creation or publication can reference them — released only after `CLOSING` is entered under the same lock.
+- **Security-descriptor lifetime (F04-RP04)**: the `SECURITY_ATTRIBUTES`/ACL buffers live as long as ANY kernel operation can reference them. Because the lifecycle lock is held across `DisconnectNamedPipe`/`CreateNamedPipeW`/close-entry themselves, entering `CLOSING` implies no in-flight kernel operation remains — only then are the buffers released. (Publication-only synchronization is insufficient: a created instance is kernel-visible before publication.)
 
-**Deterministic negative test (required):** a barrier immediately before recovery publishes its reset/replacement; shutdown is triggered from another thread AT the barrier; the oracle must prove — recovery reached the barrier → shutdown began → endpoint entered `CLOSING` → barrier released → NO new listening instance published → every handle closed exactly once → no client accepted after shutdown.
+**Deterministic negative test (required, RP04-corrected):** the barrier sits BEFORE the recovery thread acquires permission to reset or create — i.e. before it takes the lifecycle lock — and shutdown is triggered from another thread AT that barrier. The oracle must prove — recovery reached the barrier → shutdown began → endpoint entered `CLOSING` → the recovery thread then observed `CLOSING` under the lock and performed NO reset, NO creation, NO kernel-visible change → every handle closed exactly once → no client accepted after shutdown. (A barrier placed only before Python-level publication would miss the kernel-visibility window.)
 
-**Namespace-continuity negative test (required, F04-RP01):** throughout the ENTIRE recovery sequence — including a deliberately faulted `DisconnectNamedPipe` — a competing-process probe repeatedly attempts to create/open the pipe name; it must NEVER observe a creatable or foreign-owned name. (For create-before-retire, the probe runs while the original handle is held.)
+**Namespace-continuity negative test (required, RP03-corrected):** scoped to the `ACTIVE` and recoverable-`RECOVERING` states. The competing process repeatedly attempts `CreateNamedPipeW` WITH `FILE_FLAG_FIRST_PIPE_INSTANCE` on the endpoint's name (the server-side claim — the actual threat) and must always be refused; a legitimate client's `CreateFileW` on the live instance must concurrently SUCCEED; and the probe's positive control — creating a DIFFERENT unoccupied name — must succeed, proving the refusals are protection, not a broken probe. Faulted-recovery rounds that reach TERMINAL failure are excluded from the continuity assertion and instead assert safe withdrawal.
 
 ## 5. Qualification plan (the review's ten scenarios)
 
@@ -81,14 +79,39 @@ ConnectNamedPipe
 | Foreign-user access after recovery | Remains denied | The M-7 non-owner local-identity negative re-run post-recovery |
 | Remote-client access after recovery | Remains rejected | DACL/flag inspection on the reset/replacement instance — STRUCTURAL evidence only; it does NOT close T59 or M-8, whose genuine remote-host campaigns remain separate blocked requirements |
 | Authority successor after recovery | Existing identity rules preserved | The RP-02 successor-transition negative |
-| Shutdown raced against recovery at the publication barrier | No instance published after CLOSING; handles closed exactly once; no client accepted after shutdown | The F04-RP02 deterministic barrier test (§4.5) |
-| Pipe name vacated or foreign-creatable at ANY point during recovery | Never — namespace continuity holds throughout, including faulted recovery | The F04-RP01 competing-process probe (§4.5) |
+| Shutdown raced against recovery BEFORE the reset/create permission | No reset, no creation, no kernel-visible change after CLOSING; handles closed exactly once; no client accepted after shutdown | The F04-RP04 barrier test at lifecycle-lock acquisition (4.5) |
+| Competing server-side claim on the pipe name during ACTIVE/RECOVERING | Never — `CreateNamedPipeW` with `FILE_FLAG_FIRST_PIPE_INSTANCE` refused, while client `CreateFileW` succeeds and the probe's separate-name positive control passes | The F04-RP03 competing-process probe (4.5) |
+| Terminal recovery failure | Safe withdrawal: explicit unavailable state, Win32 code recorded, handles closed exactly once — no name-reservation claim beyond teardown | Faulted `DisconnectNamedPipe` rounds in the same probe test |
 | Windows Server 2025, Python 3.11/3.12 | Native qualification passes | The pinned `windows-2025` job |
 
 ## 6. Oracle promotion — the critical qualification requirement
 
 Today the F04 diagnostic intentionally RECORDS reproduction rather than failing on it. **Under the repair, the pre-accept arm must become a strict acceptance oracle:** after each pre-accept disconnect, the listener must survive or recover AND a subsequent client must complete an actual IPC exchange (hello + request + response). A green run containing `REPRODUCED_PRE_ACCEPT` must be impossible once the repair lands — the same test inverts from recording the defect to proving the fix. Until then, the diagnostic stays as the defect's witness. No green diagnostic may be presented as repair qualification.
 
-## 7. Explicitly not in this proposal
+## 7. The normative recovery protocol (review-adopted)
+
+```text
+WindowsNamedPipeEndpoint.accept()
+        |
+        v
+  ConnectNamedPipe                     [lifecycle lock NOT held]
+        |
+        +-- SUCCESS / ERROR_PIPE_CONNECTED -> existing path unchanged
+        |
+        +-- ERROR_NO_DATA (232)
+        |       |
+        |       v
+        |   Acquire lifecycle lock
+        |       +-- CLOSING                 -> exit for shutdown
+        |       +-- recovery permitted      -> DisconnectNamedPipe   [lock held]
+        |               +-- success         -> restore ACTIVE; release lock; continue loop
+        |               +-- failure         -> record Win32 code; terminal failure state;
+        |                                     fail closed
+        +-- any other error                 -> existing failure path
+```
+
+**Qualification state table:** ACTIVE = normal secure IPC; RECOVERING = controlled reset with valid ownership and handle lifetime; ACTIVE after recovery = a fresh client completes a real hello/request/response exchange; CLOSING = no new recovery or reactivation; terminal recovery failure = explicit unavailable state, no silent service; successor authority = existing identity and ownership checks preserved. Under the repair, the F04 diagnostic's oracle INVERTS: any REPRODUCED_PRE_ACCEPT outcome FAILS the repair qualification.
+
+## 8. Explicitly not in this proposal
 
 No client-visible behavior change (connection errors surface unchanged); no change to the 231 condition (the approved retry design addresses that separately); no ownership, DACL, or protocol-gate semantics changes; no retry of anything post-accept.

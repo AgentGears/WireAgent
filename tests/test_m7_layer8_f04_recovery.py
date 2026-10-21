@@ -12,6 +12,7 @@ oracles fail on exactly that outcome.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import threading
@@ -466,22 +467,16 @@ def test_transport_refuses_returned_connection_when_shutdown_wins(tmp_path: Path
 
 
 def test_single_endpoint_multiple_recoveries_long_lived(tmp_path: Path) -> None:
-    """F04-IR09: multiple ACTUAL resets on ONE long-lived endpoint.
-
-    PLATFORM FINDING (recorded from the failed deterministic attempts):
-    only the FIRST instance a bind() creates is client-connectable
-    before the server's ConnectNamedPipe; successors created by
-    _create_instance(first=False) and instances returned by a reset are
-    NOT client-connectable until the server re-enters
-    ConnectNamedPipe. The deterministic per-cycle pre-accept window
-    therefore exists exactly once per endpoint lifetime — the gated
-    primary oracle consumes it. Repeated resets on ONE endpoint can
-    only be driven through the NATURAL timing race (which is the
-    original defect's own condition). This oracle hammers
-    connect-and-immediately-close clients until the reset counter
-    advances MULTIPLE times on the same endpoint, then proves the SAME
-    listener still serves a real exchange — with the natural-race
-    basis stated rather than hidden."""
+    """F04-IR09: multiple ACTUAL resets on ONE long-lived endpoint,
+    driven by the natural race (the original defect's own condition). The
+    review CORRECTED the earlier platform claim: Microsoft documents that
+    clients may connect to ANY newly created instance before the server's
+    ConnectNamedPipe (ERROR_PIPE_CONNECTED results), so the failed
+    deterministic choreography was a TEST-STRATEGY failure, not a proven
+    impossibility; the controlled successor characterization runs in its
+    own test below. THIS oracle requires >= 3 counted resets on the same
+    endpoint, a real exchange afterwards, and steady-state lease
+    accounting."""
     log: list = []
     session, ipc, transport, loop = _gated_server(tmp_path, log)
     try:
@@ -524,3 +519,147 @@ def test_single_endpoint_multiple_recoveries_long_lived(tmp_path: Path) -> None:
         )
     finally:
         _teardown(transport, loop)
+
+
+def test_successor_pre_accept_characterization(tmp_path: Path) -> None:
+    """The review-directed controlled experiment: hold a NEWLY CREATED
+    successor at the _before_accept_attempt seam (before its
+    ConnectNamedPipe) and attempt ONE client connection, recording the
+    exact Win32 result. Per the corrected reading of Microsoft's
+    contract, a client MAY connect to any newly created instance
+    pre-ConnectNamedPipe. Whichever way the platform answers, the
+    observation is recorded — characterization, not a claim."""
+    log: list = []
+    session, ipc, transport, loop = _gated_server(tmp_path, log)
+    try:
+        endpoint = transport._endpoint
+        assert isinstance(endpoint, WindowsNamedPipeEndpoint)
+        transport.release_accept_gate()
+        holder = _open_client_bounded(endpoint)
+        parked = threading.Event()
+        release = threading.Event()
+
+        def _holding_seam(listen_handle: Any) -> None:
+            parked.set()
+            assert release.wait(timeout=10)
+            release.clear()
+
+        endpoint._before_accept_attempt = _holding_seam  # type: ignore[method-assign]
+        deadline = time.time() + 10
+        while not parked.is_set() and time.time() < deadline:
+            time.sleep(0.02)
+        assert parked.is_set(), "listener never parked on the successor"
+        outcome: dict[str, object] = {}
+        try:
+            probe = _WindowsPipeConnection.open_client(endpoint.path)
+            probe.close()
+            outcome["successor_pre_accept_connect"] = "CONNECTED"
+        except ConnectionError as exc:
+            outcome["successor_pre_accept_connect"] = repr(exc)
+        outcome["lifecycle_at_probe"] = endpoint._lifecycle
+        outcome["handle_present"] = endpoint._handle is not None
+        release.set()
+        # Un-patch BEFORE anything else: the holding seam parks on EVERY
+        # accept attempt, so leaving it patched deadlocks the next park.
+        del endpoint._before_accept_attempt  # type: ignore[attr-defined]
+        holder.close()
+        time.sleep(0.3)
+        print("SUCCESSOR-PRE-ACCEPT:", json.dumps(outcome, default=str))
+        (tmp_path / "successor-probe.json").write_text(
+            json.dumps(outcome, default=str, indent=2), encoding="utf-8"
+        )
+        # The probe consumed the parked successor's listening slot; the
+        # listener (released) enters ConnectNamedPipe on it and sees
+        # ERROR_PIPE_CONNECTED (the probe already closed) or a fresh
+        # client path — either way it keeps serving. Give it a moment,
+        # then a REAL exchange with the bounded connect.
+        time.sleep(0.3)
+        try:
+            _real_exchange(str(transport.endpoint_path or ""), session, log)
+        except ConnectionError:
+            # Transient 231 between instances (the parked probe consumed
+            # a slot; the settle may be short): one choreographed retry —
+            # NOT the production repair.
+            time.sleep(0.5)
+            _real_exchange(str(transport.endpoint_path or ""), session, log)
+    finally:
+        _teardown(transport, loop)
+
+
+def test_transport_post_accept_shutdown_interleaving_deterministic(tmp_path: Path) -> None:
+    """F04-IR03-T, the review-prescribed deterministic oracle: the REAL
+    accept loop holds an accepted, undispatched connection while
+    shutdown wins. A test wrapper around the endpoint accept() calls
+    the real accept(), signals when a connection is in hand, and blocks
+    BEFORE returning it to _accept_loop(); stop() completes meanwhile;
+    the wrapper releases; the real loop must then REFUSE the connection
+    on its captured endpoint — no dispatch, no protocol bytes, clean
+    exit, no uncaught listener exception (captured via excepthook)."""
+    log: list = []
+    session, ipc, transport, loop = _gated_server(tmp_path, log)
+    listener = transport._listener_thread
+    thread_errors: list = []
+    old_hook = threading.excepthook
+
+    def _excepthook(args: Any) -> None:
+        thread_errors.append(args)
+
+    threading.excepthook = _excepthook  # type: ignore[assignment]
+    try:
+        endpoint = transport._endpoint
+        assert isinstance(endpoint, WindowsNamedPipeEndpoint)
+        real_accept = endpoint.accept
+        in_hand = threading.Event()
+        release = threading.Event()
+
+        def _wrapping_accept() -> Any:
+            conn = real_accept()
+            if conn is not None:
+                in_hand.set()
+                assert release.wait(timeout=15), "test never released"
+            return conn
+
+        endpoint.accept = _wrapping_accept  # type: ignore[method-assign]
+        transport.release_accept_gate()
+        client = _open_client_bounded(endpoint)
+        assert in_hand.wait(timeout=15), "accept never returned a connection"
+        transport.stop()
+        release.set()
+        client.close()
+        listener.join(timeout=15)
+        assert not listener.is_alive(), "the real loop must exit"
+        assert thread_errors == [], f"listener faulted: {thread_errors}"
+        assert log == [], "no protocol bytes exchanged (no invoke reached)"
+    finally:
+        threading.excepthook = old_hook  # type: ignore[assignment]
+        _teardown(transport, loop)
+
+
+def test_shutdown_cancellation_failure_is_bounded_and_observable(tmp_path: Path) -> None:
+    """F04-IR06 failure path, PROCESS-ISOLATED: the lease refuses to
+    drain (a deliberately stuck accept that never enters
+    ConnectNamedPipe — cancellation ineffective BY CONSTRUCTION). The
+    child calls close() and reports; the parent enforces the overall
+    bound, the observable abandonment, and the never-close-under-lease
+    invariant."""
+    import os
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo helper
+        [_sys.executable, str(Path(__file__).with_name("_f04_ir06_child.py")), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+    )
+    assert proc.returncode == 0, f"child failed: {proc.stderr[-400:]!r}"
+    record = json.loads(proc.stdout.strip().splitlines()[-1])
+    print("CANCELLATION-FAILURE:", json.dumps(record))
+    assert record["elapsed_s"] < 60, f"close() was not bounded: {record}"
+    assert record["handle_still_owned"] is True, "never close under an outstanding lease"
+    assert record["lifecycle"] in (
+        WindowsNamedPipeEndpoint._CLOSING,
+        WindowsNamedPipeEndpoint._TERMINAL,
+    )
+    assert record["pending"] == 1, "the stuck lease remains outstanding (never force-drained)"

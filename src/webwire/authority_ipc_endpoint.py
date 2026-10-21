@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import ctypes  # noqa: F401 — used by _win32() via vars(ctypes)
 import hashlib
+import logging
 import os
 import socket
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,6 +41,8 @@ __all__ = [
 # LOCAL_PEERCRED-family primitives are Layer 7 qualification), and
 # typeshed treats the socket constant as platform-variable.
 _SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
+
+logger = logging.getLogger(__name__)
 
 
 def _expected_peer_uid() -> Optional[int]:
@@ -448,6 +452,10 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
     _CLOSING = 3
     _TERMINAL = 4
 
+    # F04-IR06: the total bound on close()-vs-lease-drain (the
+    # condition-variable timeout alone bounds nothing).
+    _CLOSE_DRAIN_BOUND_S = 30.0
+
     # The single DACL grant: the creating user's SID with FILE_ALL_ACCESS.
     # FILE_ALL_ACCESS (not the minimal r/w+create-instance mask) because the
     # kernel's subsequent-instance access check denied the creator's own
@@ -770,10 +778,29 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         # once and no accept operates on a closed or reused value.
         with self._lifecycle_cond:
             self._lifecycle = self._CLOSING
+            # F04-IR06 cancellation-failure policy: cancellation is a
+            # REQUEST (CancelIoEx is not guaranteed to release a blocked
+            # synchronous operation). close() bounds its TOTAL drain wait;
+            # on abandonment it leaves the handle OWNED by the outstanding
+            # lease-holder (closed exactly once when that holder exits its
+            # call) and records the abandonment observably — it NEVER
+            # closes a handle under an outstanding lease.
+            self._close_abandoned = False
+            drain_deadline = time.monotonic() + self._CLOSE_DRAIN_BOUND_S
             while self._pending_accepts > 0 and self._handle is not None:
                 _win_kernel32().CancelIoEx(self._handle, None)
-                self._lifecycle_cond.wait(timeout=1.0)
-            if self._handle is not None:
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    self._close_abandoned = True
+                    logger.warning(
+                        'IPC endpoint close(): accept-lease drain abandoned after %.1fs '
+                        '(cancellation ineffective); handle remains owned by the '
+                        'outstanding lease-holder',
+                        self._CLOSE_DRAIN_BOUND_S,
+                    )
+                    return
+                self._lifecycle_cond.wait(timeout=min(1.0, remaining))
+            if not self._close_abandoned and self._handle is not None:
                 k32 = _win_kernel32()
                 k32.CancelIoEx(self._handle, None)
                 k32.CloseHandle(self._handle)

@@ -149,8 +149,8 @@ async def test_ingest_rejects_symlink_escape(tmp_path: Path) -> None:
     try:
         (staging.parent / "link.png").symlink_to(outside)
 
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
 
     with pytest.raises(MediaIngressError, match="outside|symlink"):
         registry.ingest("link.png")
@@ -386,8 +386,8 @@ async def test_root_symlink_rejected_at_construction(tmp_path: Path) -> None:
     alias = domain / "media-staging"
     try:
         alias.symlink_to(real_staging, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     with pytest.raises(MediaIngressError, match="root_symlink_rejected"):
         MediaArtifactRegistry(
             staging_root=alias,
@@ -421,8 +421,8 @@ async def test_alias_directory_component_rejected(tmp_path: Path) -> None:
     (staging / "photo.png").write_bytes(_PNG_1X1)
     try:
         (staging / "alias").symlink_to(staging, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     with pytest.raises(MediaIngressError, match="symlink_rejected"):
         registry.ingest("alias/photo.png")
 
@@ -593,8 +593,8 @@ async def test_F88_final_component_symlink_refused_at_open(tmp_path: Path) -> No
     try:
         target.unlink()
         target.symlink_to(outside)
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed on this platform: {exc!r}")
     with pytest.raises(MediaIngressError, match="symlink_rejected"):
         registry.ingest("photo.png")
     assert registry.artifact_count == 0
@@ -727,33 +727,87 @@ async def test_F90_probe_failure_fails_closed(tmp_path: Path, monkeypatch) -> No
 
 @_win_only
 async def test_F90_substituted_pathname_bytes_come_from_validated_handle(tmp_path: Path) -> None:
-    """The reviewer-specified injected Windows race: a REGULAR final
-    component passes validation, the PATHNAME is then substituted with a
-    symlink to an outside image — and the acquired bytes still come from
-    the validated handle (the staged PNG's digest), never from the
-    substituted pathname."""
+    """F90's native Windows evidence, corrected per the L8 review: the
+    production validated handle is opened with dwShareMode=0 — the OS
+    itself REFUSES pathname deletion/replacement while the handle is
+    held. The frozen intent (a post-validation pathname substitution
+    cannot redirect acquisition) is therefore enforced on Windows by TWO
+    independent mechanisms, and this test now demonstrates each natively:
+
+    1. WHILE the validated handle is held, the OS refuses the pathname
+       replacement (staged.unlink raises PermissionError — prevention at
+       the handle-lifetime boundary, not a missing privilege).
+    2. The acquisition still completes and its bytes come from the
+       validated handle (the staged PNG's digest).
+    3. AFTER the handle is closed, the intended substitution SUCCEEDS —
+       proving the earlier refusal was handle lifetime, not environment.
+
+    Equivalence note for review: on POSIX the substitution IS possible
+    and the handle still wins (F88's O_NOFOLLOW lane carries that
+    ordering); on Windows the OS prevents the substitution outright.
+    Both establish the same frozen guarantee — the validated handle is
+    authoritative — through the platform's own mechanism."""
     registry = _registry(tmp_path)
     outside = tmp_path / "outside.png"
     outside.write_bytes(_PNG_1X1 + bytes([9]))  # DIFFERENT content
     staged = _stage(registry, "photo.png")
 
     real_validated = registry._win_create_validated
+    seam: dict[str, object] = {"substituted": False}
 
     def _validated_then_substitute(staged_name: str) -> object:
         handle = real_validated(staged_name)
-        # Substitute the pathname at exactly the validation→acquisition
-        # seam; the already-validated handle must remain authoritative.
-        staged.unlink()
-        staged.symlink_to(outside)
+        # Property 1: with the validated handle held, the OS refuses the
+        # pathname replacement. Instrumented per the review: unlink is
+        # the operation under test, separately from symlink_to.
+        try:
+            staged.unlink()
+            seam["unlink_while_held"] = "succeeded"
+        except OSError as exc:
+            seam["unlink_while_held"] = repr(exc)
+        # Only attempt the substitution if the pathname was removable;
+        # otherwise the handle-lifetime prevention is the mechanism.
+        if seam["unlink_while_held"] == "succeeded":
+            staged.symlink_to(outside)
+            seam["substituted"] = True
         return handle
 
     registry._win_create_validated = _validated_then_substitute  # type: ignore[method-assign]
     try:
         minted = registry.ingest("photo.png")
-    except OSError:
-        pytest.skip("symlink creation requires privileges on this platform")
+    finally:
+        registry._win_create_validated = real_validated  # type: ignore[method-assign]
+
     assert minted.byte_size == len(_PNG_1X1), "bytes came from the validated handle"
     assert Path(minted.owner_path).read_bytes() == _PNG_1X1  # noqa: ASYNC240
+
+    if seam["substituted"] is True:
+        # The substitution WAS possible (POSIX-style semantics): the
+        # handle still won, which is the original adversarial ordering.
+        return
+
+    # Windows: the OS refused the replacement while the handle was held
+    # (dwShareMode=0). Property 3: after the handle is closed — which the
+    # completed ingest has done — the SAME substitution succeeds, proving
+    # the refusal was handle lifetime rather than missing privilege.
+    assert "PermissionError" in str(seam["unlink_while_held"]), (
+        f"unexpected refusal kind while handle held: {seam['unlink_while_held']!r}"
+    )
+    staged.unlink()
+    try:
+        staged.symlink_to(outside)
+    except OSError as exc:
+        # Property 3 requires symlink privilege. The qualified image HAS
+        # it (the workflow's SYMLINK PROBE step proves os.symlink works
+        # there before this suite runs, so this branch is unreachable on
+        # Server 2025). WinError 1314 is the LOCAL development box's
+        # missing privilege — a labeled environment limitation, distinct
+        # from any qualification outcome.
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"local environment lacks symlink privilege (1314); "
+                        f"property 3 is carried by the qualified image's probe: {exc!r}")
+        raise
+    assert staged.resolve() == outside.resolve(), "post-release substitution succeeds"
 
 
 async def test_F91_release_of_absent_storage_reclaims_the_reference(tmp_path: Path) -> None:

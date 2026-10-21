@@ -91,9 +91,20 @@ def _child_readiness(state_dir: Path, pid: int) -> dict:
 
     marker = state_dir / f"browser-child-{pid}.pid"
     deadline = time.monotonic() + 10
-    while not marker.exists() and time.monotonic() < deadline:
+    # The child creates the file and writes in separate steps: on a slow
+    # runner the controller can observe an EMPTY or partially-written file
+    # the instant it exists. Retry until the content parses (native-run
+    # finding from the first Server-2025 execution).
+    last_error: Exception = TimeoutError("readiness marker never appeared")
+    while time.monotonic() < deadline:
+        try:
+            text = marker.read_text(encoding="utf-8") if marker.exists() else ""
+            if text.strip():
+                return json.loads(text)
+        except json.JSONDecodeError as exc:
+            last_error = exc
         time.sleep(0.05)
-    return json.loads(marker.read_text(encoding="utf-8"))
+    raise last_error
 
 
 def test_T33_owner_crash_leaves_orphan_child_successor_starts_own_runtime(tmp_path: Path) -> None:

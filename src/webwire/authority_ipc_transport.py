@@ -210,8 +210,15 @@ class IPCTransportServer:
                 break
             # F-70: None = the endpoint rejected the peer (e.g. SO_PEERCRED
             # uid mismatch) and already closed it — skip WITHOUT consuming
-            # a handler slot; the listener keeps serving.
+            # a handler slot; the listener keeps serving. F04 also uses
+            # None for "shutdown won a synchronized decision".
             if conn is None:
+                continue
+            # F04-RP08: application-level admission — a connection returned
+            # by accept() enters handler processing only if the endpoint's
+            # synchronized lifecycle decision still permits it; otherwise it
+            # was closed without any protocol byte.
+            if not self._endpoint.admit(conn):
                 continue
             # F-62: acquire a handler slot BEFORE spawning; saturation
             # refuses the connection immediately (no unlimited waiters).

@@ -22,6 +22,7 @@ import os
 import socket
 import struct
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -64,6 +65,14 @@ class IPCEndpoint:
     def close(self) -> None:
         """Close the listener and remove the rendezvous."""
         raise NotImplementedError
+
+    def admit(self, conn: Any) -> bool:
+        """Application-level admission boundary (F04-RP08): decides,
+        synchronized with shutdown, whether a connection RETURNED by
+        accept() may enter handler processing. The neutral default
+        admits everything; the Windows endpoint overrides this with its
+        lifecycle-checked decision."""
+        return True
 
     @property
     def path(self) -> str:
@@ -421,6 +430,13 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
 
     PIPE_NAME_PREFIX = r"\\.\pipe\webwire-authority-"
 
+    # Lifecycle states (F04): ACTIVE serves; RECOVERING is only observable
+    # while the lifecycle lock is held; CLOSING and TERMINAL are terminal.
+    _ACTIVE = 1
+    _RECOVERING = 2
+    _CLOSING = 3
+    _TERMINAL = 4
+
     # The single DACL grant: the creating user's SID with FILE_ALL_ACCESS.
     # FILE_ALL_ACCESS (not the minimal r/w+create-instance mask) because the
     # kernel's subsequent-instance access check denied the creator's own
@@ -437,6 +453,12 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._sd_buffer: Any = None  # absolute SECURITY_DESCRIPTOR (own buffer)
         self._acl: Any = None  # SetEntriesInAclW allocation (LocalFree'd)
         self._sa: Any = None  # SECURITY_ATTRIBUTES kept alive for instance creation
+        # F04 recovery lifecycle (docs/M7_LAYER8_232_LISTENER_RECOVERY_PROPOSAL.md
+        # rev 4): the lock is held ACROSS the short kernel-visible operations
+        # (reset, successor creation, close-entry) and NEVER across a blocking
+        # ConnectNamedPipe. CLOSING/TERMINAL are terminal.
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle = self._ACTIVE
 
     @property
     def path(self) -> str:
@@ -582,39 +604,101 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._acl = acl  # LocalAlloc'd by the API; LocalFree'd in close()
         return sa
 
+    def _before_recovery_permission(self) -> None:
+        """F04-RP04 test seam: invoked on ERROR_NO_DATA BEFORE the
+        lifecycle lock is acquired. Production behavior is a no-op; the
+        deterministic shutdown-race qualification synchronizes on this
+        point to force shutdown to win before recovery permission."""
+
+    def _reset_disconnected_instance(self) -> bool:
+        """F04 reset seam: return the disconnected instance to a valid
+        listening state on the SAME handle (reset-existing strategy)."""
+        return bool(_win_kernel32().DisconnectNamedPipe(self._handle))
+
     def accept(self) -> Any:
         """Wait for one client, then create the NEXT instance so later
         clients still find a rendezvous. Returns a socket-compatible
-        connection over the connected handle."""
+        connection over the connected handle, or None when shutdown won
+        a synchronized decision (the caller exits its loop cleanly).
+
+        F04: ERROR_NO_DATA (a client disconnected before we called
+        ConnectNamedPipe) no longer terminates the listener — the
+        instance is reset under the lifecycle lock and the accept
+        retried on the same handle."""
         k32 = _win_kernel32()
-        assert self._handle is not None
-        listen_handle = self._handle
-        connected = k32.ConnectNamedPipe(listen_handle, None)
-        if not connected:
-            err = _get_last_win32_error()
-            if err != _ERROR_PIPE_CONNECTED:  # already-connected is fine
-                raise RuntimeError(f"ConnectNamedPipe failed: error {err}")
-        try:
-            self._handle = self._create_instance(first=False)  # the next rendezvous
-        except BaseException:
-            # If the successor instance cannot be created, the endpoint is
-            # unusable — close the connected handle and fail the accept.
-            k32.CancelIoEx(listen_handle, None)
-            k32.CloseHandle(listen_handle)
-            raise
-        return _WindowsPipeConnection(listen_handle)
+        while True:
+            assert self._handle is not None
+            listen_handle = self._handle
+            connected = k32.ConnectNamedPipe(listen_handle, None)
+            if not connected:
+                err = _get_last_win32_error()
+                if err == _ERROR_NO_DATA:
+                    self._before_recovery_permission()
+                    with self._lifecycle_lock:
+                        if self._lifecycle != self._ACTIVE:
+                            return None  # shutdown (or terminal) won
+                        self._lifecycle = self._RECOVERING
+                        if not self._reset_disconnected_instance():
+                            reset_err = _get_last_win32_error()
+                            self._lifecycle = self._TERMINAL
+                            raise RuntimeError(
+                                f"DisconnectNamedPipe failed: error {reset_err}"
+                            )
+                        self._lifecycle = self._ACTIVE
+                    continue  # the same handle is listening again
+                if err != _ERROR_PIPE_CONNECTED:  # already-connected is fine
+                    with self._lifecycle_lock:
+                        if self._lifecycle == self._CLOSING:
+                            return None  # e.g. CancelIoEx woke us for shutdown
+                    raise RuntimeError(f"ConnectNamedPipe failed: error {err}")
+            # Connected (or already-connected): publish the successor
+            # instance under the lifecycle lock (F04-RP04 — creation is a
+            # kernel-visible operation).
+            with self._lifecycle_lock:
+                if self._lifecycle != self._ACTIVE:
+                    # Shutdown won: no successor instance, and the just-
+                    # connected client receives no protocol bytes.
+                    k32.CloseHandle(listen_handle)
+                    self._handle = None
+                    return None
+                try:
+                    self._handle = self._create_instance(first=False)
+                except BaseException:
+                    k32.CancelIoEx(listen_handle, None)
+                    k32.CloseHandle(listen_handle)
+                    raise
+            return _WindowsPipeConnection(listen_handle)
+
+    def admit(self, conn: Any) -> bool:
+        """F04-RP08 admission boundary: a connection returned by accept()
+        may enter handler processing only while the endpoint is ACTIVE.
+        If shutdown has won the synchronized decision, the connection is
+        closed WITHOUT any hello/request byte."""
+        with self._lifecycle_lock:
+            if self._lifecycle != self._ACTIVE:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return False
+            return True
 
     def close(self) -> None:
-        if self._handle is not None:
-            k32 = _win_kernel32()
-            # CancelIoEx releases an accept thread blocked in
-            # ConnectNamedPipe before the handle is closed underneath it.
-            k32.CancelIoEx(self._handle, None)
-            k32.CloseHandle(self._handle)
-            self._handle = None
-        if self._acl is not None:
-            _win_kernel32().LocalFree(self._acl)
-            self._acl = None
-        self._sd_buffer = None
-        self._sa = None
+        # F04-RP04/RP08: close-entry, handle closure, and security-resource
+        # release run UNDER the lifecycle lock and after CLOSING is set, so
+        # no reset, creation, or admission can interleave with teardown.
+        with self._lifecycle_lock:
+            self._lifecycle = self._CLOSING
+            if self._handle is not None:
+                k32 = _win_kernel32()
+                # CancelIoEx releases an accept thread blocked in
+                # ConnectNamedPipe before the handle is closed underneath it.
+                k32.CancelIoEx(self._handle, None)
+                k32.CloseHandle(self._handle)
+                self._handle = None
+            if self._acl is not None:
+                _win_kernel32().LocalFree(self._acl)
+                self._acl = None
+            self._sd_buffer = None
+            self._sa = None
         # Named pipes disappear when the last handle closes — no unlink.

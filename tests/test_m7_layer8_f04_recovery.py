@@ -568,6 +568,12 @@ def test_successor_pre_accept_characterization(tmp_path: Path) -> None:
         (tmp_path / "successor-probe.json").write_text(
             json.dumps(outcome, default=str, indent=2), encoding="utf-8"
         )
+        # The observed native contract, now ENFORCED as the regression
+        # property per the review's recording-vs-enforcing distinction:
+        # a newly created successor IS client-connectable before the
+        # server's ConnectNamedPipe (Microsoft's documented behavior,
+        # confirmed on the qualified image by this very probe).
+        assert outcome["successor_pre_accept_connect"] == "CONNECTED"
         # The probe consumed the parked successor's listening slot; the
         # listener (released) enters ConnectNamedPipe on it and sees
         # ERROR_PIPE_CONNECTED (the probe already closed) or a fresh
@@ -656,6 +662,7 @@ def test_shutdown_cancellation_failure_is_bounded_and_observable(tmp_path: Path)
     assert proc.returncode == 0, f"child failed: {proc.stderr[-400:]!r}"
     record = json.loads(proc.stdout.strip().splitlines()[-1])
     print("CANCELLATION-FAILURE:", json.dumps(record))
+    assert record["abandoned"] is True, "the observable abandonment state must be recorded"
     assert record["elapsed_s"] < 60, f"close() was not bounded: {record}"
     assert record["handle_still_owned"] is True, "never close under an outstanding lease"
     assert record["lifecycle"] in (
@@ -663,3 +670,43 @@ def test_shutdown_cancellation_failure_is_bounded_and_observable(tmp_path: Path)
         WindowsNamedPipeEndpoint._TERMINAL,
     )
     assert record["pending"] == 1, "the stuck lease remains outstanding (never force-drained)"
+
+
+def test_abandoned_lease_deferred_cleanup_and_successor_bind(tmp_path: Path) -> None:
+    """F04-IR10, process-isolated: close() abandons the drain (cancellation
+    ineffective by construction); the parked lease is then released and a
+    client connect makes its kernel call return; the final lease holder
+    performs the DEFERRED cleanup exactly once (handle closed, security
+    allocations freed), and a SUCCESSOR endpoint binds the same pipe
+    name — the exact consequence the review identified. The child's
+    permanent-park phase (never-returns containment: handle kept until
+    process exit, never closed under a live operation) is its own
+    documented record."""
+    import os
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo helper
+        [
+            _sys.executable,
+            str(Path(__file__).with_name("_f04_ir10_child.py")),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+    )
+    assert proc.returncode == 0, f"child failed: {proc.stderr[-400:]!r}"
+    record = json.loads(proc.stdout.strip().splitlines()[-1])
+    print("IR10-LIFECYCLE:", json.dumps(record))
+    assert record["close_elapsed_s"] < 60, f"close() was not bounded: {record}"
+    assert record["abandoned_at_close"] is True
+    assert record["handle_owned_at_close"] is True, "no close under the outstanding lease"
+    assert record["deferred_handle_after_release"] is None, (
+        f"deferred cleanup must close the handle exactly once: {record}"
+    )
+    assert record["accept_returned"] == [None], "the released holder observes shutdown and returns None"
+    assert record["successor_bound_same_name"] is True, (
+        f"a successor must bind the same pipe name after deferred cleanup: {record}"
+    )

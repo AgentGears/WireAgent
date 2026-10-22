@@ -484,6 +484,7 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         # happens exactly once.
         self._lifecycle_cond = threading.Condition(self._lifecycle_lock)
         self._pending_accepts = 0
+        self._close_abandoned: bool = False
         self._lifecycle = self._ACTIVE
 
     @property
@@ -648,6 +649,37 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         listening state on the SAME handle (reset-existing strategy)."""
         return bool(_win_kernel32().DisconnectNamedPipe(self._handle))
 
+    def _deferred_cleanup_locked(self, listen_handle: Any) -> None:
+        """F04-IR10: the last lease holder performs the cleanup close()
+        abandoned to it. Under the lifecycle lock: if close() already
+        closed the handle (drained path), self._handle no longer names
+        listen_handle and NOTHING happens; if close() abandoned the
+        drain (_close_abandoned) and left the handle to us, we close it
+        exactly once and release the security allocations. Containment
+        for a lease whose kernel operation NEVER returns is explicit:
+        cleanup happens only WHEN that holder exits its call — a
+        never-returning operation keeps the handle until process exit,
+        the documented containment limit (never a close under a live
+        kernel call)."""
+        if self._handle != listen_handle or not self._close_abandoned:
+            return  # drained path: close() itself already cleaned up
+        k32 = _win_kernel32()
+        if listen_handle is not None:
+            k32.CancelIoEx(listen_handle, None)
+            k32.CloseHandle(listen_handle)
+        self._handle = None
+        if self._acl is not None:
+            _win_kernel32().LocalFree(self._acl)
+            self._acl = None
+        self._sd_buffer = None
+        self._sa = None
+        self._close_abandoned = False
+        logger.warning(
+            "IPC endpoint: deferred cleanup executed by the final accept "
+            "lease holder (close() had abandoned the drain); handle closed "
+            "exactly once"
+        )
+
     def _terminal_cleanup_locked(self) -> None:
         """F04-IR04: terminal withdrawal — close the listener-owned handle
         EXACTLY once and mark TERMINAL. Caller holds the lifecycle lock."""
@@ -690,10 +722,14 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
                     released = True
                     self._lifecycle_cond.notify_all()
                     if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
-                        # Shutdown won while we held the lease: close() was
-                        # blocked on the lease drain (or has already run) and
-                        # OWNS the handle. The just-connected client sees a
-                        # dropped pipe — no protocol byte, no double close.
+                        # Shutdown won while we held the lease. Two cases:
+                        # close() drained the lease and closed the handle
+                        # itself (nothing to do), or close() ABANDONED the
+                        # drain after its deadline and transferred ownership
+                        # to this, the final lease holder (F04-IR10): we now
+                        # perform the DEFERRED cleanup exactly once — never
+                        # both.
+                        self._deferred_cleanup_locked(listen_handle)
                         return None
                     if connected or connect_err == _ERROR_PIPE_CONNECTED:
                         try:
@@ -721,6 +757,11 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
                     with self._lifecycle_cond:
                         self._pending_accepts -= 1
                         self._lifecycle_cond.notify_all()
+                        if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                            # Exception-release of the lease while shutdown
+                            # had won: the same deferred-cleanup obligation
+                            # (F04-IR10).
+                            self._deferred_cleanup_locked(listen_handle)
             if needs_recovery:
                 # Pre-permission seam (F04-RP04): outside every lock and
                 # lease, before the recovery decision.

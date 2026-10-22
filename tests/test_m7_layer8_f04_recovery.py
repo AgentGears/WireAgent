@@ -778,3 +778,93 @@ def test_concurrent_second_accept_is_refused(tmp_path: Path) -> None:
         release.set()
         th.join(timeout=15)
         endpoint.close()
+
+
+def test_post_permission_boundary_retires_without_client(tmp_path: Path) -> None:
+    """F04-IR13, process-isolated, NO CLIENT: the listener is parked
+    AFTER the permission check and epoch stamp, BEFORE the kernel call —
+    exactly the post-permission boundary. close() reaches abandonment
+    while parked there; the release (no client) must retire via the
+    post-barrier re-check: lease zero, all resources released, flag
+    reconciled, successor binds the same name. The pre-kernel IR11
+    negative (park before permission) is retained separately — the two
+    boundaries are distinct."""
+    import os
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo helper
+        [
+            _sys.executable,
+            str(Path(__file__).with_name("_f04_ir13_child.py")),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+    )
+    assert proc.returncode == 0, f"child failed: {proc.stderr[-400:]!r}"
+    record = json.loads(proc.stdout.strip().splitlines()[-1])
+    print("IR13-BOUNDARY:", json.dumps(record))
+    assert record["abandoned_at_close"] is True
+    assert record["accept_returned"] == [None], "retired at the boundary without a client"
+    assert record["pending_after"] == 0
+    assert record["handle_after"] is None
+    assert record["acl_after"] is None
+    assert record["sd_buffer_after"] is None
+    assert record["sa_after"] is None
+    assert record["close_abandoned_reconciled"] is False
+    assert record["successor_bound_same_name"] is True
+
+
+def test_single_acceptor_guard_covers_recovery_seam(tmp_path: Path) -> None:
+    """F04-IR12, the review's exact negative: the first accept() is
+    parked at _before_recovery_permission (the 232-recovery seam, AFTER
+    its kernel lease was released — pending_accepts == 0, lifecycle
+    ACTIVE). A second accept() must STILL be refused: the method-level
+    ownership guard spans the whole invocation, not just kernel leases."""
+    import threading
+
+    endpoint = WindowsNamedPipeEndpoint(tmp_path)
+    endpoint.bind()
+    at_seam = threading.Event()
+    release = threading.Event()
+
+    def _parked_perm() -> None:
+        at_seam.set()
+        assert release.wait(timeout=15)
+
+    endpoint._before_recovery_permission = _parked_perm  # type: ignore[method-assign]
+    # Drive the first caller into the recovery seam: park pre-kernel,
+    # a quick-close client creates the 232, release into the seam.
+    park_pre = threading.Event()
+    rel_pre = threading.Event()
+
+    def _pre_seam(handle: Any) -> None:
+        if not at_seam.is_set():
+            park_pre.set()
+            assert rel_pre.wait(timeout=10)
+
+    endpoint._before_accept_attempt = _pre_seam  # type: ignore[method-assign]
+    first: list = []
+    th = threading.Thread(target=lambda: first.append(endpoint.accept()), daemon=True)
+    th.start()
+    try:
+        assert park_pre.wait(timeout=10)
+        trigger = _WindowsPipeConnection.open_client(endpoint.path)
+        trigger.close()  # the pre-accept disconnect -> 232 on release
+        rel_pre.set()
+        assert at_seam.wait(timeout=10), "the first caller never reached the recovery seam"
+        with self_lock(endpoint):
+            assert endpoint._pending_accepts == 0, "precondition: the kernel lease is released"
+        with pytest.raises(RuntimeError, match="single-acceptor"):
+            endpoint.accept()
+    finally:
+        release.set()
+        th.join(timeout=15)
+        endpoint.close()
+
+
+def self_lock(endpoint: WindowsNamedPipeEndpoint):
+    return endpoint._lifecycle_cond

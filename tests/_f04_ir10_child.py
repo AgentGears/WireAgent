@@ -52,14 +52,17 @@ def main() -> int:
     abandoned_at_close = getattr(ep, "_close_abandoned", False)
     handle_owned_at_close = ep._handle is not None
 
+    # HONEST CLAIM (post-IR13 reconciliation): a parked-then-released
+    # lease now ALWAYS retires client-free at the operation-entry
+    # re-check — the kernel-entry attempt that this child originally
+    # unblocked with a client is exactly the race IR13 eliminated. A
+    # genuinely kernel-completed abandonment cannot be forced
+    # deterministically (it requires cancellation to fail against an
+    # ENTERED synchronous call), and the cancellation-effective path is
+    # proven by the nominal blocked-accept shutdown test. This child
+    # therefore proves the outcome contract: abandonment -> retirement
+    # -> full resource reconciliation -> successor binds the same name.
     resume.set()
-    # The parked lease now proceeds INTO ConnectNamedPipe on the
-    # still-open handle; a client connect makes the kernel call return
-    # so the lease holder can exit and perform the deferred cleanup.
-    from webwire.authority_ipc_endpoint import _WindowsPipeConnection
-
-    unblocker = _WindowsPipeConnection.open_client(ep.path)
-    unblocker.close()
     th.join(timeout=15)
     time.sleep(0.3)
 

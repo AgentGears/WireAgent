@@ -485,6 +485,12 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._lifecycle_cond = threading.Condition(self._lifecycle_lock)
         self._pending_accepts = 0
         self._close_abandoned: bool = False
+        # F04-IR13: bumped under the lock on every authorized kernel entry
+        # and by close() on entering CLOSING — the operation-entry/wakeup
+        # protocol's epoch.
+        self._entry_epoch = 0
+        # F04-IR12: the thread ident owning the active accept() invocation.
+        self._accept_owner: Optional[int] = None
         self._lifecycle = self._ACTIVE
 
     @property
@@ -631,6 +637,12 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._acl = acl  # LocalAlloc'd by the API; LocalFree'd in close()
         return sa
 
+    def _before_kernel_entry(self, listen_handle: Any) -> None:
+        """F04-IR13 test seam: invoked AFTER the entry epoch is stamped
+        under the lock and BEFORE the post-barrier re-check + kernel call —
+        exactly the post-permission boundary the review's deterministic
+        negative parks at. Production behavior is a no-op."""
+
     def _before_accept_attempt(self, listen_handle: Any) -> None:
         """F04-IR05 test seam: invoked immediately BEFORE each
         ConnectNamedPipe, while the accept lease is held. Production
@@ -693,10 +705,12 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
     def accept(self) -> Any:
         """Wait for one client, then create the NEXT instance so later
         clients still find a rendezvous. BINDING INVARIANT (F04-IR12):
-        at most ONE accept() may be in flight per endpoint — the
-        transport's single listener thread owns it; a concurrent second
-        accept is refused here so `_deferred_cleanup_locked`'s
-        final-holder semantics stay unambiguous. Returns a socket-compatible
+        at most ONE accept() METHOD INVOCATION may be active per
+        endpoint — across kernel attempts, recovery, and retries; the
+        transport's single listener thread owns it. A concurrent second
+        accept is refused across the ENTIRE invocation so
+        `_deferred_cleanup_locked`'s final-holder semantics stay
+        unambiguous. Returns a socket-compatible
         connection over the connected handle, or None when shutdown won
         a synchronized decision (the caller exits its loop cleanly).
 
@@ -709,18 +723,32 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         critical section that releases the lease, so close() cannot
         interleave between the kernel call and the ownership decision."""
         k32 = _win_kernel32()
+        # F04-IR12: METHOD-LEVEL ownership across the WHOLE invocation —
+        # kernel attempts, the 232-recovery seam, and retries. The lease
+        # counter below tracks individual kernel attempts (a distinct
+        # concept); this guard is what makes the single-acceptor contract
+        # binding even while the owner sits in _before_recovery_permission
+        # with a zero lease count.
+        with self._lifecycle_cond:
+            if self._accept_owner is not None:
+                raise RuntimeError(
+                    "concurrent accept() on one endpoint is prohibited "
+                    "(single-acceptor invariant)"
+                )
+            self._accept_owner = threading.get_ident()
+        try:
+            return self._accept_body(k32)
+        finally:
+            with self._lifecycle_cond:
+                self._accept_owner = None
+                self._lifecycle_cond.notify_all()
+
+    def _accept_body(self, k32: Any) -> Any:
+        """The accept loop body — called only by the owning invocation."""
         while True:
             with self._lifecycle_cond:
                 if self._lifecycle != self._ACTIVE or self._handle is None:
                     return None
-                if self._pending_accepts > 0:
-                    # F04-IR12: the single-acceptor invariant is binding,
-                    # not advisory — a second concurrent accept is refused
-                    # (the transport never issues one).
-                    raise RuntimeError(
-                        "concurrent accept() on one endpoint is prohibited "
-                        "(single-acceptor invariant)"
-                    )
                 listen_handle = self._handle
                 self._pending_accepts += 1
             released = False
@@ -735,6 +763,40 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
                 # never START blocking after CLOSING.
                 with self._lifecycle_cond:
                     if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                        self._pending_accepts -= 1
+                        released = True
+                        self._lifecycle_cond.notify_all()
+                        self._deferred_cleanup_locked(listen_handle)
+                        return None
+                    # F04-IR13 operation-entry protocol: stamp the entry
+                    # epoch under the SAME lock hold as the permission
+                    # check. close() bumps the epoch when entering CLOSING;
+                    # a listener whose stamp is stale at kernel-return (or
+                    # whose shutdown-won check below fires) retires via the
+                    # lease path. Because the stamp and the check share one
+                    # critical section with close()-entry, there is NO
+                    # interval in which shutdown can complete its terminal
+                    # decision between permission and entry: any close()
+                    # that starts after this critical section finds the
+                    # lease already held and must drain/abandon it — and a
+                    # close() that completed BEFORE it is caught by the
+                    # check above. The seam (F04-IR13 barrier) sits
+                    # immediately after this critical section, exactly at
+                    # the post-permission boundary the review names.
+                    self._entry_epoch += 1
+                    entry_epoch = self._entry_epoch
+                self._before_kernel_entry(listen_handle)
+                with self._lifecycle_cond:
+                    # Post-barrier re-check: the barrier can park
+                    # arbitrarily long, and shutdown may have entered (and
+                    # even abandoned) CLOSING meanwhile. A stale epoch or a
+                    # non-ACTIVE lifecycle retires here WITHOUT entering the
+                    # kernel — regardless of which side won the transition.
+                    if (
+                        self._lifecycle != self._ACTIVE
+                        or self._handle != listen_handle
+                        or self._entry_epoch != entry_epoch
+                    ):
                         self._pending_accepts -= 1
                         released = True
                         self._lifecycle_cond.notify_all()
@@ -845,6 +907,11 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         # once and no accept operates on a closed or reused value.
         with self._lifecycle_cond:
             self._lifecycle = self._CLOSING
+            # F04-IR13: bump the entry epoch so any listener holding an
+            # authorized-but-not-yet-entered stamp retires at its
+            # post-barrier re-check instead of starting a blocking kernel
+            # call after the terminal decision.
+            self._entry_epoch += 1
             # F04-IR06 cancellation-failure policy: cancellation is a
             # REQUEST (CancelIoEx is not guaranteed to release a blocked
             # synchronous operation). close() bounds its TOTAL drain wait;

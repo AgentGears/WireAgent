@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import ctypes  # noqa: F401 — used by _win32() via vars(ctypes)
 import hashlib
+import logging
 import os
 import socket
 import struct
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,6 +41,8 @@ __all__ = [
 # LOCAL_PEERCRED-family primitives are Layer 7 qualification), and
 # typeshed treats the socket constant as platform-variable.
 _SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
+
+logger = logging.getLogger(__name__)
 
 
 def _expected_peer_uid() -> Optional[int]:
@@ -64,6 +69,21 @@ class IPCEndpoint:
     def close(self) -> None:
         """Close the listener and remove the rendezvous."""
         raise NotImplementedError
+
+    def admit(self, conn: Any) -> bool:
+        """Application-level admission boundary (F04-RP08): decides,
+        synchronized with shutdown, whether a connection RETURNED by
+        accept() may enter handler processing. The neutral default
+        admits everything; the Windows endpoint overrides this with its
+        lifecycle-checked decision."""
+        return True
+
+    def admit_and_dispatch(self, conn: Any, dispatch) -> bool:
+        """F04-IR03 neutral default: no synchronized boundary (the POSIX
+        endpoints have no shutdown race in this shape); the Windows
+        endpoint makes admission and dispatch indivisible."""
+        dispatch(conn)
+        return True
 
     @property
     def path(self) -> str:
@@ -117,6 +137,10 @@ def _win_kernel32() -> Any:
         ]
         k32.ConnectNamedPipe.restype = ctypes.c_int
         k32.ConnectNamedPipe.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        # F04-IR02: the recovery-critical reset call carries the same
+        # explicit handle-width discipline as every other handle API.
+        k32.DisconnectNamedPipe.restype = ctypes.c_int
+        k32.DisconnectNamedPipe.argtypes = [ctypes.c_void_p]
         k32.ReadFile.restype = ctypes.c_int
         k32.ReadFile.argtypes = [
             ctypes.c_void_p,  # hFile
@@ -421,6 +445,17 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
 
     PIPE_NAME_PREFIX = r"\\.\pipe\webwire-authority-"
 
+    # Lifecycle states (F04): ACTIVE serves; RECOVERING is only observable
+    # while the lifecycle lock is held; CLOSING and TERMINAL are terminal.
+    _ACTIVE = 1
+    _RECOVERING = 2
+    _CLOSING = 3
+    _TERMINAL = 4
+
+    # F04-IR06: the total bound on close()-vs-lease-drain (the
+    # condition-variable timeout alone bounds nothing).
+    _CLOSE_DRAIN_BOUND_S = 30.0
+
     # The single DACL grant: the creating user's SID with FILE_ALL_ACCESS.
     # FILE_ALL_ACCESS (not the minimal r/w+create-instance mask) because the
     # kernel's subsequent-instance access check denied the creator's own
@@ -437,6 +472,26 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._sd_buffer: Any = None  # absolute SECURITY_DESCRIPTOR (own buffer)
         self._acl: Any = None  # SetEntriesInAclW allocation (LocalFree'd)
         self._sa: Any = None  # SECURITY_ATTRIBUTES kept alive for instance creation
+        # F04 recovery lifecycle (docs/M7_LAYER8_232_LISTENER_RECOVERY_PROPOSAL.md
+        # rev 4): the lock is held ACROSS the short kernel-visible operations
+        # (reset, successor creation, close-entry) and NEVER across a blocking
+        # ConnectNamedPipe. CLOSING/TERMINAL are terminal.
+        self._lifecycle_lock = threading.Lock()
+        # F04-IR04: an in-flight accept LEASE closes the snapshot-to-kernel
+        # window — close() drains the lease (waking the accept via
+        # CancelIoEx) before closing the handle, so the listener never
+        # operates on a closed or reused handle value and every close
+        # happens exactly once.
+        self._lifecycle_cond = threading.Condition(self._lifecycle_lock)
+        self._pending_accepts = 0
+        self._close_abandoned: bool = False
+        # F04-IR13: bumped under the lock on every authorized kernel entry
+        # and by close() on entering CLOSING — the operation-entry/wakeup
+        # protocol's epoch.
+        self._entry_epoch = 0
+        # F04-IR12: the thread ident owning the active accept() invocation.
+        self._accept_owner: Optional[int] = None
+        self._lifecycle = self._ACTIVE
 
     @property
     def path(self) -> str:
@@ -582,39 +637,332 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._acl = acl  # LocalAlloc'd by the API; LocalFree'd in close()
         return sa
 
-    def accept(self) -> Any:
-        """Wait for one client, then create the NEXT instance so later
-        clients still find a rendezvous. Returns a socket-compatible
-        connection over the connected handle."""
+    def _before_kernel_call(self, listen_handle: Any) -> None:
+        """F04-IR13 residual-window test seam: invoked AFTER the final
+        lifecycle re-check releases the lock and IMMEDIATELY BEFORE the
+        synchronous ConnectNamedPipe — the exact check-to-call interval.
+        The deterministic falsification parks here. Production is a
+        no-op."""
+
+    def _before_kernel_entry(self, listen_handle: Any) -> None:
+        """F04-IR13 test seam: invoked AFTER the entry epoch is stamped
+        under the lock and BEFORE the post-barrier re-check + kernel call —
+        exactly the post-permission boundary the review's deterministic
+        negative parks at. Production behavior is a no-op."""
+
+    def _before_accept_attempt(self, listen_handle: Any) -> None:
+        """F04-IR05 test seam: invoked immediately BEFORE each
+        ConnectNamedPipe, while the accept lease is held. Production
+        behavior is a no-op; the deterministic repeated-recovery
+        qualification parks here to fire a pre-accept disconnect while
+        no thread is inside ConnectNamedPipe."""
+
+    def _before_recovery_permission(self) -> None:
+        """F04-RP04 test seam: invoked on ERROR_NO_DATA BEFORE the
+        lifecycle lock is acquired. Production behavior is a no-op; the
+        deterministic shutdown-race qualification synchronizes on this
+        point to force shutdown to win before recovery permission."""
+
+    def _reset_disconnected_instance(self) -> bool:
+        """F04 reset seam: return the disconnected instance to a valid
+        listening state on the SAME handle (reset-existing strategy)."""
+        return bool(_win_kernel32().DisconnectNamedPipe(self._handle))
+
+    def _deferred_cleanup_locked(self, listen_handle: Any) -> None:
+        """F04-IR10: the last lease holder performs the cleanup close()
+        abandoned to it. Under the lifecycle lock: if close() already
+        closed the handle (drained path), self._handle no longer names
+        listen_handle and NOTHING happens; if close() abandoned the
+        drain (_close_abandoned) and left the handle to us, we close it
+        exactly once and release the security allocations. Containment
+        for a lease whose kernel operation NEVER returns is explicit:
+        cleanup happens only WHEN that holder exits its call — a
+        never-returning operation keeps the handle until process exit,
+        the documented containment limit (never a close under a live
+        kernel call)."""
+        if self._handle != listen_handle or not self._close_abandoned:
+            return  # drained path: close() itself already cleaned up
         k32 = _win_kernel32()
-        assert self._handle is not None
-        listen_handle = self._handle
-        connected = k32.ConnectNamedPipe(listen_handle, None)
-        if not connected:
-            err = _get_last_win32_error()
-            if err != _ERROR_PIPE_CONNECTED:  # already-connected is fine
-                raise RuntimeError(f"ConnectNamedPipe failed: error {err}")
-        try:
-            self._handle = self._create_instance(first=False)  # the next rendezvous
-        except BaseException:
-            # If the successor instance cannot be created, the endpoint is
-            # unusable — close the connected handle and fail the accept.
+        if listen_handle is not None:
             k32.CancelIoEx(listen_handle, None)
             k32.CloseHandle(listen_handle)
-            raise
-        return _WindowsPipeConnection(listen_handle)
-
-    def close(self) -> None:
-        if self._handle is not None:
-            k32 = _win_kernel32()
-            # CancelIoEx releases an accept thread blocked in
-            # ConnectNamedPipe before the handle is closed underneath it.
-            k32.CancelIoEx(self._handle, None)
-            k32.CloseHandle(self._handle)
-            self._handle = None
+        self._handle = None
         if self._acl is not None:
             _win_kernel32().LocalFree(self._acl)
             self._acl = None
         self._sd_buffer = None
         self._sa = None
+        self._close_abandoned = False
+        logger.warning(
+            "IPC endpoint: deferred cleanup executed by the final accept "
+            "lease holder (close() had abandoned the drain); handle closed "
+            "exactly once"
+        )
+
+    def _terminal_cleanup_locked(self) -> None:
+        """F04-IR04: terminal withdrawal — close the listener-owned handle
+        EXACTLY once and mark TERMINAL. Caller holds the lifecycle lock."""
+        k32 = _win_kernel32()
+        if self._handle is not None:
+            k32.CancelIoEx(self._handle, None)
+            k32.CloseHandle(self._handle)
+            self._handle = None
+        self._lifecycle = self._TERMINAL
+
+    def accept(self) -> Any:
+        """Wait for one client, then create the NEXT instance so later
+        clients still find a rendezvous. BINDING INVARIANT (F04-IR12):
+        at most ONE accept() METHOD INVOCATION may be active per
+        endpoint — across kernel attempts, recovery, and retries; the
+        transport's single listener thread owns it. A concurrent second
+        accept is refused across the ENTIRE invocation so
+        `_deferred_cleanup_locked`'s final-holder semantics stay
+        unambiguous. Returns a socket-compatible
+        connection over the connected handle, or None when shutdown won
+        a synchronized decision (the caller exits its loop cleanly).
+
+        F04: ERROR_NO_DATA (a client disconnected before we called
+        ConnectNamedPipe) no longer terminates the listener — the
+        instance is reset under the lifecycle lock and the accept
+        retried on the same handle. F04-IR04: the blocking
+        ConnectNamedPipe runs under an in-flight LEASE, never the lock;
+        every post-return decision runs under the lock in the same
+        critical section that releases the lease, so close() cannot
+        interleave between the kernel call and the ownership decision."""
+        k32 = _win_kernel32()
+        # F04-IR12: METHOD-LEVEL ownership across the WHOLE invocation —
+        # kernel attempts, the 232-recovery seam, and retries. The lease
+        # counter below tracks individual kernel attempts (a distinct
+        # concept); this guard is what makes the single-acceptor contract
+        # binding even while the owner sits in _before_recovery_permission
+        # with a zero lease count.
+        with self._lifecycle_cond:
+            if self._accept_owner is not None:
+                raise RuntimeError(
+                    "concurrent accept() on one endpoint is prohibited "
+                    "(single-acceptor invariant)"
+                )
+            self._accept_owner = threading.get_ident()
+        try:
+            return self._accept_body(k32)
+        finally:
+            with self._lifecycle_cond:
+                self._accept_owner = None
+                self._lifecycle_cond.notify_all()
+
+    def _accept_body(self, k32: Any) -> Any:
+        """The accept loop body — called only by the owning invocation."""
+        while True:
+            with self._lifecycle_cond:
+                if self._lifecycle != self._ACTIVE or self._handle is None:
+                    return None
+                listen_handle = self._handle
+                self._pending_accepts += 1
+            released = False
+            try:
+                self._before_accept_attempt(listen_handle)
+                # F04-IR11 operation-entry transition: the pre-kernel seam
+                # can park arbitrarily long, and shutdown may have completed
+                # its terminal decision (including drain abandonment) while
+                # we were parked. Re-check under the lock BEFORE entering the
+                # blocking kernel call: if shutdown won, release the lease and
+                # complete the deferred cleanup here — a pre-kernel lease must
+                # never START blocking after CLOSING.
+                with self._lifecycle_cond:
+                    if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                        self._pending_accepts -= 1
+                        released = True
+                        self._lifecycle_cond.notify_all()
+                        self._deferred_cleanup_locked(listen_handle)
+                        return None
+                    # F04-IR13 operation-entry protocol: stamp the entry
+                    # epoch under the SAME lock hold as the permission
+                    # check. close() bumps the epoch when entering CLOSING;
+                    # a listener whose stamp is stale at kernel-return (or
+                    # whose shutdown-won check below fires) retires via the
+                    # lease path. Because the stamp and the check share one
+                    # critical section with close()-entry, there is NO
+                    # interval in which shutdown can complete its terminal
+                    # decision between permission and entry: any close()
+                    # that starts after this critical section finds the
+                    # lease already held and must drain/abandon it — and a
+                    # close() that completed BEFORE it is caught by the
+                    # check above. The seam (F04-IR13 barrier) sits
+                    # immediately after this critical section, exactly at
+                    # the post-permission boundary the review names.
+                    self._entry_epoch += 1
+                    entry_epoch = self._entry_epoch
+                self._before_kernel_entry(listen_handle)
+                with self._lifecycle_cond:
+                    # Post-barrier re-check: the barrier can park
+                    # arbitrarily long, and shutdown may have entered (and
+                    # even abandoned) CLOSING meanwhile. A stale epoch or a
+                    # non-ACTIVE lifecycle retires here WITHOUT entering the
+                    # kernel — regardless of which side won the transition.
+                    if (
+                        self._lifecycle != self._ACTIVE
+                        or self._handle != listen_handle
+                        or self._entry_epoch != entry_epoch
+                    ):
+                        self._pending_accepts -= 1
+                        released = True
+                        self._lifecycle_cond.notify_all()
+                        self._deferred_cleanup_locked(listen_handle)
+                        return None
+                self._before_kernel_call(listen_handle)
+                # F04-IR13 RESIDUAL WINDOW — the explicitly weakened
+                # guarantee (synchronous-I/O alternative the review
+                # accepts): shutdown completing AFTER the final check
+                # above but BEFORE this syscall can no longer be detected
+                # by any pre-call check (an epoch only detects an
+                # intervening transition when subsequently checked). If
+                # that happens, the blocking call runs with NO subsequent
+                # cancellation request; retirement is then EVENT-DRIVEN —
+                # the kernel call returns (client arrival or process
+                # exit), the post-return critical section observes
+                # CLOSING, and the deferred cleanup fires. close() stays
+                # bounded regardless (drain or abandonment) and NEVER
+                # closes a handle under a live kernel call.
+                connected = k32.ConnectNamedPipe(listen_handle, None)
+                connect_err = None if connected else _get_last_win32_error()
+                needs_recovery = False
+                with self._lifecycle_cond:
+                    self._pending_accepts -= 1
+                    released = True
+                    self._lifecycle_cond.notify_all()
+                    if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                        # Shutdown won while we held the lease. Two cases:
+                        # close() drained the lease and closed the handle
+                        # itself (nothing to do), or close() ABANDONED the
+                        # drain after its deadline and transferred ownership
+                        # to this, the final lease holder (F04-IR10): we now
+                        # perform the DEFERRED cleanup exactly once — never
+                        # both.
+                        self._deferred_cleanup_locked(listen_handle)
+                        return None
+                    if connected or connect_err == _ERROR_PIPE_CONNECTED:
+                        try:
+                            self._handle = self._create_instance(first=False)
+                        except BaseException:
+                            # Successor creation failed: retire the connected
+                            # handle exactly once and withdraw terminally.
+                            k32.CancelIoEx(listen_handle, None)
+                            k32.CloseHandle(listen_handle)
+                            self._handle = None
+                            self._lifecycle = self._TERMINAL
+                            raise
+                        return _WindowsPipeConnection(listen_handle)
+                    if connect_err == _ERROR_NO_DATA:
+                        # Recovery runs in a SECOND critical section, after
+                        # the lease is released: the deterministic shutdown
+                        # race (F04-RP04) fires at the pre-permission seam
+                        # below with no lease held, so close() can drain and
+                        # win without deadlocking against this thread.
+                        needs_recovery = True
+                    else:
+                        raise RuntimeError(f"ConnectNamedPipe failed: error {connect_err}")
+            finally:
+                if not released:
+                    with self._lifecycle_cond:
+                        self._pending_accepts -= 1
+                        self._lifecycle_cond.notify_all()
+                        if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                            # Exception-release of the lease while shutdown
+                            # had won: the same deferred-cleanup obligation
+                            # (F04-IR10).
+                            self._deferred_cleanup_locked(listen_handle)
+            if needs_recovery:
+                # Pre-permission seam (F04-RP04): outside every lock and
+                # lease, before the recovery decision.
+                self._before_recovery_permission()
+                with self._lifecycle_cond:
+                    if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                        return None  # shutdown won before recovery permission
+                    self._lifecycle = self._RECOVERING
+                    if not self._reset_disconnected_instance():
+                        reset_err = _get_last_win32_error()
+                        self._terminal_cleanup_locked()
+                        raise RuntimeError(
+                            f"DisconnectNamedPipe failed: error {reset_err}"
+                        )
+                    self._lifecycle = self._ACTIVE
+                continue  # the same handle is listening again
+
+    def admit(self, conn: Any) -> bool:
+        """F04-RP08 admission boundary: a connection returned by accept()
+        may enter handler processing only while the endpoint is ACTIVE.
+        If shutdown has won the synchronized decision, the connection is
+        closed WITHOUT any hello/request byte."""
+        with self._lifecycle_lock:
+            if self._lifecycle != self._ACTIVE:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return False
+            return True
+
+    def admit_and_dispatch(self, conn: Any, dispatch) -> bool:
+        """F04-IR03: admission and handler-dispatch commitment are ONE
+        indivisible critical section relative to the terminal shutdown
+        decision. If shutdown has won, the connection is closed without
+        protocol bytes and dispatch is never invoked; otherwise
+        dispatch(conn) runs while the lifecycle lock is held, so close()
+        cannot interleave between the admission check and the dispatch
+        commitment."""
+        with self._lifecycle_cond:
+            if self._lifecycle != self._ACTIVE:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return False
+            dispatch(conn)
+            return True
+
+    def close(self) -> None:
+        # F04-RP04/RP08/IR04: close-entry, handle closure, and security-
+        # resource release run UNDER the lifecycle lock after CLOSING is
+        # set. In-flight accept leases drain first (each woken by
+        # CancelIoEx), so the listener-owned handle is closed EXACTLY
+        # once and no accept operates on a closed or reused value.
+        with self._lifecycle_cond:
+            self._lifecycle = self._CLOSING
+            # F04-IR13: bump the entry epoch so any listener holding an
+            # authorized-but-not-yet-entered stamp retires at its
+            # post-barrier re-check instead of starting a blocking kernel
+            # call after the terminal decision.
+            self._entry_epoch += 1
+            # F04-IR06 cancellation-failure policy: cancellation is a
+            # REQUEST (CancelIoEx is not guaranteed to release a blocked
+            # synchronous operation). close() bounds its TOTAL drain wait;
+            # on abandonment it leaves the handle OWNED by the outstanding
+            # lease-holder (closed exactly once when that holder exits its
+            # call) and records the abandonment observably — it NEVER
+            # closes a handle under an outstanding lease.
+            self._close_abandoned = False
+            drain_deadline = time.monotonic() + self._CLOSE_DRAIN_BOUND_S
+            while self._pending_accepts > 0 and self._handle is not None:
+                _win_kernel32().CancelIoEx(self._handle, None)
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    self._close_abandoned = True
+                    logger.warning(
+                        'IPC endpoint close(): accept-lease drain abandoned after %.1fs '
+                        '(cancellation ineffective); handle remains owned by the '
+                        'outstanding lease-holder',
+                        self._CLOSE_DRAIN_BOUND_S,
+                    )
+                    return
+                self._lifecycle_cond.wait(timeout=min(1.0, remaining))
+            if not self._close_abandoned and self._handle is not None:
+                k32 = _win_kernel32()
+                k32.CancelIoEx(self._handle, None)
+                k32.CloseHandle(self._handle)
+                self._handle = None
+            if self._acl is not None:
+                _win_kernel32().LocalFree(self._acl)
+                self._acl = None
+            self._sd_buffer = None
+            self._sa = None
         # Named pipes disappear when the last handle closes — no unlink.

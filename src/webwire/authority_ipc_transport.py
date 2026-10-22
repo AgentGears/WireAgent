@@ -200,36 +200,60 @@ class IPCTransportServer:
             self._listener_thread = None
 
     def _accept_loop(self) -> None:
-        """Accept connections via the QUALIFIED endpoint; bounded handlers."""
+        """Accept connections via the QUALIFIED endpoint; bounded handlers.
+
+        F04-IR07: the endpoint reference is captured ONCE per iteration
+        and used for BOTH accept() and admit_and_dispatch() — stop()
+        clears self._endpoint, and re-dereferencing the field after
+        accept() returned would raise AttributeError before the
+        endpoint's synchronized lifecycle decision could refuse the
+        connection cleanly. The captured object's own terminal state
+        decides admission."""
         while self._running and self._endpoint is not None:
+            endpoint = self._endpoint
+            if endpoint is None:
+                break
             try:
-                conn = self._endpoint.accept()
+                conn = endpoint.accept()
             except (OSError, RuntimeError):
                 if self._running:
                     logger.warning("IPC accept loop: accept failed", exc_info=True)
                 break
             # F-70: None = the endpoint rejected the peer (e.g. SO_PEERCRED
             # uid mismatch) and already closed it — skip WITHOUT consuming
-            # a handler slot; the listener keeps serving.
+            # a handler slot; the listener keeps serving. F04 also uses
+            # None for "shutdown won a synchronized decision".
             if conn is None:
                 continue
-            # F-62: acquire a handler slot BEFORE spawning; saturation
-            # refuses the connection immediately (no unlimited waiters).
-            if not self._handler_slots.acquire(blocking=False):
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+            # F04-IR03: admission AND handler-dispatch commitment run as
+            # ONE indivisible critical section relative to shutdown — the
+            # endpoint's synchronized decision covers the dispatch call
+            # itself, so no handler can start in the check-to-start gap.
+            if not endpoint.admit_and_dispatch(conn, self._dispatch_connection):
                 continue
-            with self._connections_lock:
-                self._connections.add(conn)
-            thread = threading.Thread(
-                target=self._handle_connection,
-                args=(conn,),
-                daemon=True,
-                name="webwire-ipc-handler",
-            )
-            thread.start()
+            # (dispatched atomically inside admit_and_dispatch above)
+
+    def _dispatch_connection(self, conn: Any) -> None:
+        """F04-IR03 dispatch body: runs INSIDE the endpoint's admission
+        critical section — slot acquisition, registration, and handler
+        start commit together with the admission decision."""
+        # F-62: acquire a handler slot BEFORE spawning; saturation
+        # refuses the connection immediately (no unlimited waiters).
+        if not self._handler_slots.acquire(blocking=False):
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        with self._connections_lock:
+            self._connections.add(conn)
+        thread = threading.Thread(
+            target=self._handle_connection,
+            args=(conn,),
+            daemon=True,
+            name="webwire-ipc-handler",
+        )
+        thread.start()
 
     def _handle_connection(self, conn: Any) -> None:
         """One connection: hello → one framed request → response → close."""

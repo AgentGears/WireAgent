@@ -3,13 +3,13 @@
 Parks an accept lease at a seam that never enters ConnectNamedPipe
 (cancellation ineffective by construction), drives close() past its
 total drain bound (abandonment recorded, handle left to the holder),
-then RELEASES the parked lease — the holder's exit must perform the
-deferred cleanup exactly once — and finally proves a SUCCESSOR
-endpoint can bind the same pipe name (the retained-handle consequence
-the review identified). The never-returns containment (a lease whose
-kernel operation never returns keeps the handle until process exit) is
-a DOCUMENTED limit in the production docstring, not a phase here; the
-client-assisted release in this child is the completed-operation case.
+then RELEASES the parked lease with NO client — under the IR11/IR13
+retirement protocol the lease retires client-free, the deferred
+cleanup runs, and a SUCCESSOR endpoint binds the same pipe name (the
+retained-handle consequence the review identified). A kernel
+operation already executing when cancellation is requested is covered
+by the nominal blocked-accept shutdown test (cancellation effective)
+and by the documented process-exit containment (never returns).
 """
 
 from __future__ import annotations

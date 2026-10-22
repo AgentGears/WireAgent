@@ -637,6 +637,13 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
         self._acl = acl  # LocalAlloc'd by the API; LocalFree'd in close()
         return sa
 
+    def _before_kernel_call(self, listen_handle: Any) -> None:
+        """F04-IR13 residual-window test seam: invoked AFTER the final
+        lifecycle re-check releases the lock and IMMEDIATELY BEFORE the
+        synchronous ConnectNamedPipe — the exact check-to-call interval.
+        The deterministic falsification parks here. Production is a
+        no-op."""
+
     def _before_kernel_entry(self, listen_handle: Any) -> None:
         """F04-IR13 test seam: invoked AFTER the entry epoch is stamped
         under the lock and BEFORE the post-barrier re-check + kernel call —
@@ -802,6 +809,20 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
                         self._lifecycle_cond.notify_all()
                         self._deferred_cleanup_locked(listen_handle)
                         return None
+                self._before_kernel_call(listen_handle)
+                # F04-IR13 RESIDUAL WINDOW — the explicitly weakened
+                # guarantee (synchronous-I/O alternative the review
+                # accepts): shutdown completing AFTER the final check
+                # above but BEFORE this syscall can no longer be detected
+                # by any pre-call check (an epoch only detects an
+                # intervening transition when subsequently checked). If
+                # that happens, the blocking call runs with NO subsequent
+                # cancellation request; retirement is then EVENT-DRIVEN —
+                # the kernel call returns (client arrival or process
+                # exit), the post-return critical section observes
+                # CLOSING, and the deferred cleanup fires. close() stays
+                # bounded regardless (drain or abandonment) and NEVER
+                # closes a handle under a live kernel call.
                 connected = k32.ConnectNamedPipe(listen_handle, None)
                 connect_err = None if connected else _get_last_win32_error()
                 needs_recovery = False

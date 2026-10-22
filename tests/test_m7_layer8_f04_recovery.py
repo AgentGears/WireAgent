@@ -868,3 +868,55 @@ def test_single_acceptor_guard_covers_recovery_seam(tmp_path: Path) -> None:
 
 def self_lock(endpoint: WindowsNamedPipeEndpoint):
     return endpoint._lifecycle_cond
+
+
+def test_residual_window_containment_and_event_driven_retirement(tmp_path: Path) -> None:
+    """F04-IR13 residual window — the review's direct falsification:
+    shutdown abandons while the listener is parked AFTER the final
+    lifecycle check and IMMEDIATELY BEFORE ConnectNamedPipe, released
+    with NO client. The weakened synchronous guarantee's behavior is
+    characterized exactly: the listener enters the blocking call (no
+    subsequent cancellation exists), close() has already returned
+    bounded, the lease stays outstanding with the handle owned by the
+    holder (never closed under a live call) — the CONTAINMENT state —
+    and retirement is EVENT-DRIVEN: a client makes the kernel call
+    return, the deferred cleanup fires with full reconciliation, and a
+    successor binds the same pipe name. The alternative (overlapped
+    submission under the lock) is recorded in the proposal as the
+    stronger design; this tranche qualifies the synchronous containment
+    contract explicitly instead of claiming it away."""
+    import os
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo helper
+        [
+            _sys.executable,
+            str(Path(__file__).with_name("_f04_ir13w_child.py")),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+    )
+    assert proc.returncode == 0, f"child failed: {proc.stderr[-400:]!r}"
+    record = json.loads(proc.stdout.strip().splitlines()[-1])
+    print("IR13-RESIDUAL-WINDOW:", json.dumps(record))
+    # Containment during the no-client block.
+    assert record["abandoned_at_close"] is True, "close() abandoned in the window"
+    assert record["close_returned_bounded"] is True
+    assert record["listener_blocked_no_client"] is True, (
+        "the listener enters the blocking call after abandonment — the documented residual"
+    )
+    assert record["pending_while_blocked"] == 1, "the lease stays outstanding (never force-drained)"
+    assert record["handle_owned_during_window"] is True, "never closed under a live call"
+    # Event-driven retirement once the call returns.
+    assert record["accept_returned"] == [None]
+    assert record["pending_after"] == 0
+    assert record["handle_after"] is None
+    assert record["acl_after"] is None
+    assert record["sd_buffer_after"] is None
+    assert record["sa_after"] is None
+    assert record["close_abandoned_reconciled"] is False
+    assert record["successor_bound_same_name"] is True

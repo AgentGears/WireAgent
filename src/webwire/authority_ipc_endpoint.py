@@ -692,7 +692,11 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
 
     def accept(self) -> Any:
         """Wait for one client, then create the NEXT instance so later
-        clients still find a rendezvous. Returns a socket-compatible
+        clients still find a rendezvous. BINDING INVARIANT (F04-IR12):
+        at most ONE accept() may be in flight per endpoint — the
+        transport's single listener thread owns it; a concurrent second
+        accept is refused here so `_deferred_cleanup_locked`'s
+        final-holder semantics stay unambiguous. Returns a socket-compatible
         connection over the connected handle, or None when shutdown won
         a synchronized decision (the caller exits its loop cleanly).
 
@@ -709,11 +713,33 @@ class WindowsNamedPipeEndpoint(IPCEndpoint):
             with self._lifecycle_cond:
                 if self._lifecycle != self._ACTIVE or self._handle is None:
                     return None
+                if self._pending_accepts > 0:
+                    # F04-IR12: the single-acceptor invariant is binding,
+                    # not advisory — a second concurrent accept is refused
+                    # (the transport never issues one).
+                    raise RuntimeError(
+                        "concurrent accept() on one endpoint is prohibited "
+                        "(single-acceptor invariant)"
+                    )
                 listen_handle = self._handle
                 self._pending_accepts += 1
             released = False
             try:
                 self._before_accept_attempt(listen_handle)
+                # F04-IR11 operation-entry transition: the pre-kernel seam
+                # can park arbitrarily long, and shutdown may have completed
+                # its terminal decision (including drain abandonment) while
+                # we were parked. Re-check under the lock BEFORE entering the
+                # blocking kernel call: if shutdown won, release the lease and
+                # complete the deferred cleanup here — a pre-kernel lease must
+                # never START blocking after CLOSING.
+                with self._lifecycle_cond:
+                    if self._lifecycle != self._ACTIVE or self._handle != listen_handle:
+                        self._pending_accepts -= 1
+                        released = True
+                        self._lifecycle_cond.notify_all()
+                        self._deferred_cleanup_locked(listen_handle)
+                        return None
                 connected = k32.ConnectNamedPipe(listen_handle, None)
                 connect_err = None if connected else _get_last_win32_error()
                 needs_recovery = False

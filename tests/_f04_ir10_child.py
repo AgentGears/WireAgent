@@ -6,9 +6,10 @@ total drain bound (abandonment recorded, handle left to the holder),
 then RELEASES the parked lease — the holder's exit must perform the
 deferred cleanup exactly once — and finally proves a SUCCESSOR
 endpoint can bind the same pipe name (the retained-handle consequence
-your review identified). A second phase covers the never-returns
-containment: a lease parked permanently keeps the handle until process
-exit (documented limit — no close under a live operation).
+the review identified). The never-returns containment (a lease whose
+kernel operation never returns keeps the handle until process exit) is
+a DOCUMENTED limit in the production docstring, not a phase here; the
+client-assisted release in this child is the completed-operation case.
 """
 
 from __future__ import annotations
@@ -69,6 +70,12 @@ def main() -> int:
         "deferred_handle_after_release": ep._handle,
         "accept_returned": result,
         "lifecycle": ep._lifecycle,
+        # Full cleanup reconciliation (review evidence table).
+        "pending_after": ep._pending_accepts,
+        "acl_after": ep._acl,
+        "sd_buffer_after": ep._sd_buffer,
+        "sa_after": ep._sa,
+        "close_abandoned_reconciled": getattr(ep, "_close_abandoned", None),
     }
 
     # The consequence that matters: a SUCCESSOR binds the same name.

@@ -710,3 +710,71 @@ def test_abandoned_lease_deferred_cleanup_and_successor_bind(tmp_path: Path) -> 
     assert record["successor_bound_same_name"] is True, (
         f"a successor must bind the same pipe name after deferred cleanup: {record}"
     )
+
+
+def test_pre_kernel_lease_retires_after_shutdown_without_client(tmp_path: Path) -> None:
+    """F04-IR11, process-isolated, NO NEW CLIENT: an accept lease parked
+    BEFORE the kernel call is released after close() reached abandonment.
+    The operation-entry transition must catch CLOSING — the listener
+    releases the lease, performs the deferred cleanup (full resource
+    reconciliation observed), returns None, and NEVER enters
+    ConnectNamedPipe. A successor then binds the same pipe name. The
+    client-assisted IR10 lifecycle remains as the completed-operation
+    case; this is the no-client retirement the review required."""
+    import os
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo helper
+        [
+            _sys.executable,
+            str(Path(__file__).with_name("_f04_ir11_child.py")),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+    )
+    assert proc.returncode == 0, f"child failed: {proc.stderr[-400:]!r}"
+    record = json.loads(proc.stdout.strip().splitlines()[-1])
+    print("IR11-NO-CLIENT:", json.dumps(record))
+    assert record["abandoned_at_close"] is True
+    assert record["accept_returned"] == [None], "the lease retired without a client"
+    assert record["pending_after"] == 0, "the lease count reached zero"
+    assert record["handle_after"] is None, "the server handle retired exactly once"
+    assert record["acl_after"] is None, "ACL released"
+    assert record["sd_buffer_after"] is None, "security descriptor released"
+    assert record["sa_after"] is None, "security attributes released"
+    assert record["close_abandoned_reconciled"] is False, "abandonment reconciled by cleanup"
+    assert record["successor_bound_same_name"] is True, "successor binds the same pipe name"
+
+
+def test_concurrent_second_accept_is_refused(tmp_path: Path) -> None:
+    """F04-IR12: the single-acceptor invariant is BINDING — while one
+    accept() holds the endpoint's lease (parked at the pre-kernel
+    seam), a second concurrent accept() is refused with an explicit
+    single-acceptor error, keeping deferred-cleanup final-holder
+    semantics unambiguous."""
+    import threading
+
+    endpoint = WindowsNamedPipeEndpoint(tmp_path)
+    endpoint.bind()
+    hold = threading.Event()
+    release = threading.Event()
+
+    def _holding_seam(listen_handle: Any) -> None:
+        hold.set()
+        assert release.wait(timeout=15)
+
+    endpoint._before_accept_attempt = _holding_seam  # type: ignore[method-assign]
+    th = threading.Thread(target=lambda: endpoint.accept(), daemon=True)
+    th.start()
+    try:
+        assert hold.wait(timeout=10), "the first accept never acquired its lease"
+        with pytest.raises(RuntimeError, match="single-acceptor"):
+            endpoint.accept()
+    finally:
+        release.set()
+        th.join(timeout=15)
+        endpoint.close()
